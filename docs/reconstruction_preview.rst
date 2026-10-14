@@ -3,8 +3,11 @@
 
 ``resources/reconstruction_preview.py`` 读取已有数据集的 PLY 与 NeRF 相机，
 使用源码新增的 ``mi.VoxelReconstruction`` 初始化体素椭球，并渲染一张图。
-它用于检查数据坐标、初始化和前向合成，尚未执行损失、反向梯度、Adam、
-拓扑更新或 coarse-to-fine 训练。普通 Cornell box 的
+保留这一现有接口名称与当前算法；这个独立的 Mitsuba C++ 实现对应 Falcor
+中 ``VoxelReconstructionNoLightTransport`` pass 的初始化与前向流程；
+Falcor 中旧的 ``VoxelReconstruction`` 光传输 pass 不属于这次移植范围。
+当前入口用于检查数据坐标、初始化和前向合成，尚未执行损失、反向梯度、
+Adam、拓扑更新或 coarse-to-fine 训练。普通 Cornell box 的
 ``local_gpu_smoke.py`` 仍然是独立的基础环境检查。
 
 编译与运行
@@ -48,11 +51,63 @@ seed=42、grid_resolution=256。使用工作区已有数据，不会下载数据
 ``python/drjit`` 的完整源码运行目录，库导入位置会再次检查。
 没有源码产物或没有新绑定时直接报错，不使用 venv 中的 wheel 回退。
 
-``--gpu`` 接收本机 ``nvidia-smi`` 的物理编号，默认 0。脚本先查询 UUID，
-再在导入 Mitsuba/Dr.Jit 前设置本进程 ``CUDA_VISIBLE_DEVICES``。
-实际模式必须为 ``cuda_ad_rgb``，结果必须位于 CUDA 设备。缓存保存在
-输出目录的 ``cache/`` 中。这个入口是本地预览工具；检测到 Slurm 作业时
-会拒绝覆盖调度器分配，HPC 入口需要另行接入作业环境。
+GPU 选择由当前运行环境决定：
+
+* 未检测到 Slurm 作业时，``--gpu`` 接收本机 ``nvidia-smi`` 的物理编号，
+  默认 0。脚本先查询 UUID，再在导入 Mitsuba/Dr.Jit 前设置本进程
+  ``CUDA_VISIBLE_DEVICES``。
+* 存在 ``SLURM_JOB_ID`` 或 ``SLURM_JOBID`` 时，原样保留调度器提供的
+  ``CUDA_VISIBLE_DEVICES`` 与作业环境变量，忽略本地 ``--gpu`` /
+  ``runtime.gpu`` 设置并在日志中注明，不调用 ``nvidia-smi`` 按物理编号
+  重新选卡。``CUDA_VISIBLE_DEVICES`` 必须是有效的非空数字编号、GPU UUID
+  或 MIG 标识列表；缺失、空串、``-1``、``NoDevFiles`` 或非法值均明确
+  报错，不回退到其他 GPU 或 CPU。验证时保留原始字符串，不重写其内容。
+
+Slurm 下如果存在 ``SLURM_CPUS_PER_TASK``，它必须是正整数；未提供时
+保守使用 1 个 CPU 线程。脚本在导入 Dr.Jit 后立即调用
+``dr.set_thread_count()``，再导入 Mitsuba/NumPy，避免使用超出作业分配
+的 Dr.Jit CPU 线程。线程限制不改变 GPU 渲染模式。
+
+两种情况都要求实际模式为 ``cuda_ad_rgb``，结果必须位于 CUDA 设备。
+Slurm 下根据 DLPack 验证设备属于进程可见设备范围，进程内逻辑编号
+不等同于服务器物理编号。多 GPU 分配时也仅在 Dr.Jit 所选的一个可见 GPU
+上执行前向计算；本脚本尚无多 GPU 加速。缓存保存在输出目录的 ``cache/`` 中。
+
+在 HPC 上使用同一脚本
+--------------------
+
+服务器源码目录为 ``/home/changkun.li/projects/reconstruction/mitsuba``，
+环境为 ``/home/changkun.li/envs/mitsuba``。同步源码后，沿用已有增量编译
+命令：
+
+.. code-block:: bash
+
+   cmake --build "$HOME/projects/reconstruction/mitsuba/build" --parallel 8
+
+编译成功后，在已经分配的 GPU 计算节点或交互式 ``srun`` shell 中执行：
+
+.. code-block:: bash
+
+   cd "$HOME/projects/reconstruction"
+   "$HOME/envs/mitsuba/bin/python" -I mitsuba/resources/reconstruction_preview.py \
+     --dataset datasets/lego --camera-index 0 \
+     --output-dir outputs/mitsuba/lego-preview
+
+已有 GPU 分配时无需为这条命令再次申请资源。也可以先执行
+``conda activate "$HOME/envs/mitsuba"``，再使用该环境的 ``python -I``
+运行同一入口；直接调用上述解释器路径不依赖 shell 激活状态。
+
+Linux 默认源码运行目录为 ``mitsuba/build``，Windows 为
+``mitsuba/build/Release``，可用 ``--build-dir`` 显式覆盖。两者都显式
+加载并核对源码版 Mitsuba/Dr.Jit，没有预编译 wheel 回退。
+
+``datasets/lego`` 在服务器解析为
+``/home/changkun.li/projects/reconstruction/datasets/lego``，输出目录也
+相对于同一个 ``reconstruction`` 父目录。这些数据文件需要已经放置在
+服务器相应位置；脚本不传输或下载数据。共享配置继续使用相对路径。
+
+这里记录的是待服务器执行的用法；本次没有登录 HPC，也没有确认该节点的
+编译、GPU 驱动或实际预览成功。
 
 统一参数入口
 ------------
@@ -64,7 +119,7 @@ seed=42、grid_resolution=256。使用工作区已有数据，不会下载数据
 * ``render``：图像大小、spp、seed、像素采样方式、裁剪面、背景、
   透射率终止阈值及每射线命中上限。
 * ``output``：输出目录，是否保存完整初始化参数快照。
-* ``runtime``：源码构建目录及本机 GPU 编号。
+* ``runtime``：源码构建目录及本机 GPU 编号；Slurm 下 GPU 编号由调度器决定。
 
 可直接改 dataclass 默认值，也可用 JSON 文件覆盖；CLI 参数最后覆盖。
 JSON 只需填写有变化的字段，例如：
@@ -87,7 +142,8 @@ JSON 只需填写有变化的字段，例如：
      --config preview-config.json
 
 PLY 与相机文件相对于 ``data.dataset``，相机 JSON 中的图像路径也相对于
-该数据集；缺少后缀时补 ``.png``。配置与示例不包含机器特有绝对路径。
+该数据集；缺少后缀时补 ``.png``。共享 JSON 配置使用相对路径，无需写入
+本机 Windows 路径或服务器部署路径。
 输出 ``config.json`` 保留用户请求的相对路径，报告 ``resolved`` 字段
 另存实际绝对路径用于诊断。
 
@@ -135,6 +191,14 @@ Falcor 非训练预览的采样布局；这里的 NumPy PCG64 与 Falcor 随机�
   与 SHA-256，以及能够确认的实际 variant 扩展文件路径与 SHA-256。
   Git 不可用时记录错误，不影响前向测试；源码哈希代表启动时的工作区，
   不能替代修改 C++ 后重新编译。
+  ``gpu.selection`` 区分 ``local`` 与 ``slurm``；
+  ``gpu.cuda_visible_devices`` 在 Slurm 下保存原始、未经改写的环境变量，
+  本地则记录选中 GPU 的 UUID。Slurm 报告的
+  ``gpu.local_gpu_index_ignored`` 记录被忽略的本地编号，
+  ``gpu.process_visible_device_index`` 记录通过 DLPack 检查的进程内设备编号。
+  ``cpu_threads.requested`` 与 ``cpu_threads.actual`` 分别记录 Slurm
+  请求上限和实际 Dr.Jit 线程数；本地保留默认线程配置，仅记录 ``actual``，
+  没有 ``requested`` 字段。未完成相应阶段的失败报告可能缺少实际值。
 * ``initial-model.npz``：仅 ``--save-model`` 时输出，用于比较初始化参数。
   数组为展平 AoS，rotation 顺序为 wxyz，SH 数目见 config；也包含在报告
   的输出文件 SHA-256 清单中。
@@ -152,7 +216,10 @@ Falcor 非训练预览的采样布局；这里的 NumPy PCG64 与 Falcor 随机�
 --------------------
 
 ``resources/test_reconstruction.py`` 使用生成的小型输入检查原生初始化
-和前向行为。先完成源码编译，再在工作区父目录运行 CUDA 测试：
+和前向行为。这个回归入口仍按本机物理 GPU 编号选卡，仅用于本地检查，
+尚未接入上述 Slurm 环境规则；不要直接在 HPC 作业中运行它。
+本次服务器适配的入口是 ``resources/reconstruction_preview.py``。
+先完成源码编译，再在本地工作区父目录运行 CUDA 测试：
 
 .. code-block:: powershell
 
@@ -173,3 +240,28 @@ Falcor 非训练预览的采样布局；这里的 NumPy PCG64 与 Falcor 随机�
 默认报告位于 ``outputs/reconstruction-tests/native-cuda_ad_rgb.json`` 和
 ``native-scalar_rgb.json``。CPU 结果仅作为辅助；CUDA 使用独立的设备与
 后端验证，CUDA 失败不会回退 CPU，也不能用 CPU 通过代替 GPU 通过。
+
+运行环境规则的单元测试
+----------------------
+
+``resources/test_reconstruction_runtime.py`` 使用 Python 标准库
+``unittest`` 模拟环境变量、进程调用、Dr.Jit 线程接口和 DLPack 设备。
+它检查本地与 Slurm 的选卡、环境保留、非法输入拒绝、线程上限及设备范围，
+不导入 Mitsuba/Dr.Jit/NumPy，不使用真实 GPU，也不渲染。
+
+在本地 ``reconstruction`` 工作区目录运行：
+
+.. code-block:: powershell
+
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_runtime.py
+
+服务器可使用已有环境的解释器执行同一项纯标准库测试，无需为它申请 GPU：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I \
+     "$HOME/projects/reconstruction/mitsuba/resources/test_reconstruction_runtime.py"
+
+该测试验证模拟输入下的运行环境处理逻辑。通过不等同于真实 Slurm GPU
+分配、驱动、源码构建或服务器渲染通过；实际验证仍需在获配 GPU 的作业中
+执行预览，并检查本次 ``preview-report.json``。

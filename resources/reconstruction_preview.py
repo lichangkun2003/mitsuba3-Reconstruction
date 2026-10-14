@@ -17,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -66,7 +67,7 @@ class OutputConfig:
 @dataclass
 class RuntimeConfig:
     build_dir: str = "mitsuba/build/Release" if os.name == "nt" else "mitsuba/build"
-    gpu: int = 0  # Physical nvidia-smi index; this script is for local testing.
+    gpu: int = 0  # Physical nvidia-smi index locally; ignored inside Slurm jobs.
 
 
 @dataclass
@@ -155,7 +156,7 @@ def parse_config(workspace: Path) -> PreviewConfig:
     parser.add_argument("--pixel-sampling", choices=("shared_jitter", "center"))
     parser.add_argument("--output-dir")
     parser.add_argument("--build-dir")
-    parser.add_argument("--gpu", type=int)
+    parser.add_argument("--gpu", type=int, help="Local nvidia-smi index; ignored inside Slurm jobs")
     parser.add_argument("--save-model", action="store_true", default=None)
     args = parser.parse_args()
     config = PreviewConfig()
@@ -212,6 +213,78 @@ def validate_config(config: PreviewConfig) -> None:
         raise ValueError("SH coefficient counts must be integers in [1, 16]")
 
 
+def prepare_device_environment(gpu: int, report: dict) -> None:
+    """Keep Slurm's CUDA namespace intact; only local runs select a physical GPU."""
+    if "SLURM_JOB_ID" in os.environ or "SLURM_JOBID" in os.environ:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        tokens = [token.strip() for token in visible.split(",")] if visible is not None else []
+        report["gpu"] = {
+            "selection": "slurm", "cuda_visible_devices": visible,
+            "visible_device_tokens": tokens, "local_gpu_index_ignored": gpu,
+            "slurm": {name: os.environ[name] for name in (
+                "SLURM_JOB_ID", "SLURM_JOBID", "SLURM_STEP_ID", "SLURM_JOB_GPUS",
+                "SLURM_STEP_GPUS", "SLURM_GPUS_ON_NODE", "SLURM_CPUS_PER_TASK",
+            ) if name in os.environ},
+        }
+        # CUDA accepts numeric ordinals, GPU UUIDs (including unique prefixes),
+        # modern MIG UUIDs, and legacy MIG-GPU-<UUID>/<GI>/<CI> identifiers.
+        uuid = r"[0-9a-fA-F]+(?:-[0-9a-fA-F]+)*"
+        device_pattern = rf"(?:[0-9]+|GPU-{uuid}|MIG-{uuid}|MIG-GPU-{uuid}/[0-9]+/[0-9]+)"
+        if not tokens or any(re.fullmatch(device_pattern, token) is None for token in tokens):
+            raise RuntimeError(
+                "Slurm job requires a valid GPU allocation in CUDA_VISIBLE_DEVICES; "
+                f"got {visible!r}. Run inside a GPU-allocated job step. "
+                "The scheduler environment will not be changed and local GPU selection is disabled."
+            )
+        cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+        if cpus is not None and (re.fullmatch(r"[0-9]+", cpus) is None or int(cpus) < 1):
+            raise RuntimeError(f"SLURM_CPUS_PER_TASK must be a positive integer; got {cpus!r}")
+        report["cpu_threads"] = {
+            "source": "SLURM_CPUS_PER_TASK" if cpus is not None else "slurm_default",
+            "requested": int(cpus) if cpus is not None else 1,
+        }
+        return
+
+    query = subprocess.run(
+        ["nvidia-smi", f"--id={gpu}",
+         "--query-gpu=index,name,uuid,driver_version,memory.total", "--format=csv,noheader,nounits"],
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    rows = list(csv.reader(query.stdout.strip().splitlines(), skipinitialspace=True))
+    if len(rows) != 1 or len(rows[0]) != 5:
+        raise RuntimeError(f"Unexpected nvidia-smi output: {query.stdout!r}")
+    report["gpu"] = dict(zip(("index", "name", "uuid", "driver_version", "memory_mib"), rows[0]))
+    os.environ["CUDA_VISIBLE_DEVICES"] = report["gpu"]["uuid"]
+    report["gpu"].update(selection="local", cuda_visible_devices=report["gpu"]["uuid"])
+
+
+def configure_drjit_threads(dr, report: dict) -> None:
+    """Set the Slurm CPU budget before importing Mitsuba or initializing a model."""
+    if report["gpu"]["selection"] == "slurm":
+        budget = report["cpu_threads"]["requested"]
+        dr.set_thread_count(budget)
+        actual = dr.thread_count()
+        report["cpu_threads"]["actual"] = actual
+        if not 1 <= actual <= budget:
+            raise RuntimeError(f"Dr.Jit CPU thread count {actual} exceeds or invalidates Slurm budget {budget}")
+    else:
+        report["cpu_threads"] = {"source": "local_default", "actual": dr.thread_count()}
+    print("Dr.Jit CPU threads:", json.dumps(report["cpu_threads"]), flush=True)
+
+
+def verify_cuda_device(array, report: dict) -> None:
+    """Check CUDA residency using process-visible ordinals, not physical GPU IDs."""
+    device = list(array.__dlpack_device__())
+    report["dlpack_device"] = device
+    visible_count = (len(report["gpu"]["visible_device_tokens"])
+                     if report["gpu"]["selection"] == "slurm" else 1)
+    if len(device) != 2 or device[0] != 2 or not 0 <= device[1] < visible_count:
+        raise RuntimeError(
+            f"Expected a CUDA device with process-visible index in [0, {visible_count}), got {device}"
+        )
+    report["gpu"]["process_visible_device_index"] = device[1]
+
+
 def prepare_runtime(config: PreviewConfig, workspace: Path, output: Path, report: dict) -> list:
     runtime = workspace_path(config.runtime.build_dir, workspace)
     package_root = runtime / "python"
@@ -223,19 +296,7 @@ def prepare_runtime(config: PreviewConfig, workspace: Path, output: Path, report
     if os.name == "nt":
         for directory in (runtime, package_root / "drjit", package_root / "mitsuba"):
             handles.append(os.add_dll_directory(str(directory)))
-    # Do not silently replace an HPC scheduler's device assignment.
-    if os.environ.get("SLURM_JOB_ID"):
-        raise RuntimeError("This local GPU selector must not override a Slurm allocation")
-    query = subprocess.run(
-        ["nvidia-smi", f"--id={config.runtime.gpu}",
-         "--query-gpu=index,name,uuid,driver_version,memory.total", "--format=csv,noheader,nounits"],
-        check=True, capture_output=True, text=True, timeout=30,
-    )
-    rows = list(csv.reader(query.stdout.strip().splitlines(), skipinitialspace=True))
-    if len(rows) != 1 or len(rows[0]) != 5:
-        raise RuntimeError(f"Unexpected nvidia-smi output: {query.stdout!r}")
-    report["gpu"] = dict(zip(("index", "name", "uuid", "driver_version", "memory_mib"), rows[0]))
-    os.environ["CUDA_VISIBLE_DEVICES"] = report["gpu"]["uuid"]
+    prepare_device_environment(config.runtime.gpu, report)
     for variable, name in (("DRJIT_CACHE_DIR", "drjit"), ("CUDA_CACHE_PATH", "cuda"),
                            ("OPTIX_CACHE_PATH", "optix")):
         cache = output / "cache" / name
@@ -339,10 +400,13 @@ def main() -> int:
         print("Python version:", platform.python_version(), flush=True)
         dll_handles = prepare_runtime(config, workspace, output, report)  # Keep handles alive.
         import drjit as dr
+        package_root = Path(report["resolved"]["build_dir"]) / "python"
+        if not Path(dr.__file__).resolve().is_relative_to(package_root):
+            raise RuntimeError(f"Source build required; imported {dr.__file__}")
+        configure_drjit_threads(dr, report)
         import mitsuba as mi
         import numpy as np
 
-        package_root = Path(report["resolved"]["build_dir"]) / "python"
         for module in (mi, dr):
             if not Path(module.__file__).resolve().is_relative_to(package_root):
                 raise RuntimeError(f"Source build required; imported {module.__file__}")
@@ -417,9 +481,7 @@ def main() -> int:
         dr.eval(rgb, alpha, hits_sum)
         dr.sync_thread()
         report["render_seconds_including_jit"] = time.perf_counter() - started
-        report["dlpack_device"] = list(rgb.x.__dlpack_device__())
-        if report["dlpack_device"] != [2, 0]:
-            raise RuntimeError(f"Expected CUDA device [2, 0], got {report['dlpack_device']}")
+        verify_cuda_device(rgb.x, report)
         height, width = config.render.height, config.render.width
         rgb_np = np.stack([np.asarray(rgb.x), np.asarray(rgb.y), np.asarray(rgb.z)], axis=-1).reshape(height, width, 3)
         alpha_np = np.asarray(alpha).reshape(height, width)
