@@ -1,0 +1,6 @@
+# Windows CPython 3.12 wheel environment; independent of source-build dependencies.
+# Dr.Jit 1.5.0 is the exact dependency selected by Mitsuba 3.9.1.
+mitsuba==3.9.1
+drjit==1.5.0
+# Required by the wheel's ndarray/Bitmap conversion when saving the PNG.
+numpy==2.5.4
