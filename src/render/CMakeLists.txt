@@ -49,6 +49,8 @@ add_library(mitsuba-render OBJECT
                    ${INC_DIR}/mueller.h
   phase.cpp        ${INC_DIR}/phase.h
   postprocess.cpp  ${INC_DIR}/postprocess.h
+  reconstruction.cpp ${INC_DIR}/reconstruction.h
+  reconstruction_pointcloud.cpp reconstruction_pointcloud.h
   sampler.cpp      ${INC_DIR}/sampler.h
   scene.cpp        ${INC_DIR}/scene.h
   scene_ir.cpp     ${INC_DIR}/scene_ir.h
