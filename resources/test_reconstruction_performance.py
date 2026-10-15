@@ -255,6 +255,7 @@ def check_multiple_hit_layout(config, payload, view, rgba, mi, dr, np):
     assert int(dr.max(hits)[0]) > 1, "Fixture must exercise suffix reads behind multiple hits"
     cases = 0
     maximum = 0.
+    reverse_kernel_counts = {}
     for max_hits in (1, 5, 16):
         results = []
         for chunk_size in (0, 37):
@@ -267,9 +268,26 @@ def check_multiple_hit_layout(config, payload, view, rgba, mi, dr, np):
         maximum = max(maximum, compare_accumulators(results[0][0], results[1][0], np))
         np.testing.assert_allclose(results[0][1], results[1][1], atol=2e-7, rtol=2e-6)
         np.testing.assert_array_equal(results[0][2], results[1][2])
+        # Record the isolated reverse stage, not the candidate or ray-generation
+        # kernels. The symbolic reverse loop must not launch one kernel per
+        # configured hit slot. Warm each capacity's separately compiled graph.
+        options = {"max_hits": float(max_hits), "profile_stages": 1.}
+        for _ in range(2):
+            measured = model.loss_and_grad(ray, mi.Color3f(.3, .6, .1), mi.Float(.8),
+                                           mi.Color3f(1), mi.Float(1), options)
+            dr.eval(measured)
+            dr.sync_thread()
+        count = measured["stage_profile"]["hit_backward"]["jit_kernels"]
+        assert count > 0, measured["stage_profile"]
+        reverse_kernel_counts[max_hits] = int(count)
         cases += 1
+    # The symbolic reverse stage measured one JIT kernel for all three limits.
+    # Permit one extra fixed setup kernel, while rejecting the old host-unrolled
+    # implementation that dispatched a separate kernel for each hit slot.
+    assert all(count <= 2 for count in reverse_kernel_counts.values()), reverse_kernel_counts
     return {"multiple_hit_suffix_layout_full_frame_vs_chunks": cases,
-            "maximum_gradient_absolute_error": maximum}
+            "maximum_gradient_absolute_error": maximum,
+            "hit_backward_jit_kernel_counts_by_max_hits": reverse_kernel_counts}
 
 
 def reference_render_view(model, render, camera, spp, seed, chunk_size, mi, dr, np):

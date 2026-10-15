@@ -62,7 +62,9 @@ DEFAULTS = dict(alpha_loss_weight=.5, foreground_alpha_min=.95, background_alpha
                 alpha_geometry_weight=.1, background_carve_weight=.01,
                 geometry_two_sided_boundary=0., geometry_boundary_band_tau=1.,
                 geometry_transition_only=1., geometry_hit_expansion_band_tau=0.,
-                max_hits=16., max_candidates=16., transmittance_threshold=.01)
+                max_hits=16., max_candidates=16., transmittance_threshold=.01,
+                collect_deletion_evidence=1., min_evidence_transmittance=.05,
+                min_removal_loss_delta=1e-4)
 
 
 def oracle(np, state, origin, direction, target_rgb, target_alpha, pdf, settings):
@@ -119,12 +121,34 @@ def oracle(np, state, origin, direction, target_rgb, target_alpha, pdf, settings
     result = {key: np.zeros_like(state["centers"]) for key in ("centers", "log_scales", "rotation_tangent")}
     result.update(geometry_valid=np.zeros(len(state["cells"])), background_carve_valid=np.zeros(len(state["cells"])),
                   appearance_valid=np.bincount([record["index"] for record in hits], minlength=len(state["cells"])),
+                  foreground_evidence=np.zeros(len(state["cells"])), background_evidence=np.zeros(len(state["cells"])),
                   rgb=rgb, alpha=alpha, raw_rgb=raw_rgb, raw_alpha=raw_alpha, hit_count=len(hits))
     suffix_rgb, suffix_t = [background.copy()], [1.]
     for record in reversed(hits):
         suffix_rgb.insert(0, record["opacity"]*record["radiance"]+(1-record["opacity"])*suffix_rgb[0])
         suffix_t.insert(0, (1-record["opacity"])*suffix_t[0])
     is_bg = target_alpha <= cfg["background_alpha_max"]
+    if cfg["collect_deletion_evidence"]:
+        # Leave one recorded hit out and recomposite the remaining hard path.
+        # This independently checks the native suffix-based loss-delta formula;
+        # deletion evidence intentionally uses raw predictions, without PDF.
+        original_loss = np.sum((raw_rgb-target)**2) + cfg["alpha_loss_weight"]*(raw_alpha-target_alpha)**2
+        for removed in hits:
+            if removed["before"] < cfg["min_evidence_transmittance"]:
+                continue
+            removed_rgb, removed_t = np.zeros(3), 1.
+            for kept in hits:
+                if kept is removed:
+                    continue
+                removed_rgb += removed_t*kept["opacity"]*kept["radiance"]
+                removed_t *= 1-kept["opacity"]
+            removed_rgb += removed_t*background
+            removed_loss = np.sum((removed_rgb-target)**2) + cfg["alpha_loss_weight"]*(1-removed_t-target_alpha)**2
+            delta_loss = removed_loss-original_loss
+            result["foreground_evidence"][removed["index"]] = (
+                not is_bg and target_alpha >= cfg["foreground_alpha_min"] and delta_loss > cfg["min_removal_loss_delta"])
+            result["background_evidence"][removed["index"]] = (
+                is_bg and delta_loss < -cfg["min_removal_loss_delta"])
     for record in hits+misses:
         index, hard = record["index"], record["hit"]
         if record["ds"] == 0 or (is_bg and not hard):
@@ -219,9 +243,9 @@ def check_sparse_divergence(np, mi, dr):
     target = mi.Color3f(*(mi.Float(targets[:, i]) for i in range(3)))
     names = []
     maximum = 0.
-    for capacity in (0, 1, 16):
-        name = f"sparse_divergent_candidate_capacity_{capacity}"
-        settings = {"max_candidates": float(capacity)}
+    for capacity, deletion in ((0, True), (1, True), (16, True), (16, False)):
+        name = f"sparse_divergent_candidate_capacity_{capacity}" + ("" if deletion else "_no_deletion")
+        settings = {"max_candidates": float(capacity), "collect_deletion_evidence": float(deletion)}
         references = [oracle(np, spec, o.astype(np.float64), d.astype(np.float64),
                              c.astype(np.float64), float(a), float(w), settings)
                       for o, d, c, a, w in zip(origins, directions, targets, alphas, weights)]
@@ -237,6 +261,10 @@ def check_sparse_divergence(np, mi, dr):
         for key in ("geometry_valid", "background_carve_valid", "appearance_valid"):
             np.testing.assert_array_equal(np.asarray(out[key]).ravel(),
                                           sum(reference[key] for reference in references), err_msg=f"{name}: {key}")
+        for key in ("foreground_evidence", "background_evidence"):
+            expected = np.maximum.reduce([reference[key] for reference in references])
+            assert bool(np.any(expected)) == deletion, f"{name}: fixture must exercise {key}"
+            np.testing.assert_array_equal(np.asarray(out[key]).ravel(), expected, err_msg=f"{name}: {key}")
         np.testing.assert_array_equal(np.asarray(out["hit_count"]), [reference["hit_count"] for reference in references])
         for key in ("rgb", "raw_rgb", "alpha", "raw_alpha"):
             expected = np.asarray([reference[key] for reference in references])
@@ -277,6 +305,13 @@ def run_tests(np, mi, dr):
     multi["rgb"][:] = [[.2, .4, .7], [.8, .1, .3], [.3, .8, .2]]
     cases += [("candidate_suffix", multi, [.21, .19, -1.], [.1]*3, 1., 1., {}),
               ("hit_truncation", multi, [.21, .19, -1.], [.9]*3, 1., 1., {"max_hits": 1.})]
+    for count in (16, 20):
+        full = create_state(np, cells=[(0, 0, z) for z in range(count)], resolution=32,
+                            scales=(.014, .012, .014), angle=.2)
+        full["opacity"][:] = .1  # All 16 slots contribute before transmittance termination.
+        full["rgb"][:] = np.linspace([.2, .4, .7], [.7, .2, .3], count)
+        name = "full_sixteen_hit_suffix" if count == 16 else "sixteen_hit_capacity_truncation"
+        cases.append((name, full, [.62/32, .55/32, -1.], [.95]*3, 1., 1., {"max_hits": 16.}))
     nearest = create_state(np, cells=((0, 0, 0), (0, 0, 1), (0, 0, 2)), resolution=3, scales=(.04, .06, .06), angle=0.)
     nearest["centers"][:, 0] = [.1, .5, .7]
     cases.append(("nearest_candidate_capacity", nearest, [.29, .17, -1.], [.1]*3, 1., 1., {"max_candidates": 1.}))
@@ -318,7 +353,8 @@ def run_tests(np, mi, dr):
             actual = np.asarray(out["gradients"][key]).reshape(-1, 3)
             np.testing.assert_allclose(actual, expected[key], atol=8e-6, rtol=4e-4, err_msg=f"{name}: {key}")
             max_error = max(max_error, float(np.max(np.abs(actual-expected[key]))))
-        for key in ("geometry_valid", "background_carve_valid", "appearance_valid", "hit_count"):
+        for key in ("geometry_valid", "background_carve_valid", "appearance_valid", "hit_count",
+                    "foreground_evidence", "background_evidence"):
             np.testing.assert_array_equal(np.asarray(out[key]).ravel(), np.asarray(expected[key]).ravel(), err_msg=f"{name}: {key}")
         for key in ("rgb", "raw_rgb", "alpha", "raw_alpha"):
             np.testing.assert_allclose(np.asarray(out[key]).ravel(), np.asarray(expected[key]).ravel(), atol=2e-6, rtol=2e-5, err_msg=f"{name}: {key}")
@@ -336,6 +372,10 @@ def run_tests(np, mi, dr):
             np.testing.assert_array_equal(expected["geometry_valid"],
                                           np.r_[np.ones(capacity), np.zeros(len(spec["cells"])-capacity)])
             assert expected["hit_count"] == 0
+        if name in ("full_sixteen_hit_suffix", "sixteen_hit_capacity_truncation"):
+            assert expected["hit_count"] == 16
+            np.testing.assert_array_equal(expected["appearance_valid"],
+                                          np.r_[np.ones(16), np.zeros(len(spec["cells"])-16)])
         if name.endswith("blocked") or name in ("center_skip", "background_no_miss", "two_sided_deep_zero", "contains_cell_blocks_expansion"):
             assert np.max(np.abs(expected["log_scales"])) == 0, name
         print("PASS", name, flush=True)

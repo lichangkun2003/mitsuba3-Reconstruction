@@ -732,7 +732,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     for(const auto *key:{"appearance_valid","geometry_valid","background_carve_valid","foreground_evidence","background_evidence"})
         result.counters[key]=dr::zeros<UIntBuffer>(m_active_count);
     const float tau=std::max(cfg["geometry_tau_voxel_fraction"]*m_size[0],1e-8f);
-    auto add_geometry=[&](UInt32 id,const Vector3f &offset,Float gmin,Float before,
+    using GradientMap = std::map<std::string, FloatBuffer>;
+    using CounterMap = std::map<std::string, UIntBuffer>;
+    auto add_geometry=[this,quaternion,rotate,clean,is_background,dcolor,dalpha,weight,tau,cfg](
+                          GradientMap &gradients,CounterMap &counters,
+                          UInt32 id,const Vector3f &offset,Float gmin,Float before,
                           Float opacity,const Color3f &radiance,const Color3f &behind,
                           Float after,Mask valid,bool hard_hit) {
         Float qw;Vector3f qv,scale,center;
@@ -749,12 +753,12 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         Float distance_scale=dr::rcp(dr::select(valid,metric,1.f));
         Float distance=gmin*distance_scale,w=dr::rcp(1.f+dr::exp(distance/tau));
         Float derivative=dr::dot(dcolor,before*opacity*(radiance-behind))*(-w*(1.f-w)/tau);
-        if(hard_hit) derivative=dr::select(is_background,-cfg["background_carve_weight"]*w/tau,derivative);
-        derivative += cfg["alpha_geometry_weight"]*dalpha*before*opacity*after*(-w*(1.f-w)/tau);
-        Float dg=dr::clip(clean(derivative*distance_scale),-cfg["geometry_grad_clamp"],cfg["geometry_grad_clamp"]);
+        if(hard_hit) derivative=dr::select(is_background,-cfg.at("background_carve_weight")*w/tau,derivative);
+        derivative += cfg.at("alpha_geometry_weight")*dalpha*before*opacity*after*(-w*(1.f-w)/tau);
+        Float dg=dr::clip(clean(derivative*distance_scale),-cfg.at("geometry_grad_clamp"),cfg.at("geometry_grad_clamp"));
         Mask contains(true);
-        const bool two_sided=cfg["geometry_two_sided_boundary"]!=0.f;
-        if(hard_hit && (two_sided || (cfg["geometry_transition_only"]!=0.f && cfg["geometry_hit_expansion_band_tau"]>0.f))) {
+        const bool two_sided=cfg.at("geometry_two_sided_boundary")!=0.f;
+        if(hard_hit && (two_sided || (cfg.at("geometry_transition_only")!=0.f && cfg.at("geometry_hit_expansion_band_tau")>0.f))) {
             for(uint32_t corner=0;corner<8;++corner) {
                 Vector3f corner_offset;
                 for(uint32_t j=0;j<3;++j) corner_offset[j]=(float((corner>>j)&1u)-center[j])*m_size[j];
@@ -762,14 +766,14 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             }
         }
         if(two_sided) {
-            float band=tau*cfg["geometry_boundary_band_tau"];
+            float band=tau*cfg.at("geometry_boundary_band_tau");
             Float t=band>0.f?dr::clip(1.f-dr::abs(distance)/band,0.f,1.f):Float(0.f);
             Float taper=t*t*(3.f-2.f*t);
             dg*=hard_hit?dr::select(is_background,1.f,taper):taper;
             if(hard_hit) dg=dr::select((dg>0.f)&(is_background|contains),0.f,dg);
-        } else if(cfg["geometry_transition_only"]!=0.f) {
+        } else if(cfg.at("geometry_transition_only")!=0.f) {
             if(hard_hit) {
-                float band=tau*cfg["geometry_hit_expansion_band_tau"];
+                float band=tau*cfg.at("geometry_hit_expansion_band_tau");
                 Float t=band>0.f?dr::clip(1.f+distance/band,0.f,1.f):Float(0.f);
                 Float taper=dr::select(!is_background & !contains,t*t*(3.f-2.f*t),0.f);
                 dg=dr::select(dg>0.f,dg*taper,dg);
@@ -779,70 +783,91 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         Vector3f gc=-2.f*rotate(weighted,qw,qv),gs=-2.f*weighted*principal,gr=2.f*dr::cross(weighted,principal);
         // Apply 1/pdf after the nonlinear proxy clamp and transition gates.
         for(uint32_t j=0;j<3;++j) {
-            dr::scatter_reduce(ReduceOp::Add,result.gradients["centers"],clean(dg*gc[j]*m_size[j])*weight,id*3+j,valid);
-            dr::scatter_reduce(ReduceOp::Add,result.gradients["log_scales"],clean(dg*gs[j])*weight,id*3+j,valid);
-            dr::scatter_reduce(ReduceOp::Add,result.gradients["rotation_tangent"],clean(dg*gr[j])*weight,id*3+j,valid);
+            dr::scatter_reduce(ReduceOp::Add,gradients["centers"],clean(dg*gc[j]*m_size[j])*weight,id*3+j,valid);
+            dr::scatter_reduce(ReduceOp::Add,gradients["log_scales"],clean(dg*gs[j])*weight,id*3+j,valid);
+            dr::scatter_reduce(ReduceOp::Add,gradients["rotation_tangent"],clean(dg*gr[j])*weight,id*3+j,valid);
         }
-        dr::scatter_reduce(ReduceOp::Add,result.counters["geometry_valid"],UInt32(1),id,valid);
-        if(hard_hit) dr::scatter_reduce(ReduceOp::Add,result.counters["background_carve_valid"],UInt32(1),id,valid&is_background);
+        dr::scatter_reduce(ReduceOp::Add,counters["geometry_valid"],UInt32(1),id,valid);
+        if(hard_hit) dr::scatter_reduce(ReduceOp::Add,counters["background_carve_valid"],UInt32(1),id,valid&is_background);
     };
 
-    Color3f behind=background;
-    Float after(1.f);
-    for(int i=int(max_hits)-1;i>=0;--i) {
-        Mask valid=UInt32(i)<state.hits;
-        UInt32 slot=uint32_t(i)*ray_count+lane,id=dr::gather<UInt32>(records.hit_id,slot,valid);
-        Vector3f offset;Color3f radiance;
-        for(uint32_t j=0;j<3;++j) {
-            offset[j]=dr::gather<Float>(records.hit,j*hit_stride+slot,valid);
-            radiance[j]=dr::gather<Float>(records.hit,(4+j)*hit_stride+slot,valid);
-        }
-        Float gmin=dr::gather<Float>(records.hit,3*hit_stride+slot,valid);
-        Float opacity=dr::gather<Float>(records.hit,7*hit_stride+slot,valid);
-        Float before=dr::gather<Float>(records.hit,8*hit_stride+slot,valid);
-        Color3f grad_rgb=clean(dcolor*before*opacity);
-        grad_rgb=dr::select(radiance<=0.f,dr::minimum(grad_rgb,0.f),grad_rgb);
-        grad_rgb=dr::select(is_background,Color3f(0.f),grad_rgb)*weight;
-        Float grad_opacity=clean(dr::dot(dcolor,before*(radiance-behind))+dalpha*before*after);
-        Float grad_logit=grad_opacity*weight*opacity*(1.f-opacity);
-        for(uint32_t k=0;k<std::max(m_sh_count,m_opacity_sh_count);++k) {
-            Float sh=reconstruction_sh(k,Vector3f(-d));
-            if(k<m_sh_count)
-                for(uint32_t j=0;j<3;++j)
-                    dr::scatter_reduce(ReduceOp::Add,result.gradients["radiance_sh"],grad_rgb[j]*sh,(id*m_sh_count+k)*3+j,valid);
-            if(k<m_opacity_sh_count)
-                dr::scatter_reduce(ReduceOp::Add,result.gradients["opacity_sh"],grad_logit*sh,id*m_opacity_sh_count+k,valid);
-        }
-        dr::scatter_reduce(ReduceOp::Add,result.counters["appearance_valid"],UInt32(1),id,valid);
-        if(cfg["collect_deletion_evidence"]!=0.f) {
-            Color3f dc=before*opacity*(behind-radiance);
-            Float da=-before*opacity*after;
-            Float delta_loss=clean(dr::dot(deletion_dcolor,dc)+dr::squared_norm(dc)+deletion_dalpha*da+cfg["alpha_loss_weight"]*da*da);
-            Mask visible=valid & (before>=cfg["min_evidence_transmittance"]);
-            dr::scatter_reduce(ReduceOp::Or,result.counters["foreground_evidence"],UInt32(1),id,
-                visible&is_foreground&(delta_loss>cfg["min_removal_loss_delta"]));
-            dr::scatter_reduce(ReduceOp::Or,result.counters["background_evidence"],UInt32(1),id,
-                visible&is_background&(delta_loss<-cfg["min_removal_loss_delta"]));
-        }
-        add_geometry(id,offset,gmin,before,opacity,radiance,behind,after,valid,true);
-        behind=dr::select(valid,clean(opacity*radiance+(1.f-opacity)*behind),behind);
-        after=dr::select(valid,dr::clip(clean(after*(1.f-opacity)),0.f,1.f),after);
-        // Reuse consumed record storage for the suffix composite needed by misses.
-        // slot = i * ray_count + lane is unique per lane. Its four field
-        // planes are disjoint, so these writes can share one kernel. The next
-        // iteration's gather still evaluates them before reading this buffer.
-        for(uint32_t j=0;j<3;++j)
-            dr::scatter(records.hit,behind[j],(4+j)*hit_stride+slot,valid,ReduceMode::NoConflicts);
-        dr::scatter(records.hit,after,7*hit_stride+slot,valid,ReduceMode::NoConflicts);
+    // Hit records stay read-only inside the symbolic reverse loop. Separate
+    // suffix storage avoids a gather-after-scatter evaluation at every hit.
+    struct ReverseState {
+        Int32 hit;
+        Color3f behind;
+        Float after;
+        FloatBuffer suffix;
+        GradientMap gradients;
+        CounterMap counters;
+        DRJIT_STRUCT(ReverseState,hit,behind,after,suffix,gradients,counters)
+    } reverse{dr::full<Int32>(int(max_hits)-1,width),background,Float(1.f),
+              dr::zeros<FloatBuffer>(size_t(hit_stride)*4),
+              std::move(result.gradients),std::move(result.counters)};
+    dr::tie(reverse)=dr::while_loop(dr::make_tuple(std::move(reverse)),
+        [](const ReverseState &s) { return s.hit>=0; },
+        [this,hit_records=records.hit,hit_ids=records.hit_id,hit_count=state.hits,
+         ray_count,hit_stride,lane,clean,dcolor,dalpha,d,weight,is_background,
+         is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry](ReverseState &s) {
+            Mask valid=UInt32(s.hit)<hit_count;
+            UInt32 slot=UInt32(s.hit)*ray_count+lane,id=dr::gather<UInt32>(hit_ids,slot,valid);
+            Vector3f offset;Color3f radiance;
+            for(uint32_t j=0;j<3;++j) {
+                offset[j]=dr::gather<Float>(hit_records,j*hit_stride+slot,valid);
+                radiance[j]=dr::gather<Float>(hit_records,(4+j)*hit_stride+slot,valid);
+            }
+            Float gmin=dr::gather<Float>(hit_records,3*hit_stride+slot,valid);
+            Float opacity=dr::gather<Float>(hit_records,7*hit_stride+slot,valid);
+            Float before=dr::gather<Float>(hit_records,8*hit_stride+slot,valid);
+            Color3f grad_rgb=clean(dcolor*before*opacity);
+            grad_rgb=dr::select(radiance<=0.f,dr::minimum(grad_rgb,0.f),grad_rgb);
+            grad_rgb=dr::select(is_background,Color3f(0.f),grad_rgb)*weight;
+            Float grad_opacity=clean(dr::dot(dcolor,before*(radiance-s.behind))+dalpha*before*s.after);
+            Float grad_logit=grad_opacity*weight*opacity*(1.f-opacity);
+            for(uint32_t k=0;k<std::max(m_sh_count,m_opacity_sh_count);++k) {
+                Float sh=reconstruction_sh(k,Vector3f(-d));
+                if(k<m_sh_count)
+                    for(uint32_t j=0;j<3;++j)
+                        dr::scatter_reduce(ReduceOp::Add,s.gradients["radiance_sh"],grad_rgb[j]*sh,(id*m_sh_count+k)*3+j,valid);
+                if(k<m_opacity_sh_count)
+                    dr::scatter_reduce(ReduceOp::Add,s.gradients["opacity_sh"],grad_logit*sh,id*m_opacity_sh_count+k,valid);
+            }
+            dr::scatter_reduce(ReduceOp::Add,s.counters["appearance_valid"],UInt32(1),id,valid);
+            if(cfg.at("collect_deletion_evidence")!=0.f) {
+                Color3f dc=before*opacity*(s.behind-radiance);
+                Float da=-before*opacity*s.after;
+                Float delta_loss=clean(dr::dot(deletion_dcolor,dc)+dr::squared_norm(dc)+deletion_dalpha*da+cfg.at("alpha_loss_weight")*da*da);
+                Mask visible=valid & (before>=cfg.at("min_evidence_transmittance"));
+                dr::scatter_reduce(ReduceOp::Or,s.counters["foreground_evidence"],UInt32(1),id,
+                    visible&is_foreground&(delta_loss>cfg.at("min_removal_loss_delta")));
+                dr::scatter_reduce(ReduceOp::Or,s.counters["background_evidence"],UInt32(1),id,
+                    visible&is_background&(delta_loss<-cfg.at("min_removal_loss_delta")));
+            }
+            add_geometry(s.gradients,s.counters,id,offset,gmin,before,opacity,radiance,s.behind,s.after,valid,true);
+            s.behind=dr::select(valid,clean(opacity*radiance+(1.f-opacity)*s.behind),s.behind);
+            s.after=dr::select(valid,dr::clip(clean(s.after*(1.f-opacity)),0.f,1.f),s.after);
+            // Each ray writes each slot once; the four planes are disjoint.
+            // Candidates read these suffixes only after reverse traversal ends.
+            for(uint32_t j=0;j<3;++j)
+                dr::scatter(s.suffix,s.behind[j],j*hit_stride+slot,valid,ReduceMode::NoConflicts);
+            dr::scatter(s.suffix,s.after,3*hit_stride+slot,valid,ReduceMode::NoConflicts);
+            s.hit-=1;
+        },"Voxel reconstruction reverse paths");
+    result.gradients=std::move(reverse.gradients);
+    result.counters=std::move(reverse.counters);
+    // Loop traversal includes maps, while schedule() needs their buffers
+    // explicitly. Materialize all reverse outputs at the existing stage boundary.
+    if constexpr (dr::is_jit_v<Float>) {
+        dr::schedule(reverse.suffix);
+        for(const auto &[name,value]:result.gradients) dr::schedule(value);
+        for(const auto &[name,value]:result.counters) dr::schedule(value);
     }
     if (profiler.enabled()) {
-        if constexpr (dr::is_jit_v<Float>)
-            dr::schedule(records.hit);
         evaluate_result(result);
         profiler.finish("hit_backward");
         profiler.begin();
-    } else {
-        dr::eval(records.hit);
+    } else if constexpr (dr::is_jit_v<Float>) {
+        dr::eval();
     }
     for(uint32_t i=0;i<max_candidates;++i) {
         Mask valid=(i<state.candidates)&!is_background;
@@ -852,11 +877,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         Mask has_suffix=valid&(front<state.hits);
         Color3f suffix_color;
         for(uint32_t j=0;j<3;++j)
-            suffix_color[j]=dr::select(has_suffix,dr::gather<Float>(records.hit,(4+j)*hit_stride+suffix,has_suffix),background[j]);
-        Float suffix_t=dr::select(has_suffix,dr::gather<Float>(records.hit,7*hit_stride+suffix,has_suffix),1.f);
+            suffix_color[j]=dr::select(has_suffix,dr::gather<Float>(reverse.suffix,j*hit_stride+suffix,has_suffix),background[j]);
+        Float suffix_t=dr::select(has_suffix,dr::gather<Float>(reverse.suffix,3*hit_stride+suffix,has_suffix),1.f);
         Color3f radiance;Float opacity;
         appearance(id,Vector3f(-d),valid,radiance,opacity);
-        add_geometry(id,candidate.point,candidate.gmin,candidate.before,opacity,radiance,suffix_color,suffix_t,valid,false);
+        add_geometry(result.gradients,result.counters,id,candidate.point,candidate.gmin,candidate.before,opacity,radiance,suffix_color,suffix_t,valid,false);
     }
     if (profiler.enabled()) {
         evaluate_result(result);
