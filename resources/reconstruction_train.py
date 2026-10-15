@@ -10,6 +10,7 @@ import argparse
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
+import gc
 import json
 import math
 from pathlib import Path
@@ -63,6 +64,16 @@ class ContourSettings:
 
 
 @dataclass
+class EvaluationSettings:
+    enabled: bool = True
+    spp: int = 64
+    max_views: int | None = 10  # First N cameras of each split; None: all views.
+    chunk_size: int = 65536
+    seed: int = 42
+    test_cameras: str = "transforms_test.json"
+
+
+@dataclass
 class TrainConfig:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -74,6 +85,7 @@ class TrainConfig:
     topology: TopologySettings = field(default_factory=TopologySettings)
     schedule: CoarseToFineConfig = field(default_factory=CoarseToFineConfig)
     contour: ContourSettings = field(default_factory=ContourSettings)
+    evaluation: EvaluationSettings = field(default_factory=EvaluationSettings)
 
 
 # ==================== 训练实验配置：常用参数在这里修改 ====================
@@ -96,6 +108,9 @@ CONFIG.training.num_epochs = 1000  # 整个实验总轮数，每轮遍历全部�
 CONFIG.training.save_count = 3  # 包含最终 model.npz，共保存三次。
 CONFIG.training.output = None  # 自动创建 outputs/场景-MM.DD-E编号/training。
 # 需要手动指定目录时，将 None 改为路径字符串，或传 --output-dir。
+CONFIG.evaluation.enabled = True  # 最终 model.npz 保存后，自动评价训练集和测试集。
+CONFIG.evaluation.spp = 64  # 仅用于评价出图，不改变训练的 1 spp。
+CONFIG.evaluation.max_views = 10  # 各取相机文件中的前 10 个视角；None 表示全部。
 # 高级参数使用 CONFIG.optimizer / gradient / topology / contour / runtime。
 # ============================ 配置区结束 ============================
 
@@ -130,6 +145,9 @@ def parse_arguments():
     parser.add_argument("--gpu", type=int, help="Local physical index; ignored under Slurm")
     parser.add_argument("--chunk-size", type=int, help="0 (default): full image; positive: maximum rays per batch")
     parser.add_argument("--profile-views", type=int, help="Record kernel/cache timings for the first N processed views")
+    parser.add_argument("--skip-evaluation", action="store_true", help="Save the final model without automatic train/test evaluation")
+    parser.add_argument("--eval-spp", type=int, help="Samples per pixel for final evaluation (default: 64)")
+    parser.add_argument("--eval-max-views", type=int, help="Evaluate the first N cameras of each split (default: 10)")
     return parser.parse_args()
 
 
@@ -139,9 +157,13 @@ def apply_arguments(config, args, values):
         (args.dataset, "data", "dataset"), (args.output_dir, "training", "output"),
         (args.build_dir, "runtime", "build_dir"), (args.gpu, "runtime", "gpu"),
         (args.chunk_size, "training", "chunk_size"),
-        (args.profile_views, "training", "profile_views")):
+        (args.profile_views, "training", "profile_views"),
+        (args.eval_spp, "evaluation", "spp"),
+        (args.eval_max_views, "evaluation", "max_views")):
         if value is not None:
             setattr(getattr(config, group), key, value)
+    if args.skip_evaluation:
+        config.evaluation.enabled = False
     config.schedule.total_epochs = config.training.num_epochs
 
 
@@ -166,6 +188,20 @@ def validate(config):
             raise ValueError(f"Invalid gradient.{name}: {value}")
     if config.gradient.geometry_tau_voxel_fraction <= 0:
         raise ValueError("geometry_tau_voxel_fraction must be positive")
+    if not isinstance(config.evaluation.enabled, bool):
+        raise ValueError("evaluation.enabled must be a boolean")
+    from reconstruction_evaluate import validate_config as validate_evaluation
+    validate_evaluation(final_evaluation_config(config, Path("model.npz")))
+
+
+def final_evaluation_config(config, model_path):
+    """Use the saved model, current runtime and experiment directory for evaluation."""
+    from reconstruction_evaluate import EvaluationConfig
+    return EvaluationConfig(checkpoint=str(model_path), dataset=config.data.dataset,
+        splits=("train", "test"), cameras={"train": config.data.cameras, "test": config.evaluation.test_cameras},
+        spp=config.evaluation.spp, max_views=config.evaluation.max_views,
+        seed=config.evaluation.seed, chunk_size=config.evaluation.chunk_size,
+        output_directory=str(model_path.parent), runtime=config.runtime)
 
 
 def settings(config):
@@ -320,7 +356,8 @@ def validate_existing_model(path: Path, resumed_checkpoint: dict) -> None:
         raise ValueError(f"Exported model belongs to a different training dataset: {path}; choose a new experiment directory")
 
 
-def main():
+def run_training():
+    """Finish and save training before releasing its GPU state for evaluation."""
     args = parse_arguments()
     overrides = json.loads(workspace_path(args.config, WORKSPACE).read_text(encoding="utf-8")) if args.config else {}
     config = TrainConfig()
@@ -332,7 +369,8 @@ def main():
     model_path = final_model_path(output)
     print("Training output:", output, flush=True)
     print("Final reconstructed model:", model_path, flush=True)
-    report = {"status": "running", "started_utc": datetime.now(timezone.utc).isoformat(),
+    report = {"status": "running", "training_status": "running", "evaluation": {"status": "not_started"},
+              "started_utc": datetime.now(timezone.utc).isoformat(),
               "scope": "Falcor NoLightTransport 1-spp full-view training; explicit geometry surrogate gradients",
               "falcor_reference_commit": "398f634ec788bbb2e86a6f4d0ab78d41158d9905",
               "training_protocol": {"spp": 1, "reference_background": [1, 1, 1],
@@ -518,13 +556,56 @@ def main():
         # atomic checkpoint format understood by independent evaluation scripts.
         save(model_path, config.training.num_epochs)
         print("Saved reconstructed voxel model:", model_path, flush=True)
-        report.update(status="passed", completed_epochs=config.training.num_epochs, global_step=global_step,
+        report.update(status="running" if config.evaluation.enabled else "passed", training_status="passed",
+                      evaluation={"status": "pending" if config.evaluation.enabled else "skipped"},
+                      completed_epochs=config.training.num_epochs, global_step=global_step,
                       checkpoint=str(model_path),
                       reconstructed_model={"path": str(model_path), "sha256": file_sha256(model_path),
                           "completed_epochs": config.training.num_epochs, "global_step": global_step})
     except Exception:
-        report.update(status="failed", error=traceback.format_exc())
+        report.update(status="failed", training_status="failed", error=traceback.format_exc())
         print(report["error"], file=sys.stderr, flush=True)
+    finally:
+        report["training_finished_utc"] = datetime.now(timezone.utc).isoformat()
+        if report["status"] != "running":
+            report["finished_utc"] = report["training_finished_utc"]
+        (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
+    return config, model_path, output, report
+
+
+def main():
+    config, model_path, output, report = run_training()
+    if report["training_status"] != "passed":
+        return 1
+    if not config.evaluation.enabled:
+        return 0
+    evaluation = final_evaluation_config(config, model_path)
+    evaluation_report = model_path.parent / "evaluation-report.json"
+    report["evaluation"] = {"status": "running", "spp": evaluation.spp,
+        "max_views_per_split": evaluation.max_views, "splits": list(evaluation.splits),
+        "output": evaluation.output_directory, "report": str(evaluation_report)}
+    (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
+    limit = "all views" if evaluation.max_views is None else f"first {evaluation.max_views} views per split"
+    print(f"Starting final train/test evaluation: {evaluation.spp} spp, {limit}", flush=True)
+    try:
+        # run_training's model, optimizer and gradients are out of scope. Reclaim
+        # their allocations before restoring the published checkpoint for evaluation.
+        gc.collect()
+        import drjit as dr
+        dr.sync_thread()
+        dr.flush_malloc_cache()
+        from reconstruction_evaluate import run_evaluation
+        result = run_evaluation(evaluation)
+        report["evaluation"]["status"] = "passed" if result == 0 else "failed"
+        report["status"] = "passed" if result == 0 else "failed"
+        if result != 0:
+            print(f"Training completed and model is saved at {model_path}; "
+                  f"evaluation failed. See {evaluation_report}", file=sys.stderr, flush=True)
+    except Exception:
+        report["status"] = "failed"
+        report["evaluation"].update(status="failed", error=traceback.format_exc())
+        print(report["evaluation"]["error"], file=sys.stderr, flush=True)
+        print(f"Training completed; the saved model is preserved at {model_path}", file=sys.stderr, flush=True)
     finally:
         report["finished_utc"] = datetime.now(timezone.utc).isoformat()
         (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")

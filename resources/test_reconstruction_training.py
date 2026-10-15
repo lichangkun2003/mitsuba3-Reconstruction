@@ -1,4 +1,4 @@
-"""Small CUDA regression: gradients, checkpoint roundtrip and full-epoch resume.
+"""Small CUDA regression: gradients, resume and automatic train/test evaluation.
 
 Only generated 16x16 images and point clouds are used. No project dataset is
 rendered. Run explicitly with the source environment after compiling C++.
@@ -127,6 +127,7 @@ def main():
                   "runtime": {"build_dir": args.build_dir, "gpu": args.gpu},
                   "training": {"num_epochs": 3, "chunk_size": 0, "profile_views": 2,
                                "save_count": 3, "output": str(run / "full")},
+                  "evaluation": {"max_views": 1},  # Exercise the default 64 spp on a subset.
                   "schedule": {"enabled": False},
                   "optimizer": {"opacity_warmup_epochs": 0, "opacity_ramp_epochs": 0,
                                 "lr_center": 0., "lr_log_scale": 0., "lr_rotation": 0.},
@@ -135,11 +136,30 @@ def main():
         config_path.write_text(json.dumps(config), encoding="utf-8")
         entry = Path(__file__).with_name("reconstruction_train.py")
 
-        def run_process(command, name):
+        def run_process(command, name, *, expect_success=True):
             result = subprocess.run(command, text=True, capture_output=True)
             (run / f"{name}.log").write_text(result.stdout + result.stderr, encoding="utf-8")
-            if result.returncode:
+            if expect_success and result.returncode:
                 raise RuntimeError(f"{name} failed:\n{result.stdout}\n{result.stderr}")
+            if not expect_success and not result.returncode:
+                raise AssertionError(f"{name} unexpectedly succeeded")
+            return result
+
+        def check_automatic_evaluation(directory, *, spp=64, count=1, max_views=1):
+            evaluation = json.loads((directory / "evaluation-report.json").read_text(encoding="utf-8"))
+            assert evaluation["status"] == "passed"
+            assert evaluation["render"]["spp"] == spp
+            assert evaluation["requested_config"]["max_views"] == max_views
+            assert evaluation["checkpoint"]["global_step"] == 6
+            for split in ("train", "test"):
+                assert evaluation["splits"][split]["aggregate"]["view_count"] == count
+                assert [view["index"] for view in evaluation["splits"][split]["views"]] == list(range(count))
+                assert {path.name for path in (directory / split).glob("*.png")} == {
+                    f"{index:04d}.png" for index in range(count)}
+                assert (directory / split / "metrics.json").is_file()
+            saved_evaluation = json.loads((directory / "evaluation-config.json").read_text(encoding="utf-8"))
+            assert saved_evaluation["spp"] == spp
+            assert saved_evaluation["max_views"] == max_views
 
         run_process([sys.executable, "-I", str(entry), "--config", str(config_path)], "full")
         first = load_checkpoint(run / "full" / "epoch-00001.npz")
@@ -152,6 +172,8 @@ def main():
         full_report = json.loads((run / "full" / "training-report.json").read_text(encoding="utf-8"))
         assert full_report["reconstructed_model"]["completed_epochs"] == 3
         assert full_report["reconstructed_model"]["global_step"] == 6
+        assert full_report["training_status"] == "passed"
+        assert full_report["evaluation"]["status"] == "passed"
         assert Path(full_report["reconstructed_model"]["path"]) == run / "full" / "model.npz"
         assert full_report["training_protocol"]["batches_per_view"] == 1
         profiles = [json.loads(line) for line in Path(full_report["profile_file"]).read_text(encoding="utf-8").splitlines()]
@@ -162,10 +184,18 @@ def main():
         report["checks"].append("full-image training, completed-view progress and optional kernel profile")
         assert len((run / "full" / "training.jsonl").read_text(encoding="utf-8").splitlines()) == 3
         report["checks"].append("three epochs save two intermediate checkpoints and final model without duplicate archives")
+        check_automatic_evaluation(run / "full")
+        saved_config = json.loads((run / "full" / "config.json").read_text(encoding="utf-8"))
+        assert saved_config["render"]["spp"] == final["config"]["render"]["spp"] == 1
+        assert saved_config["training"]["num_epochs"] == 3
+        assert final["config"]["evaluation"]["spp"] == 64
+        assert final["config"]["evaluation"]["max_views"] == 1
+        report["checks"].append("automatic 64-spp evaluation selects the first view of each split without limiting training or replacing training config")
         if np.array_equal(first["model_state"]["radiance_sh"], final["model_state"]["radiance_sh"]):
             raise AssertionError("Full-epoch training did not change radiance parameters")
         run_process([sys.executable, "-I", str(entry), "--resume", str(run / "full" / "epoch-00001.npz"),
-                     "--output-dir", str(run / "resumed"), "--build-dir", args.build_dir, "--gpu", str(args.gpu)], "resume")
+                     "--output-dir", str(run / "resumed"), "--build-dir", args.build_dir, "--gpu", str(args.gpu),
+                     "--skip-evaluation"], "resume")
         resumed = load_checkpoint(run / "resumed" / "model.npz")
         assert {path.name for path in (run / "resumed").glob("*.npz")} == {"epoch-00002.npz", "model.npz"}
         for key in final["model_state"]:
@@ -174,10 +204,14 @@ def main():
             for key, value in group.items():
                 np.testing.assert_allclose(resumed["optimizer_state"]["groups"][name][key], value, atol=2e-6, rtol=2e-6)
         assert resumed["training_state"]["rng_state"] == final["training_state"]["rng_state"]
+        assert not (run / "resumed" / "evaluation-report.json").exists()
+        resume_report = json.loads((run / "resumed" / "training-report.json").read_text(encoding="utf-8"))
+        assert resume_report["training_status"] == "passed"
+        assert resume_report["evaluation"]["status"] == "skipped"
         report["checks"].append("two-view/three-epoch updates and epoch-boundary resume equivalent")
         run_process([sys.executable, "-I", str(entry), "--resume", str(run / "full" / "model.npz"),
                      "--output-dir", str(run / "already-finished" / "training"), "--build-dir", args.build_dir,
-                     "--gpu", str(args.gpu)], "already-finished")
+                     "--gpu", str(args.gpu), "--eval-spp", "2", "--eval-max-views", "10"], "already-finished")
         assert not list((run / "already-finished" / "training").glob("*.npz"))
         assert {path.relative_to(run / "already-finished").as_posix()
                 for path in (run / "already-finished").rglob("*.npz")} == {"model.npz"}
@@ -185,12 +219,34 @@ def main():
         assert completed_export["training_state"]["global_step"] == 6
         for key in final["model_state"]:
             np.testing.assert_array_equal(completed_export["model_state"][key], final["model_state"][key])
-        report["checks"].append("completed resume exports only model.npz to the experiment parent")
+        check_automatic_evaluation(run / "already-finished", spp=2, count=2, max_views=10)
+        assert not (run / "already-finished" / "config.json").exists()
+        exported_config = json.loads((run / "already-finished" / "training" / "config.json").read_text(encoding="utf-8"))
+        assert exported_config["render"]["spp"] == 1
+        report["checks"].append("completed resume exports model.npz then evaluates; CLI limits larger than a split select all available views")
+
+        # A missing evaluation split must not invalidate or remove the trained model.
+        failure_config = run / "missing-test.json"
+        failure_config.write_text(json.dumps({"evaluation": {"test_cameras": "missing-test.json", "spp": 1}}),
+                                  encoding="utf-8")
+        run_process([sys.executable, "-I", str(entry), "--resume", str(run / "full" / "model.npz"),
+                     "--config", str(failure_config), "--output-dir", str(run / "evaluation-failed" / "training"),
+                     "--build-dir", args.build_dir, "--gpu", str(args.gpu)],
+                    "evaluation-failed", expect_success=False)
+        failure_report = json.loads((run / "evaluation-failed" / "training" / "training-report.json").read_text(encoding="utf-8"))
+        assert failure_report["training_status"] == "passed"
+        assert failure_report["evaluation"]["status"] == "failed"
+        failed_model = load_checkpoint(run / "evaluation-failed" / "model.npz")
+        assert failed_model["training_state"]["global_step"] == 6
+        for key in final["model_state"]:
+            np.testing.assert_array_equal(failed_model["model_state"][key], final["model_state"][key])
+        report["checks"].append("automatic evaluation failure exits nonzero while preserving the completed model")
 
         config["training"]["output"] = str(run / "coarse")
         config["schedule"] = {"enabled": True, "start_resolution": 4, "target_resolution": 8,
                               "enable_coarse_growth": False, "save_each_level": True}
         config["contour"] = {"enabled": True}
+        config["evaluation"]["enabled"] = False
         config_path.write_text(json.dumps(config), encoding="utf-8")
         run_process([sys.executable, "-I", str(entry), "--config", str(config_path)], "coarse")
         coarse = load_checkpoint(run / "coarse" / "model.npz")

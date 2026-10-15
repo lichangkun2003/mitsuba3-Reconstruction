@@ -69,6 +69,9 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
    CONFIG.training.num_epochs = 1000
    CONFIG.training.save_count = 3
    CONFIG.training.output = None  # 自动创建 outputs/场景-月.日-E编号/training
+   CONFIG.evaluation.enabled = True  # 完成全部训练并保存 model.npz 后自动出图
+   CONFIG.evaluation.spp = 64
+   CONFIG.evaluation.max_views = 10  # train/test 各取相机 JSON 中前十个视角
 
 ``datasets/lego`` 相对于源码仓库的父目录，即 ``reconstruction/datasets/lego``。
 点云和相机文件名相对于该场景目录；训练会遍历相机 JSON 中的全部视角。
@@ -84,6 +87,9 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 当前默认是 lego、800 × 800、1 spp、1000 个 epoch、
 随机种子 42、整个实验保存三次（含最终模型）。修改 ``--epochs`` 同时设置分辨率调度的
 总训练预算，因此不能把不同预算的早期阶段当成相同调度。
+训练完成后默认以 64 spp 评价 train/test 各前十个视角；某划分不足十个时使用全部视角。
+这里的顺序是对应相机 JSON 的原始顺序，不是训练打乱后的访问顺序。
+出图数量不限制训练：每个 epoch 仍遍历全部训练相机，始终为 1 spp。
 
 配置分组：
 
@@ -99,6 +105,15 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 * ``schedule``：coarse-to-fine 开关和分辨率计划；启用时由此组决定起始分辨率。
 * ``contour``：训练时可选的 contour 重要性采样。
 * ``runtime``：源码构建目录和本地 GPU 编号。
+* ``evaluation``：训练结束后出图设置，默认 ``enabled=True``、``spp=64``、
+  ``max_views=10``、``chunk_size=65536``、``seed=42``，测试相机文件由
+  ``test_cameras="transforms_test.json"`` 指定；``max_views=None`` 表示全部视角。
+
+仅想训练时可传 ``--skip-evaluation``，或设置 ``CONFIG.evaluation.enabled=False``。
+``--eval-spp`` 和 ``--eval-max-views`` 可分别覆盖自动评价的采样数与每个划分的视角上限。
+训练后评价使用当前实验最终保存的 ``model.npz``，不再初始化体素、不更新参数；
+评价设置保存在实验根目录的 ``evaluation-config.json``，训练自己的 ``training/config.json``
+及 checkpoint 内的训练配置保持独立。
 
 原 Falcor 宏在本实现中主要转换为运行配置，常用对应关系如下。修改这些配置无需重新
 编译 C++，但 Dr.Jit 可能为新配置生成新内核；修改底层 C++ 实现仍需源码编译。
@@ -180,7 +195,8 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 * 体素删除启用且进入证据收集阶段时，CPU 拓扑管理仍按视角读取证据，保留原来的跨视角
   累积及候选判断顺序。生长和 contour 数据也在需要的视角处理，不能作为纯可视化统一延迟到 epoch 末。
 
-这些调整没有增加训练出图。多 spp 图片和 PSNR 仍由独立评价脚本生成。
+这些调整不在训练的每个视角或每个 epoch 内出图。完成全部训练并保存最终模型后，
+训练入口调用评价脚本共用的流程，生成多 spp 图片和 PSNR。
 
 进度现在区分 ``progress 4/100``（本轮已完成四个视角）与 ``camera 19``（相机编号，从 1 开始）。
 每视角打印总墙钟时间和参考图读取、梯度阶段、拓扑观察、参数更新的分段时间；每轮 JSONL
@@ -223,13 +239,16 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
      training/          # 训练配置、日志及最多两份中间 checkpoint（默认）
      train/             # 最终模型的训练集视角 PNG 和 metrics.json
      test/              # 最终模型的测试集视角 PNG 和 metrics.json
+     evaluation-config.json
      evaluation-report.json
      initial/           # 可选：初始化模型及其 train/、test/ 基线结果
 
 默认自动分配的训练目录是实验根目录下的 ``training/``。全部 epoch 成功完成后，
 脚本自动在其父目录（实验根目录）保存 ``model.npz``。如果显式输出目录的最后一级不是 ``training``，
 则直接保存到该输出目录下的 ``model.npz``，兼容已有的平铺输出方式。
-评价时指向实验根目录，并用 ``--checkpoint`` 加载这个模型。训练轮数记录在配置、日志和
+随后自动评价，在同一实验根目录创建 ``train/``、``test/`` 及评价配置和报告；默认每个划分
+分别渲染前十个视角、64 spp。独立评价时指向实验根目录，并用 ``--checkpoint`` 加载这个模型。
+训练轮数记录在配置、日志和
 checkpoint 中，不通过 ``E编号`` 表示。下文恢复和评价命令中的 ``E1`` 仅为示例，
 应替换为启动时打印的实际实验目录。
 
@@ -239,8 +258,8 @@ checkpoint 中，不通过 ``E编号`` 表示。下文恢复和评价命令中�
 初始化模型；两者的 ``train/``、``test/`` 目前都只有各自第一个视角的 4 spp 图片，
 不是完整训练集或测试集的评价。``training-config.json``、``evaluation-config.json``、
 ``cameras/``、``logs/``、``result.json`` 与 ``README.txt`` 保留配置、子集相机及运行记录。
-初始化评价的配置另存为 ``initial/evaluation-config.json``；评价脚本生成的
-``config.json`` 不覆盖训练配置。
+初始化评价的配置另存为 ``initial/evaluation-config.json``；现在评价脚本统一使用
+``evaluation-config.json``，不会覆盖已有训练 ``config.json``。
 
 在 ``reconstruction`` 父目录中，可用保存的模型渲染全部训练和测试视角；
 这会更新该实验根目录中的评价图片和报告，不会重新训练：
@@ -267,7 +286,7 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
 ------------------
 
 首次使用原生训练、参数更新和 checkpoint 恢复接口，或修改底层 C++ 后，必须重新编译。
-本次整图提交、相机运行时数据、按需回读与性能日志的改动仅涉及 Python；已经包含上述接口的
+本次自动评价以及此前整图提交、相机运行时数据、按需回读与性能日志的改动仅涉及 Python；已经包含上述接口的
 源码构建不需要为这次改动重新编译 C++，同步脚本并重新启动进程即可。
 预编译 wheel 不包含这些原生接口，不能用于验证它们。在 ``reconstruction`` 工作区
 父目录的 PowerShell 中执行：
@@ -280,6 +299,7 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
      --dataset datasets/lego --epochs 10
 
 训练 10 轮表示每个视角都会被访问 10 次。省略 ``--output-dir`` 时使用默认的自动实验目录。
+训练完成并保存模型后会自动生成 train/test 各前十个视角的 64 spp 图片和 PSNR。
 上述命令仍启用配置中的分辨率调度；
 要使用前面的固定小网格例子，应将 JSON 保存到工作区，例如 ``train-config.json``，
 再以 ``--config train-config.json`` 运行。
@@ -326,10 +346,11 @@ Checkpoint 与恢复
 日志仍记录每轮的平均训练损失、分辨率、体素数与拓扑事件，保存次数不改变日志频率、
 参数更新或分辨率调度。Checkpoint 在完整 epoch 及该轮拓扑处理结束后保存；它不是任意
 视角中途的恢复点。中断后需从最近保存的 checkpoint 重算尚未保存的 epoch；
-第一次保存前中断则需要重新开始。保存模型不会自动生成图片或 PSNR，出图仍由评价脚本完成。
+第一次保存前中断则需要重新开始。中间 checkpoint 保存不触发出图；全部 epoch 完成并保存
+``model.npz`` 后，默认自动调用评价流程一次。
 
 最终的 ``model.npz`` 使用同一套原子写入和校验格式，包含完整体素状态、网格元数据、
-配置和训练恢复状态。它只在整个实验成功完成后导出；训练中断时，可从最近保存的
+配置和训练恢复状态。它在全部训练成功完成后、自动评价开始前导出；训练中断时，可从最近保存的
 ``training/epoch-XXXXX.npz`` 恢复或评价中间结果。恢复一个已经完成的 checkpoint 到新目录时，
 也会自动导出 ``model.npz``。训练报告的 ``reconstructed_model`` 记录导出路径、SHA-256、
 完成轮数及更新次数。新实验拒绝覆盖已有的最终模型；恢复时也会校验既有模型的配置、
@@ -401,25 +422,32 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 已运行但未保存的 epoch。比较曲线时应按本次运行的日志段与恢复点选取数据。
 若恢复到已有输出目录，其算法配置必须一致；恢复一个已经完成全部 epoch 的模型到
 新目录时，只导出对应实验目录的 ``model.npz``，不再生成额外的 checkpoint 副本。
+随后仍按本次评价设置执行自动出图；可传 ``--skip-evaluation`` 仅导出模型。
 
 多 spp 出图与指标
 -----------------
 
-训练后加载同一个 checkpoint，独立渲染训练和测试划分；不会更新模型或使用测试视角
-训练。默认评价 64 spp，默认主指标为线性 RGB PSNR，并同时报告 sRGB PSNR：
+训练入口默认在保存最终模型后调用评价流程，使用 64 spp 渲染 train/test 各前十个视角，
+并保存每个视角的图片和 PSNR。相机按对应 JSON 顺序选择；不足十个时全取。
+这不限制训练视角或改变训练 1 spp。评价只读取 checkpoint，不更新模型或使用测试视角训练。
+默认主指标为线性 RGB PSNR，并同时报告 sRGB PSNR。
+
+如果评价失败，已经完成的 ``model.npz`` 保留，进程以非零状态退出；
+``training-report.json`` 中的 ``training_status`` 与 ``evaluation`` 分别记录训练和评价结果，
+``evaluation-report.json`` 记录具体错误。可以修复数据或运行环境后直接重跑评价，无需重新训练：
 
 .. code-block:: powershell
 
    & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\reconstruction_evaluate.py `
      --checkpoint outputs/lego-10.15-E1/model.npz `
-     --split both --spp 64 `
+     --split both --spp 64 --max-views 10 `
      --output-dir outputs/lego-10.15-E1
 
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I mitsuba/resources/reconstruction_evaluate.py \
      --checkpoint outputs/lego-10.15-E1/model.npz \
-     --split both --spp 64 \
+     --split both --spp 64 --max-views 10 \
      --output-dir outputs/lego-10.15-E1
 
 ``--split train`` 或 ``--split test`` 只评价一个划分。训练相机默认继承 checkpoint
@@ -427,6 +455,9 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 ``--test-cameras`` 覆盖。数据集默认继承 checkpoint 的相对路径，也可用 ``--dataset``
 指定当前机器上的同一数据。运行环境按当前平台重新选择，不继承另一台机器的 build
 绝对路径。``--background R G B`` 同时修改预测与真值的线性 RGB 背景；默认沿用训练。
+独立评价入口省略 ``--max-views`` 时默认评价所选划分的全部视角（除非 ``--config`` 中另有设置）；
+训练入口的自动评价默认上限为十个，两者用途不同。报告同时记录划分总视角数、实际选中
+的视角及其数量；前十个视角的平均 PSNR 是子集指标，不能当作完整训练集或测试集的结果。
 
 每个视角先对 spp 次预测的线性 RGB 和 alpha 求均值，再计算指标。
 每个像素、每个 sample 使用独立的随机子像素位置；seed 由全局 seed、划分和视角索引
@@ -475,6 +506,13 @@ PNG 用于显示；进行论文或其他实现的 PSNR 对比时，应明确选�
 下表保留已有验证记录。本次整图提交与按需回读修改后，另行完成了生成小场景的 CUDA 性能回归，
 并重跑训练集成检查：两视角三轮、三次模型保存、普通及升层后恢复、独立评价均通过。
 未重新运行真实 Lego 实验，也未在 A100 或真实 Slurm 作业中测量吞吐量。
+
+本次自动评价改动另在同一 RTX 4060 的 ``cuda_ad_rgb`` 下通过生成的 16 × 16 场景检查：
+训练仍完成全部两视角、三轮共六次更新，随后按默认 64 spp 输出 train/test 各第一个视角；
+检查评价子集顺序、训练配置未被覆盖、关闭自动评价、已完成模型恢复后的出图，以及视角
+上限大于划分大小时全取。缺失测试相机时按预期返回非零状态，已训练模型完整保留。
+独立评价两个完整划分、普通恢复和 coarse-to-fine 恢复也通过。测试使用临时目录并自动清理；
+未为此次修改重新运行真实数据集或 HPC 评价。
 
 .. list-table:: 已执行检查
    :header-rows: 1

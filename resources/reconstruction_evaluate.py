@@ -31,6 +31,7 @@ class EvaluationConfig:
     cameras: dict[str, str | None] = field(default_factory=lambda: {
         "train": None, "test": "transforms_test.json"})
     spp: int = 64  # Independent evaluation sampling; training remains 1 spp.
+    max_views: int | None = None  # First N cameras per split; None evaluates all.
     seed: int = 42
     chunk_size: int = 65536
     metric_color_space: str = "linear"
@@ -66,6 +67,7 @@ def parse_config(workspace):
     parser.add_argument("--train-cameras")
     parser.add_argument("--test-cameras")
     parser.add_argument("--spp", type=int)
+    parser.add_argument("--max-views", type=int, help="Evaluate the first N cameras in each selected split")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--chunk-size", type=int)
     parser.add_argument("--metric-color-space", choices=("linear", "srgb"))
@@ -79,7 +81,7 @@ def parse_config(workspace):
     _update_config(config, asdict(CONFIG))
     if args.config:
         _update_config(config, json.loads(preview.workspace_path(args.config, workspace).read_text(encoding="utf-8")))
-    for name in ("checkpoint", "dataset", "spp", "seed", "chunk_size",
+    for name in ("checkpoint", "dataset", "spp", "max_views", "seed", "chunk_size",
                  "metric_color_space", "background", "save_linear"):
         value = getattr(args, name)
         if value is not None:
@@ -103,6 +105,10 @@ def validate_config(config):
         value = getattr(config, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{name} must be a positive integer")
+    if config.max_views is not None and (
+            isinstance(config.max_views, bool) or not isinstance(config.max_views, int)
+            or config.max_views < 1):
+        raise ValueError("max_views must be None or a positive integer")
     if isinstance(config.seed, bool) or not isinstance(config.seed, int) or config.seed < 0:
         raise ValueError("seed must be a nonnegative integer")
     if (not isinstance(config.splits, (tuple, list)) or not config.splits
@@ -165,10 +171,10 @@ def aggregate_metrics(records):
     return result
 
 
-def main():
+def run_evaluation(config: EvaluationConfig) -> int:
+    """Evaluate a saved model using the same validated runtime as the CLI."""
     repository = Path(__file__).resolve().parents[1]
     workspace = repository.parent
-    config = parse_config(workspace)
     output = preview.workspace_path(config.output_directory, workspace)
     if output.is_relative_to(repository):
         raise ValueError("Keep evaluation outputs and caches outside the Git checkout")
@@ -186,6 +192,7 @@ def main():
             "linear": "unclamped floating linear RGB after alpha compositing",
             "srgb": "linear RGB clipped to [0,1], IEC sRGB transfer, floating values before PNG quantization",
             "aggregation": "arithmetic mean of per-view PSNR; PSNR of mean MSE also reported separately",
+            "view_selection": "first max_views cameras per split in camera file order; None selects all",
             "perfect_match": "PSNR is +infinity, encoded as null with an explicit boolean flag",
         },
     }
@@ -227,16 +234,24 @@ def main():
         report["metric_protocol"]["background_linear_rgb"] = list(render.background)
         model = common.restore_model(checkpoint, mi)
         report["model_statistics"] = model.statistics()
-        (output / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
+        (output / "evaluation-config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
         for split in config.splits:
             cameras_file = config.cameras[split] or saved.get("data", {}).get("cameras", "transforms_train.json")
             views = common.load_views(dataset, cameras_file, render, np)
             if not views:
                 raise ValueError(f"Empty camera split: {split}")
+            available_view_count = len(views)
+            if config.max_views is not None:
+                views = views[:config.max_views]
             split_output = output / split
             split_output.mkdir(parents=True, exist_ok=True)
             records = []
-            split_report = {"cameras": cameras_file, "views": records}
+            split_report = {
+                "cameras": cameras_file, "views": records,
+                "max_views": config.max_views, "view_order": "camera file order",
+                "available_view_count": available_view_count,
+                "selected_view_count": len(views), "evaluated_view_count": 0,
+            }
             report["splits"][split] = split_report
             for view in views:
                 started = time.perf_counter()
@@ -257,6 +272,7 @@ def main():
                           "prediction": str(prediction_path), "seed": seed,
                           "seconds": time.perf_counter() - started, "metrics": metrics}
                 records.append(record)
+                split_report["evaluated_view_count"] = len(records)
                 score = metrics[config.metric_color_space]["psnr_db"]
                 text = "+inf" if score is None else f"{score:.4f}"
                 print(f"{split} [{len(records)}/{len(views)}] PSNR ({config.metric_color_space}) = {text} dB", flush=True)
@@ -274,6 +290,11 @@ def main():
         report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
         print("Report:", report_path, flush=True)
     return 0 if report["status"] == "passed" else 1
+
+
+def main():
+    workspace = Path(__file__).resolve().parents[2]
+    return run_evaluation(parse_config(workspace))
 
 
 if __name__ == "__main__":
