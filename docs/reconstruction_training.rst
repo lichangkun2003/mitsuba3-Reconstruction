@@ -239,6 +239,14 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 命中顺序不变，前述 ``NoConflicts`` 写入约定继续保留。这只调整记录的存取方式，
 不改变场景参数布局、checkpoint 格式、采样与梯度公式。
 
+训练原生前向使用 GPU 条件分支区分空格、命中和有效未命中：空格只推进 DDA，
+占用体素才计算椭球几何，命中才计算外观并写命中记录，有效未命中才维护候选。
+候选容量已满时，先用新分数与当前最差分数比较，仅在严格小于时执行插入；
+容量未满时仍正常插入。评分、候选容量、稳定的同分顺序、命中顺序和终止条件保持不变。
+这些修改跳过不会影响结果的工作，保留 ``VoxelReconstruction`` 接口、梯度公式及
+每视角一次参数更新；没有改变算法或引入空区层次加速结构。实际收益取决于设备、
+射线分布和场景稀疏程度，不能保证 A100 的端到端吞吐提升。
+
 默认 256 → 512 调度在 256 阶段不消费删除证据。训练现在将实际证据需求传给原生
 ``collect_deletion_evidence``，跳过这些未使用的计算；进入需要收集删除证据的目标
 分辨率后照常计算，跨视角累计、删除阈值、保护期与执行时机保持不变。256 阶段的生长
@@ -346,6 +354,43 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 训练预算、采样数、GPU 型号和测量设置一致，并分别查看预热后的普通轮次和拓扑变化轮次。
 是否值得增加 CPU、优化单卡或进一步设计多 GPU 梯度汇总，应据这些实测结果判断。
 
+固定输入的短基准
+----------------
+
+``resources/benchmark_reconstruction_forward.py`` 用于比较原生实现版本，默认读取
+``datasets/lego``，按点云初始化固定的 256³ 网格，测试训练相机索引 0、21、56
+（从 0 开始），每个视角为 800 × 800、1 spp。固定随机种子生成射线与参考输入，
+在计时前完成输入上传。脚本不更新参数或拓扑，不运行 epoch，也不生成图片或模型结果。
+
+在已完成源码编译的 HPC Slurm 终端执行：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I resources/benchmark_reconstruction_forward.py \
+     --dataset datasets/lego
+
+Windows 在 ``reconstruction`` 工作区父目录执行：
+
+.. code-block:: powershell
+
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\benchmark_reconstruction_forward.py `
+     --dataset datasets/lego
+
+默认先预热 3 次，再记录 7 次普通原生调用的墙钟时间；这项时间覆盖完整
+``loss_and_grad`` 及其 GPU 计算完成等待，包含反向工作，不是纯前向时间。
+输入上传、参考图读取、射线生成、结果回读、优化器和拓扑更新均不在该计时范围。
+随后独立预热并记录 3 次分段诊断，提供 ``forward``、``hit_backward`` 和
+``candidate_backward`` 的指标；这些分段同步会改变执行方式，应与普通调用分别比较。
+报告还提供 ``ordinary_kernel_history_samples`` 与 ``ordinary_kernel_history_medians``：
+在关闭 ``profile_stages`` 的完整原生调用上独立预热 1 次、抽样 3 次，记录整体内核统计；
+这些抽样与无内核记录的普通墙钟样本分开，不把不同测量方式的时间相加。
+
+终端打印输出位置，默认在系统临时目录创建独立目录并保留 ``benchmark.json``，
+不占用重建实验的 E 编号。``--output-dir`` 可指定源码仓库外的报告目录；
+``--save-arrays`` 可额外保存每个相机的原生结果和梯度数组，供不同版本数值对照。
+``--cameras``、``--warmup`` 和 ``--repeats`` 可调整相机或重复次数。比较版本时保持
+这些设置、数据和硬件一致；此短基准不替代完整训练的逐轮耗时、收敛与最终评价验证。
+
 重建结果目录
 ------------
 
@@ -425,9 +470,8 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
 ------------------
 
 首次使用原生训练、参数更新和 checkpoint 恢复接口，或修改底层 C++ 后，必须重新编译。
-本轮新增原生前向、命中反向和候选反向的诊断计时接口，因此必须增量编译 C++，
-再启动使用新 Python 脚本的进程。本轮只增加测量，没有交付梯度算法或执行性能优化；
-不能仅同步脚本后沿用旧的原生模块。
+原生分段计时接口以及前向条件分支、满容量候选提前拒绝均涉及 C++ 修改，必须增量编译，
+再启动使用新原生模块的进程；不能仅同步脚本后沿用旧模块。
 预编译 wheel 不包含这些原生接口，不能用于验证它们。在 ``reconstruction`` 工作区
 父目录的 PowerShell 中执行：
 
@@ -459,7 +503,9 @@ HPC Slurm
    source /apps/local/conda_init.sh &&
    conda activate "$HOME/envs/mitsuba" &&
    cd "$HOME/projects/reconstruction/mitsuba" &&
-   git pull --ff-only &&
+   git -c submodule.recurse=false pull --ff-only &&
+   git submodule sync --recursive &&
+   git submodule update --init --recursive &&
    cmake --build build --parallel "${SLURM_CPUS_PER_TASK:-1}" &&
    source build/setpath.sh &&
    "$HOME/envs/mitsuba/bin/python" -I resources/test_reconstruction_performance.py
@@ -806,3 +852,46 @@ Slurm 上的实际运行，需要在目标数据和硬件上完成验证。
 .. code-block:: powershell
 
    & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_performance_summary.py
+
+前向条件分支与候选提前拒绝的本地对照
+----------------------------------
+
+Windows、RTX 4060 Laptop 上，以真实 Lego 的固定初始化模型（80759 个活跃体素、
+256³ 网格）和相机 0、21、56 的固定 800 × 800、1 spp 输入比较修改前后。
+下表单位均为毫秒：前向 GPU 时间来自独立分段诊断的 3 次中位数，普通原生墙钟
+来自关闭分段的完整 ``loss_and_grad`` 调用的 7 次中位数，包含反向计算。
+
+.. list-table:: 固定输入的局部测量
+   :header-rows: 1
+
+   * - 相机索引
+     - 前向 GPU：修改前
+     - 前向 GPU：修改后
+     - 普通原生墙钟：修改前
+     - 普通原生墙钟：修改后
+   * - 0
+     - 54.783
+     - 29.915
+     - 279.200
+     - 233.263
+   * - 21
+     - 59.279
+     - 35.697
+     - 319.909
+     - 331.612
+   * - 56
+     - 51.500
+     - 36.103
+     - 325.969
+     - 364.428
+
+三个输入的前向诊断时间均降低，但普通完整调用只有相机 0 加快，其余两者变慢，
+不能把分段结果描述为整体训练提速。分段边界会改变融合与调度，GPU 数值也不是
+epoch 时间；A100 和完整训练的吞吐尚未测量。三个固定输入的 RGB、alpha、loss
+及计数逐位一致，全部梯度的最大绝对差为 ``3.8147e-6``；该对照不替代完整训练验证。
+
+本轮最终源码构建通过；独立几何检查通过 scalar 20 项、CUDA 24 项（最大误差分别为
+``1.18945e-6``、``1.45493e-6``），CUDA 性能回归覆盖整图/分批、分段开关、缓存、
+按需回读与非有限值拒绝，训练集成检查通过 36 项外观有限差分（最大误差 ``9.1158e-6``）、
+生成场景三轮训练、保存恢复、4 → 8 拓扑调度、自动 64 spp 评价及恢复一致性。
+本轮测试与基准产物使用临时目录，未占用重建实验的 ``outputs`` 目录。

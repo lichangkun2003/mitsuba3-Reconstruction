@@ -118,6 +118,7 @@ def oracle(np, state, origin, direction, target_rgb, target_alpha, pdf, settings
     dc, da = 2*(rgb-target), 2*cfg["alpha_loss_weight"]*(alpha-target_alpha)
     result = {key: np.zeros_like(state["centers"]) for key in ("centers", "log_scales", "rotation_tangent")}
     result.update(geometry_valid=np.zeros(len(state["cells"])), background_carve_valid=np.zeros(len(state["cells"])),
+                  appearance_valid=np.bincount([record["index"] for record in hits], minlength=len(state["cells"])),
                   rgb=rgb, alpha=alpha, raw_rgb=raw_rgb, raw_alpha=raw_alpha, hit_count=len(hits))
     suffix_rgb, suffix_t = [background.copy()], [1.]
     for record in reversed(hits):
@@ -132,7 +133,11 @@ def oracle(np, state, origin, direction, target_rgb, target_alpha, pdf, settings
         before, opacity = record["before"], record["opacity"]
         distance = record["g"]*record["ds"]
         tau = max(cfg["geometry_tau_voxel_fraction"]*state["size"][0], 1e-8)
-        w = 1/(1+math.exp(distance/tau))
+        # The far-miss capacity fixture deliberately saturates this sigmoid.
+        # Evaluate the same function without overflowing the float64 reference.
+        exponent = distance/tau
+        e = math.exp(-exponent) if exponent >= 0 else math.exp(exponent)
+        w = e/(1+e) if exponent >= 0 else 1/(1+e)
         slope = -w*(1-w)/tau
         derivative = np.dot(dc, before*opacity*(record["radiance"]-suffix_rgb[suffix]))*slope
         if hard and is_bg:
@@ -186,6 +191,63 @@ def native_model(np, mi, state):
     return mi.VoxelReconstruction.from_state(resolution, [0., 0., 0.], [1., 1., 1.], data, 1, 1)
 
 
+def check_sparse_divergence(np, mi, dr):
+    """Independent per-ray oracle for divergent paths sharing sparse cells."""
+    cells = [(0, 0, z) for z in (0, 2, 3, 6, 7)] + [(2, 0, z) for z in (1, 4, 6)]
+    spec = create_state(np, cells=cells, resolution=8, scales=(.03, .04, .035), angle=.2)
+    spec["centers"][[1, 3, 5, 7], 0] = .1
+    spec["rgb"][:] = np.array([[.2, .4, .7], [.8, .1, .3], [.3, .8, .2], [.1, .3, .9],
+                              [.7, .2, .5], [.4, .2, .1], [.3, .7, .6], [.8, .6, .3]])
+    spec = {key: (value.astype(np.float32).astype(np.float64)
+                  if isinstance(value, np.ndarray) and key != "cells" else value)
+            for key, value in spec.items()}
+    # Columns 0/2 alternate hits and misses with empty cells between them;
+    # column 4 remains empty, one ray misses the grid, and one travels backward.
+    origins = np.array([[.6/8, .52/8, -1], [2.6/8, .52/8, -1], [4.6/8, .52/8, -1],
+                        [1.2, .52/8, -1], [.6/8, .52/8, -1], [.6/8, .52/8, 2],
+                        [2.6/8, .52/8, -1], [2.6/8, .52/8, -1]], dtype=np.float32)
+    directions = np.tile(np.array([0., 0., 1.], np.float32), (len(origins), 1))
+    directions[5, 2] = -1
+    targets = np.array([[.95]*3, [.1]*3, [.5]*3, [.2]*3, [.8]*3, [.1]*3,
+                        [.3, .6, .2], [.2]*3], dtype=np.float32)
+    alphas = np.array([1., 1., 1., 1., 0., 1., .5, 0.], dtype=np.float32)
+    weights = np.array([1., 2., 1., 1., .5, 2., 3., 1.], dtype=np.float32)
+    model = native_model(np, mi, spec)
+    ray = mi.Ray3f(mi.Point3f(*(mi.Float(origins[:, i]) for i in range(3))),
+                   mi.Vector3f(*(mi.Float(directions[:, i]) for i in range(3))))
+    ray.maxt = 100.
+    target = mi.Color3f(*(mi.Float(targets[:, i]) for i in range(3)))
+    names = []
+    maximum = 0.
+    for capacity in (0, 1, 16):
+        name = f"sparse_divergent_candidate_capacity_{capacity}"
+        settings = {"max_candidates": float(capacity)}
+        references = [oracle(np, spec, o.astype(np.float64), d.astype(np.float64),
+                             c.astype(np.float64), float(a), float(w), settings)
+                      for o, d, c, a, w in zip(origins, directions, targets, alphas, weights)]
+        assert [reference["hit_count"] for reference in references] == [3, 1, 0, 0, 3, 3, 1, 1]
+        out = model.loss_and_grad(ray, target, mi.Float(alphas), mi.Color3f(1.), mi.Float(weights), settings)
+        dr.eval(out)
+        dr.sync_thread()
+        for key in ("centers", "log_scales", "rotation_tangent"):
+            expected = sum(reference[key] for reference in references)
+            actual = np.asarray(out["gradients"][key]).reshape(-1, 3)
+            np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=4e-4, err_msg=f"{name}: {key}")
+            maximum = max(maximum, float(np.max(np.abs(actual-expected))))
+        for key in ("geometry_valid", "background_carve_valid", "appearance_valid"):
+            np.testing.assert_array_equal(np.asarray(out[key]).ravel(),
+                                          sum(reference[key] for reference in references), err_msg=f"{name}: {key}")
+        np.testing.assert_array_equal(np.asarray(out["hit_count"]), [reference["hit_count"] for reference in references])
+        for key in ("rgb", "raw_rgb", "alpha", "raw_alpha"):
+            expected = np.asarray([reference[key] for reference in references])
+            if expected.ndim == 2:
+                expected = expected.T  # Dr.Jit Color3f is channel-major.
+            np.testing.assert_allclose(np.asarray(out[key]), expected, atol=2e-6, rtol=2e-5, err_msg=f"{name}: {key}")
+        print("PASS", name, flush=True)
+        names.append(name)
+    return names, maximum
+
+
 def run_tests(np, mi, dr):
     # Off-axis rays give nonzero tangent-rotation gradients. Inputs are promoted
     # from float32 before the float64 oracle to isolate arithmetic differences.
@@ -218,6 +280,24 @@ def run_tests(np, mi, dr):
     nearest = create_state(np, cells=((0, 0, 0), (0, 0, 1), (0, 0, 2)), resolution=3, scales=(.04, .06, .06), angle=0.)
     nearest["centers"][:, 0] = [.1, .5, .7]
     cases.append(("nearest_candidate_capacity", nearest, [.29, .17, -1.], [.1]*3, 1., 1., {"max_candidates": 1.}))
+    # Every cell is an ellipsoid miss. The identical geometric score is so
+    # large that all depth contributions round away in float32. Thus the
+    # native scores tie exactly, including after the candidate list fills.
+    # geometry_valid reveals which IDs survived even though the remote
+    # sigmoid gradients saturate to zero; <= instead of < evicts early IDs.
+    tied = create_state(np, cells=[(0, 0, z) for z in range(20)], resolution=32,
+                        scales=(1e-10, 1/64, 1/64), angle=0.)
+    tied_origin = [(.5+.25)/32, .5/32, -1.]
+    scale32 = np.exp(np.float32(tied["log_scales"][0, 0]))
+    radius32 = np.float32((.25/32)/scale32)
+    score32 = np.float32((np.square(radius32)-np.float32(1))/(np.float32(2)/scale32)*32)
+    depths = 1+(np.arange(20)+.5)/32
+    depth_terms = .05*depths/math.sqrt(3)
+    assert np.max(depth_terms) < float(np.spacing(score32))/2
+    np.testing.assert_array_equal((float(score32)+depth_terms).astype(np.float32), np.full(20, score32))
+    for capacity in (0, 1, 16):
+        cases.append((f"stable_tied_candidate_capacity_{capacity}", tied, tied_origin,
+                      [.1]*3, 1., 1., {"max_candidates": float(capacity)}))
     names = []
     max_error = 0.
     for name, spec, origin, target, alpha, pdf, settings in cases:
@@ -238,7 +318,7 @@ def run_tests(np, mi, dr):
             actual = np.asarray(out["gradients"][key]).reshape(-1, 3)
             np.testing.assert_allclose(actual, expected[key], atol=8e-6, rtol=4e-4, err_msg=f"{name}: {key}")
             max_error = max(max_error, float(np.max(np.abs(actual-expected[key]))))
-        for key in ("geometry_valid", "background_carve_valid", "hit_count"):
+        for key in ("geometry_valid", "background_carve_valid", "appearance_valid", "hit_count"):
             np.testing.assert_array_equal(np.asarray(out[key]).ravel(), np.asarray(expected[key]).ravel(), err_msg=f"{name}: {key}")
         for key in ("rgb", "raw_rgb", "alpha", "raw_alpha"):
             np.testing.assert_allclose(np.asarray(out[key]).ravel(), np.asarray(expected[key]).ravel(), atol=2e-6, rtol=2e-5, err_msg=f"{name}: {key}")
@@ -251,6 +331,11 @@ def run_tests(np, mi, dr):
             assert np.all(np.abs(expected["rotation_tangent"]) > 1e-4)
         if name == "nearest_candidate_capacity":
             np.testing.assert_array_equal(expected["geometry_valid"], [0, 0, 1])
+        if name.startswith("stable_tied_candidate_capacity_"):
+            capacity = int(settings["max_candidates"])
+            np.testing.assert_array_equal(expected["geometry_valid"],
+                                          np.r_[np.ones(capacity), np.zeros(len(spec["cells"])-capacity)])
+            assert expected["hit_count"] == 0
         if name.endswith("blocked") or name in ("center_skip", "background_no_miss", "two_sided_deep_zero", "contains_cell_blocks_expansion"):
             assert np.max(np.abs(expected["log_scales"])) == 0, name
         print("PASS", name, flush=True)
@@ -285,6 +370,9 @@ def run_tests(np, mi, dr):
         np.testing.assert_array_equal(np.asarray(out["hit_count"]), [value["hit_count"] for value in references])
         print("PASS divergent_ray_batch", flush=True)
         names.append("divergent_ray_batch")
+        sparse_names, sparse_maximum = check_sparse_divergence(np, mi, dr)
+        names.extend(sparse_names)
+        max_error = max(max_error, sparse_maximum)
     return dict(cases=names, maximum_geometry_absolute_error=max_error)
 
 

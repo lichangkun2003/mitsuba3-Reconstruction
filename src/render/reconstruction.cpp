@@ -1,4 +1,5 @@
 #include <mitsuba/render/reconstruction.h>
+#include <drjit/if_stmt.h>
 #include <drjit/while_loop.h>
 #include "reconstruction_pointcloud.h"
 #include <chrono>
@@ -476,10 +477,15 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         UInt32 id, front;
         DRJIT_STRUCT(Candidate, point, gmin, before, score, id, front)
     };
+    using Candidates = std::vector<Candidate>;
+    struct HitBuffers {
+        FloatBuffer hit;
+        UIntBuffer hit_id;
+    };
     struct Records {
         FloatBuffer hit;
         UIntBuffer hit_id;
-        std::vector<Candidate> candidates;
+        Candidates candidates;
         DRJIT_STRUCT(Records, hit, hit_id, candidates)
     } records{dr::zeros<FloatBuffer>(width*max_hits*9),
               dr::zeros<UIntBuffer>(width*max_hits),
@@ -489,7 +495,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     auto rotate = [](const Vector3f &v, const Float &w, const Vector3f &q) {
         return v + 2.f*dr::cross(q, dr::cross(q, v) + w*v);
     };
-    auto quaternion = [&](UInt32 id, Mask mask, Float &w, Vector3f &q) {
+    auto quaternion = [this](UInt32 id, Mask mask, Float &w, Vector3f &q) {
         w = dr::gather<Float>(m_rotations, id*4, mask);
         for (uint32_t a=0; a<3; ++a) q[a] = dr::gather<Float>(m_rotations, id*4+a+1, mask);
         Float norm = dr::sqrt(w*w+dr::squared_norm(q));
@@ -497,7 +503,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         w = dr::select(valid, w/dr::select(valid,norm,1.f), 1.f);
         q = dr::select(valid, q/dr::select(valid,norm,1.f), Vector3f(0.f));
     };
-    auto appearance = [&](UInt32 id, const Vector3f &view, Mask mask, Color3f &rgb, Float &alpha) {
+    auto appearance = [this, clean](UInt32 id, const Vector3f &view, Mask mask, Color3f &rgb, Float &alpha) {
         rgb = Color3f(0.f);
         Float logit(0.f);
         for (uint32_t k=0; k<std::max(m_sh_count,m_opacity_sh_count); ++k) {
@@ -563,62 +569,120 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             Mask occupied=s.active & (signed_id>=0);
             UInt32 id=UInt32(dr::maximum(signed_id,0));
             Float end=dr::maximum(s.entry,dr::minimum(dr::minimum(s.next.x(),dr::minimum(s.next.y(),s.next.z())),exit));
-            Vector3f relative,scale,segment=d*(end-s.entry);
-            for(uint32_t a=0;a<3;++a) {
-                Float center=dr::gather<Float>(m_centers,id*3+a,occupied);
-                relative[a]=ray.o[a]+s.entry*d[a]-(m_min[a]+(Float(s.cell[a])+center)*m_size[a]);
-                scale[a]=dr::exp(dr::clip(dr::gather<Float>(m_log_scales,id*3+a,occupied),-30.f,30.f));
-            }
-            Float qw;
-            Vector3f qv;
-            quaternion(id,occupied,qw,qv);
-            Vector3f u=rotate(relative,qw,-qv)/scale, v=rotate(segment,qw,-qv)/scale;
-            Float a=dr::squared_norm(v), b=2.f*dr::dot(u,v), c=dr::squared_norm(u)-1.f;
-            Float discriminant=b*b-4.f*a*c, root=dr::sqrt(dr::maximum(discriminant,0.f));
-            Float inv=.5f/dr::select(a>1e-20f,a,1.f);
-            Float t0=dr::maximum(0.f,(-b-root)*inv), t1=dr::minimum(1.f,(-b+root)*inv);
-            Mask hit=occupied & dr::select(a<=1e-20f,c<=0.f,(discriminant>=0.f)&(t0<=t1));
-            Float star=dr::select(a>1e-20f,dr::clip(-dr::dot(u,v)/dr::select(a>1e-20f,a,1.f),0.f,1.f),0.f);
-            Vector3f relative_star=relative+star*segment, unit_star=u+star*v;
-            Float gmin=dr::squared_norm(unit_star)-1.f;
-            Color3f emission;
-            Float opacity;
-            appearance(id,Vector3f(-d),hit,emission,opacity);
-            UInt32 slot=s.hits*ray_count+lane;
-            dr::scatter(r.hit_id,id,slot,hit);
-            for(uint32_t j=0;j<3;++j) {
-                dr::scatter(r.hit,relative_star[j],j*hit_stride+slot,hit);
-                dr::scatter(r.hit,emission[j],(4+j)*hit_stride+slot,hit);
-            }
-            dr::scatter(r.hit,gmin,3*hit_stride+slot,hit);
-            dr::scatter(r.hit,opacity,7*hit_stride+slot,hit);
-            dr::scatter(r.hit,s.transmittance,8*hit_stride+slot,hit);
-            if(max_candidates) {
-                Mask miss=occupied & !hit & dr::isfinite(gmin) & (gmin>=0.f);
-                Float radius2=dr::squared_norm(unit_star);
-                Float metric=2.f*dr::norm(unit_star/dr::sqrt(dr::maximum(radius2,1e-30f))/scale);
-                Mask valid_distance=dr::isfinite(metric)&(metric>0.f)&(radius2>1e-12f);
-                Float distance=gmin/dr::select(valid_distance,metric,1.f);
-                Float depth=s.entry+star*(end-s.entry);
-                Float score=dr::select(valid_distance,dr::maximum(distance,0.f)/std::max(m_size[0],1e-6f)+
-                                      .05f*dr::abs(depth)/std::max(diagonal,1e-6f),1e30f);
-                Candidate incoming{relative_star,gmin,s.transmittance,score,id,s.hits};
-                Mask carry=miss;
-                // Stable insertion retains the same nearest candidates and tie order as Falcor.
-                for(uint32_t j=0;j<max_candidates;++j) {
-                    Candidate old=r.candidates[j];
-                    Mask old_valid=j<s.candidates;
-                    Mask replace=carry & (!old_valid | (incoming.score<old.score));
-                    r.candidates[j]=dr::select(replace,incoming,old);
-                    incoming=dr::select(replace,old,incoming);
-                    carry &= !replace | old_valid;
-                }
-                s.candidates=dr::minimum(s.candidates+dr::select(miss,1u,0u),max_candidates);
-            }
-            Float hit_alpha=dr::select(hit,opacity,0.f);
-            s.color += s.transmittance*hit_alpha*emission;
-            s.transmittance *= 1.f-hit_alpha;
-            s.hits += dr::select(hit,1u,0u);
+            // Keep empty cells out of geometry, appearance, and candidate work.
+            // Only lane-local values participate in conditional merges. Hit
+            // buffers have different widths and are captured as scatter targets.
+            // Shared ownership also keeps the targets alive for callback replay.
+            auto hit_buffers=std::make_shared<HitBuffers>(HitBuffers{r.hit,r.hit_id});
+            dr::tie(s,r.candidates)=dr::if_stmt(
+                dr::make_tuple(s,r.candidates,id,end,occupied,ray.o,d),occupied,
+                [this,rotate,quaternion,appearance,ray_count,hit_stride,lane,
+                 max_candidates,diagonal,hit_buffers](State s,Candidates candidates,const UInt32 &id,
+                    const Float &end,const Mask &occupied,const Point3f &origin,
+                    const Vector3f &direction) {
+                    Vector3f relative,scale,segment=direction*(end-s.entry);
+                    for(uint32_t a=0;a<3;++a) {
+                        Float center=dr::gather<Float>(m_centers,id*3+a,occupied);
+                        relative[a]=origin[a]+s.entry*direction[a]-(m_min[a]+(Float(s.cell[a])+center)*m_size[a]);
+                        scale[a]=dr::exp(dr::clip(dr::gather<Float>(m_log_scales,id*3+a,occupied),-30.f,30.f));
+                    }
+                    Float qw;
+                    Vector3f qv;
+                    quaternion(id,occupied,qw,qv);
+                    Vector3f u=rotate(relative,qw,-qv)/scale, v=rotate(segment,qw,-qv)/scale;
+                    Float a=dr::squared_norm(v), b=2.f*dr::dot(u,v), c=dr::squared_norm(u)-1.f;
+                    Float discriminant=b*b-4.f*a*c, root=dr::sqrt(dr::maximum(discriminant,0.f));
+                    Float inv=.5f/dr::select(a>1e-20f,a,1.f);
+                    Float t0=dr::maximum(0.f,(-b-root)*inv), t1=dr::minimum(1.f,(-b+root)*inv);
+                    Mask hit=occupied & dr::select(a<=1e-20f,c<=0.f,(discriminant>=0.f)&(t0<=t1));
+                    Float star=dr::select(a>1e-20f,dr::clip(-dr::dot(u,v)/dr::select(a>1e-20f,a,1.f),0.f,1.f),0.f);
+                    Vector3f relative_star=relative+star*segment, unit_star=u+star*v;
+                    Float gmin=dr::squared_norm(unit_star)-1.f;
+                    s=dr::if_stmt(
+                        dr::make_tuple(s,id,relative_star,gmin,hit,direction),hit,
+                        [appearance,ray_count,hit_stride,lane,hit_buffers](State s,
+                            const UInt32 &id,const Vector3f &relative_star,
+                            const Float &gmin,const Mask &hit,const Vector3f &direction) {
+                            Color3f emission;
+                            Float opacity;
+                            appearance(id,Vector3f(-direction),hit,emission,opacity);
+                            UInt32 slot=s.hits*ray_count+lane;
+                            dr::scatter(hit_buffers->hit_id,id,slot,hit);
+                            for(uint32_t j=0;j<3;++j) {
+                                dr::scatter(hit_buffers->hit,relative_star[j],j*hit_stride+slot,hit);
+                                dr::scatter(hit_buffers->hit,emission[j],(4+j)*hit_stride+slot,hit);
+                            }
+                            dr::scatter(hit_buffers->hit,gmin,3*hit_stride+slot,hit);
+                            dr::scatter(hit_buffers->hit,opacity,7*hit_stride+slot,hit);
+                            dr::scatter(hit_buffers->hit,s.transmittance,8*hit_stride+slot,hit);
+                            Float hit_alpha=dr::select(hit,opacity,0.f);
+                            s.color += s.transmittance*hit_alpha*emission;
+                            s.transmittance *= 1.f-hit_alpha;
+                            s.hits += dr::select(hit,1u,0u);
+                            return s;
+                        },
+                        [](State s,const UInt32 &,const Vector3f &,
+                           const Float &,const Mask &,const Vector3f &) {
+                            return s;
+                        },"Voxel reconstruction training hit");
+                    if(max_candidates) {
+                        Mask miss=occupied & !hit & dr::isfinite(gmin) & (gmin>=0.f);
+                        dr::tie(s,candidates)=dr::if_stmt(
+                            dr::make_tuple(s,candidates,id,relative_star,unit_star,scale,gmin,
+                                           star,end,miss),miss,
+                            [this,max_candidates,diagonal](State s,Candidates candidates,
+                                const UInt32 &id,const Vector3f &relative_star,
+                                const Vector3f &unit_star,const Vector3f &scale,
+                                const Float &gmin,const Float &star,const Float &end,
+                                const Mask &miss) {
+                                Float radius2=dr::squared_norm(unit_star);
+                                Float metric=2.f*dr::norm(unit_star/dr::sqrt(dr::maximum(radius2,1e-30f))/scale);
+                                Mask valid_distance=dr::isfinite(metric)&(metric>0.f)&(radius2>1e-12f);
+                                Float distance=gmin/dr::select(valid_distance,metric,1.f);
+                                Float depth=s.entry+star*(end-s.entry);
+                                Float score=dr::select(valid_distance,dr::maximum(distance,0.f)/std::max(m_size[0],1e-6f)+
+                                                      .05f*dr::abs(depth)/std::max(diagonal,1e-6f),1e30f);
+                                Candidate incoming{relative_star,gmin,s.transmittance,score,id,s.hits};
+                                // A full list keeps earlier candidates on equal scores.
+                                Mask insert=(s.candidates<max_candidates) |
+                                            (score<candidates.back().score);
+                                dr::tie(s.candidates,candidates)=dr::if_stmt(
+                                    dr::make_tuple(s.candidates,candidates,incoming,miss),insert,
+                                    [max_candidates](UInt32 count,Candidates candidates,
+                                        Candidate incoming,const Mask &miss) {
+                                        Mask carry=miss;
+                                        // Keep the original stable insertion and tie order.
+                                        for(uint32_t j=0;j<max_candidates;++j) {
+                                            Candidate old=candidates[j];
+                                            Mask old_valid=j<count;
+                                            Mask replace=carry & (!old_valid | (incoming.score<old.score));
+                                            candidates[j]=dr::select(replace,incoming,old);
+                                            incoming=dr::select(replace,old,incoming);
+                                            carry &= !replace | old_valid;
+                                        }
+                                        count=dr::minimum(count+dr::select(miss,1u,0u),max_candidates);
+                                        return dr::make_tuple(count,candidates);
+                                    },
+                                    [](UInt32 count,Candidates candidates,const Candidate &,
+                                       const Mask &) {
+                                        return dr::make_tuple(count,candidates);
+                                    },"Voxel reconstruction training candidate insertion");
+                                return dr::make_tuple(s,candidates);
+                            },
+                            [](State s,Candidates candidates,const UInt32 &,const Vector3f &,
+                               const Vector3f &,const Vector3f &,const Float &,
+                               const Float &,const Float &,const Mask &) {
+                                return dr::make_tuple(s,candidates);
+                            },"Voxel reconstruction training miss");
+                    }
+                    return dr::make_tuple(s,candidates);
+                },
+                [](State s,Candidates candidates,const UInt32 &,const Float &,const Mask &,
+                   const Point3f &,const Vector3f &) {
+                    return dr::make_tuple(s,candidates);
+                },"Voxel reconstruction training occupied cell");
+            r.hit=hit_buffers->hit;
+            r.hit_id=hit_buffers->hit_id;
             Mask cross_x=(s.next.x()<=s.next.y())&(s.next.x()<=s.next.z());
             Mask cross_y=!cross_x&(s.next.y()<=s.next.z()),cross_z=!cross_x&!cross_y;
             s.cell.x()+=dr::select(cross_x,step.x(),0);s.cell.y()+=dr::select(cross_y,step.y(),0);s.cell.z()+=dr::select(cross_z,step.z(),0);
