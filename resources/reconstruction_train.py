@@ -26,6 +26,7 @@ from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, genera
 from reconstruction_checkpoint import load_checkpoint, save_checkpoint
 from reconstruction_experiment import allocate_training_output, resumed_training_output
 from reconstruction_optimizer import FalcorOptimizer, OptimizerConfig
+from reconstruction_progress import ProgressLine
 from reconstruction_topology import TopologyManager, TopologySettings, CoarseToFineConfig
 
 
@@ -377,6 +378,7 @@ def run_training():
                   "gradient_reduction": "sum over pixels, no hit-count normalization",
                   "reported_loss": "mean over pixels, then mean over training views",
                   "actual_sampling": "per-pixel uniform, optionally contour-guided; frozen for a view"}}
+    progress_line = ProgressLine()
     try:
         validate(config)
         mi, dr, np, handles = initialize_runtime(config.runtime, output, report)
@@ -490,6 +492,7 @@ def run_training():
         profile_path = output / ("profile-" + Path(history_name).stem + ".jsonl")
         if config.training.profile_views:
             report["profile_file"] = str(profile_path)
+            print("Kernel profile log:", profile_path, flush=True)
         processed_views = 0
         print("Starting training; first kernels may require JIT compilation", flush=True)
         for epoch in range(completed, config.training.num_epochs):
@@ -497,6 +500,8 @@ def run_training():
             epoch_loss = 0.
             stage_totals = dict(reference=0., gradients=0., topology_observation=0., optimizer=0.)
             started = time.perf_counter()
+            progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} | view 0/{len(views)} (0%) "
+                                 f"| grid={int(model.resolution)}", force=True)
             for progress, index in enumerate(order, 1):
                 view = views[int(index)]
                 view_started = time.perf_counter()
@@ -521,18 +526,17 @@ def run_training():
                 processed_views += 1
                 global_step += 1
                 epoch_loss += loss
-                print(f"Epoch {epoch+1}/{config.training.num_epochs}, progress {progress}/{len(views)}, "
-                      f"camera {int(index)+1}, loss={loss:.8g}, wall={optimizer_done-view_started:.3f}s "
-                      f"(reference={stage['reference']:.3f}s, gradients={stage['gradients']:.3f}s, "
-                      f"topology={stage['topology_observation']:.3f}s, update={stage['optimizer']:.3f}s)", flush=True)
+                progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} "
+                    f"| view {progress}/{len(views)} ({100*progress/len(views):.0f}%) "
+                    f"| cam {int(index)+1} | loss={loss:.6f} | {optimizer_done-view_started:.2f}s/view")
                 if profiling:
                     profile = dict(epoch=epoch+1, progress=progress, camera=int(index)+1,
                                    wall_seconds=optimizer_done-view_started, stage_seconds=stage,
                                    **kernel_profile(history))
                     with profile_path.open("a", encoding="utf-8") as stream:
                         stream.write(json.dumps(profile) + "\n")
-                    print("Kernel profile:", json.dumps({key: value for key, value in profile.items()
-                          if key not in ("jit_hashes", "stage_seconds")}), flush=True)
+            progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} "
+                                 f"| view {len(views)}/{len(views)} (100%) | updating topology...", force=True)
             topology_started = time.perf_counter()
             new_state, event = topology.finish_epoch(model, optimizer, epoch+1)
             topology.before_refine_checkpoint = None
@@ -549,9 +553,12 @@ def run_training():
             with (output / history_name).open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(entry) + "\n")
             report["last_epoch"] = entry
-            print(json.dumps(entry), flush=True)
+            progress_line.finish(f"Epoch {epoch+1}/{config.training.num_epochs} done "
+                f"| loss={entry['mean_loss']:.6f} | {entry['seconds']:.2f}s "
+                f"| grid={entry['resolution']} | voxels={entry['active_voxels']}")
             if epoch+1 in save_epochs and epoch+1 < config.training.num_epochs:
                 save(output / f"epoch-{epoch+1:05d}.npz", epoch+1)
+                print("Saved checkpoint:", output / f"epoch-{epoch+1:05d}.npz", flush=True)
         # Publish only the completed reconstruction, using the same portable,
         # atomic checkpoint format understood by independent evaluation scripts.
         save(model_path, config.training.num_epochs)
@@ -562,10 +569,16 @@ def run_training():
                       checkpoint=str(model_path),
                       reconstructed_model={"path": str(model_path), "sha256": file_sha256(model_path),
                           "completed_epochs": config.training.num_epochs, "global_step": global_step})
+    except KeyboardInterrupt:
+        progress_line.finish()
+        report.update(status="interrupted", training_status="interrupted")
+        raise
     except Exception:
+        progress_line.finish()
         report.update(status="failed", training_status="failed", error=traceback.format_exc())
         print(report["error"], file=sys.stderr, flush=True)
     finally:
+        progress_line.finish()
         report["training_finished_utc"] = datetime.now(timezone.utc).isoformat()
         if report["status"] != "running":
             report["finished_utc"] = report["training_finished_utc"]
@@ -601,6 +614,10 @@ def main():
         if result != 0:
             print(f"Training completed and model is saved at {model_path}; "
                   f"evaluation failed. See {evaluation_report}", file=sys.stderr, flush=True)
+    except KeyboardInterrupt:
+        report["status"] = "interrupted"
+        report["evaluation"]["status"] = "interrupted"
+        raise
     except Exception:
         report["status"] = "failed"
         report["evaluation"].update(status="failed", error=traceback.format_exc())

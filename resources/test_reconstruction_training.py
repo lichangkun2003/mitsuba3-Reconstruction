@@ -180,8 +180,8 @@ def main():
         assert len(profiles) == 2
         assert [item["progress"] for item in profiles] == [1, 2]
         assert all(item["jit_kernels"] > 0 and item["wall_seconds"] > 0 for item in profiles)
-        assert "progress 2/2, camera " in (run / "full.log").read_text(encoding="utf-8")
-        report["checks"].append("full-image training, completed-view progress and optional kernel profile")
+        assert "Epoch 3/3 done | loss=" in (run / "full.log").read_text(encoding="utf-8")
+        report["checks"].append("full-image training, compact epoch summary and optional kernel profile")
         assert len((run / "full" / "training.jsonl").read_text(encoding="utf-8").splitlines()) == 3
         report["checks"].append("three epochs save two intermediate checkpoints and final model without duplicate archives")
         check_automatic_evaluation(run / "full")

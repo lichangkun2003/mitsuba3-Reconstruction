@@ -198,15 +198,23 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 这些调整不在训练的每个视角或每个 epoch 内出图。完成全部训练并保存最终模型后，
 训练入口调用评价脚本共用的流程，生成多 spp 图片和 PSNR。
 
-进度现在区分 ``progress 4/100``（本轮已完成四个视角）与 ``camera 19``（相机编号，从 1 开始）。
-每视角打印总墙钟时间和参考图读取、梯度阶段、拓扑观察、参数更新的分段时间；每轮 JSONL
-记录 ``view_stage_seconds`` 和 ``epoch_topology_seconds``。这些时间包含 Python 调度、JIT、
+交互终端（Windows PowerShell、Slurm 的 ``srun --pty bash``）在同一行刷新进度，例如
+``Epoch 1/1000 | view 4/100 (4%) | cam 19 | loss=0.101282 | 0.09s/view``。
+``view`` 表示本轮已完成视角数，``cam`` 是相机编号（从 1 开始）。更新会节流并按终端宽度
+截断，避免快速刷新或自动折行；每轮结束只保留一条包含平均 loss、耗时、网格分辨率和
+体素数的摘要。拓扑处理期间显示 ``updating topology...``，保存模型时另行提示路径。
+输出重定向、管道或非交互式 Slurm 日志中不写回车刷新，只保留轮次摘要和必要提示。
+评价阶段同样每个划分使用一行进度，结束后输出一条 PSNR 汇总；异常或中断前结束活动行。
+
+完整的每轮记录仍写入 ``training.jsonl``（恢复时写入对应的独立日志段），包含
+``view_stage_seconds`` 和 ``epoch_topology_seconds``。这些时间包含 Python 调度、JIT、
 传输和等待，不是纯 GPU 内核时间；异步执行还会让某阶段发出的工作在后续阶段等待完成。
 
 需要定位编译开销时，额外传入 ``--profile-views 3``，仅记录本次进程最先处理的三个视角。
 默认关闭该测量；它会增加测量开销。记录写到训练目录下的 ``profile-training.jsonl``，
 恢复运行则使用与本次恢复日志对应的独立文件；``training-report.json`` 的 ``profile_file``
-给出实际路径。每条记录包含 JIT 内核数、缓存命中/未命中数、内核哈希、代码生成时间
+给出实际路径；终端只提示该文件位置，不逐条打印 profile JSON。每条记录包含各阶段
+墙钟时间、JIT 内核数、缓存命中/未命中数、内核哈希、代码生成时间
 ``codegen_ms``、后端编译时间 ``backend_compile_ms`` 和设备执行时间 ``device_ms``。
 设备时间取自 Dr.Jit kernel history，统计的是被记录操作的耗时，不能与各阶段墙钟时间直接等同。
 

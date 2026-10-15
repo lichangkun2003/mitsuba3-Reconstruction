@@ -21,6 +21,7 @@ import traceback
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import reconstruction_preview as preview
 from reconstruction_checkpoint import load_checkpoint
+from reconstruction_progress import ProgressLine
 
 
 @dataclass
@@ -196,6 +197,7 @@ def run_evaluation(config: EvaluationConfig) -> int:
             "perfect_match": "PSNR is +infinity, encoded as null with an explicit boolean flag",
         },
     }
+    progress = ProgressLine()
     try:
         validate_config(config)
         import reconstruction_common as common
@@ -253,6 +255,8 @@ def run_evaluation(config: EvaluationConfig) -> int:
                 "selected_view_count": len(views), "evaluated_view_count": 0,
             }
             report["splits"][split] = split_report
+            split_started = time.perf_counter()
+            progress.update(f"Eval {split} 0/{len(views)} (0.0%) | {config.spp} spp", force=True)
             for view in views:
                 started = time.perf_counter()
                 index = int(view["index"])
@@ -275,16 +279,31 @@ def run_evaluation(config: EvaluationConfig) -> int:
                 split_report["evaluated_view_count"] = len(records)
                 score = metrics[config.metric_color_space]["psnr_db"]
                 text = "+inf" if score is None else f"{score:.4f}"
-                print(f"{split} [{len(records)}/{len(views)}] PSNR ({config.metric_color_space}) = {text} dB", flush=True)
+                progress.update(
+                    f"Eval {split} {len(records)}/{len(views)} "
+                    f"({100 * len(records) / len(views):.1f}%) | {config.spp} spp | "
+                    f"PSNR({config.metric_color_space})={text} dB")
             split_report["aggregate"] = aggregate_metrics(records)
             (split_output / "metrics.json").write_text(
                 json.dumps(split_report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+            mean_score = split_report["aggregate"][config.metric_color_space]["mean_psnr_db"]
+            mean_text = "+inf" if mean_score is None else f"{mean_score:.4f}"
+            progress.finish(
+                f"Eval {split} {len(records)}/{len(views)} (100%) | {config.spp} spp | "
+                f"mean PSNR({config.metric_color_space})={mean_text} dB | "
+                f"{time.perf_counter() - split_started:.1f}s")
         report["status"] = "passed"
+    except KeyboardInterrupt:
+        progress.finish()
+        report["status"] = "interrupted"
+        raise
     except Exception:
+        progress.finish()
         report["status"] = "failed"
         report["error"] = traceback.format_exc()
         print(report["error"], file=sys.stderr, flush=True)
     finally:
+        progress.finish()
         report["finished_utc"] = datetime.now(timezone.utc).isoformat()
         report_path = output / "evaluation-report.json"
         report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
