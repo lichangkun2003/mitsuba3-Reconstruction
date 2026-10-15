@@ -297,12 +297,14 @@ def prepare_runtime(config: PreviewConfig, workspace: Path, output: Path, report
         for directory in (runtime, package_root / "drjit", package_root / "mitsuba"):
             handles.append(os.add_dll_directory(str(directory)))
     prepare_device_environment(config.runtime.gpu, report)
+    cache_root = workspace / ".cache" / "mitsuba"
     for variable, name in (("DRJIT_CACHE_DIR", "drjit"), ("CUDA_CACHE_PATH", "cuda"),
                            ("OPTIX_CACHE_PATH", "optix")):
-        cache = output / "cache" / name
+        cache = cache_root / name
         cache.mkdir(parents=True, exist_ok=True)
         os.environ[variable] = str(cache)
     report["resolved"]["build_dir"] = str(runtime)
+    report["resolved"]["cache_dir"] = str(cache_root)
     print("GPU:", json.dumps(report["gpu"]), flush=True)
     return handles
 

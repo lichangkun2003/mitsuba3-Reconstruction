@@ -12,7 +12,8 @@ NAMESPACE_BEGIN(mitsuba)
 /** Point-cloud initialized voxel ellipsoids, matching Falcor's
  * VoxelReconstructionNoLightTransport forward model. This is an independent
  * renderer: alpha is continuous transmittance coverage, not a validity mask.
- * No optimization or automatic differentiation is performed in this version.
+ * Training uses the explicit Falcor appearance derivatives and geometry proxy;
+ * it does not differentiate the discontinuous hard-hit test with ordinary AD.
  */
 template <typename Float, typename Spectrum>
 class MI_EXPORT_LIB VoxelReconstruction : public Object {
@@ -27,6 +28,32 @@ public:
                         const std::array<float, 3> &grid_max,
                         double opacity_threshold = .05,
                         uint32_t sh_count = 9, uint32_t opacity_sh_count = 9);
+
+    VoxelReconstruction(uint32_t resolution,
+                        const std::array<float, 3> &grid_min,
+                        const std::array<float, 3> &grid_max,
+                        const UIntBuffer &cell_indices,
+                        const std::map<std::string, FloatBuffer> &parameters,
+                        uint32_t sh_count = 9, uint32_t opacity_sh_count = 9);
+
+    /// Replace continuous parameters without changing occupancy or array sizes.
+    void set_parameters(const std::map<std::string, FloatBuffer> &parameters);
+
+    struct TrainingResult {
+        Color3f rgb, raw_rgb;
+        Float alpha, raw_alpha, loss;
+        UInt32 hit_count;
+        std::map<std::string, FloatBuffer> gradients;
+        std::map<std::string, UIntBuffer> counters;
+    };
+
+    /// One sample per ray/view. Pixel contributions are summed into voxel
+    /// gradients; the caller owns the optimizer and the per-view update clock.
+    TrainingResult loss_and_grad(const Ray3f &ray, const Color3f &reference_rgb,
+                                 const Float &reference_alpha,
+                                 const Color3f &background,
+                                 const Float &inverse_pdf = Float(1.f),
+                                 const std::map<std::string, float> &settings = {}) const;
 
     /// Trace independent rays, returning linear RGB (including background),
     /// accumulated alpha, and contributing hit count. maxt bounds the ray.

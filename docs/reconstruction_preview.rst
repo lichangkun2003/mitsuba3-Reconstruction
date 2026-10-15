@@ -10,6 +10,9 @@ Falcor 中旧的 ``VoxelReconstruction`` 光传输 pass 不属于这次移植范
 Adam、拓扑更新或 coarse-to-fine 训练。普通 Cornell box 的
 ``local_gpu_smoke.py`` 仍然是独立的基础环境检查。
 
+多视角训练、完整模型保存/恢复及 train/test 多 spp 评价见
+:doc:`reconstruction_training`。预览入口继续只执行初始化和前向检查。
+
 编译与运行
 ----------
 
@@ -218,7 +221,7 @@ Falcor 非训练预览的采样布局；这里的 NumPy PCG64 与 Falcor 随机�
 ``resources/test_reconstruction.py`` 使用生成的小型输入检查原生初始化
 和前向行为。这个回归入口仍按本机物理 GPU 编号选卡，仅用于本地检查，
 尚未接入上述 Slurm 环境规则；不要直接在 HPC 作业中运行它。
-本次服务器适配的入口是 ``resources/reconstruction_preview.py``。
+预览、训练和评价入口共用 Slurm 环境规则；这个旧数值回归脚本仍仅用于本地。
 先完成源码编译，再在本地工作区父目录运行 CUDA 测试：
 
 .. code-block:: powershell
