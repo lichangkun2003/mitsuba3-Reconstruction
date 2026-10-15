@@ -184,6 +184,10 @@ def main():
         assert len(profiles) == 2
         assert [item["progress"] for item in profiles] == [1, 2]
         assert all(item["jit_kernels"] > 0 and item["wall_seconds"] > 0 for item in profiles)
+        phase_names = {"forward", "hit_backward", "candidate_backward"}
+        assert all(set(item["native_stages"]) == phase_names for item in profiles)
+        assert all(sum(stage["wall_seconds"] for stage in item["native_stages"].values())
+                   <= item["stage_seconds"]["gradients"] + .001 for item in profiles)
         assert "Epoch 3/3 done | loss=" in (run / "full.log").read_text(encoding="utf-8")
         report["checks"].append("full-image training, compact epoch summary and optional kernel profile")
         epoch_history = [json.loads(line) for line in
@@ -196,6 +200,12 @@ def main():
         assert performance["by_resolution"]["4"]["completed_epochs"] == 3
         assert performance["overall"]["epoch_seconds"]["total"] == math.fsum(row["seconds"] for row in epoch_history)
         assert performance["kernel_profiles"]["overall"]["sampled_views"] == len(profiles)
+        native_summary = performance["kernel_profiles"]["overall"]["native_stages"]
+        assert set(native_summary) == phase_names
+        for name in phase_names:
+            assert native_summary[name]["sampled_views"] == len(profiles)
+            assert native_summary[name]["wall_seconds"]["total"] == math.fsum(
+                item["native_stages"][name]["wall_seconds"] for item in profiles)
         assert len(performance["checkpoints"]) == 3
         assert performance["phase_seconds"]["evaluation"] > 0
         assert performance["details"]["evaluation"]["status"] == "passed"

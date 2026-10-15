@@ -45,6 +45,8 @@ public:
         UInt32 hit_count;
         std::map<std::string, FloatBuffer> gradients;
         std::map<std::string, UIntBuffer> counters;
+        /// Populated only by the diagnostic profile_stages setting.
+        std::map<std::string, std::map<std::string, double>> stage_profile;
     };
 
     /// One sample per ray/view. Pixel contributions are summed into voxel

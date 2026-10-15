@@ -11,6 +11,11 @@ import tempfile
 import time
 
 
+_PROFILE_FIELDS = ("wall_seconds", "operations", "jit_kernels", "cache_hits", "cache_misses",
+                   "codegen_ms", "backend_compile_ms", "device_ms")
+_NATIVE_STAGES = ("forward", "hit_backward", "candidate_backward")
+
+
 def _number(value):
     return (float(value) if isinstance(value, (int, float))
             and not isinstance(value, bool) and math.isfinite(value) and value >= 0 else None)
@@ -62,16 +67,27 @@ def _epoch_summary(entries):
     }
 
 
-def _profile_summary(records):
-    fields = ("operations", "jit_kernels", "cache_hits", "cache_misses",
-              "codegen_ms", "backend_compile_ms", "device_ms")
+def _profile_statistics(records):
     return {
         "sampled_views": len(records),
         "wall_seconds": _distribution(record.get("wall_seconds") for record in records),
         "totals": {name: math.fsum(value for record in records
                                   if (value := _number(record.get(name))) is not None)
-                   for name in fields},
+                   for name in _PROFILE_FIELDS if name != "wall_seconds"},
     }
+
+
+def _profile_summary(records):
+    result = _profile_statistics(records)
+    # Stage measurements are a breakdown of a sampled view, never additional
+    # work to add to its totals. Legacy/disabled profiles have no stage samples.
+    result["native_stages"] = {}
+    for name in _NATIVE_STAGES:
+        samples = [record["native_stages"][name] for record in records
+                   if name in record.get("native_stages", {})]
+        if samples:
+            result["native_stages"][name] = _profile_statistics(samples)
+    return result
 
 
 class PerformanceRecorder:
@@ -109,10 +125,13 @@ class PerformanceRecorder:
         })
 
     def record_profile(self, record: dict):
-        fields = ("wall_seconds", "operations", "jit_kernels", "cache_hits", "cache_misses",
-                  "codegen_ms", "backend_compile_ms", "device_ms")
-        sample = {name: _number(record.get(name)) for name in fields}
+        sample = {name: _number(record.get(name)) for name in _PROFILE_FIELDS}
         sample["resolution"] = str(record.get("training_resolution", record.get("resolution", "unknown")))
+        stages = record.get("native_stages")
+        if isinstance(stages, dict):
+            sample["native_stages"] = {
+                name: {field: _number(stages[name].get(field)) for field in _PROFILE_FIELDS}
+                for name in _NATIVE_STAGES if isinstance(stages.get(name), dict)}
         self.profiles.append(sample)
 
     def record_checkpoint(self, path: Path, seconds: float):
@@ -141,7 +160,14 @@ class PerformanceRecorder:
                               "do not add nested measurements together.",
                 "resolution": "Training resolution before the epoch's topology update.",
                 "profile": "Sampled views only; device_ms sums sampled device operation times. "
-                           "Do not extrapolate these samples to all epochs or equate them with wall time.",
+                           "Do not extrapolate these samples to all epochs or equate them with wall time. "
+                           "Device time and wall time cannot be added or subtracted to obtain CPU time.",
+                "native_stages": "Optional synchronized diagnostic breakdown of sampled views. "
+                                 "Stage boundaries force evaluation, including full forward candidates, "
+                                 "and change scheduling; they do not measure normal throughput. "
+                                 "Stage values are nested within profile totals and must not be added again. "
+                                 "Legacy/disabled records are excluded from stage sample counts. "
+                                 "Fused atomic operations are not timed separately.",
                 "missing_values": "Missing, negative or nonfinite timings are excluded from aggregates.",
             },
             "phase_seconds": self.phase_seconds, "checkpoints": self.checkpoints,

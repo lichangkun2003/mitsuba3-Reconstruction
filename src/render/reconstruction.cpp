@@ -1,11 +1,110 @@
 #include <mitsuba/render/reconstruction.h>
 #include <drjit/while_loop.h>
 #include "reconstruction_pointcloud.h"
+#include <chrono>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <sstream>
 
 NAMESPACE_BEGIN(mitsuba)
+
+namespace {
+
+/// Diagnostic-only barriers and nested history regions. The disabled path must
+/// neither change evaluation nor read a clock or alter the caller's JIT flags.
+template <bool IsJit> class ReconstructionStageProfiler {
+public:
+    using Metrics = std::map<std::string, double>;
+    using Profile = std::map<std::string, Metrics>;
+    using Clock = std::chrono::steady_clock;
+
+    explicit ReconstructionStageProfiler(bool enabled) : m_enabled(enabled) {
+        if (m_enabled) {
+            if constexpr (IsJit) {
+                // Pending work belongs to the caller, not the first stage.
+                dr::sync_thread();
+                m_flag.emplace(JitFlag::KernelHistory, true);
+            }
+            begin();
+        }
+    }
+
+    ReconstructionStageProfiler(const ReconstructionStageProfiler &) = delete;
+    ReconstructionStageProfiler &operator=(const ReconstructionStageProfiler &) = delete;
+
+    ~ReconstructionStageProfiler() {
+        if constexpr (IsJit) {
+            if (m_region_active)
+                jit_kernel_history_free(jit_kernel_history_end(m_region));
+        }
+        // m_flag restores the previous flag, including an outer capture region.
+    }
+
+    bool enabled() const { return m_enabled; }
+
+    void begin() {
+        if (!m_enabled)
+            return;
+        if constexpr (IsJit) {
+            m_region = jit_kernel_history_begin();
+            m_region_active = true;
+        }
+        m_start = Clock::now();
+    }
+
+    void finish(const char *stage) {
+        if (!m_enabled)
+            return;
+        if constexpr (IsJit)
+            dr::sync_thread();
+        double seconds = std::chrono::duration<double>(Clock::now() - m_start).count();
+        Metrics metrics = zero_metrics();
+        metrics["wall_seconds"] = seconds;
+        if constexpr (IsJit) {
+            using Snapshot = std::unique_ptr<KernelHistory, decltype(&jit_kernel_history_free)>;
+            Snapshot history(jit_kernel_history_end(m_region), &jit_kernel_history_free);
+            m_region_active = false;
+            const size_t count = jit_kernel_history_size(history.get());
+            metrics["operations"] = double(count);
+            for (size_t i = 0; i < count; ++i) {
+                auto query = [&](KernelHistoryField field) {
+                    return jit_kernel_history_query(history.get(), i, field);
+                };
+                metrics["device_ms"] += double(query(KernelHistoryField::ExecutionTime)) * 1e-6;
+                metrics["codegen_ms"] += double(query(KernelHistoryField::CodegenTime)) * 1e-6;
+                metrics["backend_compile_ms"] += double(query(KernelHistoryField::BackendTime)) * 1e-6;
+                if (query(KernelHistoryField::Type) == uint64_t(KernelType::JIT)) {
+                    metrics["jit_kernels"] += 1.;
+                    metrics[query(KernelHistoryField::CacheHit) ? "cache_hits" : "cache_misses"] += 1.;
+                }
+            }
+        }
+        profile[stage] = std::move(metrics);
+    }
+
+    void zero_stage(const char *stage) {
+        if (m_enabled)
+            profile[stage] = zero_metrics();
+    }
+
+    Profile profile;
+
+private:
+    static Metrics zero_metrics() {
+        return {{"wall_seconds", 0.}, {"device_ms", 0.}, {"codegen_ms", 0.},
+                {"backend_compile_ms", 0.}, {"operations", 0.}, {"jit_kernels", 0.},
+                {"cache_hits", 0.}, {"cache_misses", 0.}};
+    }
+
+    bool m_enabled, m_region_active = false;
+    uint64_t m_region = 0;
+    Clock::time_point m_start{};
+    std::optional<dr::scoped_set_flag> m_flag;
+};
+
+} // namespace
 
 MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     const std::string &filename, uint32_t resolution,
@@ -306,7 +405,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         {"geometry_hit_expansion_band_tau", 0.f}, {"collect_deletion_evidence", 1.f},
         {"min_evidence_transmittance", .05f}, {"min_removal_loss_delta", 1e-4f},
         {"transmittance_threshold", .01f}, {"max_hits", 16.f},
-        {"max_candidates", 16.f}, {"entry_offset_fraction", 0.f}};
+        {"max_candidates", 16.f}, {"entry_offset_fraction", 0.f},
+        {"profile_stages", 0.f}};
     for (const auto &[key, value] : settings) {
         if (cfg.find(key) == cfg.end() || !std::isfinite(value) || value < 0.f)
             Throw("VoxelReconstruction.loss_and_grad(): unknown/invalid setting %s.", key.c_str());
@@ -323,6 +423,19 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                                   dr::width(inverse_pdf), dr::width(background)});
     if (width == 0 || width * std::max(max_hits, std::max(max_candidates, 1u)) * 9 > UINT32_MAX)
         Throw("VoxelReconstruction.loss_and_grad(): ray batch is empty or too large.");
+    ReconstructionStageProfiler<dr::is_jit_v<Float>> profiler(cfg["profile_stages"] != 0.f);
+    // std::map is not traversed by dr::schedule(); schedule its buffers explicitly.
+    auto evaluate_result = [](const TrainingResult &result) {
+        if constexpr (dr::is_jit_v<Float>) {
+            dr::schedule(result.rgb, result.raw_rgb, result.alpha, result.raw_alpha,
+                         result.loss, result.hit_count);
+            for (const auto &[key, value] : result.gradients)
+                dr::schedule(value);
+            for (const auto &[key, value] : result.counters)
+                dr::schedule(value);
+            dr::eval();
+        }
+    };
     if (!m_active_count) {
         TrainingResult result;
         result.raw_alpha = dr::zeros<Float>(width);
@@ -338,6 +451,13 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             result.gradients[key] = dr::zeros<FloatBuffer>(0);
         for (const auto *key : {"appearance_valid", "geometry_valid", "background_carve_valid", "foreground_evidence", "background_evidence"})
             result.counters[key] = dr::zeros<UIntBuffer>(0);
+        if (profiler.enabled()) {
+            evaluate_result(result);
+            profiler.finish("forward");
+            profiler.zero_stage("hit_backward");
+            profiler.zero_stage("candidate_backward");
+            result.stage_profile = std::move(profiler.profile);
+        }
         return result;
     }
     UInt32 lane(0);
@@ -509,7 +629,22 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             s.active &= dr::all(s.cell>=0)&dr::all(s.cell<int(m_resolution))&(s.entry<exit)&
                         (s.transmittance>cfg["transmittance_threshold"])&(s.hits<max_hits)&(s.iterations<=3*m_resolution+3);
         },"Voxel reconstruction training paths");
-    dr::eval(records,state);
+    if (profiler.enabled()) {
+        if constexpr (dr::is_jit_v<Float>) {
+            // Scheduling Records alone does not recurse into its std::vector.
+            // Materialize every candidate field here so candidate construction
+            // is measured with the DDA, not deferred into the backward stage.
+            for (const auto &candidate : records.candidates)
+                dr::schedule(candidate.point, candidate.gmin, candidate.before,
+                             candidate.score, candidate.id, candidate.front);
+            dr::schedule(records, state);
+            dr::eval();
+        }
+        profiler.finish("forward");
+        profiler.begin();
+    } else {
+        dr::eval(records,state);
+    }
 
     TrainingResult result;
     result.raw_rgb=state.color+state.transmittance*background;
@@ -636,7 +771,15 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             dr::scatter(records.hit,behind[j],(4+j)*hit_stride+slot,valid,ReduceMode::NoConflicts);
         dr::scatter(records.hit,after,7*hit_stride+slot,valid,ReduceMode::NoConflicts);
     }
-    dr::eval(records.hit);
+    if (profiler.enabled()) {
+        if constexpr (dr::is_jit_v<Float>)
+            dr::schedule(records.hit);
+        evaluate_result(result);
+        profiler.finish("hit_backward");
+        profiler.begin();
+    } else {
+        dr::eval(records.hit);
+    }
     for(uint32_t i=0;i<max_candidates;++i) {
         Mask valid=(i<state.candidates)&!is_background;
         const Candidate &candidate=records.candidates[i];
@@ -650,6 +793,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         Color3f radiance;Float opacity;
         appearance(id,Vector3f(-d),valid,radiance,opacity);
         add_geometry(id,candidate.point,candidate.gmin,candidate.before,opacity,radiance,suffix_color,suffix_t,valid,false);
+    }
+    if (profiler.enabled()) {
+        evaluate_result(result);
+        profiler.finish("candidate_backward");
+        result.stage_profile = std::move(profiler.profile);
     }
     return result;
 }

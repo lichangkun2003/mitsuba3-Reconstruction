@@ -64,6 +64,7 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
    CONFIG.training.chunk_size = 0  # 整图提交；正整数表示显式分批
    CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译和设备耗时
    CONFIG.training.profile_interval_epochs = 50  # 新分辨率及每 50 轮抽样一个视角
+   CONFIG.training.profile_stages = True  # 抽样视角进一步诊断原生前向/两类反向阶段
    CONFIG.training.reference_cache_mib = 1024  # 参考图 CPU 内存缓存；0 关闭
    CONFIG.schedule.enabled = True
    CONFIG.schedule.start_resolution = 256
@@ -99,7 +100,7 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 * ``model``：初始化边界、padding、SH 数量和固定分辨率。
 * ``render``：图像尺寸、裁剪面、背景、命中上限等；训练 ``spp`` 必须为 1。
 * ``training``：``num_epochs``、``chunk_size``、``profile_views``、``profile_interval_epochs``、
-  ``reference_cache_mib``、``seed``、``shuffle``、
+  ``profile_stages``、``reference_cache_mib``、``seed``、``shuffle``、
   ``save_count``（默认 3，包含最后一次）和输出路径 ``output``；``None`` / JSON ``null``
   表示自动分配实验目录，字符串表示使用显式路径。
 * ``gradient``：alpha 损失、几何代理宽度/截断、边界和删除证据等参数。
@@ -276,6 +277,10 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 * ``profile-training.jsonl``：稀疏抽样的 Dr.Jit 内核统计，用于判断编译、缓存和设备执行开销；
   不对所有训练视角开启详细内核记录。
 
+逐轮日志沿用 ``view_stage_seconds.gradients`` 字段名，以兼容已有报告。这个计时区间
+包含前向遍历与合成、loss、命中反向、未命中候选几何反向，以及归约检查/必要回读，
+不是只测梯度公式或原子累加。不能直接把它的全部耗时归因为梯度写冲突。
+
 性能汇总在每个完整 epoch 结束时原子刷新，训练和自动评价结束时再次更新；
 正常处理 ``Ctrl+C`` 或运行异常时也尝试保存当前已记录的信息。它不是模型 checkpoint，
 不会改变原来的三次模型保存计划，也不能用来恢复未保存的训练进度。
@@ -290,6 +295,8 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 默认 ``training.profile_interval_epochs=50``：本次进程首次进入一种训练分辨率时，
 以及每第 50 个 epoch，记录其第一个视角的内核信息。``--profile-views 3`` 还可额外记录
 本次进程最先处理的三个视角；``profile_views`` 默认仍为 0，两个条件命中同一视角时只记录一次。
+``training.profile_stages=True`` 默认只在这些已经选中的抽样视角上增加原生分段计时，
+不会额外抽取视角。``--no-profile-stages`` 关闭分段，仍保留抽样视角的总内核统计。
 若需要完全关闭内核抽样，可传 ``--profile-interval-epochs 0 --profile-views 0``，
 普通逐轮耗时及性能汇总仍保留。恢复时可调整这些性能测量参数，不改变算法设置。
 抽样有额外开销，比较优化前后速度时应使用相同的测量设置。
@@ -300,8 +307,30 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 ``device_ms``。设备时间取自 Dr.Jit kernel history，只涵盖所记录的操作；这是抽样数据，
 不能按它直接外推整个实验的 GPU 时间或多 GPU 加速比。
 
+开启分段后，抽样记录另有 ``native_stages``，包含：
+
+* ``forward``：原生前向路径与候选记录的完整物化。
+* ``hit_backward``：loss、命中体素的反向梯度及其累加、后缀记录，以及按需启用的删除证据。
+* ``candidate_backward``：未命中候选的几何反向处理。
+
+每段记录 ``wall_seconds``、``device_ms``、``codegen_ms``、``backend_compile_ms``、
+``operations``、``jit_kernels``、``cache_hits``、``cache_misses``。
+``performance-summary.json`` 的 ``kernel_profiles.overall.native_stages`` 及
+``kernel_profiles.by_resolution.<分辨率>.native_stages`` 提供各段的抽样次数、墙钟时间
+分布和上述内核指标累计值。没有分段信息的旧日志或关闭分段的视角，不计入各段样本数；
+这些细分统计不再次累加到整视角的时间与设备时间中。
+
+分段诊断在边界进行同步，并强制物化完整的前向候选，避免惰性执行把前向工作延迟计入
+后续反向阶段。这样的边界会改变正常执行的融合、调度和耗时，因此它只用于定位开销，
+不能代表无分段计时的正常训练吞吐。原子累加与公式计算融合在内核中，分段计时不能
+单独测出原子操作占比；进一步定位写冲突或寄存器/带宽瓶颈需要更细的硬件画像。
+
+例如在诊断实验中添加 ``--profile-views 3 --profile-interval-epochs 10``，可记录前三个
+视角和第 10、20 等轮的首个视角，便于观察初始执行与后续生长轮；进入新分辨率的抽样仍保留。
+
 阶段时间是墙钟时间，包含 Python 调度、JIT、传输和等待，不是纯 GPU 内核时间；
-异步执行还会让某阶段发出的工作在后续阶段等待完成。报告中的 GPU 可见设备与 CPU 线程
+异步执行还会让某阶段发出的工作在后续阶段等待完成。设备时间与主机墙钟时间不能相加，
+也不能简单相减后将差值当作纯 CPU 时间。报告中的 GPU 可见设备与 CPU 线程
 来源说明实际运行配置，不代表持续采集了 GPU 利用率、显存峰值或多 GPU 通信性能。
 目前一个训练进程仍只使用一张 GPU，性能报告本身不会启用分布式训练。
 
@@ -396,9 +425,9 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
 ------------------
 
 首次使用原生训练、参数更新和 checkpoint 恢复接口，或修改底层 C++ 后，必须重新编译。
-本次性能优化修改了原生射线记录的存取方式，因此必须增量编译 C++，再启动使用新
-Python 脚本的进程。删除证据的按需计算由 Python 根据已有阶段规则设置调用参数，
-不是新增删除算法。不能仅同步脚本后沿用旧的原生模块。
+本轮新增原生前向、命中反向和候选反向的诊断计时接口，因此必须增量编译 C++，
+再启动使用新 Python 脚本的进程。本轮只增加测量，没有交付梯度算法或执行性能优化；
+不能仅同步脚本后沿用旧的原生模块。
 预编译 wheel 不包含这些原生接口，不能用于验证它们。在 ``reconstruction`` 工作区
 父目录的 PowerShell 中执行：
 
@@ -441,10 +470,13 @@ HPC Slurm
 
    "$HOME/envs/mitsuba/bin/python" -I resources/reconstruction_train.py \
      --dataset datasets/lego --epochs 1000 --chunk-size 0 --profile-views 3 \
+     --profile-interval-epochs 10 \
      --eval-spp 64 --eval-max-views 10
 
-这里显式选择整图提交，并测量最先处理的三个视角，便于检查服务器上的编译和缓存开销；
-省略 ``--profile-views 3`` 时仍保留默认的分辨率/每 50 轮抽样。已经运行的 HPC 进程不会自动加载新脚本，
+这里显式选择整图提交，并诊断最先处理的三个视角及每第 10 轮的首个视角，
+便于区分前向与两类反向开销。省略这两个 profile 参数时，恢复默认的分辨率/每 50 轮抽样。
+需要保留内核总统计但关闭同步分段时添加 ``--no-profile-stages``。
+已经运行的 HPC 进程不会自动加载新脚本，
 需同步后重新启动；如恢复已有实验，应使用已保存的完整 epoch checkpoint 和 ``--resume``，
 未保存的 epoch 进度仍需重算。实际显存峰值和 A100 提速幅度需要在服务器测量，不能由本地测试推断。
 
@@ -765,3 +797,12 @@ Checkpoint 与 PSNR 的 CPU 单元测试不导入 GPU 后端，也不渲染数�
 范围。检查点能够加载、loss 有下降或图像看起来合理，都不能单独证明硬可见性代理梯度
 与原 Falcor 所有路径完全一致。真实 lego 收敛、正式参数选择、跨机器数值一致性及
 Slurm 上的实际运行，需要在目标数据和硬件上完成验证。
+
+原生三阶段计时已在本地 RTX 4060 的 ``cuda_ad_rgb`` 源码构建中验证：整图与每批 37 条射线
+的分段开关对照中，loss、梯度和有效计数在测试容差内一致，仍只回读两个统计标量；
+嵌套内核统计完整保留，空模型的两个反向阶段为零。生成场景的训练、恢复及分段日志汇总检查
+通过，另有三项纯 CPU 汇总测试覆盖旧日志兼容和分辨率分组。这些检查不代表 A100 的实际阶段耗时。
+
+.. code-block:: powershell
+
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_performance_summary.py

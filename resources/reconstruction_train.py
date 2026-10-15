@@ -38,6 +38,7 @@ class TrainingSettings:
     chunk_size: int = 0  # 0: submit the whole image; positive: explicit ray batches.
     profile_views: int = 0  # Record JIT/cache/device timings for the first N views.
     profile_interval_epochs: int = 50  # Sample one view periodically and on entering each resolution; 0 disables.
+    profile_stages: bool = True  # Synchronize native phase boundaries only in sampled views.
     reference_cache_mib: int = 1024  # Decoded float32 RGBA in host RAM; 0 disables caching.
     seed: int = 42
     shuffle: bool = True
@@ -106,6 +107,7 @@ CONFIG.render.spp = 1  # 训练固定每视角 1 spp；多 spp 出图使用评�
 CONFIG.training.chunk_size = 0  # 0 = 整图提交；显存不足时可显式改为 65536 等。
 CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译、缓存和 GPU 耗时。
 CONFIG.training.profile_interval_epochs = 50  # 每 50 轮及首次进入各分辨率时抽样记录内核耗时；0 关闭。
+CONFIG.training.profile_stages = True  # 仅在抽样视角细分前向、命中反向和候选梯度；会增加诊断开销。
 CONFIG.training.reference_cache_mib = 1024  # 内存缓存参考图，避免每轮重新解码；0 关闭。
 
 CONFIG.schedule.enabled = True
@@ -153,6 +155,8 @@ def parse_arguments():
     parser.add_argument("--chunk-size", type=int, help="0 (default): full image; positive: maximum rays per batch")
     parser.add_argument("--profile-views", type=int, help="Record kernel/cache timings for the first N processed views")
     parser.add_argument("--profile-interval-epochs", type=int, help="Sample one view every N epochs and on entering a resolution (default: 50); 0 disables automatic samples")
+    parser.add_argument("--profile-stages", action=argparse.BooleanOptionalAction, default=None,
+                        help="Synchronize and time native phases in sampled views; --no-profile-stages keeps only aggregate kernel profiling")
     parser.add_argument("--reference-cache-mib", type=int, help="RAM budget for decoded reference images in MiB (default: 1024); 0 disables caching")
     parser.add_argument("--skip-evaluation", action="store_true", help="Save the final model without automatic train/test evaluation")
     parser.add_argument("--eval-spp", type=int, help="Samples per pixel for final evaluation (default: 64)")
@@ -168,6 +172,7 @@ def apply_arguments(config, args, values):
         (args.chunk_size, "training", "chunk_size"),
         (args.profile_views, "training", "profile_views"),
         (args.profile_interval_epochs, "training", "profile_interval_epochs"),
+        (args.profile_stages, "training", "profile_stages"),
         (args.reference_cache_mib, "training", "reference_cache_mib"),
         (args.eval_spp, "evaluation", "spp"),
         (args.eval_max_views, "evaluation", "max_views")):
@@ -194,6 +199,8 @@ def validate(config):
             raise ValueError(f"training.{name} must be a nonnegative integer")
     if config.training.seed < 0:
         raise ValueError("training.seed must be nonnegative")
+    if not isinstance(config.training.profile_stages, bool):
+        raise ValueError("training.profile_stages must be a boolean")
     for name, value in asdict(config.gradient).items():
         if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError(f"Invalid gradient.{name}: {value}")
@@ -231,12 +238,14 @@ def effective_chunk_size(config):
 
 
 def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rendered_alpha=False,
-               collect_deletion_evidence=None):
+               collect_deletion_evidence=None, stage_profile=None):
     """Compute a full view on the GPU; only transfer data needed by CPU consumers.
 
     Gradients stay on the GPU. Loss/validity are read once per view. Optional
     contour and growth alpha are assembled on the GPU before their one readback.
     Positive chunk sizes retain bounded intermediate storage and one Adam update.
+    An optional output dictionary collects synchronized native phase diagnostics.
+    This is enabled only for sampled views, never for ordinary training calls.
     """
     count = config.render.width * config.render.height
     chunk_size = effective_chunk_size(config)
@@ -248,6 +257,8 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
     total_loss, finite = mi.Float(0), mi.Bool(True)
     camera = prepare_camera(config.render, view["camera"], mi, dr)
     native_settings = settings(config)
+    if stage_profile is not None:
+        native_settings["profile_stages"] = True
     if collect_deletion_evidence is not None:
         # The topology schedule decides whether these counters have a consumer.
         # Disabling unused counters does not disable loss/appearance/geometry terms.
@@ -259,6 +270,14 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
         ref = reference[begin:end]
         result = model.loss_and_grad(ray, mi.Color3f(mi.Float(ref[:, 0]), mi.Float(ref[:, 1]), mi.Float(ref[:, 2])),
             mi.Float(ref[:, 3]), mi.Color3f(config.render.background), mi.Float(inverse_pdf[begin:end]), native_settings)
+        if stage_profile is not None:
+            if "stage_profile" not in result:
+                raise RuntimeError("Native stage profiling is unavailable; rebuild this checkout's C++ bindings")
+            for phase, measurements in result["stage_profile"].items():
+                totals = stage_profile.setdefault(phase, {})
+                for name, value in measurements.items():
+                    value = float(value) if name == "wall_seconds" or name.endswith("_ms") else int(value)
+                    totals[name] = totals.get(name, 0) + value
         total_loss += dr.sum(result["loss"])
         finite &= dr.all(dr.isfinite(result["raw_alpha"])) & dr.all(dr.isfinite(result["alpha"]))
         for name, target in (("raw_alpha", raw_alpha), ("alpha", estimated_alpha)):
@@ -449,7 +468,9 @@ def run_training():
         report["training_protocol"].update(rays_per_view=ray_count, rays_per_batch=batch_size,
             batches_per_view=(ray_count + batch_size - 1) // batch_size,
             alpha_readback="only contour history and scheduled growth evidence; no visualization readback",
-            camera_parameters="opaque runtime inputs")
+            camera_parameters="opaque runtime inputs",
+            gradients_stage_scope="forward paths, loss, hit/candidate gradients, reductions and readbacks",
+            native_stage_profiling="synchronized sampled views only" if config.training.profile_stages else "disabled")
         print(f"Training rays: {ray_count} per view, {batch_size} per batch, "
               f"{report['training_protocol']['batches_per_view']} batch(es) per update", flush=True)
         save_epochs = checkpoint_epochs(config.training.num_epochs, config.training.save_count)
@@ -563,12 +584,14 @@ def run_training():
                     if (epoch + 1) % interval == 0:
                         reasons.append("periodic_epoch")
                 profiling = bool(reasons)
+                native_stages = {} if profiling and config.training.profile_stages else None
                 # Sparse kernel-history samples add instrumentation. Wall timings
                 # below include tracing, compilation, transfers and waits.
                 with dr.kernel_history() if profiling else nullcontext() as history:
                     gradients, loss, rendered_alpha = train_view(model, view, rgba, config, sampler, rng, mi, dr, np,
                         need_rendered_alpha=growth_evidence_requested,
-                        collect_deletion_evidence=deletion_evidence_collected)
+                        collect_deletion_evidence=deletion_evidence_collected,
+                        stage_profile=native_stages)
                     gradients_done = time.perf_counter()
                     topology.observe_view(model, gradients, view_id=int(index), epoch=epoch,
                         camera=view["camera"], reference_alpha=rgba[..., 3], rendered_alpha=rendered_alpha)
@@ -591,6 +614,9 @@ def run_training():
                                    sample_reasons=reasons, growth_evidence_requested=growth_evidence_requested,
                                    wall_seconds=optimizer_done-view_started, stage_seconds=stage,
                                    **kernel_profile(history))
+                    if native_stages is not None:
+                        profile["native_stages"] = native_stages
+                        profile["native_stage_timing"] = "synchronized boundaries; instrumented timings, not normal throughput"
                     with profile_path.open("a", encoding="utf-8") as stream:
                         stream.write(json.dumps(profile) + "\n")
                     performance.record_profile(profile)

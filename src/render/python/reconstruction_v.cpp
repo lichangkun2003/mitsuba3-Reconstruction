@@ -51,6 +51,8 @@ MI_PY_EXPORT(VoxelReconstruction) {
             result["gradients"] = values.gradients;
             for (const auto &[key, value] : values.counters)
                 result[nb::str(key.c_str())] = value;
+            if (!values.stage_profile.empty())
+                result["stage_profile"] = values.stage_profile;
             return result;
         }, "ray"_a, "reference_rgb"_a, "reference_alpha"_a,
            "background"_a = Color3f(1.f), "inverse_pdf"_a = Float(1.f),

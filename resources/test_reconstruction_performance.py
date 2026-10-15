@@ -13,6 +13,7 @@ import math
 from pathlib import Path
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -188,6 +189,53 @@ def check_unused_deletion(config, payload, view, rgba, mi, dr, np):
         np.testing.assert_allclose(np.asarray(value), np.asarray(models[1].snapshot()[name]),
                                    atol=2e-6, rtol=2e-6, err_msg=name)
     return {"unused_deletion_evidence_skipped_without_changing_gradients_or_adam": "passed"}
+
+
+def check_native_stage_profile(config, payload, view, rgba, mi, dr, np):
+    phases = {"forward", "hit_backward", "candidate_backward"}
+    fields = {"wall_seconds", "device_ms", "codegen_ms", "backend_compile_ms",
+              "operations", "jit_kernels", "cache_hits", "cache_misses"}
+    model = restore_model(payload, mi)
+    reports = []
+    for chunk in (0, 37):
+        current = copy.deepcopy(config)
+        current.training.chunk_size = chunk
+        expected = train_view(model, view, rgba, current, ContourSampler(np),
+                              np.random.default_rng(118), mi, dr, np)
+        measurements = {}
+        recorder = TransferRecorder(np, dr)
+        started = time.perf_counter()
+        with dr.kernel_history() as history:
+            actual = train_view(model, view, rgba, current, ContourSampler(np),
+                                np.random.default_rng(118), mi, dr, recorder,
+                                stage_profile=measurements)
+        elapsed = time.perf_counter() - started
+        compare_accumulators(actual[0], expected[0], np)
+        np.testing.assert_allclose(actual[1], expected[1], atol=2e-7, rtol=2e-6)
+        assert actual[2] is None and recorder.widths == [2], recorder.widths
+        assert set(measurements) == phases, measurements
+        for phase, measured in measurements.items():
+            assert set(measured) == fields, (phase, measured)
+            assert all(math.isfinite(value) and value >= 0 for value in measured.values())
+            assert measured["cache_hits"] + measured["cache_misses"] == measured["jit_kernels"]
+        assert sum(stage["wall_seconds"] for stage in measurements.values()) <= elapsed + .001
+        outer = kernel_profile(history)
+        # Native nested captures must leave the Python view-level capture intact.
+        for name in ("operations", "jit_kernels", "device_ms", "codegen_ms", "backend_compile_ms"):
+            assert sum(stage[name] for stage in measurements.values()) <= outer[name] + 1e-3, (name, measurements, outer)
+        assert measurements["forward"]["jit_kernels"] > 0
+        reports.append({"chunk_size": chunk, "native_stages": measurements})
+    empty = copy.deepcopy(payload)
+    empty["model_state"] = {key: value[:0] for key, value in empty["model_state"].items()}
+    result = restore_model(empty, mi).loss_and_grad(
+        mi.Ray3f(mi.Point3f(.5, .5, -1), mi.Vector3f(0, 0, 1)),
+        mi.Color3f(.6), mi.Float(.8), mi.Color3f(1), mi.Float(1), {"profile_stages": 1})
+    assert set(result["stage_profile"]) == phases
+    for name in ("hit_backward", "candidate_backward"):
+        assert all(value == 0 for value in result["stage_profile"][name].values())
+    return {"native_stage_profile_preserves_gradients_counts_loss_and_transfers": "passed",
+            "nested_kernel_history_preserved": True, "empty_model_profile": "passed",
+            "profiled_chunk_modes": [report["chunk_size"] for report in reports]}
 
 
 def check_multiple_hit_layout(config, payload, view, rgba, mi, dr, np):
@@ -396,6 +444,7 @@ def main():
             (check_full_frame, (config, payload, view, rgba, mi, dr, np)),
             (check_transfers, (config, payload, view, rgba, mi, dr, np)),
             (check_unused_deletion, (config, payload, view, rgba, mi, dr, np)),
+            (check_native_stage_profile, (config, payload, view, rgba, mi, dr, np)),
             (check_multiple_hit_layout, (config, payload, view, rgba, mi, dr, np)),
             (check_render_accumulation, (config, payload, view, mi, dr, np)),
             (check_camera_cache, (config, payload, view, mi, dr, np)),
