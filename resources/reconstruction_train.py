@@ -7,6 +7,7 @@ configuration, or override the main options on the command line.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 import json
@@ -19,7 +20,7 @@ import traceback
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from reconstruction_preview import DataConfig, ModelConfig, RenderConfig, RuntimeConfig, PreviewConfig, validate_config
-from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, generate_ray_batch,
+from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, generate_ray_batch, prepare_camera,
     initialize_runtime, load_views, model_metadata, read_reference, restore_model, workspace_path, file_sha256)
 from reconstruction_checkpoint import load_checkpoint, save_checkpoint
 from reconstruction_experiment import allocate_training_output, resumed_training_output
@@ -30,7 +31,8 @@ from reconstruction_topology import TopologyManager, TopologySettings, CoarseToF
 @dataclass
 class TrainingSettings:
     num_epochs: int = 1000
-    chunk_size: int = 16384
+    chunk_size: int = 0  # 0: submit the whole image; positive: explicit ray batches.
+    profile_views: int = 0  # Record JIT/cache/device timings for the first N views.
     seed: int = 42
     shuffle: bool = True
     save_count: int = 3  # Total snapshots, including the final model.npz.
@@ -84,6 +86,8 @@ CONFIG.data.cameras = "transforms_train.json"
 CONFIG.render.width = 800
 CONFIG.render.height = 800
 CONFIG.render.spp = 1  # 训练固定每视角 1 spp；多 spp 出图使用评价脚本。
+CONFIG.training.chunk_size = 0  # 0 = 整图提交；显存不足时可显式改为 65536 等。
+CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译、缓存和 GPU 耗时。
 
 CONFIG.schedule.enabled = True
 CONFIG.schedule.start_resolution = 256
@@ -124,7 +128,8 @@ def parse_arguments():
     parser.add_argument("--output-dir", help="Override automatic outputs/SCENE-MM.DD-Eindex/training; on resume the default reuses the checkpoint's experiment")
     parser.add_argument("--build-dir")
     parser.add_argument("--gpu", type=int, help="Local physical index; ignored under Slurm")
-    parser.add_argument("--chunk-size", type=int)
+    parser.add_argument("--chunk-size", type=int, help="0 (default): full image; positive: maximum rays per batch")
+    parser.add_argument("--profile-views", type=int, help="Record kernel/cache timings for the first N processed views")
     return parser.parse_args()
 
 
@@ -133,7 +138,8 @@ def apply_arguments(config, args, values):
     for value, group, key in ((args.epochs, "training", "num_epochs"),
         (args.dataset, "data", "dataset"), (args.output_dir, "training", "output"),
         (args.build_dir, "runtime", "build_dir"), (args.gpu, "runtime", "gpu"),
-        (args.chunk_size, "training", "chunk_size")):
+        (args.chunk_size, "training", "chunk_size"),
+        (args.profile_views, "training", "profile_views")):
         if value is not None:
             setattr(getattr(config, group), key, value)
     config.schedule.total_epochs = config.training.num_epochs
@@ -145,10 +151,14 @@ def validate(config):
         raise ValueError("Training requires exactly 1 spp per view; use reconstruction_evaluate.py for multi-spp images")
     if list(config.render.background) != [1., 1., 1.]:
         raise ValueError("Falcor's training reference is composited onto white; training requires background [1,1,1]. Evaluation background is configurable.")
-    for name in ("num_epochs", "chunk_size", "save_count"):
+    for name in ("num_epochs", "save_count"):
         value = getattr(config.training, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"training.{name} must be a positive integer")
+    for name in ("chunk_size", "profile_views"):
+        value = getattr(config.training, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"training.{name} must be a nonnegative integer")
     if config.training.seed < 0:
         raise ValueError("training.seed must be nonnegative")
     for name, value in asdict(config.gradient).items():
@@ -168,25 +178,41 @@ def settings(config):
     return result
 
 
-def train_view(model, view, rgba, config, sampler, rng, mi, dr, np):
-    """Chunk rays for memory, accumulating a full view before one Adam update."""
+def effective_chunk_size(config):
     count = config.render.width * config.render.height
+    return min(config.training.chunk_size or count, count)
+
+
+def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rendered_alpha=False):
+    """Compute a full view on the GPU; only transfer data needed by CPU consumers.
+
+    Gradients stay on the GPU. Loss/validity are read once per view. Optional
+    contour and growth alpha are assembled on the GPU before their one readback.
+    Positive chunk sizes retain bounded intermediate storage and one Adam update.
+    """
+    count = config.render.width * config.render.height
+    chunk_size = effective_chunk_size(config)
     offsets, inverse_pdf, token = sampler.sample(view["index"], rgba[..., 3], rng)
     reference = rgba.reshape(-1, 4)
-    raw_alpha = np.zeros(count, dtype=np.float32)
-    estimated_alpha = np.zeros(count, dtype=np.float32)
+    raw_alpha = dr.empty(mi.Float, count) if token is not None else None
+    estimated_alpha = dr.empty(mi.Float, count) if need_rendered_alpha else None
     accumulator = {"gradients": {}}
-    total_loss = 0.
-    for begin in range(0, count, config.training.chunk_size):
-        end = min(begin + config.training.chunk_size, count)
+    total_loss, finite = mi.Float(0), mi.Bool(True)
+    camera = prepare_camera(config.render, view["camera"], mi, dr)
+    for begin in range(0, count, chunk_size):
+        end = min(begin + chunk_size, count)
         ray = generate_ray_batch(config.render, view["camera"],
-            np.arange(begin, end, dtype=np.uint32), offsets[begin:end], mi, dr)
+            np.arange(begin, end, dtype=np.uint32), offsets[begin:end], mi, dr, prepared_camera=camera)
         ref = reference[begin:end]
         result = model.loss_and_grad(ray, mi.Color3f(mi.Float(ref[:, 0]), mi.Float(ref[:, 1]), mi.Float(ref[:, 2])),
             mi.Float(ref[:, 3]), mi.Color3f(config.render.background), mi.Float(inverse_pdf[begin:end]), settings(config))
-        total_loss += float(dr.sum(result["loss"])[0])
-        raw_alpha[begin:end] = np.asarray(result["raw_alpha"])
-        estimated_alpha[begin:end] = np.asarray(result["alpha"])
+        total_loss += dr.sum(result["loss"])
+        finite &= dr.all(dr.isfinite(result["raw_alpha"])) & dr.all(dr.isfinite(result["alpha"]))
+        for name, target in (("raw_alpha", raw_alpha), ("alpha", estimated_alpha)):
+            if target is not None:
+                # An opaque offset avoids a different scatter kernel per batch.
+                indices = dr.arange(mi.UInt32, end - begin) + dr.opaque(mi.UInt32, begin)
+                dr.scatter(target, result[name], indices)
         for key, value in result["gradients"].items():
             accumulator["gradients"][key] = accumulator["gradients"].get(key, 0) + value
         for key in ("appearance_valid", "geometry_valid", "background_carve_valid"):
@@ -194,16 +220,39 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np):
         for key in ("foreground_evidence", "background_evidence"):
             accumulator[key] = dr.maximum(accumulator.get(key, 0), result[key])
         # Materialize per-chunk sums; never retain all image path records/graphs.
-        dr.eval(*accumulator["gradients"].values(), *[value for key, value in accumulator.items() if key != "gradients"])
-    dr.sync_thread()
-    finite = math.isfinite(total_loss) and np.isfinite(raw_alpha).all()
-    for name, gradient in accumulator["gradients"].items():
-        if not bool(dr.all(dr.isfinite(gradient))[0]):
-            raise RuntimeError(f"Nonfinite {name} gradient at training view {view['index']}")
-    if not finite:
-        raise RuntimeError(f"Nonfinite loss/alpha at training view {view['index']}")
-    sampler.observe(token, raw_alpha)
-    return accumulator, total_loss / count, estimated_alpha.reshape(config.render.height, config.render.width)
+        dr.eval(total_loss, finite, *[x for x in (raw_alpha, estimated_alpha) if x is not None],
+                *accumulator["gradients"].values(),
+                *[value for key, value in accumulator.items() if key != "gradients"])
+    for gradient in accumulator["gradients"].values():
+        finite &= dr.all(dr.isfinite(gradient))
+    finite &= dr.isfinite(total_loss)
+    # Read loss and the combined validity flag together, rather than performing
+    # a separate host synchronization for every parameter group and ray batch.
+    summary = dr.zeros(mi.Float, 2)
+    dr.scatter(summary, total_loss / count, 0)
+    dr.scatter(summary, mi.Float(finite), 1)
+    dr.eval(summary)
+    host_summary = np.asarray(summary)
+    if not bool(host_summary[1]) or not math.isfinite(float(host_summary[0])):
+        raise RuntimeError(f"Nonfinite loss/alpha/gradient at training view {view['index']}")
+    if raw_alpha is not None:
+        sampler.observe(token, np.asarray(raw_alpha))
+    alpha = (np.asarray(estimated_alpha).reshape(config.render.height, config.render.width)
+             if estimated_alpha is not None else None)
+    return accumulator, float(host_summary[0]), alpha
+
+
+def kernel_profile(history):
+    """Separate JIT compilation from device work; all Dr.Jit times are ms."""
+    entries = list(history)
+    jit = [entry for entry in entries if entry.type.name == "JIT"]
+    return {"operations": len(entries), "jit_kernels": len(jit),
+            "cache_hits": sum(bool(entry.cache_hit) for entry in jit),
+            "cache_misses": sum(not entry.cache_hit for entry in jit),
+            "codegen_ms": sum(entry.codegen_time for entry in entries),
+            "backend_compile_ms": sum(entry.backend_time for entry in entries),
+            "device_ms": sum(entry.execution_time for entry in entries),
+            "jit_hashes": sorted({str(entry.hash) for entry in jit})}
 
 
 def dataset_signature(views, dataset, camera_file):
@@ -323,16 +372,26 @@ def main():
                     if existing.get(group) != previous[group]:
                         raise ValueError("Resume output belongs to a different configuration; choose a new --output-dir")
         report["requested_config"] = asdict(config)
+        batch_size = effective_chunk_size(config)
+        ray_count = config.render.width * config.render.height
+        report["training_protocol"].update(rays_per_view=ray_count, rays_per_batch=batch_size,
+            batches_per_view=(ray_count + batch_size - 1) // batch_size,
+            alpha_readback="only contour history and scheduled growth evidence; no visualization readback",
+            camera_parameters="opaque runtime inputs")
+        print(f"Training rays: {ray_count} per view, {batch_size} per batch, "
+              f"{report['training_protocol']['batches_per_view']} batch(es) per update", flush=True)
         save_epochs = checkpoint_epochs(config.training.num_epochs, config.training.save_count)
         report["checkpoint_epochs"] = list(save_epochs)
         (output / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
         dataset = workspace_path(config.data.dataset, WORKSPACE)
+        print("Loading training views and checking reference files:", dataset, flush=True)
         views = load_views(dataset, config.data.cameras, config.render, np)
         signature = dataset_signature(views, dataset, config.data.cameras)
         rng = np.random.default_rng(config.training.seed)
         sampler = ContourSampler(np, **asdict(config.contour))
         completed, global_step = 0, 0
         if checkpoint:
+            print("Restoring voxel model and training state", flush=True)
             state = checkpoint["training_state"]
             if state["dataset_signature"] != signature:
                 raise ValueError("Training cameras/reference images differ from the checkpoint")
@@ -344,6 +403,7 @@ def main():
             rng.bit_generator.state = state["rng_state"]
             sampler.load_state_dict(state["contour_state"])
         else:
+            print("Initializing voxel model from point cloud:", dataset / config.data.point_cloud, flush=True)
             bounds_min = np.asarray(config.model.bounds_min)
             bounds_max = np.asarray(config.model.bounds_max)
             center, half = (bounds_min + bounds_max) / 2, (bounds_max - bounds_min) / 2 * config.model.bounds_padding
@@ -389,20 +449,53 @@ def main():
         history_name = ("training-resume-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".jsonl"
                         if checkpoint else "training.jsonl")
         report["history_file"] = str(output / history_name)
+        profile_path = output / ("profile-" + Path(history_name).stem + ".jsonl")
+        if config.training.profile_views:
+            report["profile_file"] = str(profile_path)
+        processed_views = 0
+        print("Starting training; first kernels may require JIT compilation", flush=True)
         for epoch in range(completed, config.training.num_epochs):
             order = rng.permutation(len(views)) if config.training.shuffle else np.arange(len(views))
             epoch_loss = 0.
+            stage_totals = dict(reference=0., gradients=0., topology_observation=0., optimizer=0.)
             started = time.perf_counter()
-            for index in order:
+            for progress, index in enumerate(order, 1):
                 view = views[int(index)]
+                view_started = time.perf_counter()
                 rgba = read_reference(view["reference_path"], config.render.width, config.render.height, mi, np)
-                gradients, loss, raw_alpha = train_view(model, view, rgba, config, sampler, rng, mi, dr, np)
-                topology.observe_view(model, gradients, view_id=int(index), epoch=epoch,
-                    camera=view["camera"], reference_alpha=rgba[..., 3], rendered_alpha=raw_alpha)
-                optimizer.step(model, gradients, sample_count=1, epoch=epoch, coarse_to_fine=config.schedule.enabled)
+                reference_done = time.perf_counter()
+                profiling = processed_views < config.training.profile_views
+                # Disabled by default: kernel history adds instrumentation. Wall
+                # timings below include tracing, compilation, transfers and waits.
+                with dr.kernel_history() if profiling else nullcontext() as history:
+                    gradients, loss, rendered_alpha = train_view(model, view, rgba, config, sampler, rng, mi, dr, np,
+                        need_rendered_alpha=topology.needs_rendered_alpha(epoch))
+                    gradients_done = time.perf_counter()
+                    topology.observe_view(model, gradients, view_id=int(index), epoch=epoch,
+                        camera=view["camera"], reference_alpha=rgba[..., 3], rendered_alpha=rendered_alpha)
+                    topology_done = time.perf_counter()
+                    optimizer.step(model, gradients, sample_count=1, epoch=epoch, coarse_to_fine=config.schedule.enabled)
+                    optimizer_done = time.perf_counter()
+                stage = dict(reference=reference_done-view_started, gradients=gradients_done-reference_done,
+                             topology_observation=topology_done-gradients_done, optimizer=optimizer_done-topology_done)
+                for key, duration in stage.items():
+                    stage_totals[key] += duration
+                processed_views += 1
                 global_step += 1
                 epoch_loss += loss
-                print(f"Epoch {epoch+1}/{config.training.num_epochs}, view {int(index)+1}/{len(views)}, loss={loss:.8g}", flush=True)
+                print(f"Epoch {epoch+1}/{config.training.num_epochs}, progress {progress}/{len(views)}, "
+                      f"camera {int(index)+1}, loss={loss:.8g}, wall={optimizer_done-view_started:.3f}s "
+                      f"(reference={stage['reference']:.3f}s, gradients={stage['gradients']:.3f}s, "
+                      f"topology={stage['topology_observation']:.3f}s, update={stage['optimizer']:.3f}s)", flush=True)
+                if profiling:
+                    profile = dict(epoch=epoch+1, progress=progress, camera=int(index)+1,
+                                   wall_seconds=optimizer_done-view_started, stage_seconds=stage,
+                                   **kernel_profile(history))
+                    with profile_path.open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(profile) + "\n")
+                    print("Kernel profile:", json.dumps({key: value for key, value in profile.items()
+                          if key not in ("jit_hashes", "stage_seconds")}), flush=True)
+            topology_started = time.perf_counter()
             new_state, event = topology.finish_epoch(model, optimizer, epoch+1)
             topology.before_refine_checkpoint = None
             if new_state is not None:
@@ -412,7 +505,9 @@ def main():
                 sampler = ContourSampler(np, **asdict(config.contour))
             entry = {"epoch": epoch+1, "global_step": global_step, "mean_loss": epoch_loss / len(views),
                      "seconds": time.perf_counter()-started, "resolution": int(model.resolution),
-                     "active_voxels": int(model.active_voxel_count), "topology": event}
+                     "active_voxels": int(model.active_voxel_count), "topology": event,
+                     "view_stage_seconds": stage_totals,
+                     "epoch_topology_seconds": time.perf_counter()-topology_started}
             with (output / history_name).open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(entry) + "\n")
             report["last_epoch"] = entry

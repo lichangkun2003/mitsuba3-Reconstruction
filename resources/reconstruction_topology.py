@@ -377,6 +377,10 @@ class TopologyManager:
         final = (boundary - self.level_start_epoch >= self.level_budget if schedule.enabled else boundary >= schedule.total_epochs)
         return enabled and not final and boundary >= self.evidence_start and (boundary - self.evidence_start) % interval == 0
 
+    def needs_rendered_alpha(self, epoch):
+        """Only growth-evidence views need a rendered alpha image on the CPU."""
+        return self.settings.use_growth_evidence and self._growth_due(epoch + 1)
+
     def _generate_growth(self, checkpoint, boundary):
         np, cfg = self.np, self.settings
         state, metadata = checkpoint["model_state"], checkpoint["model_metadata"]
@@ -497,7 +501,9 @@ class TopologyManager:
                     raise ValueError("Deletion evidence count differs from active voxel count")
                 masks[flags & eligible, word] |= bit
         boundary = epoch + 1
-        if self.settings.use_growth_evidence and self._growth_due(boundary):
+        if self.needs_rendered_alpha(epoch):
+            if rendered_alpha is None:
+                raise ValueError("Growth evidence requires this view's rendered alpha before its update")
             if self.pending_growth is None or self.pending_growth["boundary"] != boundary:
                 checkpoint = model_checkpoint(model)
                 self.pending_growth = self._generate_growth(checkpoint, boundary)

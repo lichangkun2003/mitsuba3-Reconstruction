@@ -85,16 +85,36 @@ def read_reference(path, width, height, mi, np):
     return rgba
 
 
-def generate_ray_batch(render, camera, indices, offsets, mi, dr):
+def prepare_camera(render, camera, mi, dr):
+    """Upload camera values as runtime inputs so views can share JIT kernels.
+
+    Literal camera arrays let Dr.Jit specialize the kernel for each viewpoint.
+    Opaque arrays retain the same float32 values, but store them in device memory
+    instead of embedding them in generated code. Keep these separately from the
+    serializable camera dictionary and reuse them for every batch of a view.
+    """
+    tan_x = math.tan(camera["camera_angle_x"] / 2)
+    tan_y = tan_x * render.height / render.width
+    return {
+        "position": dr.opaque(mi.Point3f, camera["position"]),
+        "forward": dr.opaque(mi.Vector3f, camera["forward"]),
+        "right": dr.opaque(mi.Vector3f, camera["right"]),
+        "up": dr.opaque(mi.Vector3f, camera["up"]),
+        "tan_x": dr.opaque(mi.Float, tan_x),
+        "tan_y": dr.opaque(mi.Float, tan_y),
+    }
+
+
+def generate_ray_batch(render, camera, indices, offsets, mi, dr, *, prepared_camera=None):
+    values = (prepare_camera(render, camera, mi, dr)
+              if prepared_camera is None else prepared_camera)
     index = mi.UInt32(indices)
     u = (mi.Float(index % render.width) + mi.Float(offsets[:, 0])) / render.width
     v = (mi.Float(index // render.width) + mi.Float(offsets[:, 1])) / render.height
-    tan_x = math.tan(camera["camera_angle_x"] / 2)
-    tan_y = tan_x * render.height / render.width
-    direction = (mi.Vector3f(camera["forward"])
-                 + ((2 * u - 1) * tan_x) * mi.Vector3f(camera["right"])
-                 + ((1 - 2 * v) * tan_y) * mi.Vector3f(camera["up"]))
-    ray = mi.Ray3f(mi.Point3f(camera["position"]) + render.near_clip * direction,
+    direction = (values["forward"]
+                 + ((2 * u - 1) * values["tan_x"]) * values["right"]
+                 + ((1 - 2 * v) * values["tan_y"]) * values["up"])
+    ray = mi.Ray3f(values["position"] + render.near_clip * direction,
                   dr.normalize(direction))
     ray.maxt = (render.far_clip - render.near_clip) * dr.norm(direction)
     return ray
@@ -107,6 +127,7 @@ def render_view(model, render, camera, spp, seed, chunk_size, mi, dr, np):
     rgb_sum = np.zeros((count, 3), dtype=np.float64)
     alpha_sum = np.zeros(count, dtype=np.float64)
     rng = np.random.default_rng(seed)
+    prepared_camera = prepare_camera(render, camera, mi, dr)
     for sample in range(spp):
         # Draw the entire sample before chunking so chunk size cannot change rays.
         offsets = rng.random((count, 2)).astype(np.float32)
@@ -114,7 +135,7 @@ def render_view(model, render, camera, spp, seed, chunk_size, mi, dr, np):
         for begin in range(0, count, chunk_size):
             end = min(begin + chunk_size, count)
             ray = generate_ray_batch(render, camera, np.arange(begin, end, dtype=np.uint32),
-                                     offsets[begin:end], mi, dr)
+                                     offsets[begin:end], mi, dr, prepared_camera=prepared_camera)
             rgb, alpha, hits = model.trace(ray, mi.Color3f(render.background),
                 render.transmittance_threshold, render.max_hits, render.entry_offset_fraction)
             dr.eval(rgb, alpha, hits)

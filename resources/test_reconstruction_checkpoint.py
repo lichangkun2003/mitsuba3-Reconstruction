@@ -287,7 +287,8 @@ class ContourSamplerTests(unittest.TestCase):
                              Float=lambda value: np.asarray(value, np.float32),
                              Vector3f=vector, Point3f=vector,
                              Ray3f=lambda origin, direction: SimpleNamespace(o=origin, d=direction))
-        dr = SimpleNamespace(norm=norm, normalize=lambda value: value / norm(value))
+        dr = SimpleNamespace(norm=norm, normalize=lambda value: value / norm(value),
+                             opaque=lambda dtype, value: dtype(value))
         camera = dict(camera_angle_x=.7, position=[0., 0., 3.], forward=[0., 0., -1.],
                       right=[1., 0., 0.], up=[0., 1., 0.])
         render = RenderConfig(width=2, height=2)

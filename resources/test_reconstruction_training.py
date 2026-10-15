@@ -125,7 +125,8 @@ def main():
                   "model": {"grid_resolution": 4, "bounds_min": [-1.,-1.,-1.], "bounds_max": [1.,1.,1.]},
                   "render": {"width": 16, "height": 16, "spp": 1},
                   "runtime": {"build_dir": args.build_dir, "gpu": args.gpu},
-                  "training": {"num_epochs": 3, "chunk_size": 128, "save_count": 3, "output": str(run / "full")},
+                  "training": {"num_epochs": 3, "chunk_size": 0, "profile_views": 2,
+                               "save_count": 3, "output": str(run / "full")},
                   "schedule": {"enabled": False},
                   "optimizer": {"opacity_warmup_epochs": 0, "opacity_ramp_epochs": 0,
                                 "lr_center": 0., "lr_log_scale": 0., "lr_rotation": 0.},
@@ -152,6 +153,13 @@ def main():
         assert full_report["reconstructed_model"]["completed_epochs"] == 3
         assert full_report["reconstructed_model"]["global_step"] == 6
         assert Path(full_report["reconstructed_model"]["path"]) == run / "full" / "model.npz"
+        assert full_report["training_protocol"]["batches_per_view"] == 1
+        profiles = [json.loads(line) for line in Path(full_report["profile_file"]).read_text(encoding="utf-8").splitlines()]
+        assert len(profiles) == 2
+        assert [item["progress"] for item in profiles] == [1, 2]
+        assert all(item["jit_kernels"] > 0 and item["wall_seconds"] > 0 for item in profiles)
+        assert "progress 2/2, camera " in (run / "full.log").read_text(encoding="utf-8")
+        report["checks"].append("full-image training, completed-view progress and optional kernel profile")
         assert len((run / "full" / "training.jsonl").read_text(encoding="utf-8").splitlines()) == 3
         report["checks"].append("three epochs save two intermediate checkpoints and final model without duplicate archives")
         if np.array_equal(first["model_state"]["radiance_sh"], final["model_state"]["radiance_sh"]):

@@ -16,7 +16,8 @@
 
 一个 epoch 完整遍历训练相机 JSON 的所有视角。默认每轮打乱视角顺序；每个视角的
 每个像素仅发射一条射线，即固定 1 spp。完整视角的梯度累加结束后更新一次参数。
-``training.chunk_size`` 仅控制一批射线的内存占用，不改变每个视角的更新次数。
+``training.chunk_size=0`` 默认整图提交；800 × 800 时一次提交 640000 条射线。
+设为正整数可显式限制每批射线数，不改变每个视角的更新次数。
 ``data.camera_index`` 是沿用的预览配置字段，训练遍历全部视角，不使用它截取训练集。
 
 训练包括颜色与 alpha 损失、外观与几何梯度、分组 Adam、体素拓扑操作及分辨率调度。
@@ -60,6 +61,8 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
    CONFIG.render.width = 800
    CONFIG.render.height = 800
    CONFIG.render.spp = 1
+   CONFIG.training.chunk_size = 0  # 整图提交；正整数表示显式分批
+   CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译和设备耗时
    CONFIG.schedule.enabled = True
    CONFIG.schedule.start_resolution = 256
    CONFIG.schedule.target_resolution = 512
@@ -87,7 +90,7 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 * ``data``：数据集相对路径、PLY、训练相机 JSON。
 * ``model``：初始化边界、padding、SH 数量和固定分辨率。
 * ``render``：图像尺寸、裁剪面、背景、命中上限等；训练 ``spp`` 必须为 1。
-* ``training``：``num_epochs``、``chunk_size``、``seed``、``shuffle``、
+* ``training``：``num_epochs``、``chunk_size``、``profile_views``、``seed``、``shuffle``、
   ``save_count``（默认 3，包含最后一次）和输出路径 ``output``；``None`` / JSON ``null``
   表示自动分配实验目录，字符串表示使用显式路径。
 * ``gradient``：alpha 损失、几何代理宽度/截断、边界和删除证据等参数。
@@ -151,6 +154,45 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 
 这仅用于检查程序能否完成训练与恢复，不是原始 256 → 512 正式实验的等价配置。
 训练和评价严格要求参考图尺寸与配置一致，不隐式缩放真值。
+
+整图提交、内核复用与回读
+----------------------
+
+默认 ``training.chunk_size=0`` 让一个视角的全部射线一起进入前向和梯度计算，随后进行一次 Adam 更新。
+整图提交仍会执行多个 GPU 内核，并不等于只启动一个内核，也不保证所有设备上都最快。
+它需要更多显存；显存不足时，可以显式设置 ``--chunk-size 65536`` 等正整数，仍保持
+800 × 800、1 spp 和每视角一次更新。程序不会自行降低 spp、图像分辨率或回退 CPU。
+已有 JSON 配置中的正数 ``chunk_size`` 仍然生效；用 ``--chunk-size 0`` 可以覆盖旧配置，
+包括从 checkpoint 恢复时的分批设置。此处的 0 约定仅用于训练入口；评价仍使用其正数分批参数。
+
+相机的位置、方向和视场系数先通过 ``dr.opaque`` 上传为运行时数据，供同一视角的所有批次复用。
+这些数值不再作为相机专属的常量嵌入 JIT 内核，因此只换相机数值不需要重新特化内核。
+首次运行、批次大小或数据形状变化、网格升层以及算法配置变化仍可能产生新内核，不能把所有
+缓存未命中都当成错误。此修改同样用于独立评价的公共射线生成函数。
+
+回读是把 GPU 数据传回 CPU，会产生数据传输和等待。当前回读并非用于可视化：
+
+* 前向、梯度累加和 Adam 更新仍在 GPU；不把梯度数组复制到 CPU 来完成参数更新。
+* loss 与 loss/alpha/梯度的有限值检查先在 GPU 归约为两个标量，每个完整视角回读一次，
+  用于进度记录和及时发现数值异常。显式分批时，不再逐批回读 loss 或整张 alpha。
+* 原始 ``raw_alpha`` 只在 contour 采样器实际产生更新 token 时回读，用于更新采样历史。
+* 概率校正后的 alpha 只在本轮需要收集体素生长证据时回读；普通训练轮不搬运这张图。
+* 体素删除启用且进入证据收集阶段时，CPU 拓扑管理仍按视角读取证据，保留原来的跨视角
+  累积及候选判断顺序。生长和 contour 数据也在需要的视角处理，不能作为纯可视化统一延迟到 epoch 末。
+
+这些调整没有增加训练出图。多 spp 图片和 PSNR 仍由独立评价脚本生成。
+
+进度现在区分 ``progress 4/100``（本轮已完成四个视角）与 ``camera 19``（相机编号，从 1 开始）。
+每视角打印总墙钟时间和参考图读取、梯度阶段、拓扑观察、参数更新的分段时间；每轮 JSONL
+记录 ``view_stage_seconds`` 和 ``epoch_topology_seconds``。这些时间包含 Python 调度、JIT、
+传输和等待，不是纯 GPU 内核时间；异步执行还会让某阶段发出的工作在后续阶段等待完成。
+
+需要定位编译开销时，额外传入 ``--profile-views 3``，仅记录本次进程最先处理的三个视角。
+默认关闭该测量；它会增加测量开销。记录写到训练目录下的 ``profile-training.jsonl``，
+恢复运行则使用与本次恢复日志对应的独立文件；``training-report.json`` 的 ``profile_file``
+给出实际路径。每条记录包含 JIT 内核数、缓存命中/未命中数、内核哈希、代码生成时间
+``codegen_ms``、后端编译时间 ``backend_compile_ms`` 和设备执行时间 ``device_ms``。
+设备时间取自 Dr.Jit kernel history，统计的是被记录操作的耗时，不能与各阶段墙钟时间直接等同。
 
 重建结果目录
 ------------
@@ -224,8 +266,10 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
 本地源码编译与训练
 ------------------
 
-这次新增了原生训练、参数更新和 checkpoint 恢复接口，必须重新编译。
-预编译 wheel 不包含这些修改，不能用于验证它们。在 ``reconstruction`` 工作区
+首次使用原生训练、参数更新和 checkpoint 恢复接口，或修改底层 C++ 后，必须重新编译。
+本次整图提交、相机运行时数据、按需回读与性能日志的改动仅涉及 Python；已经包含上述接口的
+源码构建不需要为这次改动重新编译 C++，同步脚本并重新启动进程即可。
+预编译 wheel 不包含这些原生接口，不能用于验证它们。在 ``reconstruction`` 工作区
 父目录的 PowerShell 中执行：
 
 .. code-block:: powershell
@@ -243,14 +287,19 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
 HPC Slurm
 ----------
 
-源码同步由使用者完成。服务器先增量编译，再在已经获得 GPU 分配的作业步骤中运行：
+源码同步由使用者完成。首次使用或 C++ 有修改时先增量编译；在已经获得 GPU 分配的作业步骤中运行：
 
 .. code-block:: bash
 
    cmake --build "$HOME/projects/reconstruction/mitsuba/build" --parallel 8
    cd "$HOME/projects/reconstruction"
    "$HOME/envs/mitsuba/bin/python" -I mitsuba/resources/reconstruction_train.py \
-     --dataset datasets/lego --epochs 1000
+     --dataset datasets/lego --epochs 1000 --chunk-size 0 --profile-views 3
+
+这里显式选择整图提交，并测量最先处理的三个视角，便于检查服务器上的编译和缓存开销；
+不需要性能测量时可省略 ``--profile-views 3``。已经运行的 HPC 进程不会自动加载新脚本，
+需同步后重新启动；如恢复已有实验，应使用已保存的完整 epoch checkpoint 和 ``--resume``，
+未保存的 epoch 进度仍需重算。实际显存峰值和 A100 提速幅度需要在服务器测量，不能由本地测试推断。
 
 训练、评价和预览共用本地/Slurm 环境规则：Slurm 下保留
 ``CUDA_VISIBLE_DEVICES`` 原字符串及所有作业变量，不按本地物理编号重新选卡；
@@ -423,8 +472,9 @@ PNG 用于显示；进行论文或其他实现的 PSNR 对比时，应明确选�
 2026-10-15，本地 Windows Release 源码构建成功，在 NVIDIA RTX 4060 Laptop GPU
 上使用 ``cuda_ad_rgb`` 完成以下检查；CPU 与模拟环境检查单独列出：
 
-以下为此前已执行的验证记录。本次将保存策略改为每个实验默认三次后，已更新集成测试的
-文件数量、最终模型与升层后恢复断言，但未重新训练或渲染；下表不代表新保存策略已完成 GPU 回归。
+下表保留已有验证记录。本次整图提交与按需回读修改后，另行完成了生成小场景的 CUDA 性能回归，
+并重跑训练集成检查：两视角三轮、三次模型保存、普通及升层后恢复、独立评价均通过。
+未重新运行真实 Lego 实验，也未在 A100 或真实 Slurm 作业中测量吞吐量。
 
 .. list-table:: 已执行检查
    :header-rows: 1
@@ -446,7 +496,7 @@ PNG 用于显示；进行论文或其他实现的 PSNR 对比时，应明确选�
      - 16 项模拟环境检查通过；这不代表真实 Slurm GPU 作业已运行。
    * - 完整小场景训练闭环
      - CUDA 生成场景通过：36 项外观有限差分比较最大绝对误差约 ``9.1158e-6``；
-       checkpoint 前向一致、空模型、多 spp 分块不改变射线、两视角两轮训练与恢复一致；
+       checkpoint 前向一致、空模型、多 spp 分块不改变射线、两视角三轮训练与恢复一致；
        完成的 checkpoint 恢复到新目录；4 → 8 升层与升层前恢复；开启 contour 后升层
        清空历史；独立 train/test 2 spp 评价及 PSNR 报告。
    * - Lego 本地一轮实验
@@ -487,6 +537,24 @@ Checkpoint 与 PSNR 的 CPU 单元测试不导入 GPU 后端，也不渲染数�
 校验和破坏、pickle 拒绝、元数据与形状错误，以及已知 PSNR、聚合定义和 sRGB 转换。
 也检查 contour 提案归一化、PDF 校正后的常量/alpha 积分、仅选中 bin 的原始 alpha
 历史更新，以及恢复随机数和历史状态后的采样与射线一致性；这些检查在 CPU 上执行。
+
+整图提交和相机内核复用有独立的 CUDA 小场景回归，可从工作区父目录运行：
+
+.. code-block:: powershell
+
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_performance.py
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I mitsuba/resources/test_reconstruction_performance.py
+
+该检查使用生成的数据和临时目录，比较整图/分批的数值结果，检查按需回读、非有限值拒绝，
+以及更换相机后的 JIT 内核缓存命中。它不代表真实 Lego 数据集或 A100 的吞吐量测试。
+本次 RTX 4060 CUDA 检查中，16 × 16 整图与每批 37 条射线的梯度最大绝对差为
+``1.90735e-6``，参数更新与 contour 历史在测试容差内一致；默认关闭 contour/growth
+图像回读时只传回两个统计标量。改变相机位置、方向及视场角后，原生损失/梯度计算的
+66 个唯一 JIT 内核哈希保持一致，第二个相机全部命中缓存、后端编译耗时为零。
+相同采样下分批方式改变浮点归约顺序，不保证逐位相同。
 
 源码构建、生成的小场景数值测试、checkpoint 往返恢复和完整数据集训练分别验证不同
 范围。检查点能够加载、loss 有下降或图像看起来合理，都不能单独证明硬可见性代理梯度
