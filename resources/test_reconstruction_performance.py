@@ -1,6 +1,6 @@
 """Generated CUDA regression for full-frame training, transfers and JIT reuse.
 
-Uses one synthetic voxel and 16x16 rays. No dataset or experiment is opened;
+Uses generated single/multiple-voxel scenes and 16x16 rays. No dataset or experiment is opened;
 temporary runtime artifacts are removed automatically. Source build required.
 """
 
@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from reconstruction_common import (
     ContourSampler, generate_ray_batch, initialize_runtime, prepare_camera,
-    restore_model,
+    render_view, restore_model,
 )
 from reconstruction_optimizer import FalcorOptimizer
 from reconstruction_preview import RuntimeConfig
@@ -168,6 +168,107 @@ def check_transfers(config, payload, view, rgba, mi, dr, np):
             "contour_only_image_readbacks": recorder.widths}
 
 
+def check_unused_deletion(config, payload, view, rgba, mi, dr, np):
+    model = restore_model(payload, mi)
+    results = [train_view(model, view, rgba, config, ContourSampler(np),
+                          np.random.default_rng(71), mi, dr, np,
+                          need_rendered_alpha=True, collect_deletion_evidence=enabled)
+               for enabled in (True, False)]
+    evidence = ("foreground_evidence", "background_evidence")
+    assert any(np.any(np.asarray(results[0][0][key])) for key in evidence)
+    assert all(not np.any(np.asarray(results[1][0][key])) for key in evidence)
+    compare_accumulators(*[{key: value for key, value in result[0].items() if key not in evidence}
+                           for result in results], np)
+    np.testing.assert_allclose(results[0][1], results[1][1], atol=2e-7, rtol=2e-6)
+    np.testing.assert_array_equal(results[0][2], results[1][2])
+    models = [restore_model(payload, mi) for _ in results]
+    for updated, result in zip(models, results):
+        FalcorOptimizer(updated, copy.deepcopy(config.optimizer)).step(updated, result[0])
+    for name, value in models[0].snapshot().items():
+        np.testing.assert_allclose(np.asarray(value), np.asarray(models[1].snapshot()[name]),
+                                   atol=2e-6, rtol=2e-6, err_msg=name)
+    return {"unused_deletion_evidence_skipped_without_changing_gradients_or_adam": "passed"}
+
+
+def check_multiple_hit_layout(config, payload, view, rgba, mi, dr, np):
+    payload = copy.deepcopy(payload)
+    payload["model_metadata"]["resolution"] = 8
+    count = 8 ** 3
+    state = payload["model_state"]
+    for key, value in state.items():
+        state[key] = (np.arange(count, dtype=np.uint32) if key == "cell_indices"
+                      else np.tile(value, count))
+    state["log_scales"] = np.tile(np.log(np.array([.060, .048, .066], np.float32)), count)
+    state["opacity_sh"].reshape(count, -1)[:, 0] = math.log(.15 / .85) * (2 * math.sqrt(math.pi))
+    model = restore_model(payload, mi)
+    ray = generate_ray_batch(config.render, view["camera"], np.arange(256, dtype=np.uint32),
+                             np.full((256, 2), .5, np.float32), mi, dr)
+    rgb, alpha, hits = model.trace(ray, mi.Color3f(1))
+    assert int(dr.max(hits)[0]) > 1, "Fixture must exercise suffix reads behind multiple hits"
+    cases = 0
+    maximum = 0.
+    for max_hits in (1, 5, 16):
+        results = []
+        for chunk_size in (0, 37):
+            current = copy.deepcopy(config)
+            current.render.max_hits = max_hits
+            current.training.chunk_size = chunk_size
+            results.append(train_view(model, view, rgba, current, ContourSampler(np),
+                                      np.random.default_rng(194), mi, dr, np,
+                                      need_rendered_alpha=True))
+        maximum = max(maximum, compare_accumulators(results[0][0], results[1][0], np))
+        np.testing.assert_allclose(results[0][1], results[1][1], atol=2e-7, rtol=2e-6)
+        np.testing.assert_array_equal(results[0][2], results[1][2])
+        cases += 1
+    return {"multiple_hit_suffix_layout_full_frame_vs_chunks": cases,
+            "maximum_gradient_absolute_error": maximum}
+
+
+def reference_render_view(model, render, camera, spp, seed, chunk_size, mi, dr, np):
+    """Previous CPU Float64 accumulation, retained as a numerical oracle."""
+    count = render.width * render.height
+    rgb_sum = np.zeros((count, 3), dtype=np.float64)
+    alpha_sum = np.zeros(count, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    prepared = prepare_camera(render, camera, mi, dr)
+    for _ in range(spp):
+        offsets = rng.random((count, 2)).astype(np.float32)
+        np.minimum(offsets, np.nextafter(np.float32(1), np.float32(0)), out=offsets)
+        for begin in range(0, count, chunk_size):
+            end = min(begin + chunk_size, count)
+            ray = generate_ray_batch(render, camera, np.arange(begin, end, dtype=np.uint32),
+                                     offsets[begin:end], mi, dr, prepared_camera=prepared)
+            rgb, alpha, hits = model.trace(ray, mi.Color3f(render.background),
+                render.transmittance_threshold, render.max_hits, render.entry_offset_fraction)
+            dr.eval(rgb, alpha, hits)
+            dr.sync_thread()
+            rgb_sum[begin:end] += np.stack([np.asarray(rgb.x), np.asarray(rgb.y), np.asarray(rgb.z)], axis=-1)
+            alpha_sum[begin:end] += np.asarray(alpha)
+    return ((rgb_sum / spp).astype(np.float32).reshape(render.height, render.width, 3),
+            (alpha_sum / spp).astype(np.float32).reshape(render.height, render.width))
+
+
+def check_render_accumulation(config, payload, view, mi, dr, np):
+    model = restore_model(payload, mi)
+    cases = 0
+    for spp, seed in ((1, 7), (3, 42), (64, 7)):
+        previous = None
+        for chunk_size in (37, 256):
+            recorder = TransferRecorder(np, dr)
+            actual = render_view(model, config.render, view["camera"], spp, seed, chunk_size, mi, dr, recorder)
+            expected = reference_render_view(model, config.render, view["camera"], spp, seed, chunk_size, mi, dr, np)
+            for a, b in zip(actual, expected):
+                np.testing.assert_array_equal(a.view(np.uint32), b.view(np.uint32))
+            if previous is not None:
+                for a, b in zip(actual, previous):
+                    np.testing.assert_array_equal(a, b)
+            previous = actual
+            assert recorder.widths == [256] * 4, recorder.widths
+            cases += 1
+    return {"gpu_float64_vs_cpu_accumulation_bitwise_equal": cases,
+            "final_image_channel_readbacks": 4}
+
+
 def literal_ray(render, camera, indices, offsets, mi, dr):
     """The previous camera expression, retained only as a numerical oracle."""
     index = mi.UInt32(indices)
@@ -294,6 +395,9 @@ def main():
         for check, arguments in (
             (check_full_frame, (config, payload, view, rgba, mi, dr, np)),
             (check_transfers, (config, payload, view, rgba, mi, dr, np)),
+            (check_unused_deletion, (config, payload, view, rgba, mi, dr, np)),
+            (check_multiple_hit_layout, (config, payload, view, rgba, mi, dr, np)),
+            (check_render_accumulation, (config, payload, view, mi, dr, np)),
             (check_camera_cache, (config, payload, view, mi, dr, np)),
             (check_nonfinite, (config, view, rgba, mi, dr, np)),
         ):

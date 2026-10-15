@@ -344,6 +344,10 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     if constexpr (dr::is_jit_v<Float>) lane = dr::arange<UInt32>(width);
 
     // Nine hit floats: relative-world xStar[3], gmin, RGB[3], opacity, T_before.
+    // Each field contains hit-major rows of rays: field * hit_stride +
+    // hit_index * ray_count + lane. Reverse traversal therefore reads adjacent
+    // lanes contiguously. The batch-size check above bounds all nine fields.
+    const uint32_t ray_count = uint32_t(width), hit_stride = ray_count * max_hits;
     // Candidate slots are lane-local loop variables. A read after a scatter to
     // global memory cannot be evaluated inside a symbolic Dr.Jit loop.
     struct Candidate {
@@ -460,15 +464,15 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             Color3f emission;
             Float opacity;
             appearance(id,Vector3f(-d),hit,emission,opacity);
-            UInt32 slot=lane*max_hits+s.hits;
+            UInt32 slot=s.hits*ray_count+lane;
             dr::scatter(r.hit_id,id,slot,hit);
             for(uint32_t j=0;j<3;++j) {
-                dr::scatter(r.hit,relative_star[j],slot*9+j,hit);
-                dr::scatter(r.hit,emission[j],slot*9+4+j,hit);
+                dr::scatter(r.hit,relative_star[j],j*hit_stride+slot,hit);
+                dr::scatter(r.hit,emission[j],(4+j)*hit_stride+slot,hit);
             }
-            dr::scatter(r.hit,gmin,slot*9+3,hit);
-            dr::scatter(r.hit,opacity,slot*9+7,hit);
-            dr::scatter(r.hit,s.transmittance,slot*9+8,hit);
+            dr::scatter(r.hit,gmin,3*hit_stride+slot,hit);
+            dr::scatter(r.hit,opacity,7*hit_stride+slot,hit);
+            dr::scatter(r.hit,s.transmittance,8*hit_stride+slot,hit);
             if(max_candidates) {
                 Mask miss=occupied & !hit & dr::isfinite(gmin) & (gmin>=0.f);
                 Float radius2=dr::squared_norm(unit_star);
@@ -588,15 +592,15 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     Float after(1.f);
     for(int i=int(max_hits)-1;i>=0;--i) {
         Mask valid=UInt32(i)<state.hits;
-        UInt32 slot=lane*max_hits+uint32_t(i),id=dr::gather<UInt32>(records.hit_id,slot,valid);
+        UInt32 slot=uint32_t(i)*ray_count+lane,id=dr::gather<UInt32>(records.hit_id,slot,valid);
         Vector3f offset;Color3f radiance;
         for(uint32_t j=0;j<3;++j) {
-            offset[j]=dr::gather<Float>(records.hit,slot*9+j,valid);
-            radiance[j]=dr::gather<Float>(records.hit,slot*9+4+j,valid);
+            offset[j]=dr::gather<Float>(records.hit,j*hit_stride+slot,valid);
+            radiance[j]=dr::gather<Float>(records.hit,(4+j)*hit_stride+slot,valid);
         }
-        Float gmin=dr::gather<Float>(records.hit,slot*9+3,valid);
-        Float opacity=dr::gather<Float>(records.hit,slot*9+7,valid);
-        Float before=dr::gather<Float>(records.hit,slot*9+8,valid);
+        Float gmin=dr::gather<Float>(records.hit,3*hit_stride+slot,valid);
+        Float opacity=dr::gather<Float>(records.hit,7*hit_stride+slot,valid);
+        Float before=dr::gather<Float>(records.hit,8*hit_stride+slot,valid);
         Color3f grad_rgb=clean(dcolor*before*opacity);
         grad_rgb=dr::select(radiance<=0.f,dr::minimum(grad_rgb,0.f),grad_rgb);
         grad_rgb=dr::select(is_background,Color3f(0.f),grad_rgb)*weight;
@@ -625,20 +629,24 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         behind=dr::select(valid,clean(opacity*radiance+(1.f-opacity)*behind),behind);
         after=dr::select(valid,dr::clip(clean(after*(1.f-opacity)),0.f,1.f),after);
         // Reuse consumed record storage for the suffix composite needed by misses.
-        for(uint32_t j=0;j<3;++j) dr::scatter(records.hit,behind[j],slot*9+4+j,valid);
-        dr::scatter(records.hit,after,slot*9+7,valid);
+        // slot = i * ray_count + lane is unique per lane. Its four field
+        // planes are disjoint, so these writes can share one kernel. The next
+        // iteration's gather still evaluates them before reading this buffer.
+        for(uint32_t j=0;j<3;++j)
+            dr::scatter(records.hit,behind[j],(4+j)*hit_stride+slot,valid,ReduceMode::NoConflicts);
+        dr::scatter(records.hit,after,7*hit_stride+slot,valid,ReduceMode::NoConflicts);
     }
     dr::eval(records.hit);
     for(uint32_t i=0;i<max_candidates;++i) {
         Mask valid=(i<state.candidates)&!is_background;
         const Candidate &candidate=records.candidates[i];
         UInt32 id=candidate.id,front=candidate.front;
-        UInt32 suffix=lane*max_hits+dr::minimum(front,max_hits-1);
+        UInt32 suffix=dr::minimum(front,max_hits-1)*ray_count+lane;
         Mask has_suffix=valid&(front<state.hits);
         Color3f suffix_color;
         for(uint32_t j=0;j<3;++j)
-            suffix_color[j]=dr::select(has_suffix,dr::gather<Float>(records.hit,suffix*9+4+j,has_suffix),background[j]);
-        Float suffix_t=dr::select(has_suffix,dr::gather<Float>(records.hit,suffix*9+7,has_suffix),1.f);
+            suffix_color[j]=dr::select(has_suffix,dr::gather<Float>(records.hit,(4+j)*hit_stride+suffix,has_suffix),background[j]);
+        Float suffix_t=dr::select(has_suffix,dr::gather<Float>(records.hit,7*hit_stride+suffix,has_suffix),1.f);
         Color3f radiance;Float opacity;
         appearance(id,Vector3f(-d),valid,radiance,opacity);
         add_geometry(id,candidate.point,candidate.gmin,candidate.before,opacity,radiance,suffix_color,suffix_t,valid,false);

@@ -230,7 +230,8 @@ def effective_chunk_size(config):
     return min(config.training.chunk_size or count, count)
 
 
-def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rendered_alpha=False):
+def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rendered_alpha=False,
+               collect_deletion_evidence=None):
     """Compute a full view on the GPU; only transfer data needed by CPU consumers.
 
     Gradients stay on the GPU. Loss/validity are read once per view. Optional
@@ -246,13 +247,18 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
     accumulator = {"gradients": {}}
     total_loss, finite = mi.Float(0), mi.Bool(True)
     camera = prepare_camera(config.render, view["camera"], mi, dr)
+    native_settings = settings(config)
+    if collect_deletion_evidence is not None:
+        # The topology schedule decides whether these counters have a consumer.
+        # Disabling unused counters does not disable loss/appearance/geometry terms.
+        native_settings["collect_deletion_evidence"] = bool(collect_deletion_evidence)
     for begin in range(0, count, chunk_size):
         end = min(begin + chunk_size, count)
         ray = generate_ray_batch(config.render, view["camera"],
             np.arange(begin, end, dtype=np.uint32), offsets[begin:end], mi, dr, prepared_camera=camera)
         ref = reference[begin:end]
         result = model.loss_and_grad(ray, mi.Color3f(mi.Float(ref[:, 0]), mi.Float(ref[:, 1]), mi.Float(ref[:, 2])),
-            mi.Float(ref[:, 3]), mi.Color3f(config.render.background), mi.Float(inverse_pdf[begin:end]), settings(config))
+            mi.Float(ref[:, 3]), mi.Color3f(config.render.background), mi.Float(inverse_pdf[begin:end]), native_settings)
         total_loss += dr.sum(result["loss"])
         finite &= dr.all(dr.isfinite(result["raw_alpha"])) & dr.all(dr.isfinite(result["alpha"]))
         for name, target in (("raw_alpha", raw_alpha), ("alpha", estimated_alpha)):
@@ -561,7 +567,8 @@ def run_training():
                 # below include tracing, compilation, transfers and waits.
                 with dr.kernel_history() if profiling else nullcontext() as history:
                     gradients, loss, rendered_alpha = train_view(model, view, rgba, config, sampler, rng, mi, dr, np,
-                        need_rendered_alpha=growth_evidence_requested)
+                        need_rendered_alpha=growth_evidence_requested,
+                        collect_deletion_evidence=deletion_evidence_collected)
                     gradients_done = time.perf_counter()
                     topology.observe_view(model, gradients, view_id=int(index), epoch=epoch,
                         camera=view["camera"], reference_alpha=rgba[..., 3], rendered_alpha=rendered_alpha)

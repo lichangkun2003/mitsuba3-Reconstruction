@@ -225,6 +225,30 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 这些调整不在训练的每个视角或每个 epoch 内出图。完成全部训练并保存最终模型后，
 训练入口调用评价脚本共用的流程，生成多 spp 图片和 PSNR。
 
+原生前向/反向过程中的射线记录按射线和命中槽独占地址写入。对这些已确认无冲突的
+写入显式使用 ``ReduceMode::NoConflicts``，使 Dr.Jit 不再为每次记录写入安排不必要的
+求值与内核边界。多个射线向同一体素累加梯度仍采用原来的归约规则，不将其声明为无冲突。
+本地生成场景的原生内核回归中，唯一 JIT 内核数从此前的 66 降至 18；这表示减少了
+内核拆分，不能理解为端到端训练获得相同比例的加速。实际收益仍需结合目标设备上的
+``gradients`` 和内核抽样耗时判断。
+
+命中记录同时改为按字段分离（SoA）、字段内按命中序号排列射线的布局，索引为
+``field * ray_count * max_hits + hit * ray_count + lane``。同一命中序号下，相邻线程
+连续访问同一字段，改善记录读写的访存连续性；记录字段、缓冲元素总数与每条射线的
+命中顺序不变，前述 ``NoConflicts`` 写入约定继续保留。这只调整记录的存取方式，
+不改变场景参数布局、checkpoint 格式、采样与梯度公式。
+
+默认 256 → 512 调度在 256 阶段不消费删除证据。训练现在将实际证据需求传给原生
+``collect_deletion_evidence``，跳过这些未使用的计算；进入需要收集删除证据的目标
+分辨率后照常计算，跨视角累计、删除阈值、保护期与执行时机保持不变。256 阶段的生长
+仍然启用；跳过删除证据不等于关闭生长或删除功能。
+
+生长证据期间，每批冻结候选的中心和六个轴向采样点在世界空间中只计算一次，后续
+视角复用这七点。每个视角仍重新投影并读取当前参考/渲染 alpha，不缓存或跳过证据；
+轮末仍依据当时的模型重新生成合法候选。父格与候选格的配对匹配改为无碰撞的 uint64
+键和排序查找，保持配对含义及候选原顺序。派生几何缓存不写入 checkpoint，候选批次
+变化、升层或恢复后重新构造。
+
 交互终端（Windows PowerShell、Slurm 的 ``srun --pty bash``）在同一行刷新进度，例如
 ``Epoch 1/1000 | view 4/100 (4%) | cam 19 | loss=0.101282 | 0.09s/view``。
 ``view`` 表示本轮已完成视角数，``cam`` 是相机编号（从 1 开始）。更新会节流并按终端宽度
@@ -372,8 +396,9 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
 ------------------
 
 首次使用原生训练、参数更新和 checkpoint 恢复接口，或修改底层 C++ 后，必须重新编译。
-本次自动评价以及此前整图提交、相机运行时数据、按需回读与性能日志的改动仅涉及 Python；已经包含上述接口的
-源码构建不需要为这次改动重新编译 C++，同步脚本并重新启动进程即可。
+本次性能优化修改了原生射线记录的存取方式，因此必须增量编译 C++，再启动使用新
+Python 脚本的进程。删除证据的按需计算由 Python 根据已有阶段规则设置调用参数，
+不是新增删除算法。不能仅同步脚本后沿用旧的原生模块。
 预编译 wheel 不包含这些原生接口，不能用于验证它们。在 ``reconstruction`` 工作区
 父目录的 PowerShell 中执行：
 
@@ -393,14 +418,30 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
 HPC Slurm
 ----------
 
-源码同步由使用者完成。首次使用或 C++ 有修改时先增量编译；在已经获得 GPU 分配的作业步骤中运行：
+先在本地提交并推送代码，再在服务器同步。下面命令用于已经获得 GPU 分配的 Slurm
+作业步骤，包含 pull、增量编译和生成场景的性能回归。本次包含 C++ 改动，编译不可省略。
+若同一源码/构建目录还有训练进程运行，先等该实验结束，再更新和编译；不要在其运行期间
+替换正在使用的源码与原生库。若主动中断，应从已有完整 epoch checkpoint 恢复，未保存
+的进度需要重算。
 
 .. code-block:: bash
 
-   cmake --build "$HOME/projects/reconstruction/mitsuba/build" --parallel 8
-   cd "$HOME/projects/reconstruction"
-   "$HOME/envs/mitsuba/bin/python" -I mitsuba/resources/reconstruction_train.py \
-     --dataset datasets/lego --epochs 1000 --chunk-size 0 --profile-views 3
+   test -n "${SLURM_JOB_ID:-}" &&
+   source /apps/local/conda_init.sh &&
+   conda activate "$HOME/envs/mitsuba" &&
+   cd "$HOME/projects/reconstruction/mitsuba" &&
+   git pull --ff-only &&
+   cmake --build build --parallel "${SLURM_CPUS_PER_TASK:-1}" &&
+   source build/setpath.sh &&
+   "$HOME/envs/mitsuba/bin/python" -I resources/test_reconstruction_performance.py
+
+回归通过后，在同一终端开启新的完整实验：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I resources/reconstruction_train.py \
+     --dataset datasets/lego --epochs 1000 --chunk-size 0 --profile-views 3 \
+     --eval-spp 64 --eval-max-views 10
 
 这里显式选择整图提交，并测量最先处理的三个视角，便于检查服务器上的编译和缓存开销；
 省略 ``--profile-views 3`` 时仍保留默认的分辨率/每 50 轮抽样。已经运行的 HPC 进程不会自动加载新脚本，
@@ -418,6 +459,8 @@ HPC Slurm
 线程预算，但不会自动并行 Python 拓扑循环或让同一训练使用多张 GPU。
 是否增加资源应根据后续轮次的 ``reference``、``gradients``、``topology_observation``
 及 ``epoch_topology_seconds`` 实测判断，不能只用未触发生长的第一轮推断整个训练。
+当前仍为单 GPU 训练；这些执行层优化没有引入多 GPU 梯度汇总。A100 与 RTX 5090 的硬件、
+运行框架和实际工作负载不同，本地生成场景通过也不保证 A100 上的完整实验追平 5090。
 
 Windows 默认构建目录为 ``mitsuba/build/Release``，Linux 为 ``mitsuba/build``；
 ``--build-dir`` 可覆盖。所有相对路径固定相对于仓库父目录，包括
@@ -556,6 +599,19 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 每个像素、每个 sample 使用独立的随机子像素位置；seed 由全局 seed、划分和视角索引
 确定。评价 ``--chunk-size`` 默认 65536，用于限制射线批次，不改变采样序列。
 
+多 spp 的四个通道在 GPU 上以 Float64 按原 sample 顺序累积，每个 chunk 求值后释放
+其计算图，不保留全部 samples 的射线和计算图。每个 sample 仍先由 NumPy 生成整张图
+的相同随机偏移，再分批发射射线；没有改变 RNG、采样位置或逐 sample 加法顺序。
+完成整个视角后才显式同步并回读四个完整通道，最终除以 spp 和转换为 Float32 仍使用
+原来的 NumPy 运算。这样移除了每个 sample、每个 chunk 的同步与图像回读；它减少的是
+评价出图开销，不是训练中每个视角的梯度计算开销。
+
+累积缓冲占 32 bytes/像素，与 spp 无关；800 × 800 时约 19.5 MiB。多 chunk 最后拼接
+还需要同等大小的完整通道缓冲，两者同时存在时约 39.1 MiB，另加当前批次射线、命中记录、
+模型和运行时分配。这是缓冲大小说明，不是实测进程显存峰值；``chunk_size`` 仍限制射线
+工作批次，降低它不会消除整图累积缓冲。RTX 4060 和 A100 的 CUDA 后端支持这里的 Float64
+加法，光线追踪本身仍沿用原来的浮点类型。
+
 PSNR 的具体约定：
 
 * MSE 对整张图的所有像素与 RGB 三个通道取平均；不应用前景 mask，峰值取 1。
@@ -687,8 +743,23 @@ Checkpoint 与 PSNR 的 CPU 单元测试不导入 GPU 后端，也不渲染数�
 本次 RTX 4060 CUDA 检查中，16 × 16 整图与每批 37 条射线的梯度最大绝对差为
 ``1.90735e-6``，参数更新与 contour 历史在测试容差内一致；默认关闭 contour/growth
 图像回读时只传回两个统计标量。改变相机位置、方向及视场角后，原生损失/梯度计算的
-66 个唯一 JIT 内核哈希保持一致，第二个相机全部命中缓存、后端编译耗时为零。
+唯一 JIT 内核哈希保持一致，第二个相机全部命中缓存、后端编译耗时为零。
+加入原生记录写入的 ``NoConflicts`` 优化后，相同生成场景的唯一内核数从 66 降至 18。
 相同采样下分批方式改变浮点归约顺序，不保证逐位相同。
+
+原生记录布局改动后，另以 24 × 24 多命中场景对照修改前的原生实现，所比较数值的
+最大绝对差为 ``2.384185791e-7``。本地 RTX 4060 Laptop 的合成 800 × 800、512 个体素
+原生调用基准中，耗时中位数从约 0.2794 秒变为 0.2660 秒，降低约 5%；这是局部调用，
+不是完整训练的 epoch 时间。66 → 18 个内核不等于 3.7 倍训练加速。
+独立的 128 × 128、64 spp 评价小场景基准中，GPU Float64 累积后的耗时中位数从约
+0.0966 秒变为 0.0595 秒。这两项本地局部测量都不能外推 A100 上真实 Lego 的训练或
+全部视角出图耗时；正式比较需保持数据、设备和配置一致，并读取实际实验性能报告。
+
+最终布局已通过 CUDA 多命中/分批、18 项几何公式、15 项优化器/拓扑检查，以及包含
+保存恢复、升层和自动评价的生成场景训练检查；另通过 17 项 scalar 几何辅助检查。
+1/3/64 spp 的六组 GPU 累积结果与原 CPU 累积结果逐位一致。
+组合测试曾出现一次 Windows 原生访问异常（0xC0000005）；独立运行和原组合流程重跑
+均通过，原因尚未定位，不据此声称该异常已修复。测试产物使用临时目录，未重跑真实 Lego。
 
 源码构建、生成的小场景数值测试、checkpoint 往返恢复和完整数据集训练分别验证不同
 范围。检查点能够加载、loss 有下降或图像看起来合理，都不能单独证明硬可见性代理梯度

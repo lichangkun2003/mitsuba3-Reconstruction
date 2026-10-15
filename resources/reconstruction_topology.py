@@ -105,6 +105,22 @@ def _addresses(cells, resolution):
     return cells[:, 0] + resolution * (cells[:, 1] + resolution * cells[:, 2])
 
 
+def _matching_growth_pairs(current, pending, np):
+    """Exact membership of two uint32 cell addresses without Python tuples."""
+    # Cell addresses come from the native model's uint32 cell_indices. Packing
+    # both into uint64 is bijective, including addresses above signed int32.
+    def keys(batch):
+        return (batch["parent_cells"].astype(np.uint64) << np.uint64(32)) | batch["cells"].astype(np.uint64)
+
+    allowed, proposed = keys(current), keys(pending)
+    allowed.sort()
+    positions = np.searchsorted(allowed, proposed)
+    valid = positions < len(allowed)
+    matches = np.zeros(len(proposed), dtype=bool)
+    matches[valid] = allowed[positions[valid]] == proposed[valid]
+    return matches
+
+
 def _quaternion_matrix(quaternions, np):
     q = np.asarray(quaternions, dtype=np.float64).reshape(-1, 4).copy()
     norm = np.sum(q * q, axis=1)
@@ -322,6 +338,7 @@ class TopologyManager:
                                      self.schedule.level_weights) if self.schedule.enabled else {self.resolution: self.schedule.total_epochs})
         self.cooldown = {}
         self.pending_growth = None
+        self._growth_world_cache = None
         self.before_refine_checkpoint = None
         self.completed_windows = 0
         self._validate()
@@ -443,24 +460,23 @@ class TopologyManager:
                       seen_views=set(), boundary=boundary, resolution=resolution)
         return result
 
-    def _observe_growth(self, camera, reference_alpha, rendered_alpha, view_id, metadata):
-        np, cfg, pending = self.np, self.settings, self.pending_growth
-        if pending is None or view_id in pending["seen_views"]:
-            return
-        reference, rendered = np.asarray(reference_alpha), np.asarray(rendered_alpha)
-        if reference.shape != rendered.shape or reference.ndim != 2:
-            raise ValueError("Growth evidence needs matching HxW reference/rendered alpha")
-        height, width = reference.shape
-        position, right, up, forward = [np.asarray(camera[key]) for key in ("position", "right", "up", "forward")]
-        tan_x = math.tan(camera["camera_angle_x"] * .5)
-        tan_y = tan_x * height / width
-        near, far = camera.get("near_clip", .1), camera.get("far_clip", 1000.)
+    def _growth_world_points(self, pending, metadata):
+        """Reuse the seven frozen proposal samples across views, never evidence.
+
+        This derived cache is separate from pending_growth/checkpoints. The
+        live model is still rechecked by _generate_growth at the epoch boundary.
+        """
+        np = self.np
+        key = (metadata["resolution"], tuple(metadata["grid_min"]), tuple(metadata["grid_max"]))
+        cached = self._growth_world_cache
+        if cached is not None and cached[0] is pending and cached[1] == key:
+            return cached[2]
         center = pending["centers"]
         rotation, _ = _quaternion_matrix(pending["rotations"], np)
         axes = np.exp(np.clip(pending["log_scales"], -30., 30.))
         size = (np.asarray(metadata["grid_max"]) - metadata["grid_min"]) / metadata["resolution"]
         cells = _coordinates(pending["cells"], metadata["resolution"], np)
-        fg, bg = np.zeros(len(center), dtype=bool), np.zeros(len(center), dtype=bool)
+        points = []
         for sample in range(7):
             delta = np.zeros_like(center)
             if sample:
@@ -473,6 +489,26 @@ class TopologyManager:
                 fraction[negative] = np.minimum(fraction[negative], (.001 - center[negative, axis]) / delta[negative, axis])
             local = center + np.clip(fraction, 0, 1)[:, None] * delta
             world = np.asarray(metadata["grid_min"]) + (cells + local) * size
+            world.setflags(write=False)
+            points.append(world)
+        self._growth_world_cache = (pending, key, tuple(points))
+        return self._growth_world_cache[2]
+
+    def _observe_growth(self, camera, reference_alpha, rendered_alpha, view_id, metadata):
+        np, cfg, pending = self.np, self.settings, self.pending_growth
+        if pending is None or view_id in pending["seen_views"]:
+            return
+        reference, rendered = np.asarray(reference_alpha), np.asarray(rendered_alpha)
+        if reference.shape != rendered.shape or reference.ndim != 2:
+            raise ValueError("Growth evidence needs matching HxW reference/rendered alpha")
+        height, width = reference.shape
+        position, right, up, forward = [np.asarray(camera[key]) for key in ("position", "right", "up", "forward")]
+        tan_x = math.tan(camera["camera_angle_x"] * .5)
+        tan_y = tan_x * height / width
+        near, far = camera.get("near_clip", .1), camera.get("far_clip", 1000.)
+        count = len(pending["centers"])
+        fg, bg = np.zeros(count, dtype=bool), np.zeros(count, dtype=bool)
+        for world in self._growth_world_points(pending, metadata):
             relative = world - position
             depth = relative @ forward
             u = .5 + .5 * (relative @ right) / np.maximum(depth * tan_x, 1e-30)
@@ -576,6 +612,7 @@ class TopologyManager:
             self.completed_windows = 0
             self.cooldown = {}
             self.pending_growth = None
+            self._growth_world_cache = None
             optimizer.remap(np.empty(0, dtype=np.uint32), self.count)
             event.update(refined=True, resolution=self.resolution, active_voxel_count=self.count)
             return replacement, event
@@ -608,10 +645,9 @@ class TopologyManager:
                 selected = None
                 if (pending is not None and pending["boundary"] == boundary and
                         pending["resolution"] == self.resolution and len(pending["seen_views"]) == self.view_count and current is not None):
-                    pairs = set(zip(current["parent_cells"].tolist(), current["cells"].tolist()))
                     keep = ((pending["foreground"] >= max(2, cfg.growth_min_foreground_views)) &
                             (pending["background"] < max(1, cfg.growth_background_veto_views)))
-                    keep &= np.asarray([(int(parent), int(cell)) in pairs for parent, cell in zip(pending["parent_cells"], pending["cells"])])
+                    keep &= _matching_growth_pairs(current, pending, np)
                     selected = {key: value[keep] for key, value in pending.items() if isinstance(value, np.ndarray)}
                     mapping = {int(cell): index for index, cell in enumerate(checkpoint["model_state"]["cell_indices"])}
                     selected["parent_ids"] = np.asarray([mapping[int(cell)] for cell in selected["parent_cells"]], dtype=np.int64)
@@ -642,6 +678,7 @@ class TopologyManager:
             elif not event["deleted"]:
                 checkpoint = None
         self.pending_growth = None
+        self._growth_world_cache = None
         self.cooldown = {cell: expiry for cell, expiry in self.cooldown.items() if expiry > boundary}
         event.update(finished=final, active_voxel_count=self.count)
         return checkpoint, event
@@ -664,6 +701,7 @@ class TopologyManager:
 
     def load_state_dict(self, state):
         import copy
+        self._growth_world_cache = None
         state = copy.deepcopy(state)
         if state["count"] != self.count or state["view_count"] != self.view_count:
             raise ValueError("Topology checkpoint dimensions do not match model or dataset")

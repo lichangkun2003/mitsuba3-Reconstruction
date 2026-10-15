@@ -20,7 +20,8 @@ from reconstruction_common import WORKSPACE, initialize_runtime, restore_model, 
 from reconstruction_preview import RuntimeConfig
 from reconstruction_optimizer import FalcorOptimizer, OptimizerConfig
 from reconstruction_topology import (TopologyManager, TopologySettings, CoarseToFineConfig,
-    level_budgets, model_checkpoint, refine_state, _geometry, _coordinates, _contact)
+    level_budgets, model_checkpoint, refine_state, _geometry, _coordinates, _contact,
+    _matching_growth_pairs)
 
 
 def seed_checkpoint(cells=(73, 75), resolution=8, axes=(.8, .7, .6), sh=4):
@@ -186,6 +187,79 @@ class OptimizationTests(unittest.TestCase):
         self.assertTrue(event["refined"])
         self.assertEqual(replacement["model_metadata"]["resolution"], 16)
         self.assertEqual(restore_model(replacement, mi).active_voxel_count, 0)
+
+
+class TopologyCacheTests(unittest.TestCase):
+    """CPU-only checks; also included in the complete CUDA/topology suite."""
+
+    def manager(self):
+        from types import SimpleNamespace
+        return TopologyManager(SimpleNamespace(resolution=8, active_voxel_count=2), 8,
+            TopologySettings(enable_deletion=False, growth_interval=1),
+            CoarseToFineConfig(enabled=False, total_epochs=30), 0, 0)
+
+    def test_frozen_geometry_cache_preserves_view_votes_and_checkpoint_resume(self):
+        import copy
+        manager, uncached = self.manager(), self.manager()
+        checkpoint = seed_checkpoint(axes=(.9, .9, .9))
+        metadata = checkpoint["model_metadata"]
+        manager.pending_growth = manager._generate_growth(checkpoint, 1)
+        uncached.pending_growth = copy.deepcopy(manager.pending_growth)
+        self.assertGreater(len(manager.pending_growth["cells"]), 0)
+        camera = dict(position=[4., 4., -10.], right=[1., 0., 0.], up=[0., 1., 0.],
+                      forward=[0., 0., 1.], camera_angle_x=1.2, near_clip=.1, far_clip=100.)
+        rng = np.random.default_rng(37)
+        reference = rng.choice([0., .5, 1.], (32, 32))
+        points = None
+        for view in range(8):
+            camera["position"][0] += .2
+            rendered = rng.uniform(0., 1., (32, 32))
+            if view == 3:
+                state = manager.state_dict()
+                self.assertNotIn("_growth_world_cache", state)
+                self.assertNotIn("world_points", state["pending_growth"])
+                manager = self.manager()
+                manager.load_state_dict(state)
+                self.assertIsNone(manager._growth_world_cache)
+                points = None
+            uncached._growth_world_cache = None
+            for target in (manager, uncached):
+                target._observe_growth(camera, reference, rendered, view, metadata)
+            current_points = manager._growth_world_points(manager.pending_growth, metadata)
+            if points is not None:
+                self.assertIs(current_points, points)
+            points = current_points
+            for actual, expected in zip(points, uncached._growth_world_cache[2]):
+                np.testing.assert_array_equal(actual, expected)
+                self.assertFalse(actual.flags.writeable)
+            for field in ("foreground", "background"):
+                np.testing.assert_array_equal(manager.pending_growth[field], uncached.pending_growth[field])
+        state = manager.state_dict()
+        manager._observe_growth(camera, reference, rendered, 0, metadata)
+        for field in ("foreground", "background"):
+            np.testing.assert_array_equal(manager.pending_growth[field], state["pending_growth"][field])
+        # A new frozen batch and grid bounds must never reuse previous geometry.
+        old_points = points
+        manager.pending_growth = copy.deepcopy(manager.pending_growth)
+        points = manager._growth_world_points(manager.pending_growth, metadata)
+        self.assertIsNot(points, old_points)
+        shifted = {**metadata, "grid_min": [1., 1., 1.], "grid_max": [9., 9., 9.]}
+        new_points = manager._growth_world_points(manager.pending_growth, shifted)
+        self.assertIsNot(new_points, points)
+        for actual, expected in zip(new_points, points):
+            np.testing.assert_allclose(actual, expected + 1., rtol=0., atol=2e-15)
+
+    def test_growth_pair_membership_preserves_order_duplicates_and_empty_batches(self):
+        rng = np.random.default_rng(19)
+        pairs = rng.integers(0, 2**32, (2000, 2), dtype=np.uint64)
+        pairs[:4] = [(0, 2**32 - 1), (2**32 - 1, 0), (2**32 - 1, 2**32 - 1), (0, 0)]
+        proposed = np.concatenate((pairs[::3], pairs[::-2], rng.integers(0, 2**32, (1000, 2), dtype=np.uint64)))
+        def batch(values):
+            return {"parent_cells": values[:, 0], "cells": values[:, 1]}
+        for current, pending in ((pairs, proposed), (pairs[:0], proposed), (pairs, proposed[:0])):
+            allowed = set(map(tuple, current.tolist()))
+            expected = np.asarray([tuple(pair) in allowed for pair in pending.tolist()], dtype=bool)
+            np.testing.assert_array_equal(_matching_growth_pairs(batch(current), batch(pending), np), expected)
 
 
 class TopologyTests(unittest.TestCase):

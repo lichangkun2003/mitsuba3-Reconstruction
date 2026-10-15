@@ -165,24 +165,47 @@ def render_view(model, render, camera, spp, seed, chunk_size, mi, dr, np):
     if spp < 1 or chunk_size < 1:
         raise ValueError("spp and chunk_size must be positive")
     count = render.width * render.height
-    rgb_sum = np.zeros((count, 3), dtype=np.float64)
-    alpha_sum = np.zeros(count, dtype=np.float64)
+    # Keep the original per-pixel, sample-ordered float64 sums on the device.
+    # The persistent buffers occupy 32 bytes/pixel, independently of spp;
+    # tracing and its temporary buffers still operate on at most chunk_size rays.
+    Float64 = dr.float64_array_t(dr.detached_t(mi.Float))
+    chunks = []
+    for begin in range(0, count, chunk_size):
+        end = min(begin + chunk_size, count)
+        # Opaque zero also prevents the first add being simplified to a copy
+        # (which could otherwise preserve a negative zero, unlike NumPy's +0).
+        zero = dr.opaque(Float64, 0, end - begin)
+        chunks.append((begin, end, [zero] * 4))
     rng = np.random.default_rng(seed)
     prepared_camera = prepare_camera(render, camera, mi, dr)
     for sample in range(spp):
         # Draw the entire sample before chunking so chunk size cannot change rays.
         offsets = rng.random((count, 2)).astype(np.float32)
         np.minimum(offsets, np.nextafter(np.float32(1), np.float32(0)), out=offsets)
-        for begin in range(0, count, chunk_size):
-            end = min(begin + chunk_size, count)
+        for begin, end, sums in chunks:
             ray = generate_ray_batch(render, camera, np.arange(begin, end, dtype=np.uint32),
                                      offsets[begin:end], mi, dr, prepared_camera=prepared_camera)
             rgb, alpha, hits = model.trace(ray, mi.Color3f(render.background),
                 render.transmittance_threshold, render.max_hits, render.entry_offset_fraction)
-            dr.eval(rgb, alpha, hits)
-            dr.sync_thread()
-            rgb_sum[begin:end] += np.stack([np.asarray(rgb.x), np.asarray(rgb.y), np.asarray(rgb.z)], axis=-1)
-            alpha_sum[begin:end] += np.asarray(alpha)
+            for channel, value in enumerate((rgb.x, rgb.y, rgb.z, alpha)):
+                sums[channel] = sums[channel] + Float64(dr.detach(value))
+            # Evaluate every batch to bound graph lifetime, but let consecutive
+            # kernels execute asynchronously on the same ordered GPU stream.
+            # Each add is evaluated before the next sample's add, so neither a
+            # parallel reduction nor a reassociation changes the summation order.
+            dr.eval(*sums, hits)
+    if chunks:
+        totals = [dr.concat([sums[channel] for _, _, sums in chunks])
+                  for channel in range(4)]
+        dr.eval(*totals)
+        dr.sync_thread()
+        rgb_sum = np.stack([np.asarray(value) for value in totals[:3]], axis=-1)
+        alpha_sum = np.asarray(totals[3])
+    else:
+        rgb_sum = np.zeros((count, 3), dtype=np.float64)
+        alpha_sum = np.zeros(count, dtype=np.float64)
+    # Retain NumPy's final float64 division and float32 conversion exactly.
+    # Only these four finished image channels are transferred to the CPU.
     rgb = (rgb_sum / spp).astype(np.float32).reshape(render.height, render.width, 3)
     alpha = (alpha_sum / spp).astype(np.float32).reshape(render.height, render.width)
     if not np.isfinite(rgb).all() or not np.isfinite(alpha).all():
