@@ -7,6 +7,7 @@ build validation are shared with training; Slurm GPU allocation is preserved.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 import json
@@ -172,8 +173,21 @@ def aggregate_metrics(records):
     return result
 
 
+@contextmanager
+def _wall_stage(view_timing, split_timing, stage):
+    """Measure elapsed host time, including any existing device waits/readbacks."""
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - started
+        view_timing[stage] += elapsed
+        split_timing[stage] += elapsed
+
+
 def run_evaluation(config: EvaluationConfig) -> int:
     """Evaluate a saved model using the same validated runtime as the CLI."""
+    evaluation_started = time.perf_counter()
     repository = Path(__file__).resolve().parents[1]
     workspace = repository.parent
     output = preview.workspace_path(config.output_directory, workspace)
@@ -187,6 +201,12 @@ def run_evaluation(config: EvaluationConfig) -> int:
         "requested_config": asdict(config),
         "resolved": {"workspace": str(workspace), "output": str(output)},
         "splits": {},
+        "timing": {
+            "measurement": "wall seconds via perf_counter; not pure GPU execution time; no additional GPU synchronization",
+            "scope": "total through finalization, excluding evaluation-report.json serialization; split stages include partial failed/interrupted views",
+            "render_scope": "render_view including tracing/JIT, transfers and its existing device waits/readbacks",
+            "total_seconds": 0.0, "setup_seconds": None, "split_seconds": {},
+        },
         "metric_protocol": {
             "primary_color_space": config.metric_color_space,
             "mse": "mean over all image pixels and RGB channels; no mask; peak value 1",
@@ -237,53 +257,76 @@ def run_evaluation(config: EvaluationConfig) -> int:
         model = common.restore_model(checkpoint, mi)
         report["model_statistics"] = model.statistics()
         (output / "evaluation-config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
+        report["timing"]["setup_seconds"] = time.perf_counter() - evaluation_started
         for split in config.splits:
+            split_started = time.perf_counter()
             cameras_file = config.cameras[split] or saved.get("data", {}).get("cameras", "transforms_train.json")
-            views = common.load_views(dataset, cameras_file, render, np)
-            if not views:
-                raise ValueError(f"Empty camera split: {split}")
-            available_view_count = len(views)
-            if config.max_views is not None:
-                views = views[:config.max_views]
             split_output = output / split
-            split_output.mkdir(parents=True, exist_ok=True)
             records = []
+            stage_seconds = dict.fromkeys(
+                ("render_seconds", "reference_seconds", "metrics_seconds", "write_seconds"), 0.0)
             split_report = {
                 "cameras": cameras_file, "views": records,
                 "max_views": config.max_views, "view_order": "camera file order",
-                "available_view_count": available_view_count,
-                "selected_view_count": len(views), "evaluated_view_count": 0,
+                "evaluated_view_count": 0, "status": "running",
+                "seconds": 0.0, "stage_seconds": stage_seconds,
             }
             report["splits"][split] = split_report
-            split_started = time.perf_counter()
-            progress.update(f"Eval {split} 0/{len(views)} (0.0%) | {config.spp} spp", force=True)
-            for view in views:
-                started = time.perf_counter()
-                index = int(view["index"])
-                seed = int(np.random.SeedSequence([config.seed, 0 if split == "train" else 1, index])
-                           .generate_state(1)[0])
-                rgb, alpha = common.render_view(model, render, view["camera"], config.spp,
-                                               seed, config.chunk_size, mi, dr, np)
-                reference = common.read_reference(view["reference_path"], render.width, render.height, mi, np)
-                target = (reference[..., :3] * reference[..., 3:4]
-                          + (1 - reference[..., 3:4]) * np.asarray(render.background, dtype=np.float32))
-                metrics = image_metrics(rgb, target, np)
-                prediction_path = split_output / f"{index:04d}.png"
-                preview.write_png(prediction_path, rgb, mi, np)
-                if config.save_linear:
-                    np.savez_compressed(split_output / f"{index:04d}.npz", rgb_linear=rgb, alpha=alpha)
-                record = {"index": index, "reference": str(view["reference_path"]),
-                          "prediction": str(prediction_path), "seed": seed,
-                          "seconds": time.perf_counter() - started, "metrics": metrics}
-                records.append(record)
-                split_report["evaluated_view_count"] = len(records)
-                score = metrics[config.metric_color_space]["psnr_db"]
-                text = "+inf" if score is None else f"{score:.4f}"
-                progress.update(
-                    f"Eval {split} {len(records)}/{len(views)} "
-                    f"({100 * len(records) / len(views):.1f}%) | {config.spp} spp | "
-                    f"PSNR({config.metric_color_space})={text} dB")
-            split_report["aggregate"] = aggregate_metrics(records)
+            try:
+                views = common.load_views(dataset, cameras_file, render, np)
+                if not views:
+                    raise ValueError(f"Empty camera split: {split}")
+                split_report["available_view_count"] = len(views)
+                if config.max_views is not None:
+                    views = views[:config.max_views]
+                split_report["selected_view_count"] = len(views)
+                split_output.mkdir(parents=True, exist_ok=True)
+                progress.update(f"Eval {split} 0/{len(views)} (0.0%) | {config.spp} spp", force=True)
+                for view in views:
+                    started = time.perf_counter()
+                    index = int(view["index"])
+                    seed = int(np.random.SeedSequence([config.seed, 0 if split == "train" else 1, index])
+                               .generate_state(1)[0])
+                    view_timing = dict.fromkeys(stage_seconds, 0.0)
+                    split_report["incomplete_view"] = {"index": index, "stage_seconds": view_timing}
+                    with _wall_stage(view_timing, stage_seconds, "render_seconds"):
+                        rgb, alpha = common.render_view(model, render, view["camera"], config.spp,
+                                                       seed, config.chunk_size, mi, dr, np)
+                    with _wall_stage(view_timing, stage_seconds, "reference_seconds"):
+                        reference = common.read_reference(view["reference_path"], render.width, render.height, mi, np)
+                        target = (reference[..., :3] * reference[..., 3:4]
+                                  + (1 - reference[..., 3:4]) * np.asarray(render.background, dtype=np.float32))
+                    with _wall_stage(view_timing, stage_seconds, "metrics_seconds"):
+                        metrics = image_metrics(rgb, target, np)
+                    prediction_path = split_output / f"{index:04d}.png"
+                    with _wall_stage(view_timing, stage_seconds, "write_seconds"):
+                        preview.write_png(prediction_path, rgb, mi, np)
+                        if config.save_linear:
+                            np.savez_compressed(split_output / f"{index:04d}.npz", rgb_linear=rgb, alpha=alpha)
+                    record = {"index": index, "reference": str(view["reference_path"]),
+                              "prediction": str(prediction_path), "seed": seed,
+                              "seconds": time.perf_counter() - started, "metrics": metrics,
+                              **view_timing}
+                    records.append(record)
+                    del split_report["incomplete_view"]
+                    split_report["evaluated_view_count"] = len(records)
+                    score = metrics[config.metric_color_space]["psnr_db"]
+                    text = "+inf" if score is None else f"{score:.4f}"
+                    progress.update(
+                        f"Eval {split} {len(records)}/{len(views)} "
+                        f"({100 * len(records) / len(views):.1f}%) | {config.spp} spp | "
+                        f"PSNR({config.metric_color_space})={text} dB")
+                split_report["aggregate"] = aggregate_metrics(records)
+                split_report["status"] = "passed"
+            except KeyboardInterrupt:
+                split_report["status"] = "interrupted"
+                raise
+            except Exception:
+                split_report["status"] = "failed"
+                raise
+            finally:
+                split_report["seconds"] = time.perf_counter() - split_started
+                report["timing"]["split_seconds"][split] = split_report["seconds"]
             (split_output / "metrics.json").write_text(
                 json.dumps(split_report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
             mean_score = split_report["aggregate"][config.metric_color_space]["mean_psnr_db"]
@@ -304,6 +347,9 @@ def run_evaluation(config: EvaluationConfig) -> int:
         print(report["error"], file=sys.stderr, flush=True)
     finally:
         progress.finish()
+        report["timing"]["total_seconds"] = time.perf_counter() - evaluation_started
+        if report["timing"]["setup_seconds"] is None:
+            report["timing"]["setup_seconds"] = report["timing"]["total_seconds"]
         report["finished_utc"] = datetime.now(timezone.utc).isoformat()
         report_path = output / "evaluation-report.json"
         report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")

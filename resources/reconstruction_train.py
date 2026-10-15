@@ -21,11 +21,13 @@ import traceback
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from reconstruction_preview import DataConfig, ModelConfig, RenderConfig, RuntimeConfig, PreviewConfig, validate_config
-from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, generate_ray_batch, prepare_camera,
-    initialize_runtime, load_views, model_metadata, read_reference, restore_model, workspace_path, file_sha256)
+from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, ReferenceImageCache,
+    generate_ray_batch, prepare_camera, initialize_runtime, load_views, model_metadata,
+    restore_model, workspace_path, file_sha256)
 from reconstruction_checkpoint import load_checkpoint, save_checkpoint
 from reconstruction_experiment import allocate_training_output, resumed_training_output
 from reconstruction_optimizer import FalcorOptimizer, OptimizerConfig
+from reconstruction_performance import PerformanceRecorder
 from reconstruction_progress import ProgressLine
 from reconstruction_topology import TopologyManager, TopologySettings, CoarseToFineConfig
 
@@ -35,6 +37,8 @@ class TrainingSettings:
     num_epochs: int = 1000
     chunk_size: int = 0  # 0: submit the whole image; positive: explicit ray batches.
     profile_views: int = 0  # Record JIT/cache/device timings for the first N views.
+    profile_interval_epochs: int = 50  # Sample one view periodically and on entering each resolution; 0 disables.
+    reference_cache_mib: int = 1024  # Decoded float32 RGBA in host RAM; 0 disables caching.
     seed: int = 42
     shuffle: bool = True
     save_count: int = 3  # Total snapshots, including the final model.npz.
@@ -101,6 +105,8 @@ CONFIG.render.height = 800
 CONFIG.render.spp = 1  # 训练固定每视角 1 spp；多 spp 出图使用评价脚本。
 CONFIG.training.chunk_size = 0  # 0 = 整图提交；显存不足时可显式改为 65536 等。
 CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译、缓存和 GPU 耗时。
+CONFIG.training.profile_interval_epochs = 50  # 每 50 轮及首次进入各分辨率时抽样记录内核耗时；0 关闭。
+CONFIG.training.reference_cache_mib = 1024  # 内存缓存参考图，避免每轮重新解码；0 关闭。
 
 CONFIG.schedule.enabled = True
 CONFIG.schedule.start_resolution = 256
@@ -146,6 +152,8 @@ def parse_arguments():
     parser.add_argument("--gpu", type=int, help="Local physical index; ignored under Slurm")
     parser.add_argument("--chunk-size", type=int, help="0 (default): full image; positive: maximum rays per batch")
     parser.add_argument("--profile-views", type=int, help="Record kernel/cache timings for the first N processed views")
+    parser.add_argument("--profile-interval-epochs", type=int, help="Sample one view every N epochs and on entering a resolution (default: 50); 0 disables automatic samples")
+    parser.add_argument("--reference-cache-mib", type=int, help="RAM budget for decoded reference images in MiB (default: 1024); 0 disables caching")
     parser.add_argument("--skip-evaluation", action="store_true", help="Save the final model without automatic train/test evaluation")
     parser.add_argument("--eval-spp", type=int, help="Samples per pixel for final evaluation (default: 64)")
     parser.add_argument("--eval-max-views", type=int, help="Evaluate the first N cameras of each split (default: 10)")
@@ -159,6 +167,8 @@ def apply_arguments(config, args, values):
         (args.build_dir, "runtime", "build_dir"), (args.gpu, "runtime", "gpu"),
         (args.chunk_size, "training", "chunk_size"),
         (args.profile_views, "training", "profile_views"),
+        (args.profile_interval_epochs, "training", "profile_interval_epochs"),
+        (args.reference_cache_mib, "training", "reference_cache_mib"),
         (args.eval_spp, "evaluation", "spp"),
         (args.eval_max_views, "evaluation", "max_views")):
         if value is not None:
@@ -178,7 +188,7 @@ def validate(config):
         value = getattr(config.training, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"training.{name} must be a positive integer")
-    for name in ("chunk_size", "profile_views"):
+    for name in ("chunk_size", "profile_views", "profile_interval_epochs", "reference_cache_mib"):
         value = getattr(config.training, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"training.{name} must be a nonnegative integer")
@@ -359,6 +369,7 @@ def validate_existing_model(path: Path, resumed_checkpoint: dict) -> None:
 
 def run_training():
     """Finish and save training before releasing its GPU state for evaluation."""
+    run_started = time.perf_counter()
     args = parse_arguments()
     overrides = json.loads(workspace_path(args.config, WORKSPACE).read_text(encoding="utf-8")) if args.config else {}
     config = TrainConfig()
@@ -379,9 +390,23 @@ def run_training():
                   "reported_loss": "mean over pixels, then mean over training views",
                   "actual_sampling": "per-pixel uniform, optionally contour-guided; frozen for a view"}}
     progress_line = ProgressLine()
+    reference_cache = None
+    history_name = ("training-resume-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".jsonl"
+                    if checkpoint else "training.jsonl")
+    performance_name = ("performance-summary-" + Path(history_name).stem.removeprefix("training-") + ".json"
+                        if checkpoint else "performance-summary.json")
+    performance = PerformanceRecorder(output / performance_name,
+        {"history_file": str(output / history_name), "resumed_from": str(resume_path) if resume_path else None},
+        started_at=run_started)
+    report["performance_file"] = str(output / performance_name)
+    training_loop_started = None
+    print("Performance summary:", report["performance_file"], flush=True)
     try:
         validate(config)
         mi, dr, np, handles = initialize_runtime(config.runtime, output, report)
+        performance.metadata.update({key: report.get(key) for key in (
+            "gpu", "cpu_threads", "python_executable", "mitsuba_version", "drjit_version", "actual_variant",
+            "mitsuba_file", "drjit_file", "numpy_version", "provenance")})
         if checkpoint:
             validate_existing_model(model_path, checkpoint)
             # Runtime and output are host-specific; all algorithm settings resume from the checkpoint.
@@ -412,6 +437,7 @@ def run_training():
                     if existing.get(group) != previous[group]:
                         raise ValueError("Resume output belongs to a different configuration; choose a new --output-dir")
         report["requested_config"] = asdict(config)
+        performance.metadata["config"] = asdict(config)
         batch_size = effective_chunk_size(config)
         ray_count = config.render.width * config.render.height
         report["training_protocol"].update(rays_per_view=ray_count, rays_per_batch=batch_size,
@@ -427,6 +453,10 @@ def run_training():
         print("Loading training views and checking reference files:", dataset, flush=True)
         views = load_views(dataset, config.data.cameras, config.render, np)
         signature = dataset_signature(views, dataset, config.data.cameras)
+        reference_cache = ReferenceImageCache(config.render.width, config.render.height, mi, np,
+                                             config.training.reference_cache_mib)
+        print(f"Reference image cache: {config.training.reference_cache_mib} MiB RAM, "
+              "loaded on first use; dataset must remain unchanged during training", flush=True)
         rng = np.random.default_rng(config.training.seed)
         sampler = ContourSampler(np, **asdict(config.contour))
         completed, global_step = 0, 0
@@ -470,6 +500,7 @@ def run_training():
                 topology.before_refine_checkpoint = None
 
         def save(path, epochs):
+            save_started = time.perf_counter()
             dr.eval(*model.snapshot().values())
             dr.sync_thread()
             arrays = {key: np.array(value, copy=True) for key, value in model.snapshot().items()}
@@ -482,20 +513,30 @@ def run_training():
                     "pending_epoch_transition": False},
                 optimizer_state=optimizer_state, config=asdict(config), provenance=report["provenance"])
             report["checkpoint"] = str(path)
+            performance.record_checkpoint(path, time.perf_counter()-save_started)
 
         report.update(view_count=len(views), resumed=checkpoint is not None)
         # A restart writes a new history segment, preserving any later entries
         # from the interrupted run instead of appending ambiguous duplicate epochs.
-        history_name = ("training-resume-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".jsonl"
-                        if checkpoint else "training.jsonl")
         report["history_file"] = str(output / history_name)
         profile_path = output / ("profile-" + Path(history_name).stem + ".jsonl")
-        if config.training.profile_views:
+        if config.training.profile_views or config.training.profile_interval_epochs:
             report["profile_file"] = str(profile_path)
+            performance.metadata["profile_file"] = str(profile_path)
             print("Kernel profile log:", profile_path, flush=True)
         processed_views = 0
+        last_training_resolution = None
+        performance.set_phase_seconds("setup", time.perf_counter()-run_started)
+        performance.write("running")
+        training_loop_started = time.perf_counter()
         print("Starting training; first kernels may require JIT compilation", flush=True)
         for epoch in range(completed, config.training.num_epochs):
+            training_resolution = int(model.resolution)
+            active_voxels_before = int(model.active_voxel_count)
+            entering_resolution = last_training_resolution != training_resolution
+            growth_evidence_requested = topology.needs_rendered_alpha(epoch)
+            deletion_evidence_collected = topology.collect_deletion(epoch)
+            interval = config.training.profile_interval_epochs
             order = rng.permutation(len(views)) if config.training.shuffle else np.arange(len(views))
             epoch_loss = 0.
             stage_totals = dict(reference=0., gradients=0., topology_observation=0., optimizer=0.)
@@ -505,14 +546,22 @@ def run_training():
             for progress, index in enumerate(order, 1):
                 view = views[int(index)]
                 view_started = time.perf_counter()
-                rgba = read_reference(view["reference_path"], config.render.width, config.render.height, mi, np)
+                rgba = reference_cache.get(view["reference_path"])
                 reference_done = time.perf_counter()
-                profiling = processed_views < config.training.profile_views
-                # Disabled by default: kernel history adds instrumentation. Wall
-                # timings below include tracing, compilation, transfers and waits.
+                reasons = []
+                if processed_views < config.training.profile_views:
+                    reasons.append("initial_views")
+                if interval and progress == 1:
+                    if entering_resolution:
+                        reasons.append("enter_resolution")
+                    if (epoch + 1) % interval == 0:
+                        reasons.append("periodic_epoch")
+                profiling = bool(reasons)
+                # Sparse kernel-history samples add instrumentation. Wall timings
+                # below include tracing, compilation, transfers and waits.
                 with dr.kernel_history() if profiling else nullcontext() as history:
                     gradients, loss, rendered_alpha = train_view(model, view, rgba, config, sampler, rng, mi, dr, np,
-                        need_rendered_alpha=topology.needs_rendered_alpha(epoch))
+                        need_rendered_alpha=growth_evidence_requested)
                     gradients_done = time.perf_counter()
                     topology.observe_view(model, gradients, view_id=int(index), epoch=epoch,
                         camera=view["camera"], reference_alpha=rgba[..., 3], rendered_alpha=rendered_alpha)
@@ -531,10 +580,13 @@ def run_training():
                     f"| cam {int(index)+1} | loss={loss:.6f} | {optimizer_done-view_started:.2f}s/view")
                 if profiling:
                     profile = dict(epoch=epoch+1, progress=progress, camera=int(index)+1,
+                                   training_resolution=training_resolution, active_voxels=int(model.active_voxel_count),
+                                   sample_reasons=reasons, growth_evidence_requested=growth_evidence_requested,
                                    wall_seconds=optimizer_done-view_started, stage_seconds=stage,
                                    **kernel_profile(history))
                     with profile_path.open("a", encoding="utf-8") as stream:
                         stream.write(json.dumps(profile) + "\n")
+                    performance.record_profile(profile)
             progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} "
                                  f"| view {len(views)}/{len(views)} (100%) | updating topology...", force=True)
             topology_started = time.perf_counter()
@@ -547,20 +599,31 @@ def run_training():
                 sampler = ContourSampler(np, **asdict(config.contour))
             entry = {"epoch": epoch+1, "global_step": global_step, "mean_loss": epoch_loss / len(views),
                      "seconds": time.perf_counter()-started, "resolution": int(model.resolution),
+                     "training_resolution": training_resolution, "active_voxels_before": active_voxels_before,
+                     "growth_evidence_requested": growth_evidence_requested,
+                     "deletion_evidence_collected": deletion_evidence_collected,
                      "active_voxels": int(model.active_voxel_count), "topology": event,
+                     "reference_cache": reference_cache.statistics(),
                      "view_stage_seconds": stage_totals,
                      "epoch_topology_seconds": time.perf_counter()-topology_started}
             with (output / history_name).open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(entry) + "\n")
             report["last_epoch"] = entry
+            performance.record_epoch(entry)
+            last_training_resolution = training_resolution
             progress_line.finish(f"Epoch {epoch+1}/{config.training.num_epochs} done "
                 f"| loss={entry['mean_loss']:.6f} | {entry['seconds']:.2f}s "
                 f"| grid={entry['resolution']} | voxels={entry['active_voxels']}")
             if epoch+1 in save_epochs and epoch+1 < config.training.num_epochs:
                 save(output / f"epoch-{epoch+1:05d}.npz", epoch+1)
                 print("Saved checkpoint:", output / f"epoch-{epoch+1:05d}.npz", flush=True)
+            performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
+            performance.write("running", training_status="running")
+        performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
+        training_loop_started = None
         # Publish only the completed reconstruction, using the same portable,
         # atomic checkpoint format understood by independent evaluation scripts.
+        export_started = time.perf_counter()
         save(model_path, config.training.num_epochs)
         print("Saved reconstructed voxel model:", model_path, flush=True)
         report.update(status="running" if config.evaluation.enabled else "passed", training_status="passed",
@@ -569,6 +632,7 @@ def run_training():
                       checkpoint=str(model_path),
                       reconstructed_model={"path": str(model_path), "sha256": file_sha256(model_path),
                           "completed_epochs": config.training.num_epochs, "global_step": global_step})
+        performance.set_phase_seconds("final_export", time.perf_counter()-export_started)
     except KeyboardInterrupt:
         progress_line.finish()
         report.update(status="interrupted", training_status="interrupted")
@@ -579,15 +643,21 @@ def run_training():
         print(report["error"], file=sys.stderr, flush=True)
     finally:
         progress_line.finish()
+        if reference_cache is not None:
+            report["reference_cache"] = reference_cache.statistics()
+        if training_loop_started is not None:
+            performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
         report["training_finished_utc"] = datetime.now(timezone.utc).isoformat()
         if report["status"] != "running":
             report["finished_utc"] = report["training_finished_utc"]
         (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
-    return config, model_path, output, report
+        performance.write(report["status"], training_status=report["training_status"],
+            reference_cache=report.get("reference_cache"), training_report=str(output / "training-report.json"))
+    return config, model_path, output, report, performance
 
 
 def main():
-    config, model_path, output, report = run_training()
+    config, model_path, output, report, performance = run_training()
     if report["training_status"] != "passed":
         return 1
     if not config.evaluation.enabled:
@@ -600,6 +670,7 @@ def main():
     (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
     limit = "all views" if evaluation.max_views is None else f"first {evaluation.max_views} views per split"
     print(f"Starting final train/test evaluation: {evaluation.spp} spp, {limit}", flush=True)
+    evaluation_started = time.perf_counter()
     try:
         # run_training's model, optimizer and gradients are out of scope. Reclaim
         # their allocations before restoring the published checkpoint for evaluation.
@@ -624,8 +695,12 @@ def main():
         print(report["evaluation"]["error"], file=sys.stderr, flush=True)
         print(f"Training completed; the saved model is preserved at {model_path}", file=sys.stderr, flush=True)
     finally:
+        performance.set_phase_seconds("evaluation", time.perf_counter()-evaluation_started)
         report["finished_utc"] = datetime.now(timezone.utc).isoformat()
         (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
+        performance.write(report["status"], training_status=report["training_status"],
+            evaluation=report["evaluation"], reference_cache=report.get("reference_cache"),
+            training_report=str(output / "training-report.json"), evaluation_report=str(evaluation_report))
     return 0 if report["status"] == "passed" else 1
 
 

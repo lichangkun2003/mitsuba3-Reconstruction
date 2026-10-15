@@ -63,6 +63,8 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
    CONFIG.render.spp = 1
    CONFIG.training.chunk_size = 0  # 整图提交；正整数表示显式分批
    CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译和设备耗时
+   CONFIG.training.profile_interval_epochs = 50  # 新分辨率及每 50 轮抽样一个视角
+   CONFIG.training.reference_cache_mib = 1024  # 参考图 CPU 内存缓存；0 关闭
    CONFIG.schedule.enabled = True
    CONFIG.schedule.start_resolution = 256
    CONFIG.schedule.target_resolution = 512
@@ -96,7 +98,8 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 * ``data``：数据集相对路径、PLY、训练相机 JSON。
 * ``model``：初始化边界、padding、SH 数量和固定分辨率。
 * ``render``：图像尺寸、裁剪面、背景、命中上限等；训练 ``spp`` 必须为 1。
-* ``training``：``num_epochs``、``chunk_size``、``profile_views``、``seed``、``shuffle``、
+* ``training``：``num_epochs``、``chunk_size``、``profile_views``、``profile_interval_epochs``、
+  ``reference_cache_mib``、``seed``、``shuffle``、
   ``save_count``（默认 3，包含最后一次）和输出路径 ``output``；``None`` / JSON ``null``
   表示自动分配实验目录，字符串表示使用显式路径。
 * ``gradient``：alpha 损失、几何代理宽度/截断、边界和删除证据等参数。
@@ -170,6 +173,30 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 这仅用于检查程序能否完成训练与恢复，不是原始 256 → 512 正式实验的等价配置。
 训练和评价严格要求参考图尺寸与配置一致，不隐式缩放真值。
 
+参考图内存缓存
+--------------
+
+默认 ``training.reference_cache_mib=1024``，以 MiB 为单位限制训练参考图的 CPU 缓存。
+第一次访问一个视角时，仍通过原来的读取流程解码为线性 RGBA float32，并检查尺寸和有限值；
+后续访问直接复用只读数组，避免每个 epoch 重复读取和解码 PNG。缓存不占用 CUDA 显存，
+也不消除每次训练调用中的参考数据上传。100 张 800 × 800 RGBA float32 约占 976.6 MiB，
+默认容量可以全部容纳；这是图像数组的大小，不是整个训练进程的内存占用。
+
+容量不足时按最近使用顺序淘汰旧图，单张图片超过容量则不缓存。可通过
+``--reference-cache-mib 2048`` 扩大，或 ``--reference-cache-mib 0`` 关闭。
+若数据集超过容量且每轮遍历全部视角，频繁淘汰会降低命中率；应根据日志和可用内存调整。
+首次访问仍有解码开销，比较耗时时应观察后续轮次。缓存只对本次训练进程生效，恢复训练后重新填充，
+不会写入 checkpoint 或输出目录；恢复时可调整容量，不改变已保存的模型、优化器和随机数状态。
+
+数据集在一次运行期间视为固定输入，不支持训练中修改参考图片。缓存复用相同的 float32 数值，
+不改变随机数消耗、训练视角顺序、1 spp、每视角一次更新或拓扑证据规则。
+训练后自动评价和独立评价保持原读取流程，不继承这个训练缓存。
+
+每轮 ``training.jsonl`` 和最终 ``training-report.json`` 的 ``reference_cache`` 包含
+``capacity_bytes``、``resident_bytes``、``images``、``hits``、``misses``、``evictions``；
+命中、未命中与淘汰次数从本次进程开始累计，未命中表示实际调用了图片读取流程。
+关闭缓存时所有访问均为未命中，驻留图片数及字节数保持零。
+
 整图提交、内核复用与回读
 ----------------------
 
@@ -206,17 +233,65 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 输出重定向、管道或非交互式 Slurm 日志中不写回车刷新，只保留轮次摘要和必要提示。
 评价阶段同样每个划分使用一行进度，结束后输出一条 PSNR 汇总；异常或中断前结束活动行。
 
-完整的每轮记录仍写入 ``training.jsonl``（恢复时写入对应的独立日志段），包含
-``view_stage_seconds`` 和 ``epoch_topology_seconds``。这些时间包含 Python 调度、JIT、
-传输和等待，不是纯 GPU 内核时间；异步执行还会让某阶段发出的工作在后续阶段等待完成。
+自动耗时记录与性能诊断
+----------------------
 
-需要定位编译开销时，额外传入 ``--profile-views 3``，仅记录本次进程最先处理的三个视角。
-默认关闭该测量；它会增加测量开销。记录写到训练目录下的 ``profile-training.jsonl``，
-恢复运行则使用与本次恢复日志对应的独立文件；``training-report.json`` 的 ``profile_file``
-给出实际路径；终端只提示该文件位置，不逐条打印 profile JSON。每条记录包含各阶段
-墙钟时间、JIT 内核数、缓存命中/未命中数、内核哈希、代码生成时间
-``codegen_ms``、后端编译时间 ``backend_compile_ms`` 和设备执行时间 ``device_ms``。
-设备时间取自 Dr.Jit kernel history，统计的是被记录操作的耗时，不能与各阶段墙钟时间直接等同。
+无需额外命令，训练默认记录耗时到当前实验的 ``training/`` 目录：
+
+* ``training.jsonl``：每个完整 epoch 一条记录，包含参考图读取/缓存、前向与梯度、
+  拓扑证据观察、优化器更新的阶段累计时间，以及轮末拓扑处理时间、增删/细分事件、
+  活跃体素数和参考图缓存统计。``training_resolution`` 是本轮实际训练的网格分辨率，
+  ``resolution`` 仍是执行轮末拓扑操作后的分辨率；升层所在轮不能用后者归类本轮训练。
+  ``active_voxels_before`` 记录本轮开始时的体素数。
+* ``performance-summary.json``：汇总当前这次进程的耗时，按实际训练分辨率统计
+  每轮耗时均值、中位数、p95 和各阶段累计时间，结合冷启动、拓扑事件和缓存命中情况
+  分析普通轮次与生长/删除/细分轮次的差别。还记录初始化、checkpoint 保存、自动评价
+  的耗时、运行环境和源码版本信息，便于区分训练计算与出图、保存等开销。
+  拓扑事件轮包括生长证据采集轮、轮末证据评估轮及实际发生增删/细分的轮次；
+  512 阶段每轮常规采集删除证据，本身不将该轮归为拓扑事件轮。
+* ``profile-training.jsonl``：稀疏抽样的 Dr.Jit 内核统计，用于判断编译、缓存和设备执行开销；
+  不对所有训练视角开启详细内核记录。
+
+性能汇总在每个完整 epoch 结束时原子刷新，训练和自动评价结束时再次更新；
+正常处理 ``Ctrl+C`` 或运行异常时也尝试保存当前已记录的信息。它不是模型 checkpoint，
+不会改变原来的三次模型保存计划，也不能用来恢复未保存的训练进度。
+进程被强制结束、Slurm 超时终止或节点故障时，最后一次成功写入的完整记录仍可用于分析，
+但不能保证取得正在执行的视角或轮次的完整耗时。
+
+恢复训练为本次进程写独立的 ``performance-summary-resume-TIMESTAMP.json``、
+``training-resume-TIMESTAMP.jsonl`` 及对应的 profile 日志，保留恢复前的文件。
+各段统计只覆盖各自进程；诊断完整实验时应一起提供，并结合恢复的 checkpoint 区分
+有效进度和恢复后重算的轮次，不能直接把各段的 epoch 数当作独立训练进度相加。
+
+默认 ``training.profile_interval_epochs=50``：本次进程首次进入一种训练分辨率时，
+以及每第 50 个 epoch，记录其第一个视角的内核信息。``--profile-views 3`` 还可额外记录
+本次进程最先处理的三个视角；``profile_views`` 默认仍为 0，两个条件命中同一视角时只记录一次。
+若需要完全关闭内核抽样，可传 ``--profile-interval-epochs 0 --profile-views 0``，
+普通逐轮耗时及性能汇总仍保留。恢复时可调整这些性能测量参数，不改变算法设置。
+抽样有额外开销，比较优化前后速度时应使用相同的测量设置。
+
+``training-report.json`` 的 ``profile_file`` 给出内核记录的实际路径；终端只提示文件位置。
+每条 profile 记录包含各阶段墙钟时间、JIT 内核数、缓存命中/未命中数、内核哈希、
+代码生成时间 ``codegen_ms``、后端编译时间 ``backend_compile_ms`` 和设备执行时间
+``device_ms``。设备时间取自 Dr.Jit kernel history，只涵盖所记录的操作；这是抽样数据，
+不能按它直接外推整个实验的 GPU 时间或多 GPU 加速比。
+
+阶段时间是墙钟时间，包含 Python 调度、JIT、传输和等待，不是纯 GPU 内核时间；
+异步执行还会让某阶段发出的工作在后续阶段等待完成。报告中的 GPU 可见设备与 CPU 线程
+来源说明实际运行配置，不代表持续采集了 GPU 利用率、显存峰值或多 GPU 通信性能。
+目前一个训练进程仍只使用一张 GPU，性能报告本身不会启用分布式训练。
+
+训练完成后，可以直接提供以下小文件，无需发送 ``model.npz`` 或图片：
+
+* ``training/performance-summary.json``：首先查看整体瓶颈和各分辨率阶段。
+* ``training/training.jsonl``：核对逐轮变化、体素数量和拓扑事件。
+* ``training/profile-training.jsonl``：检查抽样内核的缓存、编译及设备执行时间。
+* 实验根目录的 ``evaluation-report.json``：分析 64 spp 出图耗时。
+
+若中途恢复过训练，同时提供相应的 ``*-resume-*`` 文件；仅运行了训练、关闭了内核抽样
+或尚未开始评价时，对应文件可能不存在。比较两个实现版本时，应保持数据集、随机种子、
+训练预算、采样数、GPU 型号和测量设置一致，并分别查看预热后的普通轮次和拓扑变化轮次。
+是否值得增加 CPU、优化单卡或进一步设计多 GPU 梯度汇总，应据这些实测结果判断。
 
 重建结果目录
 ------------
@@ -245,6 +320,9 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
    outputs/lego-10.15-E1/
      model.npz          # 训练完成后自动导出的完整体素重建模型
      training/          # 训练配置、日志及最多两份中间 checkpoint（默认）
+       performance-summary.json  # 自动更新的本次进程耗时汇总
+       training.jsonl            # 逐轮耗时、损失和拓扑事件
+       profile-training.jsonl    # 稀疏抽样的内核性能记录
      train/             # 最终模型的训练集视角 PNG 和 metrics.json
      test/              # 最终模型的测试集视角 PNG 和 metrics.json
      evaluation-config.json
@@ -325,7 +403,7 @@ HPC Slurm
      --dataset datasets/lego --epochs 1000 --chunk-size 0 --profile-views 3
 
 这里显式选择整图提交，并测量最先处理的三个视角，便于检查服务器上的编译和缓存开销；
-不需要性能测量时可省略 ``--profile-views 3``。已经运行的 HPC 进程不会自动加载新脚本，
+省略 ``--profile-views 3`` 时仍保留默认的分辨率/每 50 轮抽样。已经运行的 HPC 进程不会自动加载新脚本，
 需同步后重新启动；如恢复已有实验，应使用已保存的完整 epoch checkpoint 和 ``--resume``，
 未保存的 epoch 进度仍需重算。实际显存峰值和 A100 提速幅度需要在服务器测量，不能由本地测试推断。
 
@@ -334,6 +412,12 @@ HPC Slurm
 缺少有效 GPU 可见列表时明确报错。Dr.Jit CPU 线程数受
 ``SLURM_CPUS_PER_TASK`` 限制，未提供时使用 1 线程。没有 GPU 或源码绑定时不回退 CPU
 或 wheel。多个可见 GPU 不会自动产生多 GPU 训练。
+
+参考图缓存只需要额外 CPU 内存；当前 100 个 800 × 800 训练视角约需 1 GiB，
+无需为了这项优化增加 GPU 数量或 CPU 核数。增加 ``--cpus-per-task`` 会调整 Dr.Jit
+线程预算，但不会自动并行 Python 拓扑循环或让同一训练使用多张 GPU。
+是否增加资源应根据后续轮次的 ``reference``、``gradients``、``topology_observation``
+及 ``epoch_topology_seconds`` 实测判断，不能只用未触发生长的第一轮推断整个训练。
 
 Windows 默认构建目录为 ``mitsuba/build/Release``，Linux 为 ``mitsuba/build``；
 ``--build-dir`` 可覆盖。所有相对路径固定相对于仓库父目录，包括
@@ -350,7 +434,8 @@ Checkpoint 与恢复
 ``training/epoch-00007.npz`` 和实验根目录 ``model.npz``。
 不再额外生成 ``latest.npz``、最终轮次的 ``epoch-XXXXX.npz`` 或升分辨率前的分层副本。
 
-训练输出还包括 ``config.json``、``training.jsonl`` 和 ``training-report.json``。
+训练输出还包括 ``config.json``、``training.jsonl``、``training-report.json`` 和
+``performance-summary.json``。
 日志仍记录每轮的平均训练损失、分辨率、体素数与拓扑事件，保存次数不改变日志频率、
 参数更新或分辨率调度。Checkpoint 在完整 epoch 及该轮拓扑处理结束后保存；它不是任意
 视角中途的恢复点。中断后需从最近保存的 checkpoint 重算尚未保存的 epoch；
@@ -484,6 +569,9 @@ PSNR 的具体约定：
 ``train/`` 与 ``test/`` 保存按视角索引命名的 PNG 和各自 ``metrics.json``；
 ``evaluation-report.json`` 记录完整指标协议、逐视角结果、checkpoint 哈希、源码运行
 信息和状态。``--save-linear`` 可额外保存每个视角的线性 RGB/alpha NPZ。
+逐视角结果还记录渲染、参考图读取、指标计算和文件写入的墙钟时间，划分汇总记录相应
+阶段总时间；这些数据同时写入对应的 ``metrics.json`` 和 ``evaluation-report.json``。
+它们用于区分 64 spp 渲染与图片编码/写盘等开销，不改变 spp、射线、指标或输出图像。
 PNG 用于显示；进行论文或其他实现的 PSNR 对比时，应明确选用哪种颜色空间、背景、
 分辨率和 spp，并保证双方协议一致。
 

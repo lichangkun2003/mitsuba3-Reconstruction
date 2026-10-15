@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 import math
 from pathlib import Path
@@ -83,6 +84,46 @@ def read_reference(path, width, height, mi, np):
     if not np.isfinite(rgba).all() or np.any(rgba[..., 3] < 0) or np.any(rgba[..., 3] > 1):
         raise ValueError(f"Reference contains nonfinite values or invalid alpha: {path}")
     return rgba
+
+
+class ReferenceImageCache:
+    """Bounded RAM cache of decoded, validated linear RGBA for a static dataset."""
+
+    def __init__(self, width, height, mi, np, capacity_mib=1024):
+        if isinstance(capacity_mib, bool) or not isinstance(capacity_mib, int) or capacity_mib < 0:
+            raise ValueError("reference_cache_mib must be a nonnegative integer")
+        self.width, self.height, self.mi, self.np = width, height, mi, np
+        self.capacity_bytes = capacity_mib * 1024 * 1024
+        self.resident_bytes = 0
+        self.hits = self.misses = self.evictions = 0
+        self._images = OrderedDict()
+
+    def get(self, path):
+        if self.capacity_bytes == 0:
+            self.misses += 1
+            return read_reference(path, self.width, self.height, self.mi, self.np)
+        key = (str(Path(path).resolve()), self.width, self.height)
+        if key in self._images:
+            self.hits += 1
+            self._images.move_to_end(key)
+            return self._images[key]
+        self.misses += 1
+        rgba = read_reference(key[0], self.width, self.height, self.mi, self.np)
+        if rgba.nbytes <= self.capacity_bytes:
+            while self.resident_bytes + rgba.nbytes > self.capacity_bytes:
+                _, old = self._images.popitem(last=False)
+                self.resident_bytes -= old.nbytes
+                self.evictions += 1
+            # Sharing cached buffers must never let a consumer change a later epoch's target.
+            rgba.setflags(write=False)
+            self._images[key] = rgba
+            self.resident_bytes += rgba.nbytes
+        return rgba
+
+    def statistics(self):
+        return {"capacity_bytes": self.capacity_bytes, "resident_bytes": self.resident_bytes,
+                "images": len(self._images), "hits": self.hits, "misses": self.misses,
+                "evictions": self.evictions}
 
 
 def prepare_camera(render, camera, mi, dr):
