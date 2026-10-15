@@ -22,6 +22,7 @@ from reconstruction_preview import DataConfig, ModelConfig, RenderConfig, Runtim
 from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, generate_ray_batch,
     initialize_runtime, load_views, model_metadata, read_reference, restore_model, workspace_path, file_sha256)
 from reconstruction_checkpoint import load_checkpoint, save_checkpoint
+from reconstruction_experiment import allocate_training_output, resumed_training_output
 from reconstruction_optimizer import FalcorOptimizer, OptimizerConfig
 from reconstruction_topology import TopologyManager, TopologySettings, CoarseToFineConfig
 
@@ -33,7 +34,7 @@ class TrainingSettings:
     seed: int = 42
     shuffle: bool = True
     save_count: int = 3  # Total snapshots, including the final model.npz.
-    output: str = "outputs/mitsuba/reconstruction-train"
+    output: str | None = None  # None: automatically allocate a daily experiment.
 
 
 @dataclass
@@ -73,7 +74,26 @@ class TrainConfig:
     contour: ContourSettings = field(default_factory=ContourSettings)
 
 
+# ==================== 训练实验配置：常用参数在这里修改 ====================
+# 路径相对于 mitsuba 仓库的父目录；切换场景只需修改下面的 dataset。
 CONFIG = TrainConfig()
+CONFIG.data.dataset = "datasets/lego"
+CONFIG.data.point_cloud = "init_points.ply"
+CONFIG.data.cameras = "transforms_train.json"
+
+CONFIG.render.width = 800
+CONFIG.render.height = 800
+CONFIG.render.spp = 1  # 训练固定每视角 1 spp；多 spp 出图使用评价脚本。
+
+CONFIG.schedule.enabled = True
+CONFIG.schedule.start_resolution = 256
+CONFIG.schedule.target_resolution = 512
+CONFIG.training.num_epochs = 1000  # 整个实验总轮数，每轮遍历全部训练视角。
+CONFIG.training.save_count = 3  # 包含最终 model.npz，共保存三次。
+CONFIG.training.output = None  # 自动创建 outputs/场景-MM.DD-E编号/training。
+# 需要手动指定目录时，将 None 改为路径字符串，或传 --output-dir。
+# 高级参数使用 CONFIG.optimizer / gradient / topology / contour / runtime。
+# ============================ 配置区结束 ============================
 
 
 def update(config, values):
@@ -101,7 +121,7 @@ def parse_arguments():
     parser.add_argument("--resume", help="Resume a completed-epoch checkpoint")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--dataset")
-    parser.add_argument("--output-dir", help="Training output; a trailing training/ exports model.npz in its parent experiment directory")
+    parser.add_argument("--output-dir", help="Override automatic outputs/SCENE-MM.DD-Eindex/training; on resume the default reuses the checkpoint's experiment")
     parser.add_argument("--build-dir")
     parser.add_argument("--gpu", type=int, help="Local physical index; ignored under Slurm")
     parser.add_argument("--chunk-size", type=int)
@@ -206,6 +226,34 @@ def final_model_path(output: Path) -> Path:
     return experiment / "model.npz"
 
 
+def prepare_training_output(config, resume_path=None, checkpoint_config=None):
+    """Resolve and record one output directory before initializing the GPU."""
+    requested = config.training.output
+    if requested is None:
+        if resume_path is not None:
+            output = resumed_training_output(resume_path, checkpoint_config or {}).resolve()
+        else:
+            if workspace_path("outputs", WORKSPACE).is_relative_to(REPOSITORY):
+                raise ValueError("Keep checkpoints, logs and caches outside the Git checkout")
+            output = allocate_training_output(config.data.dataset, WORKSPACE)
+    elif not isinstance(requested, str) or not requested.strip():
+        raise ValueError("training.output must be null/None for automatic naming or a nonempty path")
+    else:
+        output = workspace_path(requested, WORKSPACE)
+    model_path = final_model_path(output)
+    if output.is_relative_to(REPOSITORY) or model_path.is_relative_to(REPOSITORY):
+        raise ValueError("Keep checkpoints, logs and caches outside the Git checkout")
+    if resume_path is None and (any(path.exists() for path in (
+            output / "latest.npz", output / "training.jsonl", model_path))
+            or any(output.glob("epoch-*.npz"))):
+        raise ValueError("Training output already contains a run; choose --output-dir or resume its checkpoint")
+    output.mkdir(parents=True, exist_ok=True)
+    # Save a concrete, portable path, never the automatic naming sentinel.
+    config.training.output = (output.relative_to(WORKSPACE).as_posix()
+                              if output.is_relative_to(WORKSPACE) else str(output))
+    return output
+
+
 def validate_existing_model(path: Path, resumed_checkpoint: dict) -> None:
     """A resume must not replace another experiment's exported reconstruction."""
     if not path.exists():
@@ -229,15 +277,12 @@ def main():
     config = TrainConfig()
     update(config, asdict(CONFIG))
     apply_arguments(config, args, overrides)
-    output = workspace_path(config.training.output, WORKSPACE)
+    resume_path = workspace_path(args.resume, WORKSPACE) if args.resume else None
+    checkpoint = load_checkpoint(resume_path) if resume_path is not None else None
+    output = prepare_training_output(config, resume_path, checkpoint["config"] if checkpoint else None)
     model_path = final_model_path(output)
-    if output.is_relative_to(REPOSITORY) or model_path.is_relative_to(REPOSITORY):
-        raise ValueError("Keep checkpoints, logs and caches outside the Git checkout")
-    if not args.resume and (any(path.exists() for path in (
-            output / "latest.npz", output / "training.jsonl", model_path))
-            or any(output.glob("epoch-*.npz"))):
-        raise ValueError("Training output already contains a run; choose --output-dir or resume its checkpoint")
-    output.mkdir(parents=True, exist_ok=True)
+    print("Training output:", output, flush=True)
+    print("Final reconstructed model:", model_path, flush=True)
     report = {"status": "running", "started_utc": datetime.now(timezone.utc).isoformat(),
               "scope": "Falcor NoLightTransport 1-spp full-view training; explicit geometry surrogate gradients",
               "falcor_reference_commit": "398f634ec788bbb2e86a6f4d0ab78d41158d9905",
@@ -248,7 +293,6 @@ def main():
     try:
         validate(config)
         mi, dr, np, handles = initialize_runtime(config.runtime, output, report)
-        checkpoint = load_checkpoint(workspace_path(args.resume, WORKSPACE)) if args.resume else None
         if checkpoint:
             validate_existing_model(model_path, checkpoint)
             # Runtime and output are host-specific; all algorithm settings resume from the checkpoint.
@@ -256,6 +300,9 @@ def main():
             update(config, checkpoint["config"])
             config.runtime, config.training.output = runtime, training_output
             apply_arguments(config, args, overrides)
+            # JSON may request automatic naming with null; keep the already
+            # selected location instead of restoring null or a stale host path.
+            config.training.output = training_output
             validate(config)
             previous = checkpoint["config"]
             current = asdict(config)

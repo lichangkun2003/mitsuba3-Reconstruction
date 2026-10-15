@@ -48,8 +48,37 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 统一配置
 --------
 
-``reconstruction_train.py`` 顶部 ``CONFIG = TrainConfig()`` 为统一入口，支持 JSON
-分组覆盖及少量命令行覆盖。当前默认是 lego、800 × 800、1 spp、1000 个 epoch、
+``reconstruction_train.py`` 顶部 ``CONFIG = TrainConfig()`` 及其后面的赋值块为统一入口。
+切换训练场景时，直接修改该块中的 ``CONFIG.data.dataset``，无需进入预览脚本查找：
+
+.. code-block:: python
+
+   CONFIG = TrainConfig()
+   CONFIG.data.dataset = "datasets/lego"  # 切换场景就在这里改，例如 datasets/ficus
+   CONFIG.data.point_cloud = "init_points.ply"
+   CONFIG.data.cameras = "transforms_train.json"
+   CONFIG.render.width = 800
+   CONFIG.render.height = 800
+   CONFIG.render.spp = 1
+   CONFIG.schedule.enabled = True
+   CONFIG.schedule.start_resolution = 256
+   CONFIG.schedule.target_resolution = 512
+   CONFIG.training.num_epochs = 1000
+   CONFIG.training.save_count = 3
+   CONFIG.training.output = None  # 自动创建 outputs/场景-月.日-E编号/training
+
+``datasets/lego`` 相对于源码仓库的父目录，即 ``reconstruction/datasets/lego``。
+点云和相机文件名相对于该场景目录；训练会遍历相机 JSON 中的全部视角。
+如果新场景使用相同的文件名，只需改 ``dataset``。还需确认其坐标范围适合模型边界，
+参考图尺寸与 ``render.width/height`` 一致。
+
+训练脚本从 ``reconstruction_preview.py`` 导入的是 ``DataConfig`` 等配置类，也就是
+字段和默认值的定义；两个脚本分别创建自己的 ``CONFIG`` 对象。因此，修改预览脚本的
+``CONFIG.data.dataset`` 只影响预览，不影响训练。训练实验的参数集中改上面这一块。
+
+配置还支持 JSON 分组覆盖及少量命令行覆盖，优先级为：代码中的 ``CONFIG``，然后
+``--config`` JSON，最后命令行参数。例如 ``--dataset datasets/ficus`` 会覆盖代码中的 lego。
+当前默认是 lego、800 × 800、1 spp、1000 个 epoch、
 随机种子 42、整个实验保存三次（含最终模型）。修改 ``--epochs`` 同时设置分辨率调度的
 总训练预算，因此不能把不同预算的早期阶段当成相同调度。
 
@@ -59,7 +88,8 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 * ``model``：初始化边界、padding、SH 数量和固定分辨率。
 * ``render``：图像尺寸、裁剪面、背景、命中上限等；训练 ``spp`` 必须为 1。
 * ``training``：``num_epochs``、``chunk_size``、``seed``、``shuffle``、
-  ``save_count``（默认 3，包含最后一次）和输出路径 ``output``。
+  ``save_count``（默认 3，包含最后一次）和输出路径 ``output``；``None`` / JSON ``null``
+  表示自动分配实验目录，字符串表示使用显式路径。
 * ``gradient``：alpha 损失、几何代理宽度/截断、边界和删除证据等参数。
 * ``optimizer``：各类参数学习率、Adam、裁剪、步长限制和不透明度调度。
 * ``topology``：体素增删及证据条件。
@@ -114,7 +144,7 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
      "training": {
        "num_epochs": 2,
        "save_count": 3,
-       "output": "outputs/lego-10.15-E1/training"
+       "output": null
      },
      "schedule": {"enabled": false}
    }
@@ -127,9 +157,20 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 
 每次实验使用 ``outputs/场景-月.日-E编号``，例如 ``outputs/lego-10.15-E0``。
 ``E0`` 表示当天的第一个实验，``E1`` 表示第二个实验；编号与 epoch 无关。
-一套配置的一次完整运行属于同一实验，初始化结果和训练后的结果放在一起；
-更换配置重新运行时使用下一个未占用编号，避免覆盖已有结果。日期和编号目前由
-``--output-dir`` 显式指定，不会自动递增。
+一套配置的一次完整运行属于同一实验，初始化结果和训练后的结果放在一起。
+默认 ``training.output=None`` 时，脚本扫描工作区 ``outputs`` 的直接子目录，取当天
+所有场景中已有的最大 ``E编号`` 加一；当天没有实验则从 ``E0`` 开始，不填补中间空号。
+例如已有 ``lego-10.15-E0`` 和 ``ficus-10.15-E2``，下一次 Lego 实验为
+``lego-10.15-E3``。场景名取配置中数据集路径的最后一级，不因数据集目录是链接而改变。
+日期统一采用 Asia/Dubai（UTC+4），使 Windows 和 HPC 不受各自系统时区影响。
+
+脚本会在启动时打印实际实验目录，并把分配后的相对输出路径写入保存的配置。
+编号分配通过工作区 ``.cache/mitsuba`` 下的短时文件锁保护，同一工作区的并发启动
+按顺序分配编号。显式指定 ``--output-dir`` 或 JSON 中的 ``training.output`` 时，
+直接使用该路径，不自动生成新编号。
+若使用以前保存的配置开启新实验，将其中的 ``training.output`` 改回 ``null``，
+即可重新自动编号。启动后即使环境检查或训练失败，也会保留已分配的目录和错误报告，
+后续新实验继续递增；已有结果不会因此被删除或覆盖。
 
 建议新实验按以下布局保存：
 
@@ -143,12 +184,12 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
      evaluation-report.json
      initial/           # 可选：初始化模型及其 train/、test/ 基线结果
 
-训练时将 ``--output-dir`` 指向 ``training/``，全部 epoch 成功完成后，脚本自动在
-其父目录（实验根目录）保存 ``model.npz``。如果输出目录的最后一级不是 ``training``，
+默认自动分配的训练目录是实验根目录下的 ``training/``。全部 epoch 成功完成后，
+脚本自动在其父目录（实验根目录）保存 ``model.npz``。如果显式输出目录的最后一级不是 ``training``，
 则直接保存到该输出目录下的 ``model.npz``，兼容已有的平铺输出方式。
 评价时指向实验根目录，并用 ``--checkpoint`` 加载这个模型。训练轮数记录在配置、日志和
-checkpoint 中，不通过 ``E编号`` 表示。下文 ``E1`` 是新实验示例；运行前应按实际
-日期及已有目录选择编号。
+checkpoint 中，不通过 ``E编号`` 表示。下文恢复和评价命令中的 ``E1`` 仅为示例，
+应替换为启动时打印的实际实验目录。
 
 已经整理的 ``outputs/lego-10.15-E0`` 保存了本地第一次 Lego 实验：
 800 × 800、256³ 网格、每视角 1 spp，完整训练 1 个 epoch，即 100 个训练视角、
@@ -192,10 +233,10 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
    cmake --build .\mitsuba\build --config Release --parallel 2
    if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
    & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\reconstruction_train.py `
-     --dataset datasets/lego --epochs 10 `
-     --output-dir outputs/lego-10.15-E1/training
+     --dataset datasets/lego --epochs 10
 
-训练 10 轮表示每个视角都会被访问 10 次。上述命令仍启用配置中的分辨率调度；
+训练 10 轮表示每个视角都会被访问 10 次。省略 ``--output-dir`` 时使用默认的自动实验目录。
+上述命令仍启用配置中的分辨率调度；
 要使用前面的固定小网格例子，应将 JSON 保存到工作区，例如 ``train-config.json``，
 再以 ``--config train-config.json`` 运行。
 
@@ -209,8 +250,7 @@ HPC Slurm
    cmake --build "$HOME/projects/reconstruction/mitsuba/build" --parallel 8
    cd "$HOME/projects/reconstruction"
    "$HOME/envs/mitsuba/bin/python" -I mitsuba/resources/reconstruction_train.py \
-     --dataset datasets/lego --epochs 1000 \
-     --output-dir outputs/lego-10.15-E1/training
+     --dataset datasets/lego --epochs 1000
 
 训练、评价和预览共用本地/Slurm 环境规则：Slurm 下保留
 ``CUDA_VISIBLE_DEVICES`` 原字符串及所有作业变量，不按本地物理编号重新选卡；
@@ -288,16 +328,19 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 .. code-block:: powershell
 
    & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\reconstruction_train.py `
-     --resume outputs/lego-10.15-E1/training/epoch-00007.npz `
-     --output-dir outputs/lego-10.15-E1/training
+     --resume outputs/lego-10.15-E1/training/epoch-00007.npz
 
 前面的服务器 1000 轮实验对应从第二次保存的第 667 轮恢复：
 
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I mitsuba/resources/reconstruction_train.py \
-     --resume outputs/lego-10.15-E1/training/epoch-00667.npz \
-     --output-dir outputs/lego-10.15-E1/training
+     --resume outputs/lego-10.15-E1/training/epoch-00667.npz
+
+恢复时默认复用 checkpoint 所在实验，不递增 ``E编号``：中间 checkpoint 使用所在的
+训练目录，标准布局根目录的 ``model.npz`` 使用同一实验下的 ``training/``，旧平铺布局
+使用原目录。仍可用 ``--output-dir`` 显式指定恢复的目标目录。这里的示例路径必须改为
+本次实际保存的 checkpoint 路径。
 
 恢复会校验训练数据签名，并保持原算法设置和总 epoch 预算。运行环境和输出目录可以
 换到当前机器；更换算法参数或重新制定分辨率调度应开启新的实验。跨机器恢复保留完整
