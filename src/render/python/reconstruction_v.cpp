@@ -83,6 +83,21 @@ MI_PY_EXPORT(VoxelReconstruction) {
            "sh_count"_a = 9, "opacity_sh_count"_a = 9, nb::rv_policy::take_ownership)
         .def("set_parameters", &Model::set_parameters, "parameters"_a,
              "Replace continuous parameter buffers atomically after shape/finite validation.")
+        .def("set_growth_candidates", [](Model &model, const nb::dict &state) {
+            if (!state.contains("cell_indices"))
+                throw nb::value_error("set_growth_candidates(): missing cell_indices");
+            auto cells = nb::cast<typename Model::UIntBuffer>(state["cell_indices"]);
+            std::map<std::string, typename Model::FloatBuffer> parameters;
+            for (auto item : state) {
+                std::string key = nb::cast<std::string>(item.first);
+                if (key != "cell_indices")
+                    parameters[key] = nb::cast<typename Model::FloatBuffer>(item.second);
+            }
+            model.set_growth_candidates(cells, parameters);
+        }, "state"_a,
+           "Install frozen empty-cell candidates for online RGB evidence; does not grow the model.")
+        .def("clear_growth_candidates", &Model::clear_growth_candidates)
+        .def_prop_ro("growth_candidate_count", &Model::growth_candidate_count)
         .def("loss_and_grad", [](const Model &model, const Ray3f &ray,
                  const Color3f &reference_rgb, const Float &reference_alpha,
                  const Color3f &background, const Float &inverse_pdf,
@@ -98,6 +113,10 @@ MI_PY_EXPORT(VoxelReconstruction) {
             result["loss"] = values.loss;
             result["gradients"] = values.gradients;
             for (const auto &[key, value] : values.counters)
+                result[nb::str(key.c_str())] = value;
+            for (const auto &[key, value] : values.growth_sums)
+                result[nb::str(key.c_str())] = value;
+            for (const auto &[key, value] : values.growth_counts)
                 result[nb::str(key.c_str())] = value;
             if (!values.stage_profile.empty())
                 result["stage_profile"] = values.stage_profile;
@@ -131,5 +150,6 @@ MI_PY_EXPORT(VoxelReconstruction) {
         }, "Return flat arrays (voxel-major, quaternion wxyz, SH coefficient then RGB). "
            "Treat these arrays as read-only.");
     cls.attr("rgb_only_version") = nb::int_(Model::rgb_only_version);
+    cls.attr("rgb_growth_version") = nb::int_(Model::rgb_growth_version);
     drjit::bind_traverse(cls);
 }

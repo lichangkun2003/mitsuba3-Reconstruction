@@ -1,8 +1,8 @@
 体素重建训练、保存与评价
 ======================
 
-阶段 1：RGB-only 训练（当前默认）
---------------------------------
+RGB-only 训练与在线生长（当前默认）
+----------------------------------
 
 本阶段从新的初始化开始，使用 800 × 800、每像素 1 spp、总计 700 个 epoch。
 每个 epoch 遍历全部训练视角；单卡和双卡使用相同总轮数及 coarse-to-fine 调度。
@@ -21,10 +21,13 @@
    CONFIG.gradient.background_carve_weight = 0
    CONFIG.gradient.geometry_transition_only = False
    CONFIG.gradient.geometry_two_sided_boundary = False
-   CONFIG.topology.enable_growth = False
+   CONFIG.topology.enable_growth = True
    CONFIG.topology.enable_deletion = False
    CONFIG.topology.use_growth_evidence = False
-   CONFIG.schedule.enable_coarse_growth = False
+   CONFIG.topology.use_rgb_growth = True
+   CONFIG.topology.growth_warmup_epochs = 20
+   CONFIG.topology.growth_fine_warmup_epochs = 20
+   CONFIG.schedule.enable_coarse_growth = True
    CONFIG.contour.enabled = False
 
 损失仅为线性 RGB 的平方误差。读取 RGBA 图片时先按白底合成一次，随后只保留三个 RGB
@@ -41,12 +44,84 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 本阶段仍使用 1 spp 的同样本残差，尚未实现多 spp 前缀估计器，也不声明其对无限采样
 平均图像 RGB 目标无偏。
 
-训练关闭生长和删除，但保留分辨率调度及父体到子体的分裂。分裂沿用已有拟合与 opacity
-衰减规则，可能改变前向图像，不能视为严格保持渲染结果。RGB-only 去掉了 alpha 约束，
-RGB loss 的下降本身不能证明几何或 opacity 唯一可辨识。
+训练启用下面的 RGB 生长，继续关闭删除，保留已有分辨率调度及父体到子体的分裂。
+分裂仍使用原有拟合与 opacity 衰减规则，本次不修改。分裂可能改变前向图像，不能视为严格
+保持渲染结果。RGB-only 去掉了 alpha 约束，RGB loss 的下降本身不能证明几何或 opacity
+唯一可辨识。要复现之前的无生长基线，同时关闭 ``topology.enable_growth``、
+``topology.use_rgb_growth`` 和 ``schedule.enable_coarse_growth``。
+
+在线 RGB 生长：复用训练前向，不增加验证渲染
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+当前 RGB-only 实验用 RGB 收益投票替换旧的前景／背景 alpha 投票。
+几何候选保留原规则：目标空格、26 邻域、有限面／棱／角接触、至少 0.05 个体素宽度的
+外伸、同一空格至少两个合法父体支持，以及成熟期与冷却条件。
+这些规则仅提出位置，不将“周围有体素”当作缺洞的证明。
+候选几何沿用原初始化，颜色继承父体 radiance DC、其余 SH 为零，初始 opacity 为 0.5；
+这些候选参数在一次证据事件中冻结，提交时使用同一组参数。
+
+粗层和每个细层开始后的前 20 轮冻结生长。以层内完成轮数计数，冻结后再按 10 轮间隔
+安排证据事件，因此两类层级的第一次事件均在层内第 30 轮，之后为第 40、50 等轮。
+仅事件轮在正常训练前向中收集证据；其他轮不安装候选。升层时重置层内计数和候选证据，
+升层边界及整个训练的最后一轮不再生长。若层级预算不够 30 轮，该层不会生长。
+生长 warmup 与优化器的 opacity warmup 是两个独立配置。
+
+在需要证据的轮次，正常 DDA 经过候选空格时额外检查候选椭球相交，并记录该位置前的
+合成 RGB ``P`` 和透射率 ``T``。候选并不参与当前渲染、真实命中计数或训练梯度。
+利用同次前向的最终颜色 ``C``、候选颜色 ``r``、opacity ``a``，计算单个候选的虚拟增量：
+
+.. code-block:: text
+
+   delta = a * (T * r - (C - P))
+   gain  = -2 * dot(C - reference_rgb, delta) - dot(delta, delta)
+
+它等于该固定候选单独插入时的同样本 RGB 平方误差减少量，包含候选对后方颜色的遮挡。
+这里不重新发射射线，不调用第二次整图前向，也不在提交前补一次确认渲染。
+需要额外的候选相交、临时记录和 GPU 归约计算，不能将其描述为零开销。
+训练仍为 1 spp；收益是有噪声的单样本证据，不宣称对无限采样平均颜色的平方误差无偏。
+
+完整视角先累加带符号收益，再按完整视角的像素数归一化；不同分批或 GPU 分片先 SUM
+合并收益与计数，再进行一次视角投票，不能各分片先投票。正收益为支持，负收益为反对，
+接近零或没有命中为中性。除了票数，还检查带符号的平均收益，不能仅靠很多微小正票
+掩盖严重负收益。整个流程不读取参考 alpha、不按 RGB 是否接近白色分类射线。
+
+射线达到实际命中上限、透射率提前终止，或候选记录容量溢出时，可能无法获得完整的
+候选后方信息。此时记录 ``growth_unknown``，不额外追踪补齐。对一个候选，只要某视角
+出现这样的未知记录，该视角整票弃权，避免只统计同视角中有利的已知射线。
+此规则较保守，低透射率或复杂层叠区域可能缺少有效证据；未知不能当作反对票。
+即使原射线完整，插入候选后可能触发命中上限或透射率终止时也保守弃权。
+例如当前候选初始 opacity 为 0.5，会将后方透射率再减半，可能使有用候选也因不满足
+完整路径条件而失去该视角的票；这需要在真实实验中结合未知计数检查。
+当前仅支持均匀训练采样；原生证据遇到非单位采样权重同样弃权，不用于 contour 模式。
+
+配置集中在 ``train.py`` 顶部及 ``topology`` 配置组，以下是首版实验参数，不是理论保证：
+
+.. code-block:: python
+
+   CONFIG.topology.growth_warmup_epochs = 20
+   CONFIG.topology.growth_fine_warmup_epochs = 20
+   CONFIG.topology.growth_max_candidates = 1024
+   CONFIG.topology.growth_max_new_voxels = 128
+   CONFIG.topology.growth_rgb_min_support_views = 3
+   CONFIG.topology.growth_rgb_max_conflict_views = 2
+   CONFIG.topology.growth_rgb_gain_epsilon = 1e-7
+   CONFIG.topology.growth_rgb_min_mean_gain = 1e-7
+   CONFIG.gradient.max_growth_hits = 8
+
+候选总数及每次新增数量有限，并继续遵守 ``topology.max_active_voxels``。
+候选在 GPU 上逐视角累积票数与收益，事件结束时才读取候选统计进行决策；安装候选和
+拓扑更新仍有 CPU 几何准备、状态快照与传输。没有每视角整图回读来进行生长投票。
+通过后正常优化新体素的几何、radiance SH 与 DC opacity，新生体素按原成熟期等待后
+才能继续成为父体。当前不新增 RGB-only 删除规则。
+
+单个候选收益不是多个候选同时加入的联合收益；有限批量提交仍可能出现候选相互遮挡、
+外层增厚或多层低 opacity 雾化。现有 RGB 优化可以降低错误候选的 opacity，但不保证
+一定淘汰它们。应通过生长数量、有效／未知证据、损失及图像对照评估此次实验。
+分裂保持不变，也不能用本次生长规则声称 RGB 已唯一确定几何。
 
 同步源码后必须重新编译 C++ 与 Python 绑定；RGB-only 启动会检查
-``mi.VoxelReconstruction.rgb_only_version``，旧二进制不能只更新 Python 后继续使用。
+``mi.VoxelReconstruction.rgb_only_version``，启用生长还要求 ``rgb_growth_version >= 1``；
+旧二进制不能只更新 Python 后继续使用。
 从仓库目录启动新的单卡实验：
 
 .. code-block:: bash
@@ -67,6 +142,14 @@ RGB loss 的下降本身不能证明几何或 opacity 唯一可辨识。
 两条命令都自动创建新的实验目录。需要短跑时添加 ``--stop-after-epochs 10``，保持
 ``--epochs 700``，避免改变完整调度。训练后的 64 spp 只用于评价出图，不改变训练 spp。
 双卡平台要求和资源分配方式见下文“同节点两张 GPU 训练与评价”。
+十轮只检查正常训练路径，不会触发默认 warmup 后的生长；检查第一次生长应改用
+``--stop-after-epochs 31 --skip-evaluation``。从仓库根目录执行 Windows 短跑：
+
+.. code-block:: powershell
+
+   & '..\envs\mitsuba\Scripts\python.exe' -I .\experiments\reconstruction\train.py `
+     --rgb-only --dataset datasets/lego --epochs 700 --chunk-size 0 `
+     --stop-after-epochs 31 --skip-evaluation --no-profile-stages
 
 已有 alpha 监督 checkpoint 禁止切换为 RGB-only 后续训，包含没有记录
 ``training.rgb_only`` 的旧 checkpoint；应从初始化开始新的 RGB-only 实验。
@@ -81,12 +164,18 @@ RGB-only checkpoint 同样不能切回旧监督模式。旧模型仍可通过
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_only.py
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_growth.py
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_growth_lifecycle.py
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_growth_training.py
 
 该测试不打开真实数据集或既有实验，覆盖参考 alpha 不变性、RGB L2 的颜色与 opacity
 有限差分、白色目标及 miss 的几何梯度、DC opacity、三通道缓存、1 → 2 分裂及负 loss
 拒绝。负平方误差会直接报错，不会被 clamp 为零；这项检查不能替代对双卡归约异常的调查。
-下文保留通用运行细节与旧实现说明，其中 alpha 监督、contour、生长、删除及 1000 轮示例
-属于 legacy 配置；本阶段以本节及当前 ``CONFIG`` 为准。
+RGB 生长测试另外使用小型合成场景，对照显式插入候选的独立渲染验证虚拟收益，检查
+正／负／中性证据、参考 alpha 不变性、原图与梯度不变性、截断弃权、分片求和，以及
+粗细层 warmup。测试中的独立渲染仅是数值验证的参照，训练投票不执行这些额外渲染。
+下文保留通用运行细节与旧实现说明，其中 alpha 监督、contour、旧生长／删除及 1000 轮
+示例属于 legacy 配置；当前实验以本节及当前 ``CONFIG`` 为准。
 
 单卡训练入口为 ``experiments/reconstruction/train.py``，实验性的同节点双卡启动器为
 ``experiments/reconstruction/train_multigpu.py``，评价入口为
@@ -289,15 +378,18 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 命中、未命中与淘汰次数从本次进程开始累计，未命中表示实际调用了图片读取流程。
 关闭缓存时所有访问均为未命中，驻留图片数及字节数保持零。
 
-默认 ``training.gpu_reference_cache_mib=1024`` 将线性 RGB 和 alpha 的四个 float32
-通道另外保存在 GPU，整图直接复用，分批则在 GPU 上读取对应像素。使用
+默认 ``training.gpu_reference_cache_mib=1024`` 将参考图另外保存在 GPU：当前 RGB-only
+使用三个 float32 通道，legacy 模式额外保留参考 alpha，共四通道。
+整图直接复用，分批则在 GPU 上读取对应像素。使用
 ``--gpu-reference-cache-mib 2048`` 调整容量，或 ``--gpu-reference-cache-mib 0``
 恢复原来的逐视角上传；CPU 缓存开关不受影响。容量不足时按最近使用顺序淘汰，单图超过
-总容量则使用原上传路径。两个缓存都开启时，100 张 800 × 800 图分别占约 976.6 MiB
-内存和显存。这里限制的是缓存持有图像的逻辑字节数，不包括 Dr.Jit 分配器保留的空间、
+总容量则使用原上传路径。两个缓存都开启时，100 张 800 × 800 图在 RGB-only 下分别占约
+732.4 MiB 内存和显存，legacy RGBA 为 976.6 MiB。这里限制的是缓存持有图像的逻辑字节数，
+不包括 Dr.Jit 分配器保留的空间、
 仍被正在执行的调用引用的淘汰数组，以及模型、梯度和射线记录；不能据此推断显存峰值。
 
-CPU 参考图仍用于 contour 和生长证据。子像素随机采样继续使用原 NumPy 随机数流，
+legacy 模式的 CPU 参考图仍用于 contour 和旧生长证据；当前 RGB 生长直接复用原生前向
+的参考 RGB 与渲染结果，不另读 CPU 参考图投票。子像素随机采样继续使用原 NumPy 随机数流，
 偏移和需要时的 PDF 权重仍需上传；显存缓存只省掉固定参考图的重复上传，不改变采样、
 损失、梯度或逐视角更新。缓存不写入 checkpoint，恢复进程重新填充，并在自动评价前释放。
 ``gpu_reference_cache`` 随逐轮日志、训练报告及性能汇总记录容量、驻留字节数、图片数、
@@ -349,12 +441,14 @@ CPU 参考图仍用于 contour 和生长证据。子像素随机采样继续使�
 * 原生 ``set_parameters()`` 对本次更新的参数组先合并有限值检查，正常路径只读取一次
   校验标志；失败时再定位具体参数组，且全部检查通过前不改变模型。
 * 原始 ``raw_alpha`` 只在 contour 采样器实际产生更新 token 时回读，用于更新采样历史。
-* 概率校正后的 alpha 只在本轮需要收集生长证据时分配，训练入口直接传给 GPU 投票，
+* legacy 模式中，概率校正后的 alpha 只在本轮需要收集旧生长证据时分配，训练入口直接传给 GPU 投票，
   不再先下载整张图。参考 alpha 复用 GPU 参考缓存；缓存关闭时按需上传。
 * 删除证据在 GPU 的跨视角 bitset 中累积，同一相机重复命中仍只计一次。
   到证据窗口边界才统计唯一视角数并交给原来的候选判定；保存、恢复和体素重排保持原状态格式。
-* 生长证据的七个冻结采样点上传一次，各视角在 GPU 上投影并投票，在 epoch 边界取回票数。
+* legacy 生长证据的七个冻结采样点上传一次，各视角在 GPU 上投影并投票，在 epoch 边界取回票数。
   背景否决、前景支持门槛和完整视角集合检查保留。contour 的历史更新仍使用原 CPU 路径。
+* 当前 RGB 生长不走上述 alpha／七点投影路径；它在同次训练前向中计算每候选收益，
+  GPU 上累计完整视角票数，到生长轮结束才读取候选级统计。
 
 这些调整不在训练的每个视角或每个 epoch 内出图。完成全部训练并保存最终模型后，
 训练入口调用评价脚本共用的流程，生成多 spp 图片和 PSNR。
@@ -362,7 +456,8 @@ CPU 参考图仍用于 contour 和生长证据。子像素随机采样继续使�
 拓扑证据与候选复核的性能对照
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-GPU 删除证据和生长投票自动用于训练入口，旧的 NumPy 输入路径保留为数值对照。
+本小节记录此前 legacy alpha 生长／删除路径的性能优化；当前 RGB 在线生长的定义见文首。
+legacy 模式的 GPU 删除证据和生长投票自动用于训练入口，旧的 NumPy 输入路径保留为数值对照。
 epoch 结束后，先检查冻结生长提案的票数，只对通过投票的目标格及其所有必要邻居
 复核当前几何。支持父体素本身不必通过投票；冷却期、等待期、已占用格、支持数、
 背景否决及确定性胜者顺序保持原规则。投票未通过时不再全量重建候选。
@@ -371,11 +466,13 @@ epoch 结束后，先检查冻结生长提案的票数，只对通过投票的�
 ``training.jsonl`` 的 ``topology_execution``、``training-report.json`` 的同名字段及
 ``performance-summary.json`` 的 ``details.topology_execution`` 记录本次进程累计的
 GPU/CPU 证据处理视角数和实际边界回读字节数。读取这些计数不会同步 GPU。
-正常训练启用删除/生长时，分别检查 ``deletion_device_views`` / ``growth_device_views`` 增长；
+legacy 训练启用删除/生长时，分别检查 ``deletion_device_views`` / ``growth_device_views`` 增长；
 没有启用的步骤保持零。阶段耗时仍是包含异步等待的墙钟时间。
+当前 RGB 生长对应 ``rgb_growth_device_views``、``rgb_growth_cpu_views`` 和
+``rgb_growth_readback_bytes``，不要用旧 alpha 生长计数判断 RGB 生长是否执行。
 
-这次优化没有修改原生 C++ 接口；已有源码构建匹配当前原生代码时无需重新编译。
-新默认 RGB 第一阶段本身关闭生长和删除，不能用它与旧 alpha 监督实验比较提速。
+此前这一性能优化没有修改原生接口，但当前新增在线 RGB 生长修改了 C++ 与绑定，必须重新编译。
+当前默认 RGB 生长与旧 alpha 生长算法不同，不能直接将它们的耗时差解释为同算法提速。
 要比较刚才的 512 阶段，可在同样的双卡分配中从旧实验保存点继续若干轮，保留全部算法设置：
 
 .. code-block:: bash
@@ -826,7 +923,9 @@ contour 提案，每张卡计算各自不重叠的半幅像素。每个像素仍
 
 rank 0 负责实验目录、日志、拓扑生长/删除/升层及 checkpoint；
 拓扑改变后将模型与 Adam 状态同步给 rank 1，并清除旧的原生重放记录。需要 contour
-历史或生长证据时，额外合并预测 alpha；普通轮次不因此回读完整 RGB 图像。
+历史或 legacy 生长证据时，额外合并预测 alpha；当前 RGB 生长只合并候选级
+``growth_gain``、``growth_observed``、``growth_unknown``，然后由 rank 0 投一次完整视角票。
+普通轮次不因此回读完整 RGB 图像。
 
 完整训练结束后，两个进程继续执行最终 train/test 评价，默认仍为每个划分前十个视角、
 每视角 64 spp。评价把已选中的 train/test 视角合并为任务列表，再交错分给两个 rank；

@@ -229,6 +229,19 @@ class NcclCollective:
         global_finite = prepare(finite, _NCCL_UINT32, _NCCL_MIN)
         global_raw = prepare(mi.Float(raw_alpha), _NCCL_FLOAT32, _NCCL_SUM) if raw_alpha is not None else None
         global_alpha = prepare(mi.Float(alpha), _NCCL_FLOAT32, _NCCL_SUM) if alpha is not None else None
+        # Candidate IDs are broadcast once per growth window. Combine every
+        # pixel shard before the primary rank classifies a full-view RGB vote.
+        growth_keys = ("growth_gain", "growth_observed", "growth_unknown")
+        present = [key in accumulator for key in growth_keys]
+        if any(present) and not all(present):
+            raise ValueError("Growth reductions require gain, observed and unknown arrays together")
+        global_growth = {}
+        if all(present):
+            if len({int(dr.width(accumulator[key])) for key in growth_keys}) != 1:
+                raise ValueError("Growth evidence arrays must share candidate IDs and lengths")
+            for key in growth_keys:
+                dtype = _NCCL_FLOAT32 if key == "growth_gain" else _NCCL_UINT32
+                global_growth[key] = prepare(accumulator[key], dtype, _NCCL_SUM)
         # Keep sources, destinations, and packed owners alive through the final
         # stream wait. Both JIT work and NCCL enqueue into the same stream.
         dr.eval(*[array for source, destination, _, _ in operations for array in (source, destination)])
@@ -259,6 +272,7 @@ class NcclCollective:
             result = {"gradients": self._unpack(global_gradients, GRADIENT_KEYS, gradient_widths, mi.Float)}
             result.update(self._unpack(global_validity, SUM_COUNTER_KEYS, validity_widths, mi.UInt32))
             result.update(self._unpack(global_evidence, MAX_COUNTER_KEYS, evidence_widths, mi.UInt32))
+            result.update(global_growth)
             self._stats["views"] += 1
             self._stats["calls"] += len(descriptors)
             self._stats["payload_bytes"] += sum(width * 4 for _, _, width, _, _ in descriptors)

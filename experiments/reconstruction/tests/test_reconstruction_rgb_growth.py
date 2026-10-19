@@ -1,0 +1,365 @@
+"""Generated CUDA checks for online, single-traversal RGB growth evidence.
+
+The separately rendered candidate-inserted models below are test oracles only:
+the training evidence implementation must not perform those extra renders.
+No dataset, existing output, or long training run is used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
+from pathlib import Path
+import sys
+import tempfile
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from preview import RuntimeConfig
+from reconstruction_common import initialize_runtime, restore_model
+from reconstruction_growth_rgb import initialize_statistics, observe_numpy, RGBGrowthEvidenceDevice
+from reconstruction_replay import NativeLossReplay
+from reconstruction_topology import CoarseToFineConfig, TopologyManager, TopologySettings
+
+
+Y00 = 1. / (2. * math.sqrt(math.pi))
+
+
+def state(np, cells, colors=None, opacities=None):
+    count = len(cells)
+    colors = [[.2, .4, .6]] * count if colors is None else colors
+    opacities = [.35] * count if opacities is None else opacities
+    return {
+        "cell_indices": np.asarray(cells, dtype=np.uint32),
+        "centers": np.tile([.5, .5, .5], count).astype(np.float32),
+        "log_scales": np.full(count * 3, math.log(.4), dtype=np.float32),
+        "rotations": np.tile([1., 0., 0., 0.], count).astype(np.float32),
+        "radiance_sh": np.asarray(colors, dtype=np.float32).ravel() / Y00,
+        "opacity_sh": np.asarray([math.log(a / (1. - a)) / Y00 for a in opacities],
+                                  dtype=np.float32),
+    }
+
+
+def payload(np, cells=(16, 48)):
+    return {"model_metadata": {"resolution": 4, "grid_min": [0.] * 3,
+                               "grid_max": [4.] * 3, "sh_count": 1,
+                               "opacity_sh_count": 1},
+            "model_state": state(np, cells)}
+
+
+def device_state(values, mi):
+    return {name: (mi.UInt32(value) if name == "cell_indices" else mi.Float(value))
+            for name, value in values.items()}
+
+
+def ray_at(mi, x=.5):
+    ray = mi.Ray3f(mi.Point3f(x, .5, -1.), mi.Vector3f(0., 0., 1.))
+    ray.maxt = 8.
+    return ray
+
+
+def evaluate(model, ray, target, mi, dr, *, enabled=True, alpha=0., weight=1., **settings):
+    options = {"rgb_only": 1., "collect_growth_evidence": float(enabled),
+               "max_growth_hits": 8., "max_hits": 16., "transmittance_threshold": .0001}
+    options.update(settings)
+    result = model.loss_and_grad(ray, mi.Color3f(target), mi.Float(alpha),
+                                 mi.Color3f(1.), mi.Float(weight), options)
+    dr.eval(result)
+    dr.sync_thread()
+    return result
+
+
+def rendered(model, ray, mi, dr, np):
+    result = model.trace(ray, mi.Color3f(1.), .0001, 16)
+    dr.eval(result)
+    dr.sync_thread()
+    return np.asarray(result[0], dtype=np.float64).reshape(3, -1)
+
+
+def inserted(base, proposals, index, np, mi):
+    checkpoint = copy.deepcopy(base)
+    dimensions = {"cell_indices": 1, "centers": 3, "log_scales": 3,
+                  "rotations": 4, "radiance_sh": 3, "opacity_sh": 1}
+    for name, dimension in dimensions.items():
+        selected = proposals[name][index * dimension:(index + 1) * dimension]
+        checkpoint["model_state"][name] = np.concatenate((checkpoint["model_state"][name], selected))
+    return restore_model(checkpoint, mi)
+
+
+def assert_baseline_equal(first, second, np):
+    for name in ("rgb", "raw_rgb", "alpha", "raw_alpha", "hit_count", "loss",
+                 "appearance_valid", "geometry_valid", "background_carve_valid",
+                 "foreground_evidence", "background_evidence"):
+        np.testing.assert_array_equal(np.asarray(first[name]), np.asarray(second[name]), err_msg=name)
+    for name, values in first["gradients"].items():
+        np.testing.assert_array_equal(np.asarray(values), np.asarray(second["gradients"][name]),
+                                      err_msg=f"gradients.{name}")
+
+
+def check_counterfactual_and_invariance(mi, dr, np):
+    base = payload(np)
+    model = restore_model(base, mi)
+    proposals = state(np, [0, 32], [[.1, .8, .2], [.7, .15, .3]], [.45, .55])
+    ray = ray_at(mi)
+    target = np.asarray([.3, .6, .4], dtype=np.float64)
+    baseline = evaluate(model, ray, target.tolist(), mi, dr, enabled=False)
+    original_trace = rendered(model, ray, mi, dr, np)
+    model.set_growth_candidates(device_state(proposals, mi))
+    assert int(model.growth_candidate_count) == 2 and int(model.active_voxel_count) == 2
+    result = evaluate(model, ray, target.tolist(), mi, dr)
+    assert_baseline_equal(baseline, result, np)
+    assert_baseline_equal(baseline, evaluate(model, ray, target.tolist(), mi, dr, enabled=False), np)
+    np.testing.assert_array_equal(rendered(model, ray, mi, dr, np), original_trace)
+    expected = []
+    baseline_loss = float(np.sum((original_trace[:, 0] - target) ** 2))
+    for index in range(2):
+        rgb = rendered(inserted(base, proposals, index, np, mi), ray, mi, dr, np)[:, 0]
+        expected.append(baseline_loss - float(np.sum((rgb - target) ** 2)))
+    np.testing.assert_allclose(np.asarray(result["growth_gain"]), expected, atol=3e-7, rtol=3e-5)
+    np.testing.assert_array_equal(np.asarray(result["growth_observed"]), [1, 1])
+    np.testing.assert_array_equal(np.asarray(result["growth_unknown"]), [0, 0])
+    for alpha in (0., .5, 1.):
+        alternate = evaluate(model, ray, target.tolist(), mi, dr, alpha=alpha)
+        assert_baseline_equal(result, alternate, np)
+        for name in ("growth_gain", "growth_observed", "growth_unknown"):
+            np.testing.assert_array_equal(np.asarray(result[name]), np.asarray(alternate[name]), err_msg=name)
+    model.clear_growth_candidates()
+    assert int(model.growth_candidate_count) == 0
+    np.testing.assert_array_equal(rendered(model, ray, mi, dr, np), original_trace)
+    assert_baseline_equal(baseline, evaluate(model, ray, target.tolist(), mi, dr), np)
+    return {"virtual_insertion_matches_separate_render_oracle": "passed",
+            "prefix_and_nonwhite_suffix": "passed", "baseline_trace_and_gradients_unchanged": "passed",
+            "growth_ignores_reference_alpha": "passed"}
+
+
+def check_positive_negative_neutral(mi, dr, np):
+    base = payload(np, [16])
+    model = restore_model(base, mi)
+    proposals = state(np, [32], [[.1, .2, .3]], [.4])
+    ray = ray_at(mi)
+    before = rendered(model, ray, mi, dr, np)[:, 0]
+    after = rendered(inserted(base, proposals, 0, np, mi), ray, mi, dr, np)[:, 0]
+    model.set_growth_candidates(device_state(proposals, mi))
+    positive = evaluate(model, ray, after.tolist(), mi, dr)
+    negative = evaluate(model, ray, before.tolist(), mi, dr)
+    assert float(np.asarray(positive["growth_gain"])[0]) > 1e-4
+    assert float(np.asarray(negative["growth_gain"])[0]) < -1e-4
+    neutral = state(np, [32], [[1., 1., 1.]], [.4])
+    model.set_growth_candidates(device_state(neutral, mi))
+    result = evaluate(model, ray, [0., 0., 0.], mi, dr)
+    np.testing.assert_allclose(np.asarray(result["growth_gain"]), 0., atol=2e-7)
+    np.testing.assert_array_equal(np.asarray(result["growth_observed"]), 1)
+    miss = evaluate(model, ray_at(mi, 1.5), [0., 0., 0.], mi, dr)
+    for name in ("growth_gain", "growth_observed", "growth_unknown"):
+        np.testing.assert_array_equal(np.asarray(miss[name]), 0, err_msg=name)
+    return {"helpful_harmful_and_color_matched_neutral_candidates": "passed",
+            "unobserved_ray_is_neutral": "passed"}
+
+
+def check_empty_baseline(mi, dr, np):
+    base = payload(np, [])
+    model = restore_model(base, mi)
+    proposals = state(np, [0])
+    model.set_growth_candidates(device_state(proposals, mi))
+    target = [.2, .3, .4]
+    result = evaluate(model, ray_at(mi), target, mi, dr)
+    rgb = rendered(inserted(base, proposals, 0, np, mi), ray_at(mi), mi, dr, np)[:, 0]
+    expected = np.sum((1. - np.asarray(target)) ** 2) - np.sum((rgb - target) ** 2)
+    np.testing.assert_allclose(np.asarray(result["growth_gain"]), expected, atol=4e-7, rtol=3e-6)
+    np.testing.assert_array_equal(np.asarray(result["growth_observed"]), 1)
+    np.testing.assert_array_equal(np.asarray(result["hit_count"]), 0)
+    assert int(model.active_voxel_count) == 0
+    return {"hypothetical_candidate_in_empty_native_model": "passed"}
+
+
+def check_partial_paths(mi, dr, np):
+    model = restore_model(payload(np), mi)
+    proposals = state(np, [0, 32])
+    model.set_growth_candidates(device_state(proposals, mi))
+    for options in ({"max_hits": 1.}, {"transmittance_threshold": .8}, {"max_growth_hits": 1.}):
+        result = evaluate(model, ray_at(mi), [.1, .2, .3], mi, dr, **options)
+        np.testing.assert_array_equal(np.asarray(result["growth_observed"]), 0)
+        np.testing.assert_array_equal(np.asarray(result["growth_gain"]), 0.)
+        assert int(np.sum(np.asarray(result["growth_unknown"]))) > 0, options
+    return {"hit_cap_early_stop_and_candidate_overflow_abstain": "passed"}
+
+
+def check_shards_and_candidate_validation(mi, dr, np):
+    model = restore_model(payload(np), mi)
+    proposals = state(np, [0, 32])
+    model.set_growth_candidates(device_state(proposals, mi))
+    xs, weights = [.45, .55, 1.5], [1., 1., 1.]
+    combined = evaluate(model, ray_at(mi, mi.Float(xs)), [.2, .3, .4], mi, dr, weight=weights)
+    partials = [evaluate(model, ray_at(mi, x), [.2, .3, .4], mi, dr, weight=w)
+                for x, w in zip(xs, weights)]
+    for name in ("growth_gain", "growth_observed", "growth_unknown"):
+        expected = sum(np.asarray(value[name]) for value in partials)
+        np.testing.assert_allclose(np.asarray(combined[name]), expected, atol=2e-7, rtol=3e-6)
+    assert np.any(np.abs(np.asarray(combined["growth_gain"])) > 1e-6)
+    weighted = evaluate(model, ray_at(mi), [.2, .3, .4], mi, dr, weight=2.)
+    np.testing.assert_array_equal(np.asarray(weighted["growth_observed"]), 0)
+    np.testing.assert_array_equal(np.asarray(weighted["growth_unknown"]), 1)
+    original = rendered(model, ray_at(mi), mi, dr, np)
+    malformed = []
+    for cells in ([16], [64], [0, 0]):
+        malformed.append(state(np, cells))
+    wrong_size = state(np, [0])
+    wrong_size["centers"] = wrong_size["centers"][:2]
+    malformed.append(wrong_size)
+    nonfinite = state(np, [0])
+    nonfinite["opacity_sh"][0] = np.nan
+    malformed.append(nonfinite)
+    for candidate in malformed:
+        try:
+            model.set_growth_candidates(device_state(candidate, mi))
+        except (RuntimeError, ValueError):
+            pass
+        else:
+            raise AssertionError("An invalid growth overlay was accepted")
+        assert int(model.growth_candidate_count) == 2
+        np.testing.assert_array_equal(rendered(model, ray_at(mi), mi, dr, np), original)
+    model.clear_growth_candidates()
+    model.clear_growth_candidates()
+    assert int(model.growth_candidate_count) == 0
+    return {"pixel_shards_sum_before_view_voting": "passed",
+            "nonuniform_sample_weights_abstain": "passed",
+            "invalid_candidate_setter_preserves_model_and_overlay": "passed"}
+
+
+def check_warmup():
+    settings = TopologySettings(enable_growth=True, enable_deletion=False,
+                                use_growth_evidence=False, use_rgb_growth=True)
+    schedule = CoarseToFineConfig(start_resolution=4, target_resolution=8, total_epochs=200)
+    manager = TopologyManager(SimpleNamespace(resolution=4, active_voxel_count=2), 4, settings, schedule)
+    assert settings.growth_warmup_epochs == settings.growth_fine_warmup_epochs == 20
+    assert not any(manager._growth_due(boundary) for boundary in range(1, 30))
+    assert manager._growth_due(30) and manager._growth_due(40)
+    assert not manager.needs_rendered_alpha(29)
+    assert not manager._growth_due(manager.level_budget), "No growth on the refinement boundary"
+    manager.resolution = 8
+    manager.level_start_epoch = manager.budgets[4]
+    for local in range(1, 30):
+        assert not manager._growth_due(manager.level_start_epoch + local)
+    assert manager._growth_due(manager.level_start_epoch + 30)
+    assert not manager._growth_due(manager.level_start_epoch + manager.level_budget)
+    manager.settings.enable_growth = False
+    assert not manager._growth_due(manager.level_start_epoch + 30)
+    return {"coarse_and_fine_20_epoch_warmup_first_event_30": "passed",
+            "refine_and_final_boundaries_do_not_grow": "passed"}
+
+
+def vote_fixture(np):
+    pending = {"cells": np.arange(5)}
+    initialize_statistics(pending, np)
+    # Positive, negative, unknown despite a positive known subset, no hit,
+    # and a nonfinite result. Only the first two are eligible view votes.
+    out = {"growth_gain": np.asarray([4., -3., 20., 0., np.nan], np.float32),
+           "growth_observed": np.asarray([2, 5, 4, 0, 1], np.uint32),
+           "growth_unknown": np.asarray([0, 0, 1, 0, 0], np.uint32)}
+    return pending, out
+
+
+def check_view_votes_numpy():
+    import numpy as np
+    pending, out = vote_fixture(np)
+    observe_numpy(pending, out, 100, .01, np)
+    np.testing.assert_array_equal(pending["support_views"], [1, 0, 0, 0, 0])
+    np.testing.assert_array_equal(pending["conflict_views"], [0, 1, 0, 0, 0])
+    np.testing.assert_array_equal(pending["observed_views"], [1, 1, 0, 0, 0])
+    np.testing.assert_array_equal(pending["unknown_views"], [0, 0, 1, 0, 0])
+    np.testing.assert_array_equal(pending["invalid_views"], [0, 0, 0, 0, 1])
+    np.testing.assert_allclose(pending["gain_sum"], [.04, -.03, 0., 0., 0.], atol=1e-8)
+    # Divide by full-image pixels, not observed rays; otherwise a tiny
+    # favorable subset could receive a larger vote than a broad harmful one.
+    assert pending["gain_sum"][0] != out["growth_gain"][0] / out["growth_observed"][0]
+    return {"full_image_normalization_signed_votes_and_whole_view_abstention": "passed"}
+
+
+def check_view_votes_device(mi, dr, np):
+    pending, out = vote_fixture(np)
+    expected = copy.deepcopy(pending)
+    gpu = RGBGrowthEvidenceDevice(pending, mi.Float, mi.UInt32, dr, np)
+    device_out = {name: (mi.Float(value) if name == "growth_gain" else mi.UInt32(value))
+                  for name, value in out.items()}
+    for _ in range(2):
+        observe_numpy(expected, out, 100, .01, np)
+        gpu.observe(device_out, 100, .01)
+    actual = gpu.materialize()
+    for name, values in actual.items():
+        np.testing.assert_allclose(values, expected[name], atol=1e-8, rtol=2e-6, err_msg=name)
+    return {"GPU_vote_accumulation_matches_CPU_reference": "passed"}
+
+
+def check_native_replay(mi, dr, np):
+    model = restore_model(payload(np), mi)
+    replay = NativeLossReplay(dr)
+    options = {"rgb_only": 1., "collect_growth_evidence": 1., "max_growth_hits": 8.,
+               "max_hits": 16., "transmittance_threshold": .0001}
+    ray, target = ray_at(mi), mi.Color3f(.2, .3, .4)
+
+    def compare_current(*, request_empty=False):
+        options["collect_growth_evidence"] = float(request_empty or model.growth_candidate_count > 0)
+        arguments = (ray, target, mi.Float(0.), mi.Color3f(1.), mi.Float(1.), options)
+        direct = model.loss_and_grad(*arguments)
+        dr.eval(direct)
+        for _ in range(2):
+            recorded = replay(model, *arguments)
+            dr.eval(recorded)
+            dr.sync_thread()
+            assert_baseline_equal(direct, recorded, np)
+            for name in ("growth_gain", "growth_observed", "growth_unknown"):
+                if name in direct:
+                    np.testing.assert_allclose(np.asarray(direct[name]), np.asarray(recorded[name]),
+                                               atol=2e-7, rtol=3e-6, err_msg=name)
+        return direct
+
+    compare_current()  # Normal training before any growth overlay was installed.
+    compare_current(request_empty=True)  # Safe direct bypass for zero-sized evidence outputs.
+    proposals = state(np, [0, 32])
+    model.set_growth_candidates(device_state(proposals, mi))
+    replay.clear()
+    before = compare_current()
+    proposals["radiance_sh"] *= .25
+    model.set_growth_candidates(device_state(proposals, mi))
+    replay.clear()  # Driver must invalidate after replacing even the same count.
+    after = compare_current()
+    assert np.any(np.abs(np.asarray(before["growth_gain"]) - np.asarray(after["growth_gain"])) > 1e-6)
+    model.clear_growth_candidates()
+    replay.clear()
+    compare_current()
+    assert replay.statistics()["replays"] >= 4
+    assert replay.statistics()["bypasses"] >= 2
+    return {"direct_vs_frozen_native_with_growth_enabled_and_disabled": "passed",
+            "empty_requested_growth_outputs_use_safe_direct_path": "passed",
+            "same_count_candidate_replace_and_clear_replay_invalidation": "passed"}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--build-dir", default=RuntimeConfig().build_dir)
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--cpu-only", action="store_true", help="Check scheduling without loading CUDA")
+    args = parser.parse_args()
+    checks = [check_warmup(), check_view_votes_numpy()]
+    for item in checks:
+        print(json.dumps(item), flush=True)
+    if not args.cpu_only:
+        with tempfile.TemporaryDirectory(prefix="mitsuba-rgb-growth-regression-") as temporary:
+            mi, dr, np, handles = initialize_runtime(RuntimeConfig(args.build_dir, args.gpu),
+                                                       Path(temporary), {})
+            assert int(getattr(mi.VoxelReconstruction, "rgb_growth_version", 0)) >= 1, \
+                "Rebuild this checkout before running RGB growth regression"
+            for check in (check_counterfactual_and_invariance, check_positive_negative_neutral,
+                          check_empty_baseline, check_partial_paths, check_shards_and_candidate_validation,
+                          check_view_votes_device, check_native_replay):
+                checks.append(check(mi, dr, np))
+                print(json.dumps(checks[-1]), flush=True)
+    print(json.dumps({"status": "passed", "checks": checks}), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

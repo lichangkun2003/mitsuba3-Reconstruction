@@ -34,6 +34,12 @@ Y00 = 1 / (2 * math.sqrt(math.pi))
 
 def fixture(np):
     config = copy.deepcopy(CONFIG)
+    # Keep this regression as the growth-disabled RGB-only baseline even when
+    # the experiment defaults enable the newer online growth mechanism.
+    config.topology.enable_growth = False
+    config.topology.use_growth_evidence = False
+    config.topology.use_rgb_growth = False
+    config.schedule.enable_coarse_growth = False
     config.render.width = config.render.height = 8
     config.training.num_epochs = config.schedule.total_epochs = 2
     config.training.chunk_size = 0

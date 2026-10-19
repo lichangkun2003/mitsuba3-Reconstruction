@@ -67,6 +67,7 @@ class GradientSettings:
     min_evidence_transmittance: float = .05
     min_removal_loss_delta: float = 1e-4
     max_candidates: int = 16
+    max_growth_hits: int = 8  # Bounded hypothetical hits per ray; overflow abstains.
 
 
 @dataclass
@@ -111,7 +112,7 @@ CONFIG.data.cameras = "transforms_train.json"
 CONFIG.render.width = 800
 CONFIG.render.height = 800
 CONFIG.render.spp = 1  # 训练固定每视角 1 spp；多 spp 出图使用评价脚本。
-CONFIG.training.rgb_only = True  # 第一阶段：参考 alpha 仅用于读图时合成 RGB，不进入训练。
+CONFIG.training.rgb_only = True  # 参考 alpha 仅用于读图时合成 RGB，不进入训练或生长投票。
 CONFIG.model.opacity_sh_count = 1  # 仅优化 DC logit；opacity = sigmoid(Y0 * b0)。
 CONFIG.gradient.alpha_loss_weight = 0.
 CONFIG.gradient.alpha_geometry_weight = 0.
@@ -119,10 +120,20 @@ CONFIG.gradient.background_carve_weight = 0.
 CONFIG.gradient.geometry_transition_only = False  # hit/miss 均保留正负 RGB 几何信号。
 CONFIG.gradient.geometry_two_sided_boundary = False  # 保留原 sigmoid，不叠加额外带宽门控。
 CONFIG.contour.enabled = False  # 所有像素均匀采样，不读取 alpha 轮廓标签。
-CONFIG.topology.enable_growth = False
+CONFIG.topology.enable_growth = True
 CONFIG.topology.enable_deletion = False
 CONFIG.topology.use_growth_evidence = False
-CONFIG.schedule.enable_coarse_growth = False  # coarse-to-fine 的独立生长开关也必须关闭。
+CONFIG.topology.use_rgb_growth = True  # 复用训练前向的 RGB 收益票，不额外渲染。
+CONFIG.topology.growth_warmup_epochs = 20  # 最粗层级先优化 20 轮，再按生长周期检查。
+CONFIG.topology.growth_fine_warmup_epochs = 20  # 每个后续层级重新 warmup。
+CONFIG.topology.growth_max_candidates = 1024  # 每次检查的候选上限（初始实验值）。
+CONFIG.topology.growth_max_new_voxels = 128  # 每次新增上限（初始实验值）。
+CONFIG.topology.growth_rgb_min_support_views = 3
+CONFIG.topology.growth_rgb_max_conflict_views = 2  # 达到 2 个反对视角则拒绝。
+CONFIG.topology.growth_rgb_gain_epsilon = 1e-7  # 全图像素归一化 RGB 平方和的票阈值。
+CONFIG.topology.growth_rgb_min_mean_gain = 1e-7  # 所有训练视角的带符号平均收益门槛。
+CONFIG.gradient.max_growth_hits = 8  # 单条射线的候选记录容量；溢出则弃权。
+CONFIG.schedule.enable_coarse_growth = True  # 分层训练的生长开关；分裂规则保持不变。
 CONFIG.training.chunk_size = 0  # 0 = 整图提交；显存不足时可显式改为 65536 等。
 CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译、缓存和 GPU 耗时。
 CONFIG.training.profile_interval_epochs = 50  # 每 50 轮及首次进入各分辨率时抽样记录内核耗时；0 关闭。
@@ -169,7 +180,7 @@ def parse_arguments():
     parser.add_argument("--config")
     parser.add_argument("--resume", help="Resume a completed-epoch checkpoint")
     parser.add_argument("--rgb-only", action=argparse.BooleanOptionalAction, default=None,
-                        help="Use phase-1 RGB-only training (CONFIG default); requires DC opacity and disabled alpha priors/topology")
+                        help="Use RGB-only training (CONFIG default); requires DC opacity and disabled reference-alpha priors")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--stop-after-epochs", type=int,
                         help="Stop after N additional complete epochs, saving a resumable checkpoint without changing the full schedule or publishing model.npz")
@@ -211,6 +222,11 @@ def apply_arguments(config, args, values):
             setattr(getattr(config, group), key, value)
     if args.skip_evaluation:
         config.evaluation.enabled = False
+    if (not config.training.rgb_only and
+            "use_rgb_growth" not in values.get("topology", {})):
+        # Explicit legacy supervision must not inherit the current RGB-only
+        # experiment's growth mode. An explicit incompatible JSON still errors.
+        config.topology.use_rgb_growth = False
     config.schedule.total_epochs = config.training.num_epochs
 
 
@@ -222,9 +238,11 @@ def validate(config):
         raise ValueError("Falcor's training reference is composited onto white; training requires background [1,1,1]. Evaluation background is configurable.")
     if not isinstance(config.training.rgb_only, bool):
         raise ValueError("training.rgb_only must be a boolean")
+    if config.topology.use_rgb_growth and not config.training.rgb_only:
+        raise ValueError("RGB growth evidence requires training.rgb_only=true")
     if config.training.rgb_only:
         if config.model.opacity_sh_count != 1:
-            raise ValueError("RGB-only phase 1 requires model.opacity_sh_count=1 (DC logit only)")
+            raise ValueError("RGB-only training requires model.opacity_sh_count=1 (DC logit only)")
         disabled = {
             "gradient.alpha_loss_weight": config.gradient.alpha_loss_weight,
             "gradient.alpha_geometry_weight": config.gradient.alpha_geometry_weight,
@@ -232,14 +250,17 @@ def validate(config):
             "gradient.geometry_transition_only": config.gradient.geometry_transition_only,
             "gradient.geometry_two_sided_boundary": config.gradient.geometry_two_sided_boundary,
             "contour.enabled": config.contour.enabled,
-            "topology.enable_growth": config.topology.enable_growth,
             "topology.enable_deletion": config.topology.enable_deletion,
             "topology.use_growth_evidence": config.topology.use_growth_evidence,
-            "schedule.enable_coarse_growth": config.schedule.enable_coarse_growth,
         }
         enabled = [name for name, value in disabled.items() if value != 0]
         if enabled:
-            raise ValueError("RGB-only phase 1 requires these settings to be zero/false: " + ", ".join(enabled))
+            raise ValueError("RGB-only training requires these settings to be zero/false: " + ", ".join(enabled))
+        if not config.topology.use_rgb_growth and (config.topology.enable_growth or config.schedule.enable_coarse_growth):
+            raise ValueError("RGB-only growth requires topology.use_rgb_growth=true; legacy alpha growth is unavailable")
+    if (isinstance(config.gradient.max_growth_hits, bool) or not isinstance(config.gradient.max_growth_hits, int)
+            or not 1 <= config.gradient.max_growth_hits <= 32):
+        raise ValueError("gradient.max_growth_hits must be an integer in [1,32]")
     for name in ("num_epochs", "save_count"):
         value = getattr(config.training, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -317,7 +338,8 @@ def shard_pixel_range(count, rank, world_size):
 def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, mi, dr, *,
                        pixel_begin=0, pixel_end=None, need_rendered_alpha=False,
                        collect_deletion_evidence=None, stage_profile=None,
-                       gpu_reference=None, native_replay=None, zero_alpha=False):
+                       gpu_reference=None, native_replay=None, zero_alpha=False,
+                       collect_growth_evidence=False):
     """Compute a pixel interval from an already sampled full view, without readback.
 
     Return the accumulator, unnormalized loss sum, finite flag, and optional
@@ -346,6 +368,7 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
     total_loss, finite = mi.Float(0), mi.Bool(True)
     camera = prepare_camera(config.render, view["camera"], mi, dr)
     native_settings = settings(config)
+    native_settings["collect_growth_evidence"] = bool(collect_growth_evidence)
     if stage_profile is not None:
         native_settings["profile_stages"] = True
     if collect_deletion_evidence is not None:
@@ -394,12 +417,20 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
             accumulator[key] = accumulator.get(key, 0) + result[key]
         for key in ("foreground_evidence", "background_evidence"):
             accumulator[key] = dr.maximum(accumulator.get(key, 0), result[key])
+        if collect_growth_evidence:
+            for key in ("growth_gain", "growth_observed", "growth_unknown"):
+                if key not in result:
+                    raise RuntimeError("RGB growth evidence is unavailable; rebuild this source checkout")
+                accumulator[key] = accumulator.get(key, 0) + result[key]
+            finite &= dr.all(dr.isfinite(result["growth_gain"]))
         # Materialize per-chunk sums; never retain all image path records/graphs.
         dr.eval(total_loss, finite, *[x for x in (raw_alpha, estimated_alpha) if x is not None],
                 *accumulator["gradients"].values(),
                 *[value for key, value in accumulator.items() if key != "gradients"])
     for gradient in accumulator["gradients"].values():
         finite &= dr.all(dr.isfinite(gradient))
+    if "growth_gain" in accumulator:
+        finite &= dr.all(dr.isfinite(accumulator["growth_gain"]))
     finite &= dr.isfinite(total_loss)
     return accumulator, total_loss, finite, raw_alpha, estimated_alpha
 
@@ -433,7 +464,8 @@ def finalize_view(partial, view, config, sampler, token, mi, dr, np, *, alpha_on
 
 def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rendered_alpha=False,
                collect_deletion_evidence=None, stage_profile=None, gpu_reference=None,
-               native_replay=None, collective=None, alpha_on_device=False):
+               native_replay=None, collective=None, alpha_on_device=False,
+               collect_growth_evidence=False):
     """Compute one full-view gradient, optionally over synchronized pixel shards.
 
     All ranks consume the same full-view sampling stream and contour history.
@@ -450,7 +482,8 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
     partial = compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, mi, dr,
         pixel_begin=begin, pixel_end=end, need_rendered_alpha=need_rendered_alpha,
         collect_deletion_evidence=collect_deletion_evidence, stage_profile=stage_profile,
-        gpu_reference=gpu_reference, native_replay=native_replay, zero_alpha=collective is not None)
+        gpu_reference=gpu_reference, native_replay=native_replay, zero_alpha=collective is not None,
+        collect_growth_evidence=collect_growth_evidence)
     if collective is not None:
         partial = collective.reduce_view(*partial)
         accumulator, total_loss, finite, raw_alpha, estimated_alpha = partial
@@ -458,6 +491,8 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
         # global result before any replica changes its optimizer or model state.
         for gradient in accumulator["gradients"].values():
             finite &= dr.all(dr.isfinite(gradient))
+        if "growth_gain" in accumulator:
+            finite &= dr.all(dr.isfinite(accumulator["growth_gain"]))
         finite &= dr.isfinite(total_loss)
         partial = accumulator, total_loss, finite, raw_alpha, estimated_alpha
     return finalize_view(partial, view, config, sampler, token, mi, dr, np,
@@ -620,6 +655,10 @@ def run_training(distributed=None):
                 validate_existing_model(model_path, checkpoint)
             # Runtime and output are host-specific; all algorithm settings resume from the checkpoint.
             runtime, training_output = config.runtime, config.training.output
+            # Fields introduced after a checkpoint must use their legacy
+            # dataclass defaults, not the latest experiment's CONFIG switches.
+            config.topology = TopologySettings()
+            config.gradient = GradientSettings()
             update(config, checkpoint["config"])
             # The field did not exist in legacy checkpoints. Do not inherit a
             # newer CONFIG default when loading their algorithm settings.
@@ -634,7 +673,11 @@ def run_training(distributed=None):
             previous = checkpoint["config"]
             current = asdict(config)
             for group in ("model", "render", "gradient", "optimizer", "topology", "contour"):
-                if current[group] != previous[group]:
+                previous_group = previous[group]
+                if group in ("gradient", "topology"):
+                    defaults = GradientSettings() if group == "gradient" else TopologySettings()
+                    previous_group = {**asdict(defaults), **previous_group}
+                if current[group] != previous_group:
                     raise ValueError(f"Cannot change {group} while resuming; start a new run for a different algorithm")
             for key in ("seed", "shuffle", "save_count"):
                 previous_value = previous["training"].get(key, 3) if key == "save_count" else previous["training"][key]
@@ -653,14 +696,21 @@ def run_training(distributed=None):
                 for group in ("data", "model", "render", "gradient", "optimizer", "topology", "schedule", "contour"):
                     if existing.get(group) != previous_json[group]:
                         raise ValueError("Resume output belongs to a different configuration; choose a new --output-dir")
+        rgb_growth_enabled = config.topology.use_rgb_growth and config.topology.enable_growth and (
+            not config.schedule.enabled or config.schedule.enable_coarse_growth)
+        if rgb_growth_enabled and getattr(mi.VoxelReconstruction, "rgb_growth_version", 0) < 1:
+            raise RuntimeError("One-pass RGB growth requires new native bindings; incrementally rebuild this checkout")
         report["requested_config"] = asdict(config)
-        report["scope"] = ("RGB-only phase 1: DC opacity, bidirectional geometry surrogate, refinement only"
+        report["scope"] = ("RGB-only: DC opacity, bidirectional geometry surrogate, refinement"
+                           + (" and one-pass RGB growth" if rgb_growth_enabled else " only")
                            if config.training.rgb_only else "Legacy Falcor NoLightTransport alpha-supervised training")
         report["training_protocol"].update(
             rgb_only=config.training.rgb_only,
             reference_preprocessing=("RGBA composited onto white at decode; only RGB retained"
                                      if config.training.rgb_only else "linear RGBA; composed inside native training"),
             actual_sampling="per-pixel uniform" if config.training.rgb_only else "per-pixel uniform or contour-guided",
+            growth_evidence=("same-DDA frozen candidate insertion; signed 1-spp RGB gain; no confirmation render"
+                             if rgb_growth_enabled else "disabled" if config.training.rgb_only else "legacy alpha evidence"),
             reported_loss="mean pixel RGB squared-error sum over channels, then mean over views"
                           if config.training.rgb_only else "mean RGB plus alpha loss over pixels and views")
         performance.metadata["config"] = asdict(config)
@@ -696,8 +746,13 @@ def run_training(distributed=None):
               f"{config.training.gpu_reference_cache_mib} MiB GPU, "
               "loaded on first use; dataset must remain unchanged during training", flush=True)
         emit("Native GPU replay:", "enabled" if config.training.freeze_native else "disabled", flush=True)
-        emit("Training supervision:", "RGB only; DC opacity; refinement only" if config.training.rgb_only
+        emit("Training supervision:", ("RGB only; DC opacity; "
+             + ("refinement + RGB growth" if rgb_growth_enabled else "refinement only")) if config.training.rgb_only
              else "legacy RGB + reference alpha", flush=True)
+        if rgb_growth_enabled:
+            emit("RGB growth warmup (epochs per level):", config.topology.growth_warmup_epochs,
+                 "coarse,", config.topology.growth_fine_warmup_epochs,
+                 "fine; no extra forward render", flush=True)
         rng = np.random.default_rng(config.training.seed)
         sampler = make_sampler(config, np)
         completed, global_step = 0, 0
@@ -802,18 +857,39 @@ def run_training(distributed=None):
         end_epoch = (min(config.training.num_epochs, completed + args.stop_after_epochs)
                      if args.stop_after_epochs is not None else config.training.num_epochs)
         for epoch in range(completed, end_epoch):
+            started = time.perf_counter()
             training_resolution = int(model.resolution)
             active_voxels_before = int(model.active_voxel_count)
             entering_resolution = last_training_resolution != training_resolution
-            flags = (topology.needs_rendered_alpha(epoch), topology.collect_deletion(epoch)) if primary else None
+            growth_prepare_started = time.perf_counter()
+            previous_growth_count = int(getattr(model, "growth_candidate_count", 0))
+            if primary:
+                rgb_growth_requested = False
+                if config.topology.use_rgb_growth:
+                    if previous_growth_count or topology._growth_due(epoch + 1):
+                        native_replay.clear()
+                    rgb_growth_requested = topology.prepare_rgb_growth(model, epoch)
+                payload = topology.pending_growth["candidate_state"] if rgb_growth_requested else None
+                flags = (topology.needs_rendered_alpha(epoch), topology.collect_deletion(epoch),
+                         rgb_growth_requested, payload)
+            else:
+                flags = None
             if distributed is not None:
                 flags = distributed.broadcast(flags)
-            growth_evidence_requested, deletion_evidence_collected = flags
+            alpha_growth_requested, deletion_evidence_collected, rgb_growth_requested, growth_payload = flags
+            if not primary and (previous_growth_count or rgb_growth_requested):
+                native_replay.clear()
+                if rgb_growth_requested:
+                    model.set_growth_candidates({key: mi.UInt32(value) if key == "cell_indices" else mi.Float(value)
+                                                 for key, value in growth_payload.items()})
+                else:
+                    model.clear_growth_candidates()
+            growth_prepare_seconds = time.perf_counter() - growth_prepare_started
+            growth_evidence_requested = alpha_growth_requested or rgb_growth_requested
             interval = config.training.profile_interval_epochs
             order = rng.permutation(len(views)) if config.training.shuffle else np.arange(len(views))
             epoch_loss = 0.
             stage_totals = dict(reference=0., gradients=0., topology_observation=0., optimizer=0.)
-            started = time.perf_counter()
             communication_before = collective.statistics() if collective is not None else None
             progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} | view 0/{len(views)} (0%) "
                                  f"| grid={int(model.resolution)}", force=True)
@@ -837,12 +913,16 @@ def run_training(distributed=None):
                 # below include tracing, compilation, transfers and waits.
                 with dr.kernel_history() if profiling else nullcontext() as history:
                     gradients, loss, rendered_alpha = train_view(model, view, rgba, config, sampler, rng, mi, dr, np,
-                        need_rendered_alpha=growth_evidence_requested,
+                        need_rendered_alpha=alpha_growth_requested,
                         collect_deletion_evidence=deletion_evidence_collected,
+                        collect_growth_evidence=rgb_growth_requested,
                         stage_profile=native_stages, gpu_reference=gpu_reference,
                         native_replay=native_replay, collective=collective, alpha_on_device=True)
                     gradients_done = time.perf_counter()
-                    if primary and not config.training.rgb_only:
+                    if primary and rgb_growth_requested:
+                        topology.observe_rgb_growth(model, gradients, view_id=int(index), epoch=epoch,
+                                                    pixel_count=ray_count)
+                    elif primary and not config.training.rgb_only:
                         topology.observe_view(model, gradients, view_id=int(index), epoch=epoch,
                             camera=view["camera"],
                             reference_alpha=gpu_reference.alpha if gpu_reference is not None else rgba[..., 3],
@@ -904,6 +984,7 @@ def run_training(distributed=None):
                      "seconds": time.perf_counter()-started, "resolution": int(model.resolution),
                      "training_resolution": training_resolution, "active_voxels_before": active_voxels_before,
                      "growth_evidence_requested": growth_evidence_requested,
+                     "rgb_growth_evidence_requested": rgb_growth_requested,
                      "deletion_evidence_collected": deletion_evidence_collected,
                      "active_voxels": int(model.active_voxel_count), "topology": event,
                      "reference_cache": reference_cache.statistics(),
@@ -911,6 +992,7 @@ def run_training(distributed=None):
                      "native_replay": native_replay.statistics(),
                      "topology_execution": topology.statistics() if primary else None,
                      "view_stage_seconds": stage_totals,
+                     "epoch_growth_prepare_seconds": growth_prepare_seconds,
                      "epoch_topology_seconds": time.perf_counter()-topology_started}
             if collective is not None:
                 communication_after = collective.statistics()

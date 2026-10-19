@@ -90,7 +90,7 @@ def generate_growth_for_targets(manager, checkpoint, boundary, target_cells):
                  ((boundary >= wait_start - 1) &
                   (boundary - (wait_start - 1) >= cfg.growth_wait_epochs)))
     target_coordinates = _coordinates(targets, resolution, np)
-    evidence = cfg.use_growth_evidence
+    evidence = cfg.use_growth_evidence or cfg.use_rgb_growth
     offsets = _neighbor_offsets(evidence and cfg.growth_use_26_neighbors, np)
     neighborhoods = []
     for offset in offsets:

@@ -25,6 +25,8 @@ public:
 
     /// Version of the alpha-independent RGB training contract exposed to Python.
     static constexpr uint32_t rgb_only_version = 1;
+    /// Frozen empty-cell proposals observed by the existing training traversal.
+    static constexpr uint32_t rgb_growth_version = 1;
 
     VoxelReconstruction(const std::string &filename, uint32_t resolution,
                         const std::array<float, 3> &grid_min,
@@ -42,12 +44,23 @@ public:
     /// Replace continuous parameters without changing occupancy or array sizes.
     void set_parameters(const std::map<std::string, FloatBuffer> &parameters);
 
+    /// Install immutable hypothetical cells. They never change trace(), actual
+    /// parameter buffers, occupancy snapshots, or the training image/gradient.
+    void set_growth_candidates(const UIntBuffer &cell_indices,
+                               const std::map<std::string, FloatBuffer> &parameters);
+    void clear_growth_candidates();
+    uint32_t growth_candidate_count() const { return m_growth_count; }
+
     struct TrainingResult {
         Color3f rgb, raw_rgb;
         Float alpha, raw_alpha, loss;
         UInt32 hit_count;
         std::map<std::string, FloatBuffer> gradients;
         std::map<std::string, UIntBuffer> counters;
+        /// Per-candidate single-insertion RGB loss gain and ray coverage.
+        /// Incomplete paths and record overflow contribute unknown, not votes.
+        std::map<std::string, FloatBuffer> growth_sums;
+        std::map<std::string, UIntBuffer> growth_counts;
         /// Populated only by the diagnostic profile_stages setting.
         std::map<std::string, std::map<std::string, double>> stage_profile;
     };
@@ -99,8 +112,19 @@ private:
     IntBuffer m_index;
     UIntBuffer m_cells;
     FloatBuffer m_centers, m_log_scales, m_rotations, m_radiance, m_opacity;
+    uint32_t m_growth_count = 0;
+    // Frozen-function traversal in this Dr.Jit version requires nonempty
+    // buffers. These inert placeholders are never addressed when count is zero.
+    UIntBuffer m_growth_cells = dr::zeros<UIntBuffer>(1);
+    FloatBuffer m_growth_centers = dr::zeros<FloatBuffer>(1),
+                m_growth_log_scales = dr::zeros<FloatBuffer>(1),
+                m_growth_rotations = dr::zeros<FloatBuffer>(1),
+                m_growth_radiance = dr::zeros<FloatBuffer>(1),
+                m_growth_opacity = dr::zeros<FloatBuffer>(1);
     MI_TRAVERSE_CB(Object, m_index, m_cells, m_centers, m_log_scales,
-                   m_rotations, m_radiance, m_opacity)
+                   m_rotations, m_radiance, m_opacity, m_growth_cells,
+                   m_growth_centers, m_growth_log_scales, m_growth_rotations,
+                   m_growth_radiance, m_growth_opacity)
 };
 
 MI_EXTERN_CLASS(VoxelReconstruction)

@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <unordered_set>
 
 NAMESPACE_BEGIN(mitsuba)
 
@@ -239,6 +240,69 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_parameters(
     }
 }
 
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::clear_growth_candidates() {
+    if (m_growth_count)
+        dr::scatter(m_index, dr::full<IntBuffer>(-1, m_growth_count), m_growth_cells);
+    m_growth_count = 0;
+    m_growth_cells = dr::zeros<UIntBuffer>(1);
+    m_growth_centers = m_growth_log_scales = m_growth_rotations =
+        m_growth_radiance = m_growth_opacity = dr::zeros<FloatBuffer>(1);
+}
+
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_growth_candidates(
+    const UIntBuffer &cells, const std::map<std::string, FloatBuffer> &parameters) {
+    const size_t count = cells.size();
+    if (count > size_t(INT32_MAX) - 1)
+        Throw("VoxelReconstruction.set_growth_candidates(): too many candidates.");
+    const std::map<std::string, size_t> sizes = {
+        {"centers", count*3}, {"log_scales", count*3}, {"rotations", count*4},
+        {"radiance_sh", count*m_sh_count*3}, {"opacity_sh", count*m_opacity_sh_count}};
+    if (parameters.size() != sizes.size())
+        Throw("VoxelReconstruction.set_growth_candidates(): requires all five parameter groups.");
+    Mask finite = true;
+    for (const auto &[name, size] : sizes) {
+        auto it = parameters.find(name);
+        if (it == parameters.end() || it->second.size() != size)
+            Throw("VoxelReconstruction.set_growth_candidates(): missing or wrong size: %s.", name.c_str());
+        if (size)
+            finite &= dr::all(dr::isfinite(it->second));
+    }
+    if (!dr::slice(finite))
+        Throw("VoxelReconstruction.set_growth_candidates(): parameters must be finite.");
+    // Check the complete transaction before restoring/replacing the old overlay.
+    // Negative entries are hypothetical cells and remain genuinely unoccupied.
+    std::vector<uint32_t> host_cells(count);
+    dr::eval(cells);
+    if (count) dr::store(host_cells.data(), cells);
+    const size_t total = size_t(m_resolution)*m_resolution*m_resolution;
+    std::unordered_set<uint32_t> unique;
+    for (uint32_t cell : host_cells)
+        if (cell >= total || !unique.insert(cell).second)
+            Throw("VoxelReconstruction.set_growth_candidates(): cells must be unique and in bounds.");
+    if (count && m_active_count) {
+        auto occupied = dr::gather<IntBuffer>(m_index, cells) >= 0;
+        if (dr::slice(dr::any(occupied)))
+            Throw("VoxelReconstruction.set_growth_candidates(): target cells must be empty.");
+    }
+    // Keep independent buffer references alive even when the caller reuses its
+    // dictionary. All accesses are detached, and no gradients target proposals.
+    UIntBuffer new_cells = dr::detach(cells);
+    clear_growth_candidates();
+    if (!count)
+        return;
+    if (count && !m_index.size())
+        m_index = dr::full<IntBuffer>(-1, total);
+    m_growth_cells = std::move(new_cells);
+    m_growth_centers = dr::detach(parameters.at("centers"));
+    m_growth_log_scales = dr::detach(parameters.at("log_scales"));
+    m_growth_rotations = dr::detach(parameters.at("rotations"));
+    m_growth_radiance = dr::detach(parameters.at("radiance_sh"));
+    m_growth_opacity = dr::detach(parameters.at("opacity_sh"));
+    m_growth_count = uint32_t(count);
+    if (count)
+        dr::scatter(m_index, -2 - dr::arange<IntBuffer>(count), m_growth_cells);
+}
+
 // Falcor's real SH convention: positive y,z,x at degree one. Do not substitute
 // a library SH basis without checking its signs and coefficient ordering.
 template <typename T> static T reconstruction_sh(uint32_t i, const Vector<T, 3> &p) {
@@ -417,13 +481,20 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         {"min_evidence_transmittance", .05f}, {"min_removal_loss_delta", 1e-4f},
         {"transmittance_threshold", .01f}, {"max_hits", 16.f},
         {"max_candidates", 16.f}, {"entry_offset_fraction", 0.f},
-        {"profile_stages", 0.f}, {"rgb_only", 0.f}};
+        {"profile_stages", 0.f}, {"rgb_only", 0.f},
+        {"collect_growth_evidence", 0.f}, {"max_growth_hits", 8.f}};
     for (const auto &[key, value] : settings) {
         if (cfg.find(key) == cfg.end() || !std::isfinite(value) || value < 0.f)
             Throw("VoxelReconstruction.loss_and_grad(): unknown/invalid setting %s.", key.c_str());
         cfg[key] = value;
     }
     const bool rgb_only = cfg["rgb_only"] != 0.f;
+    const bool growth_requested = cfg["collect_growth_evidence"] != 0.f;
+    const bool collect_growth = growth_requested && m_growth_count != 0;
+    const uint32_t max_growth_hits = uint32_t(cfg["max_growth_hits"]);
+    if ((growth_requested && !rgb_only) || !max_growth_hits || max_growth_hits > 32 ||
+        cfg["max_growth_hits"] != float(max_growth_hits))
+        Throw("VoxelReconstruction.loss_and_grad(): growth requires RGB-only mode and max_growth_hits in [1, 32].");
     const uint32_t max_hits = uint32_t(cfg["max_hits"]), max_candidates = uint32_t(cfg["max_candidates"]);
     if (!max_hits || max_hits > 128 || cfg["max_hits"] != float(max_hits) ||
         max_candidates > 128 || cfg["max_candidates"] != float(max_candidates) ||
@@ -437,7 +508,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     // differently sized compatibility alpha argument must not affect the batch.
     if (!rgb_only)
         width = std::max(width, dr::width(reference_alpha));
-    if (width == 0 || width * std::max(max_hits, std::max(max_candidates, 1u)) * 9 > UINT32_MAX)
+    if (width == 0 || width * std::max(max_hits, std::max(max_candidates,
+        collect_growth ? max_growth_hits : 1u)) * 9 > UINT32_MAX)
         Throw("VoxelReconstruction.loss_and_grad(): ray batch is empty or too large.");
     ReconstructionStageProfiler<dr::is_jit_v<Float>> profiler(cfg["profile_stages"] != 0.f);
     // std::map is not traversed by dr::schedule(); schedule its buffers explicitly.
@@ -449,10 +521,14 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 dr::schedule(value);
             for (const auto &[key, value] : result.counters)
                 dr::schedule(value);
+            for (const auto &[key, value] : result.growth_sums)
+                dr::schedule(value);
+            for (const auto &[key, value] : result.growth_counts)
+                dr::schedule(value);
             dr::eval();
         }
     };
-    if (!m_active_count) {
+    if (!m_active_count && !collect_growth) {
         TrainingResult result;
         result.raw_alpha = dr::zeros<Float>(width);
         result.raw_rgb = background + result.raw_alpha;
@@ -469,6 +545,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             result.gradients[key] = dr::zeros<FloatBuffer>(0);
         for (const auto *key : {"appearance_valid", "geometry_valid", "background_carve_valid", "foreground_evidence", "background_evidence"})
             result.counters[key] = dr::zeros<UIntBuffer>(0);
+        if (growth_requested) {
+            result.growth_sums["growth_gain"] = dr::zeros<FloatBuffer>(0);
+            result.growth_counts["growth_observed"] = dr::zeros<UIntBuffer>(0);
+            result.growth_counts["growth_unknown"] = dr::zeros<UIntBuffer>(0);
+        }
         if (profiler.enabled()) {
             evaluate_result(result);
             profiler.finish("forward");
@@ -499,15 +580,25 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         FloatBuffer hit;
         UIntBuffer hit_id;
     };
+    struct GrowthBuffers {
+        FloatBuffer values;
+        UIntBuffer ids, unknown;
+    };
     struct Records {
         FloatBuffer hit;
         UIntBuffer hit_id;
         Candidates candidates;
-        DRJIT_STRUCT(Records, hit, hit_id, candidates)
+        FloatBuffer growth_values;
+        UIntBuffer growth_ids, growth_unknown;
+        DRJIT_STRUCT(Records, hit, hit_id, candidates, growth_values, growth_ids, growth_unknown)
     } records{dr::zeros<FloatBuffer>(width*max_hits*9),
               dr::zeros<UIntBuffer>(width*max_hits),
               std::vector<Candidate>(max_candidates,
-                  Candidate{Vector3f(0.f), Float(0.f), Float(0.f), Float(0.f), UInt32(0), UInt32(0)})};
+                  Candidate{Vector3f(0.f), Float(0.f), Float(0.f), Float(0.f), UInt32(0), UInt32(0)}),
+              dr::zeros<FloatBuffer>(collect_growth ? width*max_growth_hits*4 : 1),
+              dr::zeros<UIntBuffer>(collect_growth ? width*max_growth_hits : 1),
+              dr::zeros<UIntBuffer>(collect_growth ? m_growth_count : 1)};
+    const uint32_t growth_stride = collect_growth ? ray_count*max_growth_hits : 0;
     auto clean = [](const auto &value) { return dr::select(dr::isfinite(value), value, 0.f); };
     auto rotate = [](const Vector3f &v, const Float &w, const Vector3f &q) {
         return v + 2.f*dr::cross(q, dr::cross(q, v) + w*v);
@@ -569,14 +660,14 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                           (boundary-ray.o[a])/dr::select(step[a]==0,1.f,d[a])));
     }
     struct State {
-        Mask active;
+        Mask active, growth_overflow;
         Vector3i cell;
         Vector3f next;
         Float entry, transmittance;
         Color3f color;
-        UInt32 hits,candidates,iterations;
-        DRJIT_STRUCT(State,active,cell,next,entry,transmittance,color,hits,candidates,iterations)
-    } state{active,cell,next,entry,Float(1.f),Color3f(0.f),UInt32(0),UInt32(0),UInt32(0)};
+        UInt32 hits,candidates,iterations,growth_hits;
+        DRJIT_STRUCT(State,active,growth_overflow,cell,next,entry,transmittance,color,hits,candidates,iterations,growth_hits)
+    } state{active,Mask(false),cell,next,entry,Float(1.f),Color3f(0.f),UInt32(0),UInt32(0),UInt32(0),UInt32(0)};
     const float diagonal=std::sqrt(dr::square(m_max[0]-m_min[0])+dr::square(m_max[1]-m_min[1])+dr::square(m_max[2]-m_min[2]));
     dr::tie(state,records)=dr::while_loop(dr::make_tuple(state,records),
         [](const State &s,const Records &) {return s.active;},
@@ -586,12 +677,68 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             Mask occupied=s.active & (signed_id>=0);
             UInt32 id=UInt32(dr::maximum(signed_id,0));
             Float end=dr::maximum(s.entry,dr::minimum(dr::minimum(s.next.x(),dr::minimum(s.next.y(),s.next.z())),exit));
+            if (collect_growth) {
+                Mask proposal = s.active & (signed_id <= -2);
+                UInt32 growth_id = UInt32(-dr::minimum(signed_id, Int32(-2)) - 2);
+                auto buffers = std::make_shared<GrowthBuffers>(
+                    GrowthBuffers{r.growth_values, r.growth_ids, r.growth_unknown});
+                s = dr::if_stmt(dr::make_tuple(s, growth_id, end, proposal, ray.o, d), proposal,
+                    [this, rotate, buffers, lane, ray_count, growth_stride, max_growth_hits](
+                        State s, const UInt32 &id, const Float &end, const Mask &proposal,
+                        const Point3f &origin, const Vector3f &direction) {
+                        // Exactly the occupied-cell clipped ellipsoid intersection,
+                        // evaluated in the existing DDA at an empty hypothetical cell.
+                        Vector3f relative, scale, segment = direction*(end-s.entry);
+                        for (uint32_t a=0; a<3; ++a) {
+                            Float center = dr::gather<Float>(m_growth_centers,id*3+a,proposal);
+                            relative[a] = origin[a]+s.entry*direction[a] -
+                                (m_min[a]+(Float(s.cell[a])+center)*m_size[a]);
+                            scale[a] = dr::exp(dr::clip(dr::gather<Float>(m_growth_log_scales,
+                                id*3+a,proposal),-30.f,30.f));
+                        }
+                        Float qw = dr::gather<Float>(m_growth_rotations,id*4,proposal);
+                        Vector3f qv;
+                        for (uint32_t a=0; a<3; ++a)
+                            qv[a] = dr::gather<Float>(m_growth_rotations,id*4+a+1,proposal);
+                        Float norm = dr::sqrt(qw*qw+dr::squared_norm(qv));
+                        Mask valid_q = dr::isfinite(norm)&(norm>1e-10f);
+                        qw = dr::select(valid_q,qw/dr::select(valid_q,norm,1.f),1.f);
+                        qv = dr::select(valid_q,qv/dr::select(valid_q,norm,1.f),Vector3f(0.f));
+                        Vector3f u = rotate(relative,qw,-qv)/scale, v = rotate(segment,qw,-qv)/scale;
+                        Float a = dr::squared_norm(v), b = 2.f*dr::dot(u,v), c = dr::squared_norm(u)-1.f;
+                        Float discriminant = b*b-4.f*a*c;
+                        Float root = dr::sqrt(dr::maximum(discriminant,0.f));
+                        Float inv = .5f/dr::select(a>1e-20f,a,1.f);
+                        Float t0 = dr::maximum(0.f,(-b-root)*inv), t1 = dr::minimum(1.f,(-b+root)*inv);
+                        Mask hit = proposal & dr::select(a<=1e-20f,c<=0.f,
+                            (discriminant>=0.f)&(t0<=t1));
+                        Mask stored = hit & (s.growth_hits < max_growth_hits);
+                        Mask overflow = hit & !stored;
+                        UInt32 slot = dr::minimum(s.growth_hits,max_growth_hits-1)*ray_count+lane;
+                        dr::scatter(buffers->ids,id,slot,stored);
+                        for (uint32_t j=0; j<3; ++j)
+                            dr::scatter(buffers->values,s.color[j],j*growth_stride+slot,stored);
+                        dr::scatter(buffers->values,s.transmittance,3*growth_stride+slot,stored);
+                        // Do not silently favor the first records on overflow:
+                        // discarded candidates and every stored record become unknown.
+                        dr::scatter_reduce(ReduceOp::Add,buffers->unknown,UInt32(1),id,overflow);
+                        s.growth_overflow |= overflow;
+                        s.growth_hits = dr::minimum(s.growth_hits+dr::select(hit,1u,0u),max_growth_hits);
+                        return s;
+                    },
+                    [](State s,const UInt32 &,const Float &,const Mask &,
+                       const Point3f &,const Vector3f &) { return s; },
+                    "Voxel reconstruction hypothetical growth hit");
+                r.growth_values = buffers->values;
+                r.growth_ids = buffers->ids;
+                r.growth_unknown = buffers->unknown;
+            }
             // Keep empty cells out of geometry, appearance, and candidate work.
             // Only lane-local values participate in conditional merges. Hit
             // buffers have different widths and are captured as scatter targets.
             // Shared ownership also keeps the targets alive for callback replay.
             auto hit_buffers=std::make_shared<HitBuffers>(HitBuffers{r.hit,r.hit_id});
-            dr::tie(s,r.candidates)=dr::if_stmt(
+            if (m_active_count) dr::tie(s,r.candidates)=dr::if_stmt(
                 dr::make_tuple(s,r.candidates,id,end,occupied,ray.o,d),occupied,
                 [this,rotate,quaternion,appearance,ray_count,hit_stride,lane,
                  max_candidates,diagonal,hit_buffers](State s,Candidates candidates,const UInt32 &id,
@@ -749,12 +896,70 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         is_background=reference_alpha<=cfg["background_alpha_max"];
         is_foreground=!is_background & (reference_alpha>=cfg["foreground_alpha_min"]);
     }
+    if (growth_requested) {
+        result.growth_sums["growth_gain"] = dr::zeros<FloatBuffer>(m_growth_count);
+        result.growth_counts["growth_observed"] = dr::zeros<UIntBuffer>(m_growth_count);
+        result.growth_counts["growth_unknown"] = collect_growth ?
+            records.growth_unknown : dr::zeros<UIntBuffer>(m_growth_count);
+    }
+    if (collect_growth) {
+        // No second forward pass: an insertion changes the final color by
+        // alpha * (T_before * radiance - already-weighted baseline suffix).
+        // Empty candidate cells cannot reorder existing clipped-cell hits.
+        // A stopped path has no reliable full suffix, and inserting a hit can
+        // itself trigger the cap/early exit. Be conservative and report unknown
+        // for both cases instead of extending traversal or inventing evidence.
+        Mask exited = !dr::all(state.cell>=0) | !dr::all(state.cell<int(m_resolution)) |
+                      (state.entry>=exit);
+        Mask complete = exited & (state.iterations<=3*m_resolution+3) &
+                        !state.growth_overflow & (state.hits+1u<max_hits) &
+                        (weight==1.f) & dr::all(dr::isfinite(result.raw_rgb)) &
+                        dr::all(dr::isfinite(reference_rgb));
+        for (uint32_t k=0; k<max_growth_hits; ++k) {
+            Mask stored = k<state.growth_hits;
+            UInt32 slot = k*ray_count+lane;
+            UInt32 id = dr::gather<UInt32>(records.growth_ids,slot,stored);
+            Color3f prefix, radiance(0.f);
+            for (uint32_t j=0; j<3; ++j)
+                prefix[j] = dr::gather<Float>(records.growth_values,j*growth_stride+slot,stored);
+            Float before = dr::gather<Float>(records.growth_values,3*growth_stride+slot,stored);
+            Float logit(0.f);
+            for (uint32_t j=0; j<std::max(m_sh_count,m_opacity_sh_count); ++j) {
+                Float sh = reconstruction_sh(j,Vector3f(-d));
+                if (j<m_sh_count)
+                    for (uint32_t channel=0; channel<3; ++channel)
+                        radiance[channel] += sh*dr::gather<Float>(m_growth_radiance,
+                            (id*m_sh_count+j)*3+channel,stored);
+                if (j<m_opacity_sh_count)
+                    logit += sh*dr::gather<Float>(m_growth_opacity,id*m_opacity_sh_count+j,stored);
+            }
+            radiance = dr::maximum(clean(radiance),0.f);
+            Float opacity = dr::rcp(1.f+dr::exp(-logit));
+            Color3f change = opacity*(before*radiance-(result.raw_rgb-prefix));
+            Float gain = -2.f*dr::dot(result.raw_rgb-reference_rgb,change)-dr::squared_norm(change);
+            Mask known = stored & complete & dr::isfinite(gain) &
+                         (state.transmittance*(1.f-opacity)>cfg["transmittance_threshold"]);
+            dr::scatter_reduce(ReduceOp::Add,result.growth_sums["growth_gain"],
+                dr::detach(gain),id,known);
+            dr::scatter_reduce(ReduceOp::Add,result.growth_counts["growth_observed"],UInt32(1),id,known);
+            dr::scatter_reduce(ReduceOp::Add,result.growth_counts["growth_unknown"],UInt32(1),id,stored&!known);
+        }
+    }
     for(const auto &[name,size]:std::map<std::string,size_t>{{"centers",size_t(m_active_count)*3},
         {"log_scales",size_t(m_active_count)*3},{"rotation_tangent",size_t(m_active_count)*3},
         {"radiance_sh",size_t(m_active_count)*m_sh_count*3},{"opacity_sh",size_t(m_active_count)*m_opacity_sh_count}})
         result.gradients[name]=dr::zeros<FloatBuffer>(size);
     for(const auto *key:{"appearance_valid","geometry_valid","background_carve_valid","foreground_evidence","background_evidence"})
         result.counters[key]=dr::zeros<UIntBuffer>(m_active_count);
+    if (!m_active_count) {
+        if (profiler.enabled()) {
+            evaluate_result(result);
+            profiler.finish("hit_backward");
+            profiler.zero_stage("candidate_backward");
+            result.stage_profile = std::move(profiler.profile);
+        }
+        return result;
+    }
     const float tau=std::max(cfg["geometry_tau_voxel_fraction"]*m_size[0],1e-8f);
     using GradientMap = std::map<std::string, FloatBuffer>;
     using CounterMap = std::map<std::string, UIntBuffer>;

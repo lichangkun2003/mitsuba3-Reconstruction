@@ -5,6 +5,22 @@
 切换场景修改 ``CONFIG.data.dataset``，或传入 ``--dataset datasets/lego``；
 命令行参数覆盖配置文件与默认配置。RTX 5090 Windows 主机使用这个单卡入口。
 
+当前为 RGB-only 训练加在线 RGB 生长：保留原来两个合法父体支持、有限边界接触和
+外伸的候选规则，利用正常训练前向计算候选的虚拟插入 RGB 收益，不额外渲染确认。
+粗层、细层分别先冻结生长 20 轮，之后按 10 轮周期处理；各层第一次事件在第 30 轮。
+分裂机制不变，删除仍关闭，训练保持 1 spp。配置位置：
+
+.. code-block:: python
+
+   CONFIG.topology.use_rgb_growth = True
+   CONFIG.topology.growth_warmup_epochs = 20
+   CONFIG.topology.growth_fine_warmup_epochs = 20
+
+同步后需要增量编译 C++ 和绑定，启用生长要求 ``mi.VoxelReconstruction.rgb_growth_version >= 1``。
+完整投票定义、截断弃权、候选预算和局限见 ``docs/reconstruction_training.rst`` 开头。
+仅运行十轮不会覆盖生长；检查一次默认生长事件可保留 ``--epochs 700``，另传
+``--stop-after-epochs 31 --skip-evaluation``。这仍是新实验，不会修改已有结果。
+
 目录导航
 --------
 
@@ -192,9 +208,9 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 当前算法范围
 ------------
 
-当前默认是 RGB-only 第一阶段：800 × 800、每视角 1 spp、opacity 仅优化 DC。
+当前默认是 RGB-only 加在线生长：800 × 800、每视角 1 spp、opacity 仅优化 DC。
 参考 alpha 只在读取时参与白底合成，之后不参与训练监督或筛选。
-关闭生长、删除及其证据计算，保留 256 → 512 分裂。
+启用同次训练前向中的 RGB 生长证据，粗、细层各 warmup 20 轮；关闭删除，保留 256 → 512 分裂。
 最终出图为 64 spp，训练集与测试集各取前 10 个视角。
 
 旧 alpha 监督 checkpoint 不能直接切换为 RGB-only 续训，应新开实验；旧模型仍可

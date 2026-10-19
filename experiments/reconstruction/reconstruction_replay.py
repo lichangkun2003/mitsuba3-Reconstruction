@@ -33,6 +33,7 @@ class NativeLossReplay:
         self._calls = self._recordings = self._replays = self._bypasses = 0
         self._clears = self._model_changes = self._evictions = 0
         self._empty_model_bypasses = 0
+        self._empty_growth_bypasses = 0
 
         # The only closure capture is the Dr.Jit module. Never capture a model,
         # options dictionary, camera, reference, or previous result here.
@@ -70,11 +71,19 @@ class NativeLossReplay:
             self._bypasses += 1
             self._empty_model_bypasses += 1
             return model.loss_and_grad(ray, rgb, alpha, background, inverse_pdf, options)
+        if bool(options.get("collect_growth_evidence", False)) and not int(model.growth_candidate_count):
+            # Explicit requests with no proposals return zero-length evidence
+            # arrays, which this Dr.Jit revision cannot record. The training
+            # driver only enables collection for nonempty proposal batches.
+            self._bypasses += 1
+            self._empty_growth_bypasses += 1
+            return model.loss_and_grad(ray, rgb, alpha, background, inverse_pdf, options)
         self._model = model
         # Every native scalar and literal buffer stride is included. Exact input
         # widths matter: native code embeds ray_count in hit/candidate offsets.
         key = (
             int(model.resolution), int(model.active_voxel_count),
+            int(getattr(model, "growth_candidate_count", 0)),
             int(model.sh_count), int(model.opacity_sh_count),
             tuple(float(x) for x in model.grid_min),
             tuple(float(x) for x in model.grid_max),
@@ -110,6 +119,7 @@ class NativeLossReplay:
                 "recordings": self._recordings, "replays": self._replays,
                 "bypasses": self._bypasses, "entries": len(self._entries),
                 "empty_model_bypasses": self._empty_model_bypasses,
+                "empty_growth_bypasses": self._empty_growth_bypasses,
                 "cached_recordings": sum(f.n_cached_recordings for f in self._entries.values()),
                 "max_entries": self.max_entries, "clears": self._clears,
                 "model_changes": self._model_changes, "evictions": self._evictions}

@@ -16,6 +16,17 @@ class TopologySettings:
     enable_deletion: bool = True
     enable_growth: bool = True
     use_growth_evidence: bool = True
+    # RGB candidates are inserted virtually during the existing training trace.
+    # Legacy alpha evidence remains readable for old experiment checkpoints.
+    use_rgb_growth: bool = False
+    growth_warmup_epochs: int = 20
+    growth_fine_warmup_epochs: int = 20
+    growth_max_candidates: int = 1024
+    growth_max_new_voxels: int = 128
+    growth_rgb_min_support_views: int = 3
+    growth_rgb_max_conflict_views: int = 2
+    growth_rgb_gain_epsilon: float = 1e-7
+    growth_rgb_min_mean_gain: float = 1e-7
     growth_use_26_neighbors: bool = True
     growth_evidence_penetration: float = .05
     growth_min_supporting_parents: int = 2
@@ -401,12 +412,15 @@ class TopologyManager:
         self.pending_growth = None
         self._growth_world_cache = None
         self._growth_device = None
+        self._rgb_growth_device = None
         self._deletion_device = None
         self._device_statistics = {"deletion_device_views": 0, "growth_device_views": 0,
                                    "deletion_cpu_views": 0, "growth_cpu_views": 0,
                                    "deletion_count_readback_bytes": 0,
                                    "deletion_mask_readback_bytes": 0,
                                    "growth_count_readback_bytes": 0}
+        self._device_statistics.update(rgb_growth_device_views=0, rgb_growth_cpu_views=0,
+                                       rgb_growth_readback_bytes=0)
         self.before_refine_checkpoint = None
         self.completed_windows = 0
         self._validate()
@@ -416,6 +430,8 @@ class TopologyManager:
         cfg, schedule = self.settings, self.schedule
         if not 1 <= self.view_count <= 32767:
             raise ValueError("Training requires 1..32767 distinct cameras")
+        if not isinstance(cfg.use_rgb_growth, bool):
+            raise ValueError("topology.use_rgb_growth must be a boolean")
         for name, value in asdict(cfg).items():
             if isinstance(value, bool):
                 continue
@@ -424,6 +440,14 @@ class TopologyManager:
         if any(getattr(cfg, name) < 1 for name in ("growth_interval", "evidence_interval", "deletion_interval",
                                                   "min_deletion_conflict_views", "max_active_voxels")):
             raise ValueError("Topology intervals, conflict count and capacity must be positive")
+        rgb_integer_fields = ("growth_warmup_epochs", "growth_fine_warmup_epochs", "growth_max_candidates",
+                              "growth_max_new_voxels", "growth_rgb_min_support_views",
+                              "growth_rgb_max_conflict_views")
+        if any(not isinstance(getattr(cfg, name), int) or isinstance(getattr(cfg, name), bool)
+               for name in rgb_integer_fields):
+            raise ValueError("RGB growth warmups, budgets and vote thresholds must be integers")
+        if any(getattr(cfg, name) < 1 for name in rgb_integer_fields[2:]):
+            raise ValueError("RGB growth budgets and vote thresholds must be positive")
         if not 0 <= schedule.parent_opacity_threshold <= .99 or not 0 < schedule.opacity_optical_depth_scale <= 1:
             raise ValueError("Invalid refinement opacity configuration")
         if not 0 <= schedule.child_face_overlap <= .2 or schedule.coarse_growth_interval < 1:
@@ -460,6 +484,12 @@ class TopologyManager:
         return dict(self._device_statistics)
 
     def _materialize_growth(self):
+        if self._rgb_growth_device is not None:
+            pending, device = self._rgb_growth_device
+            if pending is self.pending_growth:
+                arrays = device.materialize()
+                self._device_statistics["rgb_growth_readback_bytes"] += sum(value.nbytes for value in arrays.values())
+            self._rgb_growth_device = None
         if self._growth_device is not None:
             pending, device = self._growth_device
             if pending is self.pending_growth:
@@ -512,6 +542,13 @@ class TopologyManager:
 
     def _growth_due(self, boundary):
         schedule, cfg = self.schedule, self.settings
+        if cfg.use_rgb_growth:
+            local_epoch = boundary - self.level_start_epoch
+            enabled = cfg.enable_growth and (not schedule.enabled or schedule.enable_coarse_growth)
+            interval = schedule.coarse_growth_interval if schedule.enabled else cfg.growth_interval
+            final = local_epoch >= self.level_budget
+            warmup = self.growth_warmup
+            return enabled and not final and local_epoch > warmup and (local_epoch - warmup) % interval == 0
         enabled = schedule.enable_coarse_growth if schedule.enabled else cfg.enable_growth
         interval = schedule.coarse_growth_interval if schedule.enabled else cfg.growth_interval
         final = (boundary - self.level_start_epoch >= self.level_budget if schedule.enabled else boundary >= schedule.total_epochs)
@@ -519,7 +556,14 @@ class TopologyManager:
 
     def needs_rendered_alpha(self, epoch):
         """Only growth-evidence views need the rendered alpha image."""
-        return self.settings.use_growth_evidence and self._growth_due(epoch + 1)
+        return (not self.settings.use_rgb_growth and self.settings.use_growth_evidence and
+                self._growth_due(epoch + 1))
+
+    @property
+    def growth_warmup(self):
+        """Growth-only warmup; deletion and continuous optimization are unchanged."""
+        return (self.settings.growth_warmup_epochs if self.resolution == self.schedule_start_resolution
+                else self.settings.growth_fine_warmup_epochs)
 
     def _generate_growth(self, checkpoint, boundary):
         np, cfg = self.np, self.settings
@@ -531,7 +575,7 @@ class TopologyManager:
         eligible &= (self.growth_wait_start == 0) | ((boundary >= self.growth_wait_start - 1) &
                                                     (boundary - (self.growth_wait_start - 1) >= cfg.growth_wait_epochs))
         occupied = np.asarray(state["cell_indices"], dtype=np.int64)
-        evidence = cfg.use_growth_evidence
+        evidence = cfg.use_growth_evidence or cfg.use_rgb_growth
         if evidence:
             penetration = float(np.clip(cfg.growth_evidence_penetration, 0., 4.))
         elif self.schedule.enabled:
@@ -582,6 +626,100 @@ class TopologyManager:
         result.update(foreground=np.zeros(count, dtype=np.uint32), background=np.zeros(count, dtype=np.uint32),
                       seen_views=set(), boundary=boundary, resolution=resolution)
         return result
+
+    def prepare_rgb_growth(self, model, epoch):
+        """Freeze/upload bounded candidates once, before this epoch's first trace.
+
+        ``epoch`` is zero-based. The first coarse and fine events are local
+        epoch 30 with the default 20-epoch warmup and 10-epoch interval.
+        The payload in pending_growth['candidate_state'] can be broadcast to
+        worker models; none of these arrays are committed model parameters.
+        """
+        cfg, np, boundary = self.settings, self.np, int(epoch) + 1
+        if not cfg.use_rgb_growth:
+            return False
+        if not self._growth_due(boundary):
+            model.clear_growth_candidates()
+            self.pending_growth = None
+            self._rgb_growth_device = None
+            return False
+        pending = self.pending_growth
+        if (pending is None or pending.get("mode") != "rgb" or
+                pending["boundary"] != boundary or pending["resolution"] != self.resolution):
+            from reconstruction_growth_rgb import initialize_statistics
+            checkpoint = model_checkpoint(model)
+            proposals = self._generate_growth(checkpoint, boundary)
+            cells, winners, counts = np.unique(proposals["cells"], return_index=True, return_counts=True)
+            # Prefer stronger geometric support; stable cell order resolves ties.
+            # All winners retain the exact legacy first legal parent geometry.
+            ranking = np.lexsort((cells, -counts))[:cfg.growth_max_candidates]
+            winners = winners[ranking]
+            pending = {name: values[winners].copy() for name, values in proposals.items()
+                       if isinstance(values, np.ndarray)}
+            count = len(winners)
+            state, metadata = checkpoint["model_state"], checkpoint["model_metadata"]
+            radiance = np.zeros((count, metadata["sh_count"], 3), dtype=np.float32)
+            radiance[:, 0] = state["radiance_sh"].reshape(self.count, metadata["sh_count"], 3)[pending["parent_ids"], 0]
+            opacity = np.zeros((count, metadata["opacity_sh_count"]), dtype=np.float32)
+            alpha = float(np.clip(cfg.growth_initial_opacity, .01, .99))
+            opacity[:, 0] = math.log(alpha / (1 - alpha)) * (2 * math.sqrt(math.pi))
+            pending.update(radiance_sh=radiance, opacity_sh=opacity,
+                           geometric_support=counts[ranking].astype(np.uint32),
+                           mode="rgb", boundary=boundary, resolution=self.resolution,
+                           all_candidate_count=len(cells), seen_views=set())
+            for name in ("centers", "log_scales", "rotations"):
+                pending[name] = pending[name].astype(np.float32)
+            pending["candidate_state"] = {
+                "cell_indices": pending["cells"].astype(np.uint32),
+                **{name: pending[name].reshape(-1).copy() for name in
+                   ("centers", "log_scales", "rotations", "radiance_sh", "opacity_sh")}}
+            initialize_statistics(pending, np)
+            self.pending_growth = pending
+            self._growth_world_cache = None
+            self._growth_device = None
+            self._rgb_growth_device = None
+        if not len(pending["cells"]):
+            model.clear_growth_candidates()
+            return False
+        from reconstruction_growth_rgb import upload_rgb_growth_candidates
+        upload_rgb_growth_candidates(model, pending["candidate_state"])
+        return True
+
+    def observe_rgb_growth(self, model, out, view_id, epoch, pixel_count):
+        """Consume ONE full-view native statistic after chunk/rank reduction.
+
+        Any incomplete ray makes that candidate/view abstain: an unknown
+        harmful ray must not be silently omitted from an otherwise positive
+        view. No-hit and invisible candidates are neutral. Full-image
+        normalization is retained, including views with no usable evidence.
+        """
+        cfg, pending, np = self.settings, self.pending_growth, self.np
+        if not cfg.use_rgb_growth or not self._growth_due(int(epoch) + 1):
+            return
+        if (pending is None or pending.get("mode") != "rgb" or
+                pending["boundary"] != int(epoch) + 1 or pending["resolution"] != self.resolution):
+            raise ValueError("RGB growth must be prepared before tracing the evidence epoch")
+        if not 0 <= view_id < self.view_count or int(model.active_voxel_count) != self.count:
+            raise ValueError("Unexpected RGB growth view ID or model topology")
+        if not isinstance(pixel_count, int) or pixel_count < 1:
+            raise ValueError("RGB growth requires a positive full-image pixel count")
+        if view_id in pending["seen_views"]:
+            return
+        if len(pending["cells"]):
+            dr = _cuda_array(out["growth_gain"])
+            if dr is not None:
+                from reconstruction_growth_rgb import RGBGrowthEvidenceDevice
+                if self._rgb_growth_device is None:
+                    self._rgb_growth_device = (pending, RGBGrowthEvidenceDevice(
+                        pending, type(out["growth_gain"]), type(out["growth_observed"]), dr, np))
+                self._rgb_growth_device[1].observe(out, pixel_count, cfg.growth_rgb_gain_epsilon)
+                self._device_statistics["rgb_growth_device_views"] += 1
+            else:
+                from reconstruction_growth_rgb import observe_numpy
+                self._materialize_growth()
+                observe_numpy(pending, out, pixel_count, cfg.growth_rgb_gain_epsilon, np)
+                self._device_statistics["rgb_growth_cpu_views"] += 1
+        pending["seen_views"].add(int(view_id))
 
     def _growth_world_points(self, pending, metadata):
         """Reuse the seven frozen proposal samples across views, never evidence.
@@ -747,6 +885,54 @@ class TopologyManager:
             self.growth_wait_start[kept:] = boundary + 1
         self.count = new_count
 
+    def _select_rgb_growth(self, model, checkpoint, boundary, event):
+        """Read bounded epoch statistics, recheck geometry, keep frozen params."""
+        np, cfg, pending = self.np, self.settings, self.pending_growth
+        selected = None
+        if (pending is None or pending.get("mode") != "rgb" or
+                pending["boundary"] != boundary or pending["resolution"] != self.resolution):
+            event["growth_rgb"] = {"status": "no_prepared_candidates"}
+            return checkpoint, selected
+        count = len(pending["cells"])
+        seen = len(pending["seen_views"])
+        mean_gain = pending["gain_sum"] / self.view_count
+        status = "no_candidates" if not count else ("complete" if seen == self.view_count else "incomplete_views")
+        detail = {"status": status,
+                  "geometric_candidates": pending["all_candidate_count"], "tested_candidates": count,
+                  "views": seen, "support_votes": int(pending["support_views"].sum()),
+                  "conflict_votes": int(pending["conflict_views"].sum()),
+                  "unknown_votes": int(pending["unknown_views"].sum()),
+                  "invalid_votes": int(pending["invalid_views"].sum()),
+                  "observed_rays": int(pending["observed_rays"].sum()),
+                  "unknown_rays": int(pending["unknown_rays"].sum()),
+                  "mean_gain_sum": float(mean_gain.sum()), "rgb_qualified": 0,
+                  "geometry_revalidated": 0}
+        event["growth_rgb"] = detail
+        if seen != self.view_count or not count:
+            return checkpoint, selected
+        keep = ((pending["support_views"] >= cfg.growth_rgb_min_support_views) &
+                (pending["conflict_views"] < cfg.growth_rgb_max_conflict_views) &
+                (pending["invalid_views"] == 0) &
+                np.isfinite(mean_gain) & (mean_gain > cfg.growth_rgb_min_mean_gain))
+        detail["rgb_qualified"] = int(np.count_nonzero(keep))
+        if not np.any(keep):
+            return checkpoint, selected
+        from reconstruction_growth_filter import generate_growth_for_targets, match_growth_parents
+        voted = {key: value[keep] for key, value in pending.items() if isinstance(value, np.ndarray)}
+        if checkpoint is None:
+            checkpoint = model_checkpoint(model)
+        current = generate_growth_for_targets(self, checkpoint, boundary, voted["cells"])
+        matches, parent_ids = match_growth_parents(current, voted)
+        selected = {key: value[matches] for key, value in voted.items()}
+        selected["parent_ids"] = parent_ids
+        detail["geometry_revalidated"] = len(parent_ids)
+        capacity = max(0, cfg.max_active_voxels - self.count)
+        ranking = np.lexsort((selected["cells"], -selected["gain_sum"]))
+        winners = ranking[:min(capacity, cfg.growth_max_new_voxels)]
+        selected = {key: value[winners] for key, value in selected.items()}
+        detail["budget_selected"] = len(winners)
+        return checkpoint, selected
+
     def finish_epoch(self, model, optimizer, completed_epochs: int):
         """Called after every view update. Returns (replacement checkpoint or None, event)."""
         np, cfg, schedule = self.np, self.settings, self.schedule
@@ -755,6 +941,12 @@ class TopologyManager:
         self.before_refine_checkpoint = None
         event = {"completed_epochs": boundary, "resolution": self.resolution, "deleted": 0, "grown": 0,
                  "refined": False, "finished": False, "level_budget": self.level_budget}
+        if cfg.use_rgb_growth:
+            model.clear_growth_candidates()
+            event.update(growth_mode="rgb_online", growth_level_epoch=boundary - self.level_start_epoch,
+                         growth_warmup_epochs=self.growth_warmup,
+                         growth_warmup_active=boundary - self.level_start_epoch <= self.growth_warmup,
+                         growth_evidence_requested=self._growth_due(boundary))
         checkpoint = None
         level_done = boundary - self.level_start_epoch >= self.level_budget
         if schedule.enabled and self.resolution < schedule.target_resolution and level_done:
@@ -772,6 +964,7 @@ class TopologyManager:
             self.pending_growth = None
             self._growth_world_cache = None
             self._growth_device = None
+            self._rgb_growth_device = None
             optimizer.remap(np.empty(0, dtype=np.uint32), self.count)
             event.update(refined=True, resolution=self.resolution, active_voxel_count=self.count)
             return replacement, event
@@ -796,7 +989,9 @@ class TopologyManager:
             self.completed_windows = 0
         if self._growth_due(boundary):
             selected = None
-            if cfg.use_growth_evidence:
+            if cfg.use_rgb_growth:
+                checkpoint, selected = self._select_rgb_growth(model, checkpoint, boundary, event)
+            elif cfg.use_growth_evidence:
                 pending = self.pending_growth
                 if (pending is not None and pending["boundary"] == boundary and
                         pending["resolution"] == self.resolution and len(pending["seen_views"]) == self.view_count):
@@ -827,11 +1022,16 @@ class TopologyManager:
                     raise RuntimeError("Growth exceeds max_active_voxels")
                 state, metadata = checkpoint["model_state"], checkpoint["model_metadata"]
                 parents = selected["parent_ids"]
-                radiance = np.zeros((added, metadata["sh_count"], 3), dtype=np.float32)
-                radiance[:, 0] = state["radiance_sh"].reshape(self.count, metadata["sh_count"], 3)[parents, 0]
-                opacity = np.zeros((added, metadata["opacity_sh_count"]), dtype=np.float32)
-                alpha = float(np.clip(cfg.growth_initial_opacity, .01, .99))
-                opacity[:, 0] = math.log(alpha / (1 - alpha)) * (2 * math.sqrt(math.pi))
+                if cfg.use_rgb_growth:
+                    # Commit exactly what the training rays evaluated, even
+                    # though the parent's appearance changed during the epoch.
+                    radiance, opacity = selected["radiance_sh"], selected["opacity_sh"]
+                else:
+                    radiance = np.zeros((added, metadata["sh_count"], 3), dtype=np.float32)
+                    radiance[:, 0] = state["radiance_sh"].reshape(self.count, metadata["sh_count"], 3)[parents, 0]
+                    opacity = np.zeros((added, metadata["opacity_sh_count"]), dtype=np.float32)
+                    alpha = float(np.clip(cfg.growth_initial_opacity, .01, .99))
+                    opacity[:, 0] = math.log(alpha / (1 - alpha)) * (2 * math.sqrt(math.pi))
                 new = {"cell_indices": selected["cells"].astype(np.uint32), "centers": selected["centers"],
                        "log_scales": selected["log_scales"], "rotations": selected["rotations"],
                        "radiance_sh": radiance, "opacity_sh": opacity}
@@ -846,6 +1046,7 @@ class TopologyManager:
         self.pending_growth = None
         self._growth_world_cache = None
         self._growth_device = None
+        self._rgb_growth_device = None
         self.cooldown = {cell: expiry for cell, expiry in self.cooldown.items() if expiry > boundary}
         event.update(finished=final, active_voxel_count=self.count)
         return checkpoint, event
@@ -872,6 +1073,7 @@ class TopologyManager:
         import copy
         self._growth_world_cache = None
         self._growth_device = None
+        self._rgb_growth_device = None
         self._deletion_device = None
         state = copy.deepcopy(state)
         if state["count"] != self.count or state["view_count"] != self.view_count:
