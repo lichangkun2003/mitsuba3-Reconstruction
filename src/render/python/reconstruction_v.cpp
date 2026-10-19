@@ -9,6 +9,54 @@
 MI_PY_EXPORT(VoxelReconstruction) {
     MI_PY_IMPORT_TYPES()
     using Model = mitsuba::VoxelReconstruction<Float, Spectrum>;
+    // Keep device selection and stream ownership inside the Dr.Jit runtime.
+    // These narrow helpers let the optional NCCL transport operate on evaluated
+    // buffers without changing CUDA_VISIBLE_DEVICES or importing another tensor
+    // runtime. The Python caller must retain each array until communication ends.
+    m.def("_reconstruction_cuda_context", [](int device) {
+        if constexpr (!dr::is_cuda_v<Float>) {
+            throw nb::value_error("Reconstruction CUDA communication requires cuda_ad_rgb");
+        } else {
+            int count = jit_cuda_device_count();
+            if (device >= count || device < -1)
+                throw nb::value_error("Requested reconstruction CUDA device is unavailable");
+            if (device >= 0)
+                jit_cuda_set_device(device);
+            nb::dict result;
+            result["device_count"] = count;
+            result["device"] = jit_cuda_device();
+            result["raw_device"] = jit_cuda_device_raw();
+            result["stream"] = (uintptr_t) jit_cuda_stream();
+            result["context"] = (uintptr_t) jit_cuda_context();
+            return result;
+        }
+    }, "device"_a = -1);
+    m.def("_reconstruction_cuda_push_context", [](uintptr_t context) {
+        if constexpr (!dr::is_cuda_v<Float>)
+            throw nb::value_error("Reconstruction CUDA communication requires cuda_ad_rgb");
+        else
+            jit_cuda_push_context((void *) context);
+    }, "context"_a);
+    m.def("_reconstruction_cuda_pop_context", []() {
+        if constexpr (!dr::is_cuda_v<Float>)
+            throw nb::value_error("Reconstruction CUDA communication requires cuda_ad_rgb");
+        else
+            return (uintptr_t) jit_cuda_pop_context();
+    });
+    m.def("_reconstruction_float_buffer_info", [](typename Model::FloatBuffer &value) {
+        nb::dict result;
+        result["pointer"] = (uintptr_t) value.data();
+        result["size"] = dr::width(value);
+        result["dtype"] = "float32";
+        return result;
+    }, "value"_a.noconvert());
+    m.def("_reconstruction_uint_buffer_info", [](typename Model::UIntBuffer &value) {
+        nb::dict result;
+        result["pointer"] = (uintptr_t) value.data();
+        result["size"] = dr::width(value);
+        result["dtype"] = "uint32";
+        return result;
+    }, "value"_a.noconvert());
     auto cls = nb::class_<Model, Object>(m, "VoxelReconstruction",
         "Point-cloud voxel ellipsoids with the Falcor NoLightTransport forward model.")
         .def(nb::init<const std::string &, uint32_t, const std::array<float, 3> &,

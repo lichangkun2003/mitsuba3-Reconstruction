@@ -64,6 +64,8 @@ def _epoch_summary(entries):
             for name, value in stages.items()},
         "active_voxels_before": _distribution(entry["active_voxels_before"] for entry in entries),
         "active_voxels_at_epoch_end": _distribution(entry["active_voxels"] for entry in entries),
+        "communication_seconds": _distribution(entry.get("communication_seconds") for entry in entries),
+        "communication_payload_bytes": _distribution(entry.get("communication_payload_bytes") for entry in entries),
     }
 
 
@@ -122,6 +124,8 @@ class PerformanceRecorder:
             "seconds": _number(entry.get("seconds")), "stages": stages,
             "active_voxels": _number(entry.get("active_voxels")),
             "active_voxels_before": _number(entry.get("active_voxels_before")), "topology_event": topology_event,
+            "communication_seconds": _number(entry.get("epoch_communication_seconds")),
+            "communication_payload_bytes": _number(entry.get("epoch_communication_bytes")),
         })
 
     def record_profile(self, record: dict):
@@ -170,6 +174,9 @@ class PerformanceRecorder:
                                  "Stage values are nested within profile totals and must not be added again. "
                                  "Legacy/disabled records are excluded from stage sample counts. "
                                  "Fused atomic operations are not timed separately.",
+                "communication": "NCCL packing, pending GPU work, peer wait, collective and completion wait. "
+                                 "Nested within gradients/epoch wall time; not pure network time or additional time. "
+                                 "Payload bytes count reduced inputs per rank, not network wire traffic.",
                 "missing_values": "Missing, negative or nonfinite timings are excluded from aggregates.",
             },
             "phase_seconds": self.phase_seconds, "checkpoints": self.checkpoints,

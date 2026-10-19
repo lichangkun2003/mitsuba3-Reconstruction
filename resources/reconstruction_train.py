@@ -7,10 +7,12 @@ configuration, or override the main options on the command line.
 from __future__ import annotations
 
 import argparse
+import builtins
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 import gc
+import io
 import json
 import math
 from pathlib import Path
@@ -154,6 +156,8 @@ def parse_arguments():
     parser.add_argument("--config")
     parser.add_argument("--resume", help="Resume a completed-epoch checkpoint")
     parser.add_argument("--epochs", type=int)
+    parser.add_argument("--stop-after-epochs", type=int,
+                        help="Stop after N additional complete epochs, saving a resumable checkpoint without changing the full schedule or publishing model.npz")
     parser.add_argument("--dataset")
     parser.add_argument("--output-dir", help="Override automatic outputs/SCENE-MM.DD-Eindex/training; on resume the default reuses the checkpoint's experiment")
     parser.add_argument("--build-dir")
@@ -250,24 +254,38 @@ def effective_chunk_size(config):
     return min(config.training.chunk_size or count, count)
 
 
-def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rendered_alpha=False,
-               collect_deletion_evidence=None, stage_profile=None, gpu_reference=None,
-               native_replay=None):
-    """Compute a full view on the GPU; only transfer data needed by CPU consumers.
+def shard_pixel_range(count, rank, world_size):
+    """Partition global pixel IDs exactly once, including uneven image sizes."""
+    if any(isinstance(value, bool) or not isinstance(value, int)
+           for value in (count, rank, world_size)):
+        raise ValueError("Pixel count, rank and world size must be integers")
+    if world_size < 1 or count < world_size or not 0 <= rank < world_size:
+        raise ValueError("Each GPU requires a nonempty pixel shard and a valid rank")
+    return count * rank // world_size, count * (rank + 1) // world_size
 
-    Gradients stay on the GPU. Loss/validity are read once per view. Optional
-    contour and growth alpha are assembled on the GPU before their one readback.
-    Positive chunk sizes retain bounded intermediate storage and one Adam update.
-    An optional output dictionary collects synchronized native phase diagnostics.
-    This is enabled only for sampled views, never for ordinary training calls.
-    Optional run-owned reference/replay caches contain no checkpoint state.
+
+def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, mi, dr, *,
+                       pixel_begin=0, pixel_end=None, need_rendered_alpha=False,
+                       collect_deletion_evidence=None, stage_profile=None,
+                       gpu_reference=None, native_replay=None, zero_alpha=False):
+    """Compute a pixel interval from an already sampled full view, without readback.
+
+    Return the accumulator, unnormalized loss sum, finite flag, and optional
+    full-sized alpha buffers. Partial buffers are zero outside the shard so a
+    SUM reduction reconstructs the original image without changing its pixels.
+    Sampling, contour observation and Adam updates are deliberately outside.
     """
     count = config.render.width * config.render.height
+    pixel_end = count if pixel_end is None else pixel_end
+    if (any(isinstance(value, bool) or not isinstance(value, int)
+            for value in (pixel_begin, pixel_end))
+            or not 0 <= pixel_begin < pixel_end <= count):
+        raise ValueError("Pixel shard must be a nonempty interval within the full image")
     chunk_size = effective_chunk_size(config)
-    offsets, inverse_pdf, token = sampler.sample(view["index"], rgba[..., 3], rng)
     reference = rgba.reshape(-1, 4)
-    raw_alpha = dr.empty(mi.Float, count) if token is not None else None
-    estimated_alpha = dr.empty(mi.Float, count) if need_rendered_alpha else None
+    allocate = dr.zeros if zero_alpha or pixel_begin != 0 or pixel_end != count else dr.empty
+    raw_alpha = allocate(mi.Float, count) if token is not None else None
+    estimated_alpha = allocate(mi.Float, count) if need_rendered_alpha else None
     accumulator = {"gradients": {}}
     total_loss, finite = mi.Float(0), mi.Bool(True)
     camera = prepare_camera(config.render, view["camera"], mi, dr)
@@ -278,8 +296,8 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
         # The topology schedule decides whether these counters have a consumer.
         # Disabling unused counters does not disable loss/appearance/geometry terms.
         native_settings["collect_deletion_evidence"] = bool(collect_deletion_evidence)
-    for begin in range(0, count, chunk_size):
-        end = min(begin + chunk_size, count)
+    for begin in range(pixel_begin, pixel_end, chunk_size):
+        end = min(begin + chunk_size, pixel_end)
         indices = dr.arange(mi.UInt32, end - begin) + dr.opaque(mi.UInt32, begin)
         ray = generate_ray_batch(config.render, view["camera"],
             indices, offsets[begin:end], mi, dr, prepared_camera=camera)
@@ -323,6 +341,13 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
     for gradient in accumulator["gradients"].values():
         finite &= dr.all(dr.isfinite(gradient))
     finite &= dr.isfinite(total_loss)
+    return accumulator, total_loss, finite, raw_alpha, estimated_alpha
+
+
+def finalize_view(partial, view, config, sampler, token, mi, dr, np):
+    """Validate a globally reduced view and observe its contour history once."""
+    accumulator, total_loss, finite, raw_alpha, estimated_alpha = partial
+    count = config.render.width * config.render.height
     # Read loss and the combined validity flag together, rather than performing
     # a separate host synchronization for every parameter group and ray batch.
     summary = dr.zeros(mi.Float, 2)
@@ -337,6 +362,37 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
     alpha = (np.asarray(estimated_alpha).reshape(config.render.height, config.render.width)
              if estimated_alpha is not None else None)
     return accumulator, float(host_summary[0]), alpha
+
+
+def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rendered_alpha=False,
+               collect_deletion_evidence=None, stage_profile=None, gpu_reference=None,
+               native_replay=None, collective=None):
+    """Compute one full-view gradient, optionally over synchronized pixel shards.
+
+    All ranks consume the same full-view sampling stream and contour history.
+    A collective combines gradient/validity SUMs, evidence MAXs and disjoint
+    alpha buffers before the single logical Adam update performed by the caller.
+    The ordinary path retains one small loss/finite readback per view; only
+    contour and growth consumers request image readbacks.
+    """
+    count = config.render.width * config.render.height
+    begin, end = ((0, count) if collective is None else
+                  shard_pixel_range(count, collective.rank, collective.world_size))
+    offsets, inverse_pdf, token = sampler.sample(view["index"], rgba[..., 3], rng)
+    partial = compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, mi, dr,
+        pixel_begin=begin, pixel_end=end, need_rendered_alpha=need_rendered_alpha,
+        collect_deletion_evidence=collect_deletion_evidence, stage_profile=stage_profile,
+        gpu_reference=gpu_reference, native_replay=native_replay, zero_alpha=collective is not None)
+    if collective is not None:
+        partial = collective.reduce_view(*partial)
+        accumulator, total_loss, finite, raw_alpha, estimated_alpha = partial
+        # Finite local values can overflow when summed across ranks. Reject the
+        # global result before any replica changes its optimizer or model state.
+        for gradient in accumulator["gradients"].values():
+            finite &= dr.all(dr.isfinite(gradient))
+        finite &= dr.isfinite(total_loss)
+        partial = accumulator, total_loss, finite, raw_alpha, estimated_alpha
+    return finalize_view(partial, view, config, sampler, token, mi, dr, np)
 
 
 def kernel_profile(history):
@@ -417,20 +473,28 @@ def validate_existing_model(path: Path, resumed_checkpoint: dict) -> None:
         raise ValueError(f"Exported model belongs to a different training dataset: {path}; choose a new experiment directory")
 
 
-def run_training():
+def run_training(distributed=None):
     """Finish and save training before releasing its GPU state for evaluation."""
     run_started = time.perf_counter()
+    primary = distributed is None or distributed.rank == 0
+    emit = builtins.print if primary else lambda *a, **k: None
     args = parse_arguments()
+    if args.stop_after_epochs is not None and args.stop_after_epochs < 1:
+        raise ValueError("--stop-after-epochs must be positive")
     overrides = json.loads(workspace_path(args.config, WORKSPACE).read_text(encoding="utf-8")) if args.config else {}
     config = TrainConfig()
     update(config, asdict(CONFIG))
     apply_arguments(config, args, overrides)
     resume_path = workspace_path(args.resume, WORKSPACE) if args.resume else None
     checkpoint = load_checkpoint(resume_path) if resume_path is not None else None
-    output = prepare_training_output(config, resume_path, checkpoint["config"] if checkpoint else None)
+    output = prepare_training_output(config, resume_path, checkpoint["config"] if checkpoint else None) if primary else None
+    if distributed is not None:
+        location, config.training.output = distributed.broadcast(
+            (str(output), config.training.output) if primary else None)
+        output = Path(location)
     model_path = final_model_path(output)
-    print("Training output:", output, flush=True)
-    print("Final reconstructed model:", model_path, flush=True)
+    emit("Training output:", output, flush=True)
+    emit("Final reconstructed model:", model_path, flush=True)
     report = {"status": "running", "training_status": "running", "evaluation": {"status": "not_started"},
               "started_utc": datetime.now(timezone.utc).isoformat(),
               "scope": "Falcor NoLightTransport 1-spp full-view training; explicit geometry surrogate gradients",
@@ -439,10 +503,11 @@ def run_training():
                   "gradient_reduction": "sum over pixels, no hit-count normalization",
                   "reported_loss": "mean over pixels, then mean over training views",
                   "actual_sampling": "per-pixel uniform, optionally contour-guided; frozen for a view"}}
-    progress_line = ProgressLine()
+    progress_line = ProgressLine() if primary else ProgressLine(stream=io.StringIO())
     reference_cache = None
     gpu_reference_cache = None
     native_replay = None
+    collective = None
     history_name = ("training-resume-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".jsonl"
                     if checkpoint else "training.jsonl")
     performance_name = ("performance-summary-" + Path(history_name).stem.removeprefix("training-") + ".json"
@@ -451,16 +516,30 @@ def run_training():
         {"history_file": str(output / history_name), "resumed_from": str(resume_path) if resume_path else None},
         started_at=run_started)
     report["performance_file"] = str(output / performance_name)
+    publish_performance = performance.write if primary else lambda *a, **k: None
     training_loop_started = None
-    print("Performance summary:", report["performance_file"], flush=True)
+    emit("Performance summary:", report["performance_file"], flush=True)
     try:
         validate(config)
-        mi, dr, np, handles = initialize_runtime(config.runtime, output, report)
+        mi, dr, np, handles = initialize_runtime(config.runtime, output, report,
+            cuda_device=distributed.rank if distributed else None,
+            cpu_threads=distributed.cpus_per_rank if distributed else None)
+        if distributed is not None:
+            from reconstruction_collective import NcclCollective
+            collective = NcclCollective(distributed.rank, distributed.world_size,
+                                         distributed.connection, mi, dr, np)
+            report["distributed"] = dict(world_size=distributed.world_size, rank=distributed.rank,
+                sharding="contiguous global pixel intervals of the same view",
+                gradient_reduction="SUM; one logical Adam update per view; no GPU-count averaging",
+                communication=collective.statistics())
+            performance.metadata["distributed"] = report["distributed"]
+            distributed.heartbeat("runtime_initialized", force=True)
         performance.metadata.update({key: report.get(key) for key in (
             "gpu", "cpu_threads", "python_executable", "mitsuba_version", "drjit_version", "actual_variant",
             "mitsuba_file", "drjit_file", "numpy_version", "provenance")})
         if checkpoint:
-            validate_existing_model(model_path, checkpoint)
+            if primary:
+                validate_existing_model(model_path, checkpoint)
             # Runtime and output are host-specific; all algorithm settings resume from the checkpoint.
             runtime, training_output = config.runtime, config.training.output
             update(config, checkpoint["config"])
@@ -483,10 +562,14 @@ def run_training():
             if current["schedule"] != previous["schedule"]:
                 raise ValueError("Resume must preserve its original resolution schedule and epoch budget")
             existing_config = output / "config.json"
-            if existing_config.exists():
+            if primary and existing_config.exists():
                 existing = json.loads(existing_config.read_text(encoding="utf-8"))
+                # Checkpoints preserve tuples, whereas config.json stores JSON
+                # arrays. Compare their serialized forms. Only the writer checks
+                # this file so a peer cannot race its replacement below.
+                previous_json = json.loads(json.dumps(previous))
                 for group in ("data", "model", "render", "gradient", "optimizer", "topology", "schedule", "contour"):
-                    if existing.get(group) != previous[group]:
+                    if existing.get(group) != previous_json[group]:
                         raise ValueError("Resume output belongs to a different configuration; choose a new --output-dir")
         report["requested_config"] = asdict(config)
         performance.metadata["config"] = asdict(config)
@@ -500,13 +583,14 @@ def run_training():
             native_stage_profiling="synchronized sampled views only; bypasses frozen replay" if config.training.profile_stages else "disabled",
             freeze_native=config.training.freeze_native,
             gpu_reference_cache_mib=config.training.gpu_reference_cache_mib)
-        print(f"Training rays: {ray_count} per view, {batch_size} per batch, "
+        emit(f"Training rays: {ray_count} per view, {batch_size} per batch, "
               f"{report['training_protocol']['batches_per_view']} batch(es) per update", flush=True)
         save_epochs = checkpoint_epochs(config.training.num_epochs, config.training.save_count)
         report["checkpoint_epochs"] = list(save_epochs)
-        (output / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
+        if primary:
+            (output / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
         dataset = workspace_path(config.data.dataset, WORKSPACE)
-        print("Loading training views and checking reference files:", dataset, flush=True)
+        emit("Loading training views and checking reference files:", dataset, flush=True)
         views = load_views(dataset, config.data.cameras, config.render, np)
         signature = dataset_signature(views, dataset, config.data.cameras)
         reference_cache = ReferenceImageCache(config.render.width, config.render.height, mi, np,
@@ -514,15 +598,15 @@ def run_training():
         gpu_reference_cache = GPUReferenceCache(config.render.width, config.render.height, mi, dr, np,
                                                 config.training.gpu_reference_cache_mib)
         native_replay = NativeLossReplay(dr, enabled=config.training.freeze_native)
-        print(f"Reference image cache: {config.training.reference_cache_mib} MiB RAM, "
+        emit(f"Reference image cache: {config.training.reference_cache_mib} MiB RAM, "
               f"{config.training.gpu_reference_cache_mib} MiB GPU, "
               "loaded on first use; dataset must remain unchanged during training", flush=True)
-        print("Native GPU replay:", "enabled" if config.training.freeze_native else "disabled", flush=True)
+        emit("Native GPU replay:", "enabled" if config.training.freeze_native else "disabled", flush=True)
         rng = np.random.default_rng(config.training.seed)
         sampler = ContourSampler(np, **asdict(config.contour))
         completed, global_step = 0, 0
         if checkpoint:
-            print("Restoring voxel model and training state", flush=True)
+            emit("Restoring voxel model and training state", flush=True)
             state = checkpoint["training_state"]
             if state["dataset_signature"] != signature:
                 raise ValueError("Training cameras/reference images differ from the checkpoint")
@@ -534,7 +618,7 @@ def run_training():
             rng.bit_generator.state = state["rng_state"]
             sampler.load_state_dict(state["contour_state"])
         else:
-            print("Initializing voxel model from point cloud:", dataset / config.data.point_cloud, flush=True)
+            emit("Initializing voxel model from point cloud:", dataset / config.data.point_cloud, flush=True)
             bounds_min = np.asarray(config.model.bounds_min)
             bounds_max = np.asarray(config.model.bounds_max)
             center, half = (bounds_min + bounds_max) / 2, (bounds_max - bounds_min) / 2 * config.model.bounds_padding
@@ -552,7 +636,7 @@ def run_training():
             # Loading legacy lifecycle state restores its schedule too. Avoid
             # making additional pre-refinement snapshots under the new policy.
             topology.schedule.save_each_level = False
-            if checkpoint["training_state"].get("pending_epoch_transition", False):
+            if primary and checkpoint["training_state"].get("pending_epoch_transition", False):
                 replacement, transition = topology.finish_epoch(model, optimizer, completed)
                 if replacement is not None:
                     model = restore_model(replacement, mi)
@@ -560,7 +644,33 @@ def run_training():
                     sampler = ContourSampler(np, **asdict(config.contour))
                 topology.before_refine_checkpoint = None
 
+        if distributed is not None:
+            # Establish a canonical model/Adam/RNG before the first collective,
+            # including legacy checkpoints whose epoch transition was pending.
+            initial = None
+            if primary:
+                initial = dict(model_state={key: np.asarray(value).copy() for key, value in model.snapshot().items()},
+                    model_metadata=model_metadata(model), optimizer_state=optimizer.state_dict(),
+                    rng_state=rng.bit_generator.state, contour_state=sampler.state_dict(),
+                    dataset_signature=signature, config=asdict(config), global_step=global_step)
+            initial = distributed.broadcast(initial)
+            if initial["dataset_signature"] != signature or initial["config"] != asdict(config):
+                raise ValueError("GPU workers have different datasets or training configurations")
+            if initial["global_step"] != global_step:
+                raise ValueError("GPU workers restored different training steps")
+            if not primary:
+                model = restore_model(initial, mi)
+                optimizer = FalcorOptimizer(model, config.optimizer)
+                optimizer.load_state_dict(initial["optimizer_state"])
+                rng.bit_generator.state = initial["rng_state"]
+                sampler.load_state_dict(initial["contour_state"])
+            del initial
+            distributed.barrier()
+            distributed.heartbeat("replicas_initialized", force=True)
+
         def save(path, epochs):
+            if not primary:
+                return
             save_started = time.perf_counter()
             dr.eval(*model.snapshot().values())
             dr.sync_thread()
@@ -584,24 +694,29 @@ def run_training():
         if config.training.profile_views or config.training.profile_interval_epochs:
             report["profile_file"] = str(profile_path)
             performance.metadata["profile_file"] = str(profile_path)
-            print("Kernel profile log:", profile_path, flush=True)
+            emit("Kernel profile log:", profile_path, flush=True)
         processed_views = 0
         last_training_resolution = None
         performance.set_phase_seconds("setup", time.perf_counter()-run_started)
-        performance.write("running")
+        publish_performance("running")
         training_loop_started = time.perf_counter()
-        print("Starting training; first kernels may require JIT compilation", flush=True)
-        for epoch in range(completed, config.training.num_epochs):
+        emit("Starting training; first kernels may require JIT compilation", flush=True)
+        end_epoch = (min(config.training.num_epochs, completed + args.stop_after_epochs)
+                     if args.stop_after_epochs is not None else config.training.num_epochs)
+        for epoch in range(completed, end_epoch):
             training_resolution = int(model.resolution)
             active_voxels_before = int(model.active_voxel_count)
             entering_resolution = last_training_resolution != training_resolution
-            growth_evidence_requested = topology.needs_rendered_alpha(epoch)
-            deletion_evidence_collected = topology.collect_deletion(epoch)
+            flags = (topology.needs_rendered_alpha(epoch), topology.collect_deletion(epoch)) if primary else None
+            if distributed is not None:
+                flags = distributed.broadcast(flags)
+            growth_evidence_requested, deletion_evidence_collected = flags
             interval = config.training.profile_interval_epochs
             order = rng.permutation(len(views)) if config.training.shuffle else np.arange(len(views))
             epoch_loss = 0.
             stage_totals = dict(reference=0., gradients=0., topology_observation=0., optimizer=0.)
             started = time.perf_counter()
+            communication_before = collective.statistics() if collective is not None else None
             progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} | view 0/{len(views)} (0%) "
                                  f"| grid={int(model.resolution)}", force=True)
             for progress, index in enumerate(order, 1):
@@ -627,10 +742,11 @@ def run_training():
                         need_rendered_alpha=growth_evidence_requested,
                         collect_deletion_evidence=deletion_evidence_collected,
                         stage_profile=native_stages, gpu_reference=gpu_reference,
-                        native_replay=native_replay)
+                        native_replay=native_replay, collective=collective)
                     gradients_done = time.perf_counter()
-                    topology.observe_view(model, gradients, view_id=int(index), epoch=epoch,
-                        camera=view["camera"], reference_alpha=rgba[..., 3], rendered_alpha=rendered_alpha)
+                    if primary:
+                        topology.observe_view(model, gradients, view_id=int(index), epoch=epoch,
+                            camera=view["camera"], reference_alpha=rgba[..., 3], rendered_alpha=rendered_alpha)
                     topology_done = time.perf_counter()
                     optimizer.step(model, gradients, sample_count=1, epoch=epoch, coarse_to_fine=config.schedule.enabled)
                     optimizer_done = time.perf_counter()
@@ -640,11 +756,13 @@ def run_training():
                     stage_totals[key] += duration
                 processed_views += 1
                 global_step += 1
+                if distributed is not None:
+                    distributed.heartbeat(f"epoch {epoch+1} view {progress}")
                 epoch_loss += loss
                 progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} "
                     f"| view {progress}/{len(views)} ({100*progress/len(views):.0f}%) "
                     f"| cam {int(index)+1} | loss={loss:.6f} | {optimizer_done-view_started:.2f}s/view")
-                if profiling:
+                if profiling and primary:
                     profile = dict(epoch=epoch+1, progress=progress, camera=int(index)+1,
                                    training_resolution=training_resolution, active_voxels=int(model.active_voxel_count),
                                    sample_reasons=reasons, growth_evidence_requested=growth_evidence_requested,
@@ -663,13 +781,20 @@ def run_training():
             progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} "
                                  f"| view {len(views)}/{len(views)} (100%) | updating topology...", force=True)
             topology_started = time.perf_counter()
-            new_state, event = topology.finish_epoch(model, optimizer, epoch+1)
+            new_state, event = topology.finish_epoch(model, optimizer, epoch+1) if primary else (None, None)
             topology.before_refine_checkpoint = None
+            if distributed is not None:
+                transition = distributed.broadcast((new_state, event,
+                    optimizer.state_dict() if new_state is not None else None) if primary else None)
+                new_state, event, new_optimizer = transition
             if new_state is not None:
                 # Drop recordings retaining the old occupancy/parameter buffers,
                 # including same-size replacements and transitions after pruning.
                 native_replay.clear()
                 model = restore_model(new_state, mi)
+                if not primary:
+                    optimizer = FalcorOptimizer(model, config.optimizer)
+                    optimizer.load_state_dict(new_optimizer)
             if event.get("refined", False):
                 # Falcor resets contour proposals whenever grid resolution changes.
                 sampler = ContourSampler(np, **asdict(config.contour))
@@ -684,8 +809,14 @@ def run_training():
                      "native_replay": native_replay.statistics(),
                      "view_stage_seconds": stage_totals,
                      "epoch_topology_seconds": time.perf_counter()-topology_started}
-            with (output / history_name).open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(entry) + "\n")
+            if collective is not None:
+                communication_after = collective.statistics()
+                entry["collective"] = communication_after
+                entry["epoch_communication_seconds"] = communication_after["seconds"] - communication_before["seconds"]
+                entry["epoch_communication_bytes"] = communication_after["payload_bytes"] - communication_before["payload_bytes"]
+            if primary:
+                with (output / history_name).open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(entry) + "\n")
             report["last_epoch"] = entry
             performance.record_epoch(entry)
             last_training_resolution = training_resolution
@@ -694,18 +825,31 @@ def run_training():
                 f"| grid={entry['resolution']} | voxels={entry['active_voxels']}")
             if epoch+1 in save_epochs and epoch+1 < config.training.num_epochs:
                 save(output / f"epoch-{epoch+1:05d}.npz", epoch+1)
-                print("Saved checkpoint:", output / f"epoch-{epoch+1:05d}.npz", flush=True)
+                emit("Saved checkpoint:", output / f"epoch-{epoch+1:05d}.npz", flush=True)
             performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
-            performance.write("running", training_status="running",
+            publish_performance("running", training_status="running",
                               gpu_reference_cache=entry["gpu_reference_cache"], native_replay=entry["native_replay"])
         performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
         training_loop_started = None
+        if end_epoch < config.training.num_epochs:
+            stopped_checkpoint = output / f"epoch-{end_epoch:05d}.npz"
+            if end_epoch not in save_epochs:
+                save(stopped_checkpoint, end_epoch)
+            if distributed is not None:
+                distributed.barrier()
+            report.update(status="stopped", training_status="stopped", completed_epochs=end_epoch,
+                          global_step=global_step, checkpoint=str(stopped_checkpoint),
+                          evaluation={"status": "skipped", "reason": "bounded training trial"})
+            emit("Stopped at a complete epoch; resume checkpoint:", stopped_checkpoint, flush=True)
+            return config, model_path, output, report, performance
         # Publish only the completed reconstruction, using the same portable,
         # atomic checkpoint format understood by independent evaluation scripts.
         export_started = time.perf_counter()
         save(model_path, config.training.num_epochs)
-        print("Saved reconstructed voxel model:", model_path, flush=True)
-        report.update(status="running" if config.evaluation.enabled else "passed", training_status="passed",
+        emit("Saved reconstructed voxel model:", model_path, flush=True)
+        if distributed is not None:
+            distributed.barrier()
+        report.update(status="running" if config.evaluation.enabled and primary else "passed", training_status="passed",
                       evaluation={"status": "pending" if config.evaluation.enabled else "skipped"},
                       completed_epochs=config.training.num_epochs, global_step=global_step,
                       checkpoint=str(model_path),
@@ -719,7 +863,9 @@ def run_training():
     except Exception:
         progress_line.finish()
         report.update(status="failed", training_status="failed", error=traceback.format_exc())
-        print(report["error"], file=sys.stderr, flush=True)
+        emit(report["error"], file=sys.stderr, flush=True)
+        if distributed is not None:
+            raise
     finally:
         progress_line.finish()
         if reference_cache is not None:
@@ -730,23 +876,30 @@ def run_training():
         if native_replay is not None:
             report["native_replay"] = native_replay.statistics()
             native_replay.clear()
+        if collective is not None:
+            report["collective"] = collective.statistics()
+            collective.close(abort=report["training_status"] not in ("passed", "stopped"))
         if training_loop_started is not None:
             performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
         report["training_finished_utc"] = datetime.now(timezone.utc).isoformat()
         if report["status"] != "running":
             report["finished_utc"] = report["training_finished_utc"]
-        (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
-        performance.write(report["status"], training_status=report["training_status"],
+        if primary:
+            (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
+        publish_performance(report["status"], training_status=report["training_status"],
             reference_cache=report.get("reference_cache"), gpu_reference_cache=report.get("gpu_reference_cache"),
-            native_replay=report.get("native_replay"), training_report=str(output / "training-report.json"))
+            native_replay=report.get("native_replay"), collective=report.get("collective"),
+            training_report=str(output / "training-report.json"))
     return config, model_path, output, report, performance
 
 
-def main():
-    config, model_path, output, report, performance = run_training()
+def main(distributed=None):
+    config, model_path, output, report, performance = run_training(distributed)
+    if report["training_status"] == "stopped":
+        return 0
     if report["training_status"] != "passed":
         return 1
-    if not config.evaluation.enabled:
+    if not config.evaluation.enabled or (distributed is not None and distributed.rank != 0):
         return 0
     evaluation = final_evaluation_config(config, model_path)
     evaluation_report = model_path.parent / "evaluation-report.json"
@@ -765,7 +918,9 @@ def main():
         dr.sync_thread()
         dr.flush_malloc_cache()
         from reconstruction_evaluate import run_evaluation
-        result = run_evaluation(evaluation)
+        if distributed is not None:
+            distributed.heartbeat("evaluation_start", force=True)
+        result = run_evaluation(evaluation, progress_callback=distributed.heartbeat if distributed else None)
         report["evaluation"]["status"] = "passed" if result == 0 else "failed"
         report["status"] = "passed" if result == 0 else "failed"
         if result != 0:
@@ -787,6 +942,7 @@ def main():
         performance.write(report["status"], training_status=report["training_status"],
             evaluation=report["evaluation"], reference_cache=report.get("reference_cache"),
             gpu_reference_cache=report.get("gpu_reference_cache"), native_replay=report.get("native_replay"),
+            collective=report.get("collective"),
             training_report=str(output / "training-report.json"), evaluation_report=str(evaluation_report))
     return 0 if report["status"] == "passed" else 1
 

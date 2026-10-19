@@ -1,7 +1,8 @@
 体素重建训练、保存与评价
 ======================
 
-训练入口为 ``resources/reconstruction_train.py``，评价入口为
+单卡训练入口为 ``resources/reconstruction_train.py``，实验性的同节点双卡启动器为
+``resources/reconstruction_multigpu.py``，评价入口为
 ``resources/reconstruction_evaluate.py``。它们共享场景表达、相机、源码运行环境和
 前向渲染工具；``reconstruction_preview.py`` 继续用于初始化检查。
 原生接口保留名称 ``mi.VoxelReconstruction``，移植对象是 Falcor 的
@@ -396,7 +397,8 @@ CPU 参考图仍用于 contour 和生长证据。子像素随机采样继续使�
 异步执行还会让某阶段发出的工作在后续阶段等待完成。设备时间与主机墙钟时间不能相加，
 也不能简单相减后将差值当作纯 CPU 时间。报告中的 GPU 可见设备与 CPU 线程
 来源说明实际运行配置，不代表持续采集了 GPU 利用率、显存峰值或多 GPU 通信性能。
-目前一个训练进程仍只使用一张 GPU，性能报告本身不会启用分布式训练。
+普通训练入口仍只使用一张 GPU；双 GPU 必须使用下文的专用启动器，
+性能报告本身不会启用分布式训练。
 
 训练完成后，可以直接提供以下小文件，无需发送 ``model.npz`` 或图片：
 
@@ -655,19 +657,139 @@ CPU 核数。增加 ``--cpus-per-task`` 会调整 Dr.Jit
 线程预算，但不会自动并行 Python 拓扑循环或让同一训练使用多张 GPU。
 是否增加资源应根据后续轮次的 ``reference``、``gradients``、``topology_observation``
 及 ``epoch_topology_seconds`` 实测判断，不能只用未触发生长的第一轮推断整个训练。
-当前仍为单 GPU 训练；这些执行层优化没有引入多 GPU 梯度汇总。A100 与 RTX 5090 的硬件、
-运行框架和实际工作负载不同，本地生成场景通过也不保证 A100 上的完整实验追平 5090。
-
-以后若要保持每视角一次更新的算法，可以把同一视角的射线分给多张卡，使用同一组
-当前模型参数，先对梯度和有效计数做 SUM 归约、对删除证据做 OR 归约，再执行一次
-Adam 并同步更新后的模型。不同视角并行计算后平均梯度，会改变逐视角更新时使用的
-模型及更新顺序，不能当作当前算法的等价实现；即使采用同视角拆分，也需验证浮点
-归约顺序和通信成本。上述是设计限制，当前脚本没有实现多 GPU 训练。
+A100 与 RTX 5090 的硬件、运行框架和实际工作负载不同，本地生成场景通过也不保证
+A100 上的完整实验追平 5090。双卡训练是下面单独的实验性入口，不由单卡优化选项开启。
 
 Windows 默认构建目录为 ``mitsuba/build/Release``，Linux 为 ``mitsuba/build``；
 ``--build-dir`` 可覆盖。所有相对路径固定相对于仓库父目录，包括
 ``datasets/lego``、checkpoint 与输出。共享配置使用相对路径；无需把本机绝对路径
 写入 Git。输出和缓存禁止放进源码仓库。
+
+同节点两张 GPU 训练（实验性）
+----------------------------------------
+
+``resources/reconstruction_multigpu.py`` 启动两个独立进程，分别使用调度器可见的逻辑
+GPU 0 和 1。当前仅支持 Linux Slurm、同一节点、两个训练进程。普通 Windows 本地训练
+继续使用 ``reconstruction_train.py``。这里没有承诺两倍加速：每个视角都需要梯度汇总，
+收益取决于射线计算量、模型大小、通信及同步成本。真实双 A100 的 NCCL 通信、数值一致性、
+完整收敛和速度尚需在服务器验证；本地的 CPU 模拟通信测试不等于真实双卡验证。
+
+本地 RTX 4060 Laptop 的源码增量构建、CUDA 缓冲外部写入、整图与像素分片数值对照已通过。
+另外使用两个进程共享一张 GPU、测试专用的主机归约验证了完整训练、4 → 8 升层、
+contour/Adam/RNG 状态和单卡/双进程之间的 checkpoint 恢复；生产路径不使用该主机归约。
+
+双卡拆分的是同一视角内的像素射线。两个进程保持相同模型、相机顺序、CPU 随机采样及
+contour 提案，每张卡计算各自不重叠的半幅像素。每个像素仍为 1 spp，每个 epoch
+仍遍历全部视角。通过 NCCL 在 GPU 上将梯度、有效计数和损失做 SUM 归约，布尔删除证据
+用 MAX 合并，有限值状态合并检查。梯度不除以卡数，也不把不同视角组成新的训练 batch。
+拿到相同的完整视角梯度后，两份模型副本各执行相同的一次 Adam 更新，逻辑全局步数只加 1。
+浮点求和的分组和次序会改变，因此不保证与单卡逐位相同。
+
+rank 0 负责实验目录、日志、拓扑生长/删除/升层、checkpoint 及最终 train/test 评价；
+拓扑改变后将模型与 Adam 状态同步给 rank 1，并清除旧的原生重放记录。需要 contour
+历史或生长证据时，额外合并预测 alpha；普通轮次不因此回读完整 RGB 图像。最终 64 spp
+评价目前仍由 rank 0 单卡执行，这部分耗时不会因训练使用两张卡而自动减半。
+
+先申请同一节点的一项任务和两张 GPU，例如：
+
+.. code-block:: bash
+
+   srun --partition=cscc-gpu-p --qos=gpu-debug-qos \
+     --nodes=1 --ntasks=1 --gres=gpu:a100-sxm4-40gb:2 --cpus-per-task=16 --mem=80G \
+     --time=01:00:00 --pty bash
+
+这是首次短测试的资源示例；正式实验按集群 QoS 允许的时限安排。启动器自身创建两个
+进程，不要再用 ``--ntasks=2`` 启动两份启动器。它要求有效的 Slurm 作业、至少两个不同
+的 ``CUDA_VISIBLE_DEVICES`` 条目，以及至少 2 个 ``SLURM_CPUS_PER_TASK``。
+每个子进程原样继承 ``CUDA_VISIBLE_DEVICES`` 和所有 ``SLURM_*`` 变量，仅通过 Dr.Jit
+选择可见逻辑设备，不重写物理卡号。16 个 CPU 配额分为每进程 8 个 Dr.Jit 线程；
+奇数配额向下均分，不超过调度器总配额。两份参考图缓存各自占用内存和显存。
+
+本地先提交并 push；服务器在没有旧训练使用同一构建目录时同步和增量编译：
+
+.. code-block:: bash
+
+   test -n "${SLURM_JOB_ID:-}" &&
+   source /apps/local/conda_init.sh &&
+   conda activate "$HOME/envs/mitsuba" &&
+   cd "$HOME/projects/reconstruction/mitsuba" &&
+   git -c submodule.recurse=false pull --ff-only &&
+   git submodule sync --recursive &&
+   git submodule update --init --recursive &&
+   cmake --build build --parallel "${SLURM_CPUS_PER_TASK:-1}" &&
+   source build/setpath.sh
+
+本次新增了原生 CUDA 缓冲和流信息绑定，因此编译不可省略。运行时还需要与节点驱动
+兼容的 NCCL 动态库。优先使用集群现有 NCCL module 或系统库；若库不在默认搜索路径，
+可将 ``MITSUBA_NCCL_LIBRARY`` 设置为实际 ``libnccl.so.2`` 的绝对路径。已安装在项目
+Python 环境中的 NVIDIA NCCL 包也会被搜索。启动器不会自动安装依赖，不需要为本功能
+预先安装 PyTorch、CUDA Toolkit 或其他大型工具链；找不到库时明确报错。
+
+在这项双 GPU Slurm 分配内先运行实际 NCCL 通信检查：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I resources/test_reconstruction_nccl.py
+
+该检查与 CPU 模拟测试 ``test_reconstruction_collective.py`` 不同；它需要两张实际
+CUDA 设备及上述 NCCL 库。通信检查通过后再运行短训练，检查真实场景的行为与吞吐。
+
+先保持 1000 轮的完整分辨率调度，执行前 10 轮并保存恢复点：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I resources/reconstruction_multigpu.py \
+     --workers 2 --worker-timeout 600 \
+     --dataset datasets/lego --epochs 1000 --stop-after-epochs 10 \
+     --chunk-size 0 --freeze-native --gpu-reference-cache-mib 1024 \
+     --profile-views 3 --profile-interval-epochs 10 --no-profile-stages
+
+``--stop-after-epochs 10`` 表示本次进程最多额外完成 10 轮；恢复时同样从恢复点继续计数。
+它仅限制本次执行的轮数边界，不把总训练预算改成 10，也不提前
+导出声称完成 1000 轮的 ``model.npz``。它在完整 epoch 和拓扑更新结束后保存中间
+checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这个提前停止边界时
+自动跳过最终评价，保留配置中的评价开关，恢复到全部轮次完成后仍可自动出图。直接使用
+``--epochs 10`` 会重新分配 coarse-to-fine 预算，不能作为上述 1000 轮实验的早期速度对照。
+
+为了比较同一节点和同一版本的单卡基线，可在双卡测试结束后运行：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I resources/reconstruction_train.py \
+     --dataset datasets/lego --epochs 1000 --stop-after-epochs 10 \
+     --chunk-size 0 --freeze-native --gpu-reference-cache-mib 1024 \
+     --profile-views 3 --profile-interval-epochs 10 --no-profile-stages
+
+两个命令分别自动分配实验目录。先比较预热后的普通轮次，再单独比较第 10 轮的拓扑事件；
+同时检查 loss、保存参数及有效计数/删除证据，不能只根据每轮时间判断移植正确。
+单卡入口即使看见两个 GPU，也只使用一张卡，并保留调度器环境。
+
+短测试确认后，在有足够剩余作业时间的终端开启新的完整双卡实验：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I resources/reconstruction_multigpu.py \
+     --workers 2 --worker-timeout 600 \
+     --dataset datasets/lego --epochs 1000 --chunk-size 0 \
+     --freeze-native --gpu-reference-cache-mib 1024 \
+     --profile-views 3 --profile-interval-epochs 10 --no-profile-stages \
+     --eval-spp 64 --eval-max-views 10
+
+若要继续前面的短实验，可给同一启动器传 ``--resume`` 和实际保存的中间 checkpoint
+相对路径，省略 ``--stop-after-epochs``。checkpoint 格式沿用单卡格式；它不是每个 rank
+各保存一份模型。恢复后的浮点结果仍需按数值容差和训练曲线检查。
+
+双卡 ``training.jsonl`` 增加 ``epoch_communication_seconds``、
+``epoch_communication_bytes`` 以及 ``collective`` 的累计统计。通信墙钟包含打包、物化、
+调用和同步等待，可能等待此前发出的 GPU 运算；它已经包含在 ``gradients`` 中，不能再次
+加到 epoch 总时间，也不能当作纯 NCCL 传输时间。``payload_bytes`` 及每轮的字节差值
+表示每个 rank 参与归约的逻辑输入字节数，不是 NVLink/PCIe 实际传输流量。
+抽样内核报告仍主要描述 rank 0 的 Dr.Jit 运算，NCCL 内核不会自动被归入 Dr.Jit 内核统计。
+
+任一子进程失败、超时或收到中断，启动器会终止并回收同伴进程，避免一张卡一直等待归约。
+默认 ``--worker-timeout 600`` 表示某个进程连续 600 秒没有报告进展时终止；对于很慢的
+首次编译、拓扑操作或评价，可显式提高为 ``--worker-timeout 1200``。正常训练每视角报告
+进展，父进程心跳消息按秒节流，不增加逐像素通信。
 
 Checkpoint 与恢复
 -----------------
@@ -678,6 +800,9 @@ Checkpoint 与恢复
 例如前面的本地 10 轮命令会生成 ``training/epoch-00004.npz``、
 ``training/epoch-00007.npz`` 和实验根目录 ``model.npz``。
 不再额外生成 ``latest.npz``、最终轮次的 ``epoch-XXXXX.npz`` 或升分辨率前的分层副本。
+显式使用 ``--stop-after-epochs`` 做有界短测试时，会在本次结束的完整轮次额外保存
+``epoch-XXXXX.npz`` 作为恢复点；这个主动停止点不改变总训练预算和原定三次保存计划。
+尚未完成全部预算时，不生成最终的 ``model.npz``，也不运行最终评价。
 
 训练输出还包括 ``config.json``、``training.jsonl``、``training-report.json`` 和
 ``performance-summary.json``。

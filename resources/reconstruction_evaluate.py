@@ -185,7 +185,7 @@ def _wall_stage(view_timing, split_timing, stage):
         split_timing[stage] += elapsed
 
 
-def run_evaluation(config: EvaluationConfig) -> int:
+def run_evaluation(config: EvaluationConfig, *, progress_callback=None) -> int:
     """Evaluate a saved model using the same validated runtime as the CLI."""
     evaluation_started = time.perf_counter()
     repository = Path(__file__).resolve().parents[1]
@@ -283,6 +283,8 @@ def run_evaluation(config: EvaluationConfig) -> int:
                 split_output.mkdir(parents=True, exist_ok=True)
                 progress.update(f"Eval {split} 0/{len(views)} (0.0%) | {config.spp} spp", force=True)
                 for view in views:
+                    if progress_callback is not None:
+                        progress_callback(f"evaluation {split} view {view['index']}")
                     started = time.perf_counter()
                     index = int(view["index"])
                     seed = int(np.random.SeedSequence([config.seed, 0 if split == "train" else 1, index])

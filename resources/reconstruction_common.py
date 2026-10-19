@@ -18,7 +18,8 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 WORKSPACE = REPOSITORY.parent
 
 
-def initialize_runtime(runtime: RuntimeConfig, output: Path, report: dict):
+def initialize_runtime(runtime: RuntimeConfig, output: Path, report: dict, *,
+                       cuda_device=None, cpu_threads=None):
     """Use only this checkout's build, respecting the local/Slurm device policy."""
     report.setdefault("resolved", {}).update(workspace=str(WORKSPACE), output=str(output))
     report.update(python_executable=sys.executable, requested_variant="cuda_ad_rgb")
@@ -31,11 +32,25 @@ def initialize_runtime(runtime: RuntimeConfig, output: Path, report: dict):
     if not Path(dr.__file__).resolve().is_relative_to(package_root):
         raise RuntimeError(f"Source build required; imported {dr.__file__}")
     configure_drjit_threads(dr, report)
+    if cpu_threads is not None:
+        allocation = report["cpu_threads"].get("requested", dr.thread_count())
+        if type(cpu_threads) is not int or not 1 <= cpu_threads <= allocation:
+            raise ValueError("Worker CPU budget must fit within the Slurm task allocation")
+        dr.set_thread_count(cpu_threads)
+        report["cpu_threads"].update(worker_budget=cpu_threads, actual=dr.thread_count())
+        if not 1 <= report["cpu_threads"]["actual"] <= cpu_threads:
+            raise RuntimeError("Dr.Jit worker thread count exceeds its share of the Slurm CPU allocation")
+        print("Dr.Jit worker CPU threads:", json.dumps(report["cpu_threads"]), flush=True)
     import mitsuba as mi
     import numpy as np
     if not Path(mi.__file__).resolve().is_relative_to(package_root):
         raise RuntimeError(f"Source build required; imported {mi.__file__}")
     mi.set_variant("cuda_ad_rgb")
+    if cuda_device is not None:
+        if not hasattr(mi, "_reconstruction_cuda_context"):
+            raise RuntimeError("Rebuild this checkout: multi-GPU CUDA device bindings are missing")
+        device = mi._reconstruction_cuda_context(cuda_device)
+        report["worker_cuda"] = {name: device[name] for name in ("device", "raw_device", "device_count")}
     if mi.variant() != "cuda_ad_rgb" or dr.backend_v(mi.Float) != dr.JitBackend.CUDA:
         raise RuntimeError("CUDA variant/backend verification failed")
     if not hasattr(mi, "VoxelReconstruction") or not hasattr(mi.VoxelReconstruction, "from_state"):
