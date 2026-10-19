@@ -29,6 +29,8 @@
      - 保留旧 alpha 监督模式的前向与执行方式基准；当前 RGB-only 速度请用 ``train.py`` 短跑测量。
    * - ``tools/smoke_gpu.py``
      - 程序生成 Cornell box 的基础 CUDA 环境检查。
+   * - ``tools/deploy_windows.ps1``
+     - Windows 源码部署：工具预检、独立 Python 环境、编译与单卡 CUDA／RGB-only 检查。
 
 这些脚本调用本仓库的 C++ ``mi.VoxelReconstruction``。渲染与梯度核心仍在
 ``src/render/reconstruction.cpp``；目录整理没有将算法改成纯 Python 实现。
@@ -53,6 +55,69 @@ Visual Studio 2022。使用支持该 GPU 的 NVIDIA 驱动；本说明不代表�
 机器上验证。无需为这条构建流程预先安装 CUDA Toolkit。
 不要复制其他机器的 ``envs`` 或 ``build``，它们包含本机解释器与构建路径。
 
+RTX 5090 新主机快速部署
+~~~~~~~~~~~~~~~~~~~~~~
+
+当前定制源码标记为 Mitsuba ``3.10.0.dev1``、Dr.Jit ``1.6.0.dev1``。
+RTX 5090 的计算能力为 12.0，配套 Dr.Jit 已包含 Blackwell 支持；
+仍应安装 NVIDIA 官网适用于这张卡和 Windows 版本的当前驱动，并在目标机完成检查。
+这条源码构建使用 Dr.Jit 运行时生成 GPU 代码，无需设置
+``CMAKE_CUDA_ARCHITECTURES=120`` 或单独安装 CUDA Toolkit／OptiX SDK。
+参考 `NVIDIA GPU 列表 <https://developer.nvidia.com/cuda/gpus>`_、
+`Dr.Jit 更新记录 <https://drjit.readthedocs.io/en/latest/changelog.html>`_ 与
+`Mitsuba GPU 构建说明 <https://mitsuba.readthedocs.io/en/latest/src/developer_guide/compiling.html#gpu-variants>`_。
+
+先安装上述工具。Visual Studio Installer 中选择 Visual Studio 2022 或其
+Build Tools 的“使用 C++ 的桌面开发”，包含 MSVC v143 x64/x86 工具和 Windows SDK。
+安装 Git、CMake 时加入 PATH；安装完成后新开 PowerShell。Python 使用 64 位 3.12。
+
+将 **本项目当前源码** 同步到目标主机。首次获取已推送版本可执行：
+
+.. code-block:: powershell
+
+   # 在目标机器选好的 reconstruction 父目录下执行。
+   git clone --recursive https://github.com/lichangkun2003/mitsuba3-Reconstruction.git mitsuba
+   if ($LASTEXITCODE -ne 0) { throw 'Source clone failed' }
+   Set-Location .\mitsuba
+
+Git clone 只包含已推送的改动；本地新加的部署脚本也需同步。也可以复制完整源码和
+子模块（保留 Git 元数据），排除 ``build*``，并在目标机器重新创建 Python 环境。
+不要改为克隆上游 Mitsuba，因为本项目的 C++ 重建接口在当前定制仓库中。
+
+从目标机器的 Mitsuba 仓库根目录运行：
+
+.. code-block:: powershell
+
+   # 只检查工具、GPU 和已有环境／构建配置，不安装或编译。
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\experiments\reconstruction\tools\deploy_windows.ps1 -CheckOnly
+   if ($LASTEXITCODE -ne 0) { throw 'Resolve the reported prerequisite first' }
+
+   # 创建／复用独立环境、初始化固定版本的子模块、编译并检查。
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\experiments\reconstruction\tools\deploy_windows.ps1 -Gpu 0 -Jobs 2
+   if ($LASTEXITCODE -ne 0) { throw 'Deployment failed; inspect the error above' }
+
+``-Gpu`` 对应 ``nvidia-smi`` 的物理编号，多卡机器应先确认 5090 的编号。
+``-Jobs 2`` 控制 MSBuild 同时构建的项目数；仓库还启用了 MSVC ``/MP``，
+项目内部可以并行编译，因此实际编译进程数可能超过 2。增加它需要足够的系统内存。
+这里的执行策略只作用于新开的 PowerShell 进程。
+脚本默认使用 ``../envs/mitsuba`` 和 ``build/Release``，不依赖终端当前目录。
+若检查发现从其他机器复制的缓存或不匹配的变体，会报告问题，由使用者另行保留、
+重命名旧构建目录后再运行。
+
+编译后依次运行 64×64 Cornell box CUDA／OptiX 渲染和六组 RGB-only 重建回归，
+验证源码导入位置、定制绑定、颜色／opacity 梯度、训练更新及体素分裂。
+检查无需 Lego 数据集；日志和基础渲染报告保存到仓库父目录的
+``outputs/mitsuba/`` 下，以脚本打印的路径为准。
+只有两项检查都通过才报告部署成功；这不替代真实数据上的短跑或性能测量。
+
+接着同步 ``datasets/lego``，包含 ``init_points.ply``、
+``transforms_train.json``、``transforms_test.json`` 及 JSON 引用的训练／测试图片，
+再运行下方十轮短跑命令。VS Code 的 Python 解释器选择新主机的
+``envs/mitsuba/Scripts/python.exe``，不要沿用本机的绝对路径。
+
+手工环境与编译步骤
+~~~~~~~~~~~~~~~~~~
+
 已有独立环境先检查后复用；没有时创建。依赖安装明确指向该环境：
 
 .. code-block:: powershell
@@ -70,6 +135,8 @@ Visual Studio 2022。使用支持该 GPU 的 NVIDIA 驱动；本说明不代表�
    if ($LASTEXITCODE -ne 0) { throw 'Submodule initialization failed' }
 
 从源码构建 Mitsuba 和配套 Dr.Jit，无需另外安装 Mitsuba wheel。
+``requirements-local-smoke.txt`` 只用于旧版 wheel 环境的基础测试，
+不是本定制源码的部署依赖；此处仅需安装 NumPy。
 首次配置采用已有 Windows 构建选项：
 
 .. code-block:: powershell
@@ -77,13 +144,16 @@ Visual Studio 2022。使用支持该 GPU 的 NVIDIA 驱动；本说明不代表�
    cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 `
      "-DPython_EXECUTABLE=$python" `
      '-DMI_DEFAULT_VARIANTS=scalar_rgb,cuda_ad_rgb' `
-     -DMI_SPLIT_MODE=OFF -DMI_ENABLE_EMBREE=OFF
+     -DMI_SPLIT_MODE=OFF -DMI_ENABLE_EMBREE=OFF `
+     -DCMAKE_POLICY_VERSION_MINIMUM=3.5
    if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
    cmake --build build --config Release --parallel 2
    if ($LASTEXITCODE -ne 0) { throw 'Source build failed' }
 
 ``MI_DEFAULT_VARIANTS`` 仅在首次生成 ``build/mitsuba.conf`` 时生效；已有构建应检查
-该文件中的启用变体。``--parallel 2`` 是保守的内存用量，可按新主机可用内存增加。
+该文件中的启用变体。``--parallel 2`` 限制项目并发数，不限制 ``/MP`` 的内部编译进程数，
+可按新主机可用内存调整。
+``CMAKE_POLICY_VERSION_MINIMUM=3.5`` 允许 CMake 4.x 配置仓库中较旧的第三方库。
 以后 C++ 改动只需再次执行上述 ``cmake --build`` 增量编译命令。
 
 运行脚本会显式加载 ``build/Release/python``，打印并检查 Mitsuba、Dr.Jit 路径与

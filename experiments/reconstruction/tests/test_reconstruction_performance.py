@@ -160,6 +160,14 @@ def check_transfers(config, payload, view, rgba, mi, dr, np):
     assert widths[1].count(256) == 1, widths[1]
     compare_accumulators(results[0][0], results[1][0], np)
     np.testing.assert_allclose(results[0][1], results[1][1], atol=2e-7, rtol=2e-6)
+    device_recorder = TransferRecorder(np, dr)
+    device_result = train_view(model, view, rgba, config, ContourSampler(np),
+        np.random.default_rng(71), mi, dr, device_recorder,
+        need_rendered_alpha=True, alpha_on_device=True)
+    assert device_recorder.widths == [2], device_recorder.widths
+    assert dr.is_array_v(type(device_result[2]))
+    np.testing.assert_array_equal(np.asarray(device_result[2]).reshape(rgba.shape[:2]), results[1][2])
+    compare_accumulators(device_result[0], results[1][0], np)
     recorder = TransferRecorder(np, dr)
     sampler = ContourSampler(np, enabled=True)
     result = train_view(model, view, rgba, config, sampler,
@@ -167,6 +175,7 @@ def check_transfers(config, payload, view, rgba, mi, dr, np):
     assert result[2] is None
     assert recorder.widths.count(256) == 1, recorder.widths
     return {"image_readbacks_contour_off": widths,
+            "device_topology_readbacks": device_recorder.widths,
             "contour_only_image_readbacks": recorder.widths}
 
 

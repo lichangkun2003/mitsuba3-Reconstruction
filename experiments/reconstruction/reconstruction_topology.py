@@ -1,7 +1,7 @@
-"""Falcor topology lifecycle and coarse-to-fine transfer on NumPy arrays.
+"""Falcor topology lifecycle, GPU evidence, and coarse-to-fine transfer.
 
-Continuous parameters/Adam live on the GPU. Host snapshots are taken only for
-scheduled topology work and checkpoints. Native model replacement is left to
+Continuous parameters/Adam and per-view evidence live on the GPU. Host snapshots
+are taken only for scheduled topology work and checkpoints. Native replacement is left to
 the training driver, so allocation failure cannot partially replace its model.
 """
 
@@ -82,10 +82,12 @@ def level_budgets(start: int, target: int, total: int, weights=(19, 12, 14, 25))
     return budgets
 
 
-def model_checkpoint(model) -> dict:
+def model_checkpoint(model, fields=None) -> dict:
     import numpy as np
     import drjit as dr
     snapshot = model.snapshot()
+    if fields is not None:
+        snapshot = {name: snapshot[name] for name in fields}
     dr.eval(*snapshot.values())
     dr.sync_thread()
     return {
@@ -323,6 +325,65 @@ def refine_state(checkpoint: dict, config: CoarseToFineConfig, max_active_voxels
     }}
 
 
+class _DeletionEvidenceDevice:
+    """Distinct-view bitsets: GPU updates, counts only at window boundaries.
+
+    A separate array for each 32-view word avoids a scatter and keeps the two
+    per-view updates proportional to the active voxel count. No host reads are
+    needed to deduplicate repeated observations of the same camera.
+    """
+
+    def __init__(self, array_type, foreground, background, eligible, dr, np):
+        self.dr, self.np, self.UInt = dr, np, array_type
+        self.count = len(eligible)
+        self.foreground = [array_type(foreground[:, word].copy()) for word in range(foreground.shape[1])]
+        self.background = [array_type(background[:, word].copy()) for word in range(background.shape[1])]
+        self.eligible = dr.int64_array_t(array_type)(eligible)
+        self.is_cleared = False
+        dr.eval(*self.foreground, *self.background, self.eligible)
+
+    def observe(self, foreground, background, view_id, epoch):
+        dr, UInt = self.dr, self.UInt
+        if dr.width(foreground) != self.count or dr.width(background) != self.count:
+            raise ValueError("Deletion evidence count differs from active voxel count")
+        if not self.count:
+            return
+        self.is_cleared = False
+        word = view_id // 32
+        bit = dr.opaque(UInt, 1 << (view_id % 32))
+        eligible = dr.opaque(type(self.eligible), epoch) >= self.eligible
+        self.foreground[word] = self.foreground[word] | dr.select((foreground != 0) & eligible, bit, 0)
+        self.background[word] = self.background[word] | dr.select((background != 0) & eligible, bit, 0)
+        # Bound the JIT graph without synchronizing or copying flags to the CPU.
+        dr.eval(self.foreground[word], self.background[word])
+
+    def counts(self):
+        dr, UInt = self.dr, self.UInt
+        foreground, background = dr.zeros(UInt, self.count), dr.zeros(UInt, self.count)
+        for fg, bg in zip(self.foreground, self.background):
+            foreground += dr.popcnt(fg)
+            background += dr.popcnt(bg)
+        dr.eval(foreground, background)
+        return self.np.array(foreground, copy=True), self.np.array(background, copy=True)
+
+    def materialize(self):
+        return (self.np.column_stack([self.np.array(value, copy=True) for value in arrays])
+                for arrays in (self.foreground, self.background))
+
+    def clear(self):
+        self.foreground = [self.dr.zeros(self.UInt, self.count) for _ in self.foreground]
+        self.background = [self.dr.zeros(self.UInt, self.count) for _ in self.background]
+        self.is_cleared = True
+
+
+def _cuda_array(value):
+    """Keep NumPy-only topology tests independent of a CUDA runtime."""
+    if type(value).__module__.split(".")[0] != "drjit":
+        return None
+    import drjit as dr
+    return dr if dr.backend_v(type(value)) == dr.JitBackend.CUDA else None
+
+
 class TopologyManager:
     def __init__(self, model, view_count: int, settings: TopologySettings | None = None,
                  schedule: CoarseToFineConfig | None = None, opacity_warmup=20, opacity_ramp=30):
@@ -339,6 +400,13 @@ class TopologyManager:
         self.cooldown = {}
         self.pending_growth = None
         self._growth_world_cache = None
+        self._growth_device = None
+        self._deletion_device = None
+        self._device_statistics = {"deletion_device_views": 0, "growth_device_views": 0,
+                                   "deletion_cpu_views": 0, "growth_cpu_views": 0,
+                                   "deletion_count_readback_bytes": 0,
+                                   "deletion_mask_readback_bytes": 0,
+                                   "growth_count_readback_bytes": 0}
         self.before_refine_checkpoint = None
         self.completed_windows = 0
         self._validate()
@@ -365,15 +433,70 @@ class TopologyManager:
 
     def _initialize_lifecycle(self, count):
         np = self.np
+        self._deletion_device = None
         self.count = count
         words = (self.view_count + 31) // 32
-        self.foreground_masks = np.zeros((count, words), dtype=np.uint32)
-        self.background_masks = np.zeros((count, words), dtype=np.uint32)
+        self._foreground_masks = np.zeros((count, words), dtype=np.uint32)
+        self._background_masks = np.zeros((count, words), dtype=np.uint32)
         self.qualified = np.zeros(count, dtype=bool)
         self.candidates = np.zeros(count, dtype=bool)
-        self.deletion_eligible = np.zeros(count, dtype=np.int64)
+        self._deletion_eligible = np.zeros(count, dtype=np.int64)
         self.growth_birth = np.zeros(count, dtype=np.int64)
         self.growth_wait_start = np.zeros(count, dtype=np.int64)
+
+    def _materialize_deletion_masks(self):
+        if self._deletion_device is not None:
+            if self._deletion_device.is_cleared:
+                self._foreground_masks.fill(0)
+                self._background_masks.fill(0)
+            else:
+                self._foreground_masks, self._background_masks = self._deletion_device.materialize()
+                self._device_statistics["deletion_mask_readback_bytes"] += (
+                    self._foreground_masks.nbytes + self._background_masks.nbytes)
+            self._deletion_device = None
+
+    def statistics(self):
+        """Cumulative transfer/path counters; reading these never synchronizes."""
+        return dict(self._device_statistics)
+
+    def _materialize_growth(self):
+        if self._growth_device is not None:
+            pending, device = self._growth_device
+            if pending is self.pending_growth:
+                arrays = device.materialize()
+                self._device_statistics["growth_count_readback_bytes"] += sum(value.nbytes for value in arrays.values())
+            self._growth_device = None
+
+    @property
+    def foreground_masks(self):
+        self._materialize_deletion_masks()
+        return self._foreground_masks
+
+    @foreground_masks.setter
+    def foreground_masks(self, value):
+        self._materialize_deletion_masks()
+        self._foreground_masks = value
+
+    @property
+    def background_masks(self):
+        self._materialize_deletion_masks()
+        return self._background_masks
+
+    @background_masks.setter
+    def background_masks(self, value):
+        self._materialize_deletion_masks()
+        self._background_masks = value
+
+    @property
+    def deletion_eligible(self):
+        # The public NumPy state remains mutable for legacy checkpoint callers.
+        self._materialize_deletion_masks()
+        return self._deletion_eligible
+
+    @deletion_eligible.setter
+    def deletion_eligible(self, value):
+        self._materialize_deletion_masks()
+        self._deletion_eligible = value
 
     @property
     def level_budget(self):
@@ -395,7 +518,7 @@ class TopologyManager:
         return enabled and not final and boundary >= self.evidence_start and (boundary - self.evidence_start) % interval == 0
 
     def needs_rendered_alpha(self, epoch):
-        """Only growth-evidence views need a rendered alpha image on the CPU."""
+        """Only growth-evidence views need the rendered alpha image."""
         return self.settings.use_growth_evidence and self._growth_due(epoch + 1)
 
     def _generate_growth(self, checkpoint, boundary):
@@ -495,6 +618,7 @@ class TopologyManager:
         return self._growth_world_cache[2]
 
     def _observe_growth(self, camera, reference_alpha, rendered_alpha, view_id, metadata):
+        self._materialize_growth()
         np, cfg, pending = self.np, self.settings, self.pending_growth
         if pending is None or view_id in pending["seen_views"]:
             return
@@ -524,35 +648,67 @@ class TopologyManager:
         pending["seen_views"].add(int(view_id))
 
     def observe_view(self, model, out: dict, *, view_id: int, epoch: int, camera: dict,
-                     reference_alpha, rendered_alpha):
+                     reference_alpha, rendered_alpha, image_shape=None):
         np = self.np
         if not 0 <= view_id < self.view_count or int(model.active_voxel_count) != self.count:
             raise ValueError("Unexpected view ID or model topology")
         if self.collect_deletion(epoch):
-            eligible = epoch >= self.deletion_eligible
-            bit, word = np.uint32(1 << (view_id % 32)), view_id // 32
-            for key, masks in (("foreground_evidence", self.foreground_masks), ("background_evidence", self.background_masks)):
-                flags = np.asarray(out[key]).reshape(-1) != 0
-                if len(flags) != self.count:
-                    raise ValueError("Deletion evidence count differs from active voxel count")
-                masks[flags & eligible, word] |= bit
+            dr = _cuda_array(out["foreground_evidence"])
+            if dr is not None and _cuda_array(out["background_evidence"]) is not None:
+                if self._deletion_device is None:
+                    self._deletion_device = _DeletionEvidenceDevice(
+                        type(out["foreground_evidence"]), self._foreground_masks,
+                        self._background_masks, self._deletion_eligible, dr, np)
+                self._deletion_device.observe(out["foreground_evidence"], out["background_evidence"], view_id, epoch)
+                self._device_statistics["deletion_device_views"] += 1
+            else:
+                self._materialize_deletion_masks()
+                eligible = epoch >= self._deletion_eligible
+                bit, word = np.uint32(1 << (view_id % 32)), view_id // 32
+                for key, masks in (("foreground_evidence", self._foreground_masks), ("background_evidence", self._background_masks)):
+                    flags = np.asarray(out[key]).reshape(-1) != 0
+                    if len(flags) != self.count:
+                        raise ValueError("Deletion evidence count differs from active voxel count")
+                    masks[flags & eligible, word] |= bit
+                self._device_statistics["deletion_cpu_views"] += 1
         boundary = epoch + 1
         if self.needs_rendered_alpha(epoch):
             if rendered_alpha is None:
                 raise ValueError("Growth evidence requires this view's rendered alpha before its update")
             if self.pending_growth is None or self.pending_growth["boundary"] != boundary:
-                checkpoint = model_checkpoint(model)
+                self._growth_device = None
+                checkpoint = model_checkpoint(model, ("cell_indices", "centers", "log_scales", "rotations"))
                 self.pending_growth = self._generate_growth(checkpoint, boundary)
             metadata = {"resolution": self.resolution, "grid_min": list(model.grid_min), "grid_max": list(model.grid_max)}
-            self._observe_growth(camera, reference_alpha, rendered_alpha, view_id, metadata)
+            dr = _cuda_array(rendered_alpha)
+            if dr is not None:
+                if image_shape is None or len(image_shape) != 2:
+                    raise ValueError("GPU growth evidence requires an (height, width) image_shape")
+                import mitsuba as mi
+                from reconstruction_topology_device import GrowthEvidenceDevice
+                if self._growth_device is None or self._growth_device[0] is not self.pending_growth:
+                    points = self._growth_world_points(self.pending_growth, metadata)
+                    self._growth_device = (self.pending_growth, GrowthEvidenceDevice(points, self.pending_growth, mi, dr, np))
+                height, width = image_shape
+                self._growth_device[1].observe(camera, reference_alpha, rendered_alpha,
+                                               width, height, view_id, self.settings)
+                self._device_statistics["growth_device_views"] += 1
+            else:
+                self._observe_growth(camera, reference_alpha, rendered_alpha, view_id, metadata)
+                self._device_statistics["growth_cpu_views"] += 1
 
     def _evaluate_deletion(self, boundary):
         np, cfg = self.np, self.settings
         if not self.collect_deletion(boundary) or boundary <= self.evidence_start or (boundary - self.evidence_start) % cfg.evidence_interval:
             return False
-        lut = np.asarray([int(value).bit_count() for value in range(256)], dtype=np.uint8)
-        fg = lut[self.foreground_masks.view(np.uint8)].sum(axis=1)
-        bg = lut[self.background_masks.view(np.uint8)].sum(axis=1)
+        if self._deletion_device is not None:
+            fg, bg = self._deletion_device.counts()
+            self._device_statistics["deletion_count_readback_bytes"] += fg.nbytes + bg.nbytes
+            self._deletion_device.clear()
+        else:
+            lut = np.asarray([int(value).bit_count() for value in range(256)], dtype=np.uint8)
+            fg = lut[self._foreground_masks.view(np.uint8)].sum(axis=1)
+            bg = lut[self._background_masks.view(np.uint8)].sum(axis=1)
         ratio = max(1, min(1000, cfg.deletion_conflict_support_ratio))
         dominates = bg >= ratio * fg
         reliable = max(2, (cfg.min_deletion_conflict_views + ratio - 1) // ratio)
@@ -560,11 +716,11 @@ class TopologyManager:
         qualified = (bg >= cfg.min_deletion_conflict_views) & dominates
         self.candidates = ~rejected & (self.candidates | (qualified & self.qualified))
         self.qualified = ~rejected & (self.qualified | qualified | self.candidates)
-        protected = boundary < self.deletion_eligible
+        protected = boundary < self._deletion_eligible
         self.candidates[protected] = False
         self.qualified[protected] = False
-        self.foreground_masks.fill(0)
-        self.background_masks.fill(0)
+        self._foreground_masks.fill(0)
+        self._background_masks.fill(0)
         self.completed_windows += 1
         return True
 
@@ -577,6 +733,7 @@ class TopologyManager:
 
     def _remap_lifecycle(self, survivors, new_count, boundary):
         np = self.np
+        self._materialize_deletion_masks()
         kept = len(survivors)
         for name in ("foreground_masks", "background_masks", "qualified", "candidates",
                      "deletion_eligible", "growth_birth", "growth_wait_start"):
@@ -594,6 +751,7 @@ class TopologyManager:
         """Called after every view update. Returns (replacement checkpoint or None, event)."""
         np, cfg, schedule = self.np, self.settings, self.schedule
         boundary = int(completed_epochs)
+        self._materialize_growth()
         self.before_refine_checkpoint = None
         event = {"completed_epochs": boundary, "resolution": self.resolution, "deleted": 0, "grown": 0,
                  "refined": False, "finished": False, "level_budget": self.level_budget}
@@ -613,6 +771,7 @@ class TopologyManager:
             self.cooldown = {}
             self.pending_growth = None
             self._growth_world_cache = None
+            self._growth_device = None
             optimizer.remap(np.empty(0, dtype=np.uint32), self.count)
             event.update(refined=True, resolution=self.resolution, active_voxel_count=self.count)
             return replacement, event
@@ -636,21 +795,28 @@ class TopologyManager:
             self.candidates.fill(False)
             self.completed_windows = 0
         if self._growth_due(boundary):
-            if checkpoint is None:
-                checkpoint = model_checkpoint(model)
-            current = self._generate_growth(checkpoint, boundary)
-            selected = current
+            selected = None
             if cfg.use_growth_evidence:
                 pending = self.pending_growth
-                selected = None
                 if (pending is not None and pending["boundary"] == boundary and
-                        pending["resolution"] == self.resolution and len(pending["seen_views"]) == self.view_count and current is not None):
+                        pending["resolution"] == self.resolution and len(pending["seen_views"]) == self.view_count):
                     keep = ((pending["foreground"] >= max(2, cfg.growth_min_foreground_views)) &
                             (pending["background"] < max(1, cfg.growth_background_veto_views)))
-                    keep &= _matching_growth_pairs(current, pending, np)
-                    selected = {key: value[keep] for key, value in pending.items() if isinstance(value, np.ndarray)}
-                    mapping = {int(cell): index for index, cell in enumerate(checkpoint["model_state"]["cell_indices"])}
-                    selected["parent_ids"] = np.asarray([mapping[int(cell)] for cell in selected["parent_cells"]], dtype=np.int64)
+                    if np.any(keep):
+                        from reconstruction_growth_filter import generate_growth_for_targets, match_growth_parents
+                        voted = {key: value[keep] for key, value in pending.items() if isinstance(value, np.ndarray)}
+                        if checkpoint is None:
+                            checkpoint = model_checkpoint(model)
+                        # Validate current geometry and *all* supporting parents,
+                        # but only for cells whose frozen proposals passed votes.
+                        current = generate_growth_for_targets(self, checkpoint, boundary, voted["cells"])
+                        matches, parent_ids = match_growth_parents(current, voted)
+                        selected = {key: value[matches] for key, value in voted.items()}
+                        selected["parent_ids"] = parent_ids
+            else:
+                if checkpoint is None:
+                    checkpoint = model_checkpoint(model)
+                selected = self._generate_growth(checkpoint, boundary)
             if selected is not None and len(selected["cells"]):
                 # Falcor's atomic winner is nondeterministic. Use the first valid
                 # proposal per cell deterministically without changing eligibility.
@@ -679,12 +845,15 @@ class TopologyManager:
                 checkpoint = None
         self.pending_growth = None
         self._growth_world_cache = None
+        self._growth_device = None
         self.cooldown = {cell: expiry for cell, expiry in self.cooldown.items() if expiry > boundary}
         event.update(finished=final, active_voxel_count=self.count)
         return checkpoint, event
 
     def state_dict(self):
         import copy
+        self._materialize_deletion_masks()
+        self._materialize_growth()
         state = {"settings": asdict(self.settings), "schedule": asdict(self.schedule), "view_count": self.view_count,
                  "opacity_warmup": self.opacity_warmup, "opacity_ramp": self.opacity_ramp,
                  "resolution": self.resolution, "schedule_start_resolution": self.schedule_start_resolution,
@@ -702,6 +871,8 @@ class TopologyManager:
     def load_state_dict(self, state):
         import copy
         self._growth_world_cache = None
+        self._growth_device = None
+        self._deletion_device = None
         state = copy.deepcopy(state)
         if state["count"] != self.count or state["view_count"] != self.view_count:
             raise ValueError("Topology checkpoint dimensions do not match model or dataset")

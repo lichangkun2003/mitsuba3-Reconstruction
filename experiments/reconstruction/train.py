@@ -404,7 +404,7 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
     return accumulator, total_loss, finite, raw_alpha, estimated_alpha
 
 
-def finalize_view(partial, view, config, sampler, token, mi, dr, np):
+def finalize_view(partial, view, config, sampler, token, mi, dr, np, *, alpha_on_device=False):
     """Validate a globally reduced view and observe its contour history once."""
     accumulator, total_loss, finite, raw_alpha, estimated_alpha = partial
     count = config.render.width * config.render.height
@@ -423,21 +423,24 @@ def finalize_view(partial, view, config, sampler, token, mi, dr, np):
                            "check GPU reduction/readback correctness before continuing")
     if raw_alpha is not None:
         sampler.observe(token, np.asarray(raw_alpha))
-    alpha = (np.asarray(estimated_alpha).reshape(config.render.height, config.render.width)
-             if estimated_alpha is not None else None)
+    # Topology voting consumes the device image directly. Keep the host return
+    # available for diagnostic callers and older scripts that inspect pixels.
+    alpha = estimated_alpha
+    if alpha is not None and not alpha_on_device:
+        alpha = np.asarray(alpha).reshape(config.render.height, config.render.width)
     return accumulator, mean_loss, alpha
 
 
 def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rendered_alpha=False,
                collect_deletion_evidence=None, stage_profile=None, gpu_reference=None,
-               native_replay=None, collective=None):
+               native_replay=None, collective=None, alpha_on_device=False):
     """Compute one full-view gradient, optionally over synchronized pixel shards.
 
     All ranks consume the same full-view sampling stream and contour history.
     A collective combines gradient/validity SUMs, evidence MAXs and disjoint
     alpha buffers before the single logical Adam update performed by the caller.
-    The ordinary path retains one small loss/finite readback per view; only
-    contour and growth consumers request image readbacks.
+    The ordinary path retains one small loss/finite readback per view. Contour
+    history still reads its image; production topology keeps alpha on device.
     """
     count = config.render.width * config.render.height
     begin, end = ((0, count) if collective is None else
@@ -457,7 +460,8 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
             finite &= dr.all(dr.isfinite(gradient))
         finite &= dr.isfinite(total_loss)
         partial = accumulator, total_loss, finite, raw_alpha, estimated_alpha
-    return finalize_view(partial, view, config, sampler, token, mi, dr, np)
+    return finalize_view(partial, view, config, sampler, token, mi, dr, np,
+                         alpha_on_device=alpha_on_device)
 
 
 def kernel_profile(history):
@@ -578,6 +582,7 @@ def run_training(distributed=None):
     gpu_reference_cache = None
     native_replay = None
     collective = None
+    topology = None
     history_name = ("training-resume-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".jsonl"
                     if checkpoint else "training.jsonl")
     performance_name = ("performance-summary-" + Path(history_name).stem.removeprefix("training-") + ".json"
@@ -664,7 +669,7 @@ def run_training(distributed=None):
         report["training_protocol"].update(rays_per_view=ray_count, rays_per_batch=batch_size,
             batches_per_view=(ray_count + batch_size - 1) // batch_size,
             alpha_readback=("none during RGB-only training" if config.training.rgb_only else
-                            "only contour history and scheduled growth evidence; no visualization readback"),
+                            "only contour history; scheduled growth evidence consumes device alpha"),
             camera_parameters="opaque runtime inputs",
             gradients_stage_scope="forward paths, loss, hit/candidate gradients, reductions and readbacks",
             native_stage_profiling="synchronized sampled views only; bypasses frozen replay" if config.training.profile_stages else "disabled",
@@ -835,11 +840,14 @@ def run_training(distributed=None):
                         need_rendered_alpha=growth_evidence_requested,
                         collect_deletion_evidence=deletion_evidence_collected,
                         stage_profile=native_stages, gpu_reference=gpu_reference,
-                        native_replay=native_replay, collective=collective)
+                        native_replay=native_replay, collective=collective, alpha_on_device=True)
                     gradients_done = time.perf_counter()
                     if primary and not config.training.rgb_only:
                         topology.observe_view(model, gradients, view_id=int(index), epoch=epoch,
-                            camera=view["camera"], reference_alpha=rgba[..., 3], rendered_alpha=rendered_alpha)
+                            camera=view["camera"],
+                            reference_alpha=gpu_reference.alpha if gpu_reference is not None else rgba[..., 3],
+                            rendered_alpha=rendered_alpha,
+                            image_shape=(config.render.height, config.render.width))
                     topology_done = time.perf_counter()
                     optimizer.step(model, gradients, sample_count=1, epoch=epoch, coarse_to_fine=config.schedule.enabled)
                     optimizer_done = time.perf_counter()
@@ -901,6 +909,7 @@ def run_training(distributed=None):
                      "reference_cache": reference_cache.statistics(),
                      "gpu_reference_cache": gpu_reference_cache.statistics(),
                      "native_replay": native_replay.statistics(),
+                     "topology_execution": topology.statistics() if primary else None,
                      "view_stage_seconds": stage_totals,
                      "epoch_topology_seconds": time.perf_counter()-topology_started}
             if collective is not None:
@@ -922,7 +931,8 @@ def run_training(distributed=None):
                 emit("Saved checkpoint:", output / f"epoch-{epoch+1:05d}.npz", flush=True)
             performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
             publish_performance("running", training_status="running",
-                              gpu_reference_cache=entry["gpu_reference_cache"], native_replay=entry["native_replay"])
+                              gpu_reference_cache=entry["gpu_reference_cache"], native_replay=entry["native_replay"],
+                              topology_execution=entry["topology_execution"])
         performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
         training_loop_started = None
         if end_epoch < config.training.num_epochs:
@@ -970,6 +980,8 @@ def run_training(distributed=None):
         if native_replay is not None:
             report["native_replay"] = native_replay.statistics()
             native_replay.clear()
+        if topology is not None and primary:
+            report["topology_execution"] = topology.statistics()
         if collective is not None:
             report["collective"] = collective.statistics()
             collective.close(abort=report["training_status"] not in ("passed", "stopped"))
@@ -983,6 +995,7 @@ def run_training(distributed=None):
         publish_performance(report["status"], training_status=report["training_status"],
             reference_cache=report.get("reference_cache"), gpu_reference_cache=report.get("gpu_reference_cache"),
             native_replay=report.get("native_replay"), collective=report.get("collective"),
+            topology_execution=report.get("topology_execution"),
             training_report=str(output / "training-report.json"))
     return config, model_path, output, report, performance
 
@@ -1046,6 +1059,7 @@ def main(distributed=None):
                 evaluation=report["evaluation"], reference_cache=report.get("reference_cache"),
                 gpu_reference_cache=report.get("gpu_reference_cache"), native_replay=report.get("native_replay"),
                 collective=report.get("collective"),
+                topology_execution=report.get("topology_execution"),
                 training_report=str(output / "training-report.json"), evaluation_report=str(evaluation_report))
     return 0 if report["status"] == "passed" else 1
 

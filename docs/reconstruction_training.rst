@@ -349,12 +349,64 @@ CPU 参考图仍用于 contour 和生长证据。子像素随机采样继续使�
 * 原生 ``set_parameters()`` 对本次更新的参数组先合并有限值检查，正常路径只读取一次
   校验标志；失败时再定位具体参数组，且全部检查通过前不改变模型。
 * 原始 ``raw_alpha`` 只在 contour 采样器实际产生更新 token 时回读，用于更新采样历史。
-* 概率校正后的 alpha 只在本轮需要收集体素生长证据时回读；普通训练轮不搬运这张图。
-* 体素删除启用且进入证据收集阶段时，CPU 拓扑管理仍按视角读取证据，保留原来的跨视角
-  累积及候选判断顺序。生长和 contour 数据也在需要的视角处理，不能作为纯可视化统一延迟到 epoch 末。
+* 概率校正后的 alpha 只在本轮需要收集生长证据时分配，训练入口直接传给 GPU 投票，
+  不再先下载整张图。参考 alpha 复用 GPU 参考缓存；缓存关闭时按需上传。
+* 删除证据在 GPU 的跨视角 bitset 中累积，同一相机重复命中仍只计一次。
+  到证据窗口边界才统计唯一视角数并交给原来的候选判定；保存、恢复和体素重排保持原状态格式。
+* 生长证据的七个冻结采样点上传一次，各视角在 GPU 上投影并投票，在 epoch 边界取回票数。
+  背景否决、前景支持门槛和完整视角集合检查保留。contour 的历史更新仍使用原 CPU 路径。
 
 这些调整不在训练的每个视角或每个 epoch 内出图。完成全部训练并保存最终模型后，
 训练入口调用评价脚本共用的流程，生成多 spp 图片和 PSNR。
+
+拓扑证据与候选复核的性能对照
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+GPU 删除证据和生长投票自动用于训练入口，旧的 NumPy 输入路径保留为数值对照。
+epoch 结束后，先检查冻结生长提案的票数，只对通过投票的目标格及其所有必要邻居
+复核当前几何。支持父体素本身不必通过投票；冷却期、等待期、已占用格、支持数、
+背景否决及确定性胜者顺序保持原规则。投票未通过时不再全量重建候选。
+首个生长视角仍在 CPU 生成冻结候选，但只回读几何参数，不再为该步骤复制全部 SH 参数。
+
+``training.jsonl`` 的 ``topology_execution``、``training-report.json`` 的同名字段及
+``performance-summary.json`` 的 ``details.topology_execution`` 记录本次进程累计的
+GPU/CPU 证据处理视角数和实际边界回读字节数。读取这些计数不会同步 GPU。
+正常训练启用删除/生长时，分别检查 ``deletion_device_views`` / ``growth_device_views`` 增长；
+没有启用的步骤保持零。阶段耗时仍是包含异步等待的墙钟时间。
+
+这次优化没有修改原生 C++ 接口；已有源码构建匹配当前原生代码时无需重新编译。
+新默认 RGB 第一阶段本身关闭生长和删除，不能用它与旧 alpha 监督实验比较提速。
+要比较刚才的 512 阶段，可在同样的双卡分配中从旧实验保存点继续若干轮，保留全部算法设置：
+
+.. code-block:: bash
+
+   # 将下面 checkpoint 和输出路径中的实验名替换为实际名称；输出目录须尚未使用。
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
+     --workers 2 --resume outputs/原实验/training/epoch-00467.npz --no-rgb-only \
+     --output-dir outputs/原实验-topology-check/training \
+     --stop-after-epochs 20 --chunk-size 0 --freeze-native \
+     --profile-views 3 --profile-interval-epochs 10 --no-profile-stages
+
+不要同时修改总 epoch 或层级比例；恢复过程会校验它们。短测试在完整 epoch 后保存，
+不会触发最终评价。分别比较普通轮、证据窗口轮和生长轮的
+``view_stage_seconds.topology_observation``、``epoch_topology_seconds`` 以及总 ``seconds``。
+本地生成场景回归不能代替双 A100 的实际吞吐和 NCCL 验证。
+
+新增的生成数据回归在仓库根目录运行，测试临时文件写在系统临时目录：
+
+.. code-block:: powershell
+
+   & '..\envs\mitsuba\Scripts\python.exe' -I experiments/reconstruction/tests/test_reconstruction_growth_filter.py
+   & '..\envs\mitsuba\Scripts\python.exe' -I experiments/reconstruction/tests/test_reconstruction_growth_device.py
+   & '..\envs\mitsuba\Scripts\python.exe' -I experiments/reconstruction/tests/test_reconstruction_topology_device.py
+
+2026-10-19 本地 RTX 4060 Laptop 的独立合成对照：先预热一次，三个重复取中位数，
+计时结束等待 GPU 完成。128 万体素、100 个视角的删除证据累积由约 1.976 秒降为
+0.018 秒，窗口计数及资格判定由约 0.125 秒降为 0.017 秒；资格及候选结果相同。
+10 万个冻结生长提案、20 个视角的七点投票由约 0.486 秒降为 0.012 秒，票数相同。
+这些只测证据处理，排除首次候选生成、参考上传、渲染、Adam、NCCL 和完整模型重排，
+不是整轮训练或双 A100 的加速比。生成小场景的训练、检查点恢复、GPU 参考缓存关闭、
+旧拓扑规则及 RGB 第一阶段回归另行通过；完整 700 轮仍需服务器验证。
 
 原生前向/反向过程中的射线记录按射线和命中槽独占地址写入。对这些已确认无冲突的
 写入显式使用 ``ReduceMode::NoConflicts``，使 Dr.Jit 不再为每次记录写入安排不必要的
@@ -1095,9 +1147,10 @@ PNG 用于显示；进行论文或其他实现的 PSNR 对比时，应明确选�
 迁移保留 NoLightTransport 的硬椭球前向、外观梯度、几何代理规则、分组更新和拓扑调度，
 同时有以下需要在实验中记录的实现差异：
 
-* 前向、梯度和参数更新使用 CUDA/Dr.Jit；拓扑处理在 CPU NumPy 中执行，部分几何运算
-  使用 float64，再写回 float32 模型。临界阈值附近可能与 Falcor 的 GPU float32 决策不同，
-  拓扑性能也不能假定与原实现相同。
+* 前向、梯度、参数更新、删除证据累积和生长投票使用 CUDA/Dr.Jit。生长候选生成、
+  升层拟合、边界处的生命周期判定和模型重排仍有 CPU NumPy 工作及模型快照，尚未全部迁移到 GPU。
+  几何及生长投影保留 float64 精度，再写回 float32 模型；临界阈值附近可能与 Falcor 的
+  GPU float32 决策不同，拓扑性能也不能假定与原实现相同。
 * 多个增长提案竞争同一格时，使用确定性的胜者选择；Falcor 的原子竞争顺序不确定。
   删除后的剩余体素保留顺序，而 Falcor 使用空洞/供体搬移，索引顺序可能不同。
 * 对全部活跃体素预分配颜色 Adam 状态，没有复制 D3D 缓冲区分页耗尽时临时退回 SGD

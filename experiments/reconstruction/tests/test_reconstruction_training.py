@@ -356,6 +356,39 @@ def main():
             assert all(row["render_seconds"] > 0 and row["write_seconds"] > 0 for row in measured["views"])
         report["checks"].append("performance summaries, checkpoint/evaluation timings, per-resolution samples and disabled profiling preserve resume results")
         report["checks"].append("independent train/test 2-spp evaluation and PSNR reports")
+        # Exercise the production device-alpha handoff, including cache-disabled
+        # resume. Helper-only tests cannot detect a driver still downloading alpha.
+        config["training"]["output"] = str(run / "device-topology")
+        config["schedule"] = {"enabled": False}
+        config["contour"] = {"enabled": False}
+        config["topology"] = {"enable_deletion": True, "enable_growth": True,
+            "use_growth_evidence": True, "growth_interval": 1, "evidence_interval": 1,
+            "deletion_interval": 1, "growth_min_foreground_views": 2,
+            "min_deletion_conflict_views": 2}
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        run_process([sys.executable, "-I", str(entry), "--config", str(config_path)], "device-topology")
+        topology_report = json.loads((run / "device-topology" / "training-report.json").read_text(encoding="utf-8"))
+        paths = topology_report["topology_execution"]
+        assert paths["deletion_device_views"] == 6 and paths["growth_device_views"] == 4, paths
+        assert paths["deletion_cpu_views"] == paths["growth_cpu_views"] == 0, paths
+        topology_summary = json.loads(Path(topology_report["performance_file"]).read_text(encoding="utf-8"))
+        assert topology_summary["details"]["topology_execution"] == paths
+        run_process([sys.executable, "-I", str(entry),
+            "--resume", str(run / "device-topology" / "epoch-00001.npz"), "--no-rgb-only",
+            "--output-dir", str(run / "device-topology-resume"), "--build-dir", args.build_dir,
+            "--gpu", str(args.gpu), "--gpu-reference-cache-mib", "0"], "device-topology-resume")
+        expected = load_checkpoint(run / "device-topology" / "model.npz")
+        actual = load_checkpoint(run / "device-topology-resume" / "model.npz")
+        for key, value in expected["model_state"].items():
+            np.testing.assert_allclose(actual["model_state"][key], value, atol=2e-6, rtol=2e-6)
+        for key in ("foreground_masks", "background_masks", "qualified", "candidates", "deletion_eligible"):
+            np.testing.assert_array_equal(actual["training_state"]["topology_state"][key],
+                                          expected["training_state"]["topology_state"][key])
+        for name, group in expected["optimizer_state"]["groups"].items():
+            for key, value in group.items():
+                np.testing.assert_allclose(actual["optimizer_state"]["groups"][name][key], value, atol=2e-6, rtol=2e-6)
+        assert actual["training_state"]["rng_state"] == expected["training_state"]["rng_state"]
+        report["checks"].append("GPU deletion/growth training and cache-disabled resume preserve topology, Adam, model and RNG")
         report.update(status="passed", integration_output=str(run))
     except Exception:
         report.update(status="failed", error=traceback.format_exc())
