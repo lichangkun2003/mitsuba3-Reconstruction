@@ -23,6 +23,9 @@ public:
     using UIntBuffer = mitsuba::DynamicBuffer<UInt32>;
     using IntBuffer = mitsuba::DynamicBuffer<Int32>;
 
+    /// Version of the alpha-independent RGB training contract exposed to Python.
+    static constexpr uint32_t rgb_only_version = 1;
+
     VoxelReconstruction(const std::string &filename, uint32_t resolution,
                         const std::array<float, 3> &grid_min,
                         const std::array<float, 3> &grid_max,
@@ -51,6 +54,11 @@ public:
 
     /// One sample per ray/view. Pixel contributions are summed into voxel
     /// gradients; the caller owns the optimizer and the per-view update clock.
+    /// With settings["rgb_only"] != 0, reference_rgb is the composited target
+    /// and reference_alpha is ignored (including its width and values). This
+    /// mode uses RGB loss and the ungated sigmoid-distance geometry proxy;
+    /// alpha supervision, background carving, and deletion evidence are off.
+    /// Internal opacity, transmittance, and returned rendered alpha remain active.
     TrainingResult loss_and_grad(const Ray3f &ray, const Color3f &reference_rgb,
                                  const Float &reference_alpha,
                                  const Color3f &background,

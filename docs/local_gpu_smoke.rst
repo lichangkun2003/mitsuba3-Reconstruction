@@ -93,7 +93,7 @@ Python 3.12 的 Mitsuba 3.10 开发版。实际选择 3.9.1 wheel，让它解析
 
 .. code-block:: powershell
 
-   & '..\envs\mitsuba\Scripts\python.exe' -I .\resources\local_gpu_smoke.py --gpu 0
+   & '..\envs\mitsuba\Scripts\python.exe' -I .\experiments\reconstruction\tools\smoke_gpu.py --gpu 0
 
 ``-I`` 让此次 wheel 测试忽略 ``PYTHONPATH`` 和用户 site-packages。
 不要将这个解释器和参数组合直接当作源码构建的验证命令。
@@ -103,7 +103,7 @@ Python 3.12 的 Mitsuba 3.10 开发版。实际选择 3.9.1 wheel，让它解析
 .. code-block:: powershell
 
    & '..\envs\mitsuba\Scripts\Activate.ps1'
-   python -I .\resources\local_gpu_smoke.py --gpu 0
+   python -I .\experiments\reconstruction\tools\smoke_gpu.py --gpu 0
    deactivate
 
 若激活被执行策略拦截，使用上面的解释器完整路径命令即可，无需更改
@@ -200,7 +200,7 @@ VS Code 打开共享父目录 ``reconstruction``，因此可以同时看到
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\local_gpu_smoke.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tools\smoke_gpu.py `
      --build-dir .\mitsuba\build\Release `
      --output-dir .\outputs\mitsuba\source-smoke --gpu 0
 

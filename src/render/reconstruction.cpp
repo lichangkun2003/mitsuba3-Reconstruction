@@ -417,21 +417,26 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         {"min_evidence_transmittance", .05f}, {"min_removal_loss_delta", 1e-4f},
         {"transmittance_threshold", .01f}, {"max_hits", 16.f},
         {"max_candidates", 16.f}, {"entry_offset_fraction", 0.f},
-        {"profile_stages", 0.f}};
+        {"profile_stages", 0.f}, {"rgb_only", 0.f}};
     for (const auto &[key, value] : settings) {
         if (cfg.find(key) == cfg.end() || !std::isfinite(value) || value < 0.f)
             Throw("VoxelReconstruction.loss_and_grad(): unknown/invalid setting %s.", key.c_str());
         cfg[key] = value;
     }
+    const bool rgb_only = cfg["rgb_only"] != 0.f;
     const uint32_t max_hits = uint32_t(cfg["max_hits"]), max_candidates = uint32_t(cfg["max_candidates"]);
     if (!max_hits || max_hits > 128 || cfg["max_hits"] != float(max_hits) ||
         max_candidates > 128 || cfg["max_candidates"] != float(max_candidates) ||
-        cfg["transmittance_threshold"] >= 1.f || cfg["foreground_alpha_min"] > 1.f ||
-        cfg["background_alpha_max"] > cfg["foreground_alpha_min"] || cfg["min_evidence_transmittance"] > 1.f)
+        cfg["transmittance_threshold"] >= 1.f ||
+        (!rgb_only && (cfg["foreground_alpha_min"] > 1.f ||
+         cfg["background_alpha_max"] > cfg["foreground_alpha_min"] || cfg["min_evidence_transmittance"] > 1.f)))
         Throw("VoxelReconstruction.loss_and_grad(): invalid path capacity or thresholds.");
-    const size_t width = std::max({dr::width(ray.o), dr::width(ray.d), dr::width(ray.maxt),
-                                  dr::width(reference_rgb), dr::width(reference_alpha),
-                                  dr::width(inverse_pdf), dr::width(background)});
+    size_t width = std::max({dr::width(ray.o), dr::width(ray.d), dr::width(ray.maxt),
+                             dr::width(reference_rgb), dr::width(inverse_pdf), dr::width(background)});
+    // RGB-only callers pass an already composited target. Even an empty or
+    // differently sized compatibility alpha argument must not affect the batch.
+    if (!rgb_only)
+        width = std::max(width, dr::width(reference_alpha));
     if (width == 0 || width * std::max(max_hits, std::max(max_candidates, 1u)) * 9 > UINT32_MAX)
         Throw("VoxelReconstruction.loss_and_grad(): ray batch is empty or too large.");
     ReconstructionStageProfiler<dr::is_jit_v<Float>> profiler(cfg["profile_stages"] != 0.f);
@@ -454,9 +459,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         Float weight = dr::select(inverse_pdf > 0.f, inverse_pdf, 1.f);
         result.rgb = Color3f(1.f) + (result.raw_rgb - 1.f)*weight;
         result.alpha = result.raw_alpha;
-        Color3f target = reference_rgb*reference_alpha + Color3f(1.f)*(1.f-reference_alpha);
-        result.loss = dr::squared_norm(result.rgb-target) +
-                      cfg["alpha_loss_weight"]*dr::square(reference_alpha);
+        Color3f target = rgb_only ? reference_rgb :
+            reference_rgb*reference_alpha + Color3f(1.f)*(1.f-reference_alpha);
+        result.loss = dr::squared_norm(result.rgb-target);
+        if (!rgb_only)
+            result.loss += cfg["alpha_loss_weight"]*dr::square(reference_alpha);
         result.hit_count = dr::zeros<UInt32>(width);
         for (const auto *key : {"centers", "log_scales", "rotation_tangent", "radiance_sh", "opacity_sh"})
             result.gradients[key] = dr::zeros<FloatBuffer>(0);
@@ -727,14 +734,21 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     Float weight=dr::select(inverse_pdf>0.f,inverse_pdf,1.f);
     result.rgb=Color3f(1.f)+(result.raw_rgb-1.f)*weight;
     result.alpha=result.raw_alpha*weight;
-    Color3f target=reference_rgb*reference_alpha+Color3f(1.f)*(1.f-reference_alpha);
+    Color3f target=rgb_only ? reference_rgb :
+        reference_rgb*reference_alpha+Color3f(1.f)*(1.f-reference_alpha);
     Color3f delta=result.rgb-target,dcolor=2.f*delta;
-    Float dalpha=2.f*cfg["alpha_loss_weight"]*(result.alpha-reference_alpha);
-    result.loss=dr::squared_norm(delta)+cfg["alpha_loss_weight"]*dr::square(result.alpha-reference_alpha);
-    Color3f deletion_dcolor=2.f*(result.raw_rgb-target);
-    Float deletion_dalpha=2.f*cfg["alpha_loss_weight"]*(result.raw_alpha-reference_alpha);
-    Mask is_background=reference_alpha<=cfg["background_alpha_max"];
-    Mask is_foreground=!is_background & (reference_alpha>=cfg["foreground_alpha_min"]);
+    Float dalpha(0.f),deletion_dalpha(0.f);
+    Color3f deletion_dcolor(0.f);
+    Mask is_background(false),is_foreground(false);
+    result.loss=dr::squared_norm(delta);
+    if (!rgb_only) {
+        dalpha=2.f*cfg["alpha_loss_weight"]*(result.alpha-reference_alpha);
+        result.loss+=cfg["alpha_loss_weight"]*dr::square(result.alpha-reference_alpha);
+        deletion_dcolor=2.f*(result.raw_rgb-target);
+        deletion_dalpha=2.f*cfg["alpha_loss_weight"]*(result.raw_alpha-reference_alpha);
+        is_background=reference_alpha<=cfg["background_alpha_max"];
+        is_foreground=!is_background & (reference_alpha>=cfg["foreground_alpha_min"]);
+    }
     for(const auto &[name,size]:std::map<std::string,size_t>{{"centers",size_t(m_active_count)*3},
         {"log_scales",size_t(m_active_count)*3},{"rotation_tangent",size_t(m_active_count)*3},
         {"radiance_sh",size_t(m_active_count)*m_sh_count*3},{"opacity_sh",size_t(m_active_count)*m_opacity_sh_count}})
@@ -744,7 +758,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     const float tau=std::max(cfg["geometry_tau_voxel_fraction"]*m_size[0],1e-8f);
     using GradientMap = std::map<std::string, FloatBuffer>;
     using CounterMap = std::map<std::string, UIntBuffer>;
-    auto add_geometry=[this,quaternion,rotate,clean,is_background,dcolor,dalpha,weight,tau,cfg](
+    auto add_geometry=[this,quaternion,rotate,clean,is_background,dcolor,dalpha,weight,tau,cfg,rgb_only](
                           GradientMap &gradients,CounterMap &counters,
                           UInt32 id,const Vector3f &offset,Float gmin,Float before,
                           Float opacity,const Color3f &radiance,const Color3f &behind,
@@ -759,16 +773,19 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         Float radius2=dr::squared_norm(unit);
         Float metric=2.f*dr::norm(unit/dr::sqrt(dr::maximum(radius2,1e-30f))/scale);
         valid &= dr::isfinite(gmin)&dr::isfinite(radius2)&(radius2>1e-12f)&dr::isfinite(metric)&(metric>0.f);
-        if(!hard_hit) valid &= !is_background;
+        if(!rgb_only && !hard_hit) valid &= !is_background;
         Float distance_scale=dr::rcp(dr::select(valid,metric,1.f));
         Float distance=gmin*distance_scale,w=dr::rcp(1.f+dr::exp(distance/tau));
         Float derivative=dr::dot(dcolor,before*opacity*(radiance-behind))*(-w*(1.f-w)/tau);
-        if(hard_hit) derivative=dr::select(is_background,-cfg.at("background_carve_weight")*w/tau,derivative);
-        derivative += cfg.at("alpha_geometry_weight")*dalpha*before*opacity*after*(-w*(1.f-w)/tau);
+        if(!rgb_only) {
+            if(hard_hit) derivative=dr::select(is_background,-cfg.at("background_carve_weight")*w/tau,derivative);
+            derivative += cfg.at("alpha_geometry_weight")*dalpha*before*opacity*after*(-w*(1.f-w)/tau);
+        }
         Float dg=dr::clip(clean(derivative*distance_scale),-cfg.at("geometry_grad_clamp"),cfg.at("geometry_grad_clamp"));
         Mask contains(true);
-        const bool two_sided=cfg.at("geometry_two_sided_boundary")!=0.f;
-        if(hard_hit && (two_sided || (cfg.at("geometry_transition_only")!=0.f && cfg.at("geometry_hit_expansion_band_tau")>0.f))) {
+        const bool two_sided=!rgb_only && cfg.at("geometry_two_sided_boundary")!=0.f;
+        const bool transition_only=!rgb_only && cfg.at("geometry_transition_only")!=0.f;
+        if(hard_hit && (two_sided || (transition_only && cfg.at("geometry_hit_expansion_band_tau")>0.f))) {
             for(uint32_t corner=0;corner<8;++corner) {
                 Vector3f corner_offset;
                 for(uint32_t j=0;j<3;++j) corner_offset[j]=(float((corner>>j)&1u)-center[j])*m_size[j];
@@ -781,7 +798,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             Float taper=t*t*(3.f-2.f*t);
             dg*=hard_hit?dr::select(is_background,1.f,taper):taper;
             if(hard_hit) dg=dr::select((dg>0.f)&(is_background|contains),0.f,dg);
-        } else if(cfg.at("geometry_transition_only")!=0.f) {
+        } else if(transition_only) {
             if(hard_hit) {
                 float band=tau*cfg.at("geometry_hit_expansion_band_tau");
                 Float t=band>0.f?dr::clip(1.f+distance/band,0.f,1.f):Float(0.f);
@@ -798,7 +815,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             dr::scatter_reduce(ReduceOp::Add,gradients["rotation_tangent"],clean(dg*gr[j])*weight,id*3+j,valid);
         }
         dr::scatter_reduce(ReduceOp::Add,counters["geometry_valid"],UInt32(1),id,valid);
-        if(hard_hit) dr::scatter_reduce(ReduceOp::Add,counters["background_carve_valid"],UInt32(1),id,valid&is_background);
+        if(!rgb_only && hard_hit) dr::scatter_reduce(ReduceOp::Add,counters["background_carve_valid"],UInt32(1),id,valid&is_background);
     };
 
     // Hit records stay read-only inside the symbolic reverse loop. Separate
@@ -818,7 +835,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         [](const ReverseState &s) { return s.hit>=0; },
         [this,hit_records=records.hit,hit_ids=records.hit_id,hit_count=state.hits,
          ray_count,hit_stride,lane,clean,dcolor,dalpha,d,weight,is_background,
-         is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry](ReverseState &s) {
+         is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry,rgb_only](ReverseState &s) {
             Mask valid=UInt32(s.hit)<hit_count;
             UInt32 slot=UInt32(s.hit)*ray_count+lane,id=dr::gather<UInt32>(hit_ids,slot,valid);
             Vector3f offset;Color3f radiance;
@@ -831,7 +848,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             Float before=dr::gather<Float>(hit_records,8*hit_stride+slot,valid);
             Color3f grad_rgb=clean(dcolor*before*opacity);
             grad_rgb=dr::select(radiance<=0.f,dr::minimum(grad_rgb,0.f),grad_rgb);
-            grad_rgb=dr::select(is_background,Color3f(0.f),grad_rgb)*weight;
+            if(!rgb_only) grad_rgb=dr::select(is_background,Color3f(0.f),grad_rgb);
+            grad_rgb*=weight;
             Float grad_opacity=clean(dr::dot(dcolor,before*(radiance-s.behind))+dalpha*before*s.after);
             Float grad_logit=grad_opacity*weight*opacity*(1.f-opacity);
             for(uint32_t k=0;k<std::max(m_sh_count,m_opacity_sh_count);++k) {
@@ -843,7 +861,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     dr::scatter_reduce(ReduceOp::Add,s.gradients["opacity_sh"],grad_logit*sh,id*m_opacity_sh_count+k,valid);
             }
             dr::scatter_reduce(ReduceOp::Add,s.counters["appearance_valid"],UInt32(1),id,valid);
-            if(cfg.at("collect_deletion_evidence")!=0.f) {
+            if(!rgb_only && cfg.at("collect_deletion_evidence")!=0.f) {
                 Color3f dc=before*opacity*(s.behind-radiance);
                 Float da=-before*opacity*s.after;
                 Float delta_loss=clean(dr::dot(deletion_dcolor,dc)+dr::squared_norm(dc)+deletion_dalpha*da+cfg.at("alpha_loss_weight")*da*da);
@@ -880,7 +898,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         dr::eval();
     }
     for(uint32_t i=0;i<max_candidates;++i) {
-        Mask valid=(i<state.candidates)&!is_background;
+        Mask valid=i<state.candidates;
+        if(!rgb_only) valid &= !is_background;
         const Candidate &candidate=records.candidates[i];
         UInt32 id=candidate.id,front=candidate.front;
         UInt32 suffix=dr::minimum(front,max_hits-1)*ray_count+lane;

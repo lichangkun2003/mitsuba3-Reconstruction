@@ -5,6 +5,8 @@ alt="Mitsuba banner">
 
 # Mitsuba Renderer 3
 
+本仓库的体素重建实验入口与 Windows 运行说明见 [experiments/reconstruction](experiments/reconstruction/README.rst)。
+
 | Documentation  | Tutorial videos  | Linux             | MacOS             | Windows           |       PyPI        |
 |      :---:     |      :---:       |       :---:       |       :---:       |       :---:       |       :---:       |
 | [![docs][1]][2]| [![vids][9]][10] | [![rgl-ci][3]][4] | [![rgl-ci][5]][6] | [![rgl-ci][7]][8] | [![pypi][11]][12] |

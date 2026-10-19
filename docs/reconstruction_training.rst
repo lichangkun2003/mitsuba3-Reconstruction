@@ -1,10 +1,97 @@
 体素重建训练、保存与评价
 ======================
 
-单卡训练入口为 ``resources/reconstruction_train.py``，实验性的同节点双卡启动器为
-``resources/reconstruction_multigpu.py``，评价入口为
-``resources/reconstruction_evaluate.py``。它们共享场景表达、相机、源码运行环境和
-前向渲染工具；``reconstruction_preview.py`` 继续用于初始化检查。
+阶段 1：RGB-only 训练（当前默认）
+--------------------------------
+
+本阶段从新的初始化开始，使用 800 × 800、每像素 1 spp、总计 700 个 epoch。
+每个 epoch 遍历全部训练视角；单卡和双卡使用相同总轮数及 coarse-to-fine 调度。
+常用参数集中在 ``experiments/reconstruction/train.py`` 顶部的 ``CONFIG`` 赋值区，
+切换场景修改 ``CONFIG.data.dataset``，不要修改预览脚本的 ``CONFIG``。
+
+.. code-block:: python
+
+   CONFIG.training.rgb_only = True
+   CONFIG.model.opacity_sh_count = 1
+   CONFIG.render.width = CONFIG.render.height = 800
+   CONFIG.render.spp = 1
+   CONFIG.training.num_epochs = 700
+   CONFIG.gradient.alpha_loss_weight = 0
+   CONFIG.gradient.alpha_geometry_weight = 0
+   CONFIG.gradient.background_carve_weight = 0
+   CONFIG.gradient.geometry_transition_only = False
+   CONFIG.gradient.geometry_two_sided_boundary = False
+   CONFIG.topology.enable_growth = False
+   CONFIG.topology.enable_deletion = False
+   CONFIG.topology.use_growth_evidence = False
+   CONFIG.schedule.enable_coarse_growth = False
+   CONFIG.contour.enabled = False
+
+损失仅为线性 RGB 的平方误差。读取 RGBA 图片时先按白底合成一次，随后只保留三个 RGB
+通道；普通 RGB 图片可直接使用。源图片的 alpha 仅参与这一步图像合成，不再作为训练
+监督、几何门控、采样依据或删除证据。预测背景固定为白色。底层
+``loss_and_grad(..., reference_rgb, reference_alpha, ..., {"rgb_only": 1})``
+要求 ``reference_rgb`` 已完成合成，并完全忽略兼容签名中的 ``reference_alpha``。
+
+前向仍为射线与椭球的硬命中及 alpha compositing。每个椭球的 opacity 仅有一个 DC
+系数，采用 ``sigmoid(Y0 * b0)``，与观察方向无关。几何反向继续使用 signed-distance
+sigmoid surrogate，并保留对称梯度 clamp；RGB-only 取消原来的单向梯度门控与基于参考
+alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用旧的
+``geometry_two_sided_boundary`` 窄带分支。该 surrogate 不等于硬可见性目标的精确梯度。
+本阶段仍使用 1 spp 的同样本残差，尚未实现多 spp 前缀估计器，也不声明其对无限采样
+平均图像 RGB 目标无偏。
+
+训练关闭生长和删除，但保留分辨率调度及父体到子体的分裂。分裂沿用已有拟合与 opacity
+衰减规则，可能改变前向图像，不能视为严格保持渲染结果。RGB-only 去掉了 alpha 约束，
+RGB loss 的下降本身不能证明几何或 opacity 唯一可辨识。
+
+同步源码后必须重新编译 C++ 与 Python 绑定；RGB-only 启动会检查
+``mi.VoxelReconstruction.rgb_only_version``，旧二进制不能只更新 Python 后继续使用。
+从仓库目录启动新的单卡实验：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
+     --rgb-only --dataset datasets/lego --epochs 700 --chunk-size 0 \
+     --eval-spp 64 --eval-max-views 10
+
+在已经分配同节点两张 GPU 的 Linux Slurm 作业内启动新的双卡实验：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
+     --workers 2 --worker-timeout 600 \
+     --rgb-only --dataset datasets/lego --epochs 700 --chunk-size 0 \
+     --eval-spp 64 --eval-max-views 10
+
+两条命令都自动创建新的实验目录。需要短跑时添加 ``--stop-after-epochs 10``，保持
+``--epochs 700``，避免改变完整调度。训练后的 64 spp 只用于评价出图，不改变训练 spp。
+双卡平台要求和资源分配方式见下文“同节点两张 GPU 训练与评价”。
+
+已有 alpha 监督 checkpoint 禁止切换为 RGB-only 后续训，包含没有记录
+``training.rgb_only`` 的旧 checkpoint；应从初始化开始新的 RGB-only 实验。
+RGB-only checkpoint 同样不能切回旧监督模式。旧模型仍可通过
+``experiments/reconstruction/evaluate.py --checkpoint <实际模型路径>`` 单独评价。
+若要按原算法恢复旧实验，明确使用 ``--no-rgb-only --resume <旧 checkpoint 路径>``。
+配置类 ``TrainConfig()`` 及原生接口的默认行为保留 legacy 语义；新实验默认由上面的
+``CONFIG`` 显式开启，不能把类默认值当作当前实验配置。
+
+编译后的生成场景 GPU 数值回归命令：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_only.py
+
+该测试不打开真实数据集或既有实验，覆盖参考 alpha 不变性、RGB L2 的颜色与 opacity
+有限差分、白色目标及 miss 的几何梯度、DC opacity、三通道缓存、1 → 2 分裂及负 loss
+拒绝。负平方误差会直接报错，不会被 clamp 为零；这项检查不能替代对双卡归约异常的调查。
+下文保留通用运行细节与旧实现说明，其中 alpha 监督、contour、生长、删除及 1000 轮示例
+属于 legacy 配置；本阶段以本节及当前 ``CONFIG`` 为准。
+
+单卡训练入口为 ``experiments/reconstruction/train.py``，实验性的同节点双卡启动器为
+``experiments/reconstruction/train_multigpu.py``，评价入口为
+``experiments/reconstruction/evaluate.py``。它们共享场景表达、相机、源码运行环境和
+前向渲染工具；``preview.py`` 继续用于初始化检查。
 原生接口保留名称 ``mi.VoxelReconstruction``，移植对象是 Falcor 的
 ``VoxelReconstructionNoLightTransport``，不是旧的光传输 pass。
 
@@ -50,7 +137,7 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 统一配置
 --------
 
-``reconstruction_train.py`` 顶部 ``CONFIG = TrainConfig()`` 及其后面的赋值块为统一入口。
+``train.py`` 顶部 ``CONFIG = TrainConfig()`` 及其后面的赋值块为统一入口。
 切换训练场景时，直接修改该块中的 ``CONFIG.data.dataset``，无需进入预览脚本查找：
 
 .. code-block:: python
@@ -84,7 +171,7 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 如果新场景使用相同的文件名，只需改 ``dataset``。还需确认其坐标范围适合模型边界，
 参考图尺寸与 ``render.width/height`` 一致。
 
-训练脚本从 ``reconstruction_preview.py`` 导入的是 ``DataConfig`` 等配置类，也就是
+训练脚本从 ``preview.py`` 导入的是 ``DataConfig`` 等配置类，也就是
 字段和默认值的定义；两个脚本分别创建自己的 ``CONFIG`` 对象。因此，修改预览脚本的
 ``CONFIG.data.dataset`` 只影响预览，不影响训练。训练实验的参数集中改上面这一块。
 
@@ -415,7 +502,7 @@ CPU 参考图仍用于 contour 和生长证据。子像素随机采样继续使�
 固定输入的短基准
 ----------------
 
-``resources/benchmark_reconstruction_forward.py`` 用于比较原生实现版本，默认读取
+``experiments/reconstruction/benchmarks/benchmark_reconstruction_forward.py`` 用于比较原生实现版本，默认读取
 ``datasets/lego``，按点云初始化固定的 256³ 网格，测试训练相机索引 0、21、56
 （从 0 开始），每个视角为 800 × 800、1 spp。固定随机种子生成射线与参考输入，
 在计时前完成输入上传。脚本不更新参数或拓扑，不运行 epoch，也不生成图片或模型结果。
@@ -424,14 +511,14 @@ CPU 参考图仍用于 contour 和生长证据。子像素随机采样继续使�
 
 .. code-block:: bash
 
-   "$HOME/envs/mitsuba/bin/python" -I resources/benchmark_reconstruction_forward.py \
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/benchmarks/benchmark_reconstruction_forward.py \
      --dataset datasets/lego
 
 Windows 在 ``reconstruction`` 工作区父目录执行：
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\benchmark_reconstruction_forward.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\benchmarks\benchmark_reconstruction_forward.py `
      --dataset datasets/lego
 
 默认先预热 3 次，再记录 7 次普通原生调用的墙钟时间；这项时间覆盖完整
@@ -453,7 +540,7 @@ Windows 在 ``reconstruction`` 工作区父目录执行：
 
 .. code-block:: bash
 
-   "$HOME/envs/mitsuba/bin/python" -I resources/benchmark_reconstruction_execution.py \
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/benchmarks/benchmark_reconstruction_execution.py \
      --dataset datasets/lego --ablations
 
 该脚本默认使用相同的三个 800 × 800、1 spp Lego 视角，以及固定的初始化 256³ 拓扑。
@@ -567,7 +654,7 @@ checkpoint 中，不通过 ``E编号`` 表示。下文恢复和评价命令中�
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\reconstruction_evaluate.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\evaluate.py `
      --checkpoint outputs/lego-10.15-E0/model.npz --split both --spp 64 `
      --output-dir outputs/lego-10.15-E0
 
@@ -575,7 +662,7 @@ checkpoint 中，不通过 ``E编号`` 表示。下文恢复和评价命令中�
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\reconstruction_evaluate.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\evaluate.py `
      --config outputs/lego-10.15-E0/evaluation-config.json
 
 ``outputs/ficus-10.14-E0`` 保留较早的 Ficus 初始化模型和训练第一个视角的预览，
@@ -596,7 +683,7 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
 
    cmake --build .\mitsuba\build --config Release --parallel 2
    if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\reconstruction_train.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\train.py `
      --dataset datasets/lego --epochs 10
 
 训练 10 轮表示每个视角都会被访问 10 次。省略 ``--output-dir`` 时使用默认的自动实验目录。
@@ -625,13 +712,13 @@ HPC Slurm
    git submodule update --init --recursive &&
    cmake --build build --parallel "${SLURM_CPUS_PER_TASK:-1}" &&
    source build/setpath.sh &&
-   "$HOME/envs/mitsuba/bin/python" -I resources/test_reconstruction_performance.py
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_performance.py
 
 回归通过后，在同一终端开启新的完整实验：
 
 .. code-block:: bash
 
-   "$HOME/envs/mitsuba/bin/python" -I resources/reconstruction_train.py \
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
      --dataset datasets/lego --epochs 1000 --chunk-size 0 --profile-views 3 \
      --profile-interval-epochs 10 \
      --eval-spp 64 --eval-max-views 10
@@ -668,9 +755,9 @@ Windows 默认构建目录为 ``mitsuba/build/Release``，Linux 为 ``mitsuba/bu
 同节点两张 GPU 训练与评价（实验性）
 ----------------------------------------
 
-``resources/reconstruction_multigpu.py`` 启动两个独立进程，分别使用调度器可见的逻辑
+``experiments/reconstruction/train_multigpu.py`` 启动两个独立进程，分别使用调度器可见的逻辑
 GPU 0 和 1。当前仅支持 Linux Slurm、同一节点、两个工作进程。普通 Windows 本地训练
-继续使用 ``reconstruction_train.py``。这里没有承诺两倍加速：每个视角都需要梯度汇总，
+继续使用 ``train.py``。这里没有承诺两倍加速：每个视角都需要梯度汇总，
 收益取决于射线计算量、模型大小、通信及同步成本。真实双 A100 的 NCCL 通信、数值一致性、
 完整收敛和速度尚需在服务器验证；本地的 CPU 模拟通信测试不等于真实双卡验证。
 
@@ -703,7 +790,7 @@ rank 0 负责实验目录、日志、拓扑生长/删除/升层及 checkpoint；
 
 .. code-block:: powershell
 
-   & '..\envs\mitsuba\Scripts\python.exe' -I resources/test_reconstruction_distributed_evaluation.py
+   & '..\envs\mitsuba\Scripts\python.exe' -I experiments/reconstruction/tests/test_reconstruction_distributed_evaluation.py
 
 先申请同一节点的一项任务和两张 GPU，例如：
 
@@ -746,7 +833,7 @@ Python 环境中的 NVIDIA NCCL 包也会被搜索。启动器不会自动安装
 
 .. code-block:: bash
 
-   "$HOME/envs/mitsuba/bin/python" -I resources/test_reconstruction_nccl.py
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_nccl.py
 
 该检查与 CPU 模拟测试 ``test_reconstruction_collective.py`` 不同；它需要两张实际
 CUDA 设备及上述 NCCL 库。通信检查通过后再运行短训练，检查真实场景的行为与吞吐。
@@ -755,7 +842,7 @@ CUDA 设备及上述 NCCL 库。通信检查通过后再运行短训练，检查
 
 .. code-block:: bash
 
-   "$HOME/envs/mitsuba/bin/python" -I resources/reconstruction_multigpu.py \
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --workers 2 --worker-timeout 600 \
      --dataset datasets/lego --epochs 1000 --stop-after-epochs 10 \
      --chunk-size 0 --freeze-native --gpu-reference-cache-mib 1024 \
@@ -772,7 +859,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
 
 .. code-block:: bash
 
-   "$HOME/envs/mitsuba/bin/python" -I resources/reconstruction_train.py \
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
      --dataset datasets/lego --epochs 1000 --stop-after-epochs 10 \
      --chunk-size 0 --freeze-native --gpu-reference-cache-mib 1024 \
      --profile-views 3 --profile-interval-epochs 10 --no-profile-stages
@@ -785,7 +872,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
 
 .. code-block:: bash
 
-   "$HOME/envs/mitsuba/bin/python" -I resources/reconstruction_multigpu.py \
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --workers 2 --worker-timeout 600 \
      --dataset datasets/lego --epochs 1000 --chunk-size 0 \
      --freeze-native --gpu-reference-cache-mib 1024 \
@@ -800,14 +887,14 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
 
 .. code-block:: bash
 
-   "$HOME/envs/mitsuba/bin/python" -I resources/reconstruction_multigpu.py \
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --evaluate --workers 2 --worker-timeout 600 \
      --checkpoint outputs/lego-10.15-E1/model.npz \
      --split both --spp 64 --max-views 10 \
      --output-dir outputs/lego-10.15-E1
 
 把示例实验目录替换为实际目录。``--evaluate`` 将其余评价参数转交给
-``reconstruction_evaluate.py``，不进入训练流程；这里使用 ``--spp`` / ``--max-views``，
+``evaluate.py``，不进入训练流程；这里使用 ``--spp`` / ``--max-views``，
 而训练后自动评价仍使用 ``--eval-spp`` / ``--eval-max-views``。输出保存到同一实验目录的
 ``train/``、``test/`` 和共享评价报告中，重跑会更新相应图片与指标。两种双卡入口都沿用
 同一份 Slurm 分配，16 个 CPU 分为每进程 8 个线程，不另起 Slurm 作业。
@@ -892,21 +979,21 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
    saved = load_checkpoint(model_path)  # 指向当前实验的 model.npz
    model = restore_model(saved, mi)
 
-这些模块位于 ``resources``，独立脚本需要将该目录加入 Python 导入路径。
+这些模块位于 ``experiments/reconstruction``，独立脚本需要将该目录加入 Python 导入路径。
 模型文件包含渲染所需的全部体素参数；计算 PSNR 仍需数据集的相机 JSON 和真值图片。
 
 例如前面的本地 10 轮实验在第二次保存后中断，可从第 7 轮恢复：
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\reconstruction_train.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\train.py `
      --resume outputs/lego-10.15-E1/training/epoch-00007.npz
 
 前面的服务器 1000 轮实验对应从第二次保存的第 667 轮恢复：
 
 .. code-block:: bash
 
-   "$HOME/envs/mitsuba/bin/python" -I mitsuba/resources/reconstruction_train.py \
+   "$HOME/envs/mitsuba/bin/python" -I mitsuba/experiments/reconstruction/train.py \
      --resume outputs/lego-10.15-E1/training/epoch-00667.npz
 
 恢复时默认复用 checkpoint 所在实验，不递增 ``E编号``：中间 checkpoint 使用所在的
@@ -934,7 +1021,7 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 这不限制训练视角或改变训练 1 spp。评价只读取 checkpoint，不更新模型或使用测试视角训练。
 默认主指标为线性 RGB PSNR，并同时报告 sRGB PSNR。
 
-单卡入口使用一张 GPU 出图；经 ``reconstruction_multigpu.py`` 启动的完整训练保留两个
+单卡入口使用一张 GPU 出图；经 ``train_multigpu.py`` 启动的完整训练保留两个
 工作进程，把上述已选视角分配到两张卡独立出图。选择范围与每视角 spp 不变，不将
 ``--eval-max-views 10`` 解释为每张卡各十个视角。双卡单独出图的 ``--evaluate`` 命令见
 上文“同节点两张 GPU 训练与评价”。
@@ -945,14 +1032,14 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\reconstruction_evaluate.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\evaluate.py `
      --checkpoint outputs/lego-10.15-E1/model.npz `
      --split both --spp 64 --max-views 10 `
      --output-dir outputs/lego-10.15-E1
 
 .. code-block:: bash
 
-   "$HOME/envs/mitsuba/bin/python" -I mitsuba/resources/reconstruction_evaluate.py \
+   "$HOME/envs/mitsuba/bin/python" -I mitsuba/experiments/reconstruction/evaluate.py \
      --checkpoint outputs/lego-10.15-E1/model.npz \
      --split both --spp 64 --max-views 10 \
      --output-dir outputs/lego-10.15-E1
@@ -1072,14 +1159,14 @@ PNG 用于显示；进行论文或其他实现的 PSNR 对比时，应明确选�
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction.py `
      --build-dir .\mitsuba\build\Release --variant cuda_ad_rgb
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_gradients.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_gradients.py `
      --build-dir .\mitsuba\build\Release --variant cuda_ad_rgb
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_gradients.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_gradients.py `
      --build-dir .\mitsuba\build\Release --variant scalar_rgb
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_optimization.py
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_training.py
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_optimization.py
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_training.py
 
 新训练闭环测试自行生成小场景，不使用 lego 或下载数据集；重新运行时报告默认写入
 ``outputs/mitsuba/training-tests/training-tests.json``；优化器/拓扑检查位于
@@ -1091,8 +1178,8 @@ Checkpoint 与 PSNR 的 CPU 单元测试不导入 GPU 后端，也不渲染数�
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_checkpoint.py
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_runtime.py
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_checkpoint.py
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_runtime.py
 
 该测试覆盖模型/优化器/随机数状态往返、空数组与标量布局、原子替换失败保留旧文件、
 校验和破坏、pickle 拒绝、元数据与形状错误，以及已知 PSNR、聚合定义和 sRGB 转换。
@@ -1103,12 +1190,12 @@ Checkpoint 与 PSNR 的 CPU 单元测试不导入 GPU 后端，也不渲染数�
 
 .. code-block:: bash
 
-   "$HOME/envs/mitsuba/bin/python" -I resources/test_reconstruction_replay.py &&
-   "$HOME/envs/mitsuba/bin/python" -I resources/test_reconstruction_reference.py &&
-   "$HOME/envs/mitsuba/bin/python" -I resources/test_reconstruction_parameters.py
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_replay.py &&
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_reference.py &&
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_parameters.py
 
 Windows 在工作区父目录将解释器替换为 ``.\envs\mitsuba\Scripts\python.exe``，
-脚本路径改为 ``.\mitsuba\resources\...``。三个测试都只使用生成的数据和自动清理的临时目录，
+脚本路径改为 ``.\mitsuba\experiments\reconstruction\tests\...``。三个测试都只使用生成的数据和自动清理的临时目录，
 不写实验 ``outputs``。重放测试对照变化的相机、参考、参数、分批尾部、连续 Adam 更新、
 contour 状态、不同拓扑/边界/SH 和分段诊断旁路；显存缓存测试检查全图/分批数值一致、
 LRU 淘汰、容量统计和关闭路径；参数测试覆盖标量与 CUDA、非有限值/尺寸/键错误、
@@ -1118,11 +1205,11 @@ LRU 淘汰、容量统计和关闭路径；参数测试覆盖标量与 CUDA、�
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_performance.py
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_performance.py
 
 .. code-block:: bash
 
-   "$HOME/envs/mitsuba/bin/python" -I mitsuba/resources/test_reconstruction_performance.py
+   "$HOME/envs/mitsuba/bin/python" -I mitsuba/experiments/reconstruction/tests/test_reconstruction_performance.py
 
 该检查使用生成的数据和临时目录，比较整图/分批的数值结果，检查按需回读、非有限值拒绝，
 以及更换相机后的 JIT 内核缓存命中。它不代表真实 Lego 数据集或 A100 的吞吐量测试。
@@ -1159,7 +1246,7 @@ Slurm 上的实际运行，需要在目标数据和硬件上完成验证。
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_performance_summary.py
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_performance_summary.py
 
 前向条件分支与候选提前拒绝的本地对照
 ----------------------------------

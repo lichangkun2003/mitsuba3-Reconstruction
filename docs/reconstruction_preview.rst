@@ -1,14 +1,14 @@
 重建初始化的源码 CUDA 预览
 =========================
 
-``resources/reconstruction_preview.py`` 读取已有数据集的 PLY 与 NeRF 相机，
+``experiments/reconstruction/preview.py`` 读取已有数据集的 PLY 与 NeRF 相机，
 使用源码新增的 ``mi.VoxelReconstruction`` 初始化体素椭球，并渲染一张图。
 保留这一现有接口名称与当前算法；这个独立的 Mitsuba C++ 实现对应 Falcor
 中 ``VoxelReconstructionNoLightTransport`` pass 的初始化与前向流程；
 Falcor 中旧的 ``VoxelReconstruction`` 光传输 pass 不属于这次移植范围。
 当前入口用于检查数据坐标、初始化和前向合成，尚未执行损失、反向梯度、
 Adam、拓扑更新或 coarse-to-fine 训练。普通 Cornell box 的
-``local_gpu_smoke.py`` 仍然是独立的基础环境检查。
+``experiments/reconstruction/tools/smoke_gpu.py`` 仍然是独立的基础环境检查。
 
 多视角训练、完整模型保存/恢复及 train/test 多 spp 评价见
 :doc:`reconstruction_training`。预览入口继续只执行初始化和前向检查。
@@ -22,7 +22,7 @@ Adam、拓扑更新或 coarse-to-fine 训练。普通 Cornell box 的
 
    cmake --build .\mitsuba\build --config Release --parallel 2
    if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\reconstruction_preview.py
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\preview.py
 
 默认使用 ``datasets/lego/init_points.ply``、
 ``datasets/lego/transforms_train.json`` 中第 0 个相机，800 × 800、spp=1、
@@ -45,7 +45,7 @@ seed=42、grid_resolution=256。使用工作区已有数据，不会下载数据
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\reconstruction_preview.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\preview.py `
      --dataset datasets/lego --camera-index 0 --pixel-sampling center `
      --output-dir outputs/mitsuba/lego-preview
 
@@ -92,7 +92,7 @@ Slurm 下根据 DLPack 验证设备属于进程可见设备范围，进程内逻
 .. code-block:: bash
 
    cd "$HOME/projects/reconstruction"
-   "$HOME/envs/mitsuba/bin/python" -I mitsuba/resources/reconstruction_preview.py \
+   "$HOME/envs/mitsuba/bin/python" -I mitsuba/experiments/reconstruction/preview.py \
      --dataset datasets/lego --camera-index 0 \
      --output-dir outputs/mitsuba/lego-preview
 
@@ -141,7 +141,7 @@ JSON 只需填写有变化的字段，例如：
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\reconstruction_preview.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\preview.py `
      --config preview-config.json
 
 PLY 与相机文件相对于 ``data.dataset``，相机 JSON 中的图像路径也相对于
@@ -218,7 +218,7 @@ Falcor 非训练预览的采样布局；这里的 NumPy PCG64 与 Falcor 随机�
 前向与初始化回归检查
 --------------------
 
-``resources/test_reconstruction.py`` 使用生成的小型输入检查原生初始化
+``experiments/reconstruction/tests/test_reconstruction.py`` 使用生成的小型输入检查原生初始化
 和前向行为。这个回归入口仍按本机物理 GPU 编号选卡，仅用于本地检查，
 尚未接入上述 Slurm 环境规则；不要直接在 HPC 作业中运行它。
 预览、训练和评价入口共用 Slurm 环境规则；这个旧数值回归脚本仍仅用于本地。
@@ -226,7 +226,7 @@ Falcor 非训练预览的采样布局；这里的 NumPy PCG64 与 Falcor 随机�
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction.py `
      --build-dir .\mitsuba\build\Release --variant cuda_ad_rgb
 
 这个测试脚本的 ``--build-dir`` 与 ``--output-dir`` 相对于终端当前目录，
@@ -237,7 +237,7 @@ Falcor 非训练预览的采样布局；这里的 NumPy PCG64 与 Falcor 随机�
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction.py `
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction.py `
      --build-dir .\mitsuba\build\Release --variant scalar_rgb
 
 默认报告位于 ``outputs/reconstruction-tests/native-cuda_ad_rgb.json`` 和
@@ -247,7 +247,7 @@ Falcor 非训练预览的采样布局；这里的 NumPy PCG64 与 Falcor 随机�
 运行环境规则的单元测试
 ----------------------
 
-``resources/test_reconstruction_runtime.py`` 使用 Python 标准库
+``experiments/reconstruction/tests/test_reconstruction_runtime.py`` 使用 Python 标准库
 ``unittest`` 模拟环境变量、进程调用、Dr.Jit 线程接口和 DLPack 设备。
 它检查本地与 Slurm 的选卡、环境保留、非法输入拒绝、线程上限及设备范围，
 不导入 Mitsuba/Dr.Jit/NumPy，不使用真实 GPU，也不渲染。
@@ -256,14 +256,14 @@ Falcor 非训练预览的采样布局；这里的 NumPy PCG64 与 Falcor 随机�
 
 .. code-block:: powershell
 
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\resources\test_reconstruction_runtime.py
+   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_runtime.py
 
 服务器可使用已有环境的解释器执行同一项纯标准库测试，无需为它申请 GPU：
 
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I \
-     "$HOME/projects/reconstruction/mitsuba/resources/test_reconstruction_runtime.py"
+     "$HOME/projects/reconstruction/mitsuba/experiments/reconstruction/tests/test_reconstruction_runtime.py"
 
 该测试验证模拟输入下的运行环境处理逻辑。通过不等同于真实 Slurm GPU
 分配、驱动、源码构建或服务器渲染通过；实际验证仍需在获配 GPU 的作业中
