@@ -19,6 +19,32 @@ from reconstruction_common import initialize_runtime
 from reconstruction_preview import RuntimeConfig
 
 
+def check_collective_packing(mi, dr, np):
+    """Exercise the real CUDA array rules without needing a second GPU/NCCL."""
+    from reconstruction_collective import NcclCollective
+
+    collective = NcclCollective.__new__(NcclCollective)
+    collective.mi, collective.dr = mi, dr
+    cases = (([], [], [], [], []), ([], [2, 4], [], [6], []), ([1, 3], [5, 7]))
+    checked = 0
+    for array_type, dtype in ((mi.Float, np.float32), (mi.UInt32, np.uint32)):
+        for parts in cases:
+            arrays = [array_type(np.asarray(part, dtype=dtype)) for part in parts]
+            packed, widths = collective._pack(arrays, array_type)
+            assert widths == [len(part) for part in parts]
+            names = [f"group_{index}" for index in range(len(parts))]
+            restored = collective._unpack(packed, names, widths, array_type)
+            dr.eval(packed, *restored.values())
+            dr.sync_thread()
+            np.testing.assert_array_equal(np.asarray(packed), np.concatenate(parts).astype(dtype))
+            for name, part in zip(names, parts):
+                assert type(restored[name]) is array_type
+                np.testing.assert_array_equal(np.asarray(restored[name]), np.asarray(part, dtype=dtype))
+            checked += 1
+    return {"status": "passed", "cases": checked,
+            "scope": "real CUDA Float/UInt pack/unpack; no NCCL communication"}
+
+
 def check_interop(mi, dr, np):
     driver = ctypes.WinDLL("nvcuda.dll") if sys.platform == "win32" else ctypes.CDLL("libcuda.so.1")
     memset = getattr(driver, "cuMemsetD32Async_v2", None) or driver.cuMemsetD32Async
@@ -85,6 +111,7 @@ def main():
         mi, dr, np, handles = initialize_runtime(
             RuntimeConfig(build_dir=args.build_dir, gpu=args.gpu), Path(directory), {})
         result = check_interop(mi, dr, np)
+        result["collective_packing"] = check_collective_packing(mi, dr, np)
         print(json.dumps(result), flush=True)
     return 0
 

@@ -177,14 +177,21 @@ class NcclCollective:
     def _pack(self, arrays, array_type):
         values = [array_type(value) for value in arrays]
         widths = [int(self.dr.width(value)) for value in values]
-        packed = self.dr.concat(values)
+        # Dr.Jit concat builds indices even for empty inputs, triggering a
+        # zero-width + scalar operation. Preserve group widths for unpacking,
+        # but concatenate only populated groups (an empty topology is valid).
+        populated = [value for value, width in zip(values, widths) if width]
+        packed = self.dr.concat(populated) if populated else self.dr.empty(array_type, 0)
         return packed, widths
 
     def _unpack(self, packed, names, widths, array_type):
         result, begin = {}, 0
         for name, width in zip(names, widths):
-            index = self.dr.arange(self.mi.UInt32, width) + self.dr.opaque(self.mi.UInt32, begin)
-            result[name] = self.dr.gather(array_type, packed, index)
+            if width == 0:
+                result[name] = self.dr.empty(array_type, 0)
+            else:
+                index = self.dr.arange(self.mi.UInt32, width) + self.dr.opaque(self.mi.UInt32, begin)
+                result[name] = self.dr.gather(array_type, packed, index)
             begin += width
         return result
 

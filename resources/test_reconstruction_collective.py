@@ -39,6 +39,9 @@ class _Dr:
 
     @staticmethod
     def concat(values):
+        # NumPy permits empty concatenation, while the current Dr.Jit CUDA
+        # implementation rejects zero-width index arithmetic internally.
+        assert values and all(value.size for value in values), "Empty groups must bypass concat"
         return np.concatenate(values)
 
     @staticmethod
@@ -51,6 +54,7 @@ class _Dr:
 
     @staticmethod
     def arange(array_type, size):
+        assert size > 0, "Empty groups must bypass offset indexing"
         return np.arange(size, dtype=np.uint32)
 
     @staticmethod
