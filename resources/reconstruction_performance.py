@@ -127,6 +127,7 @@ class PerformanceRecorder:
     def record_profile(self, record: dict):
         sample = {name: _number(record.get(name)) for name in _PROFILE_FIELDS}
         sample["resolution"] = str(record.get("training_resolution", record.get("resolution", "unknown")))
+        sample["native_execution"] = record.get("native_execution", "unknown")
         stages = record.get("native_stages")
         if isinstance(stages, dict):
             sample["native_stages"] = {
@@ -165,6 +166,7 @@ class PerformanceRecorder:
                 "native_stages": "Optional synchronized diagnostic breakdown of sampled views. "
                                  "Stage boundaries force evaluation, including full forward candidates, "
                                  "and change scheduling; they do not measure normal throughput. "
+                                 "Native stage diagnostics bypass frozen replay. "
                                  "Stage values are nested within profile totals and must not be added again. "
                                  "Legacy/disabled records are excluded from stage sample counts. "
                                  "Fused atomic operations are not timed separately.",
@@ -179,6 +181,9 @@ class PerformanceRecorder:
             "by_resolution": {},
             "kernel_profiles": {
                 "overall": _profile_summary(self.profiles),
+                "by_native_execution": {execution: _profile_summary([
+                    record for record in self.profiles if record["native_execution"] == execution])
+                    for execution in sorted({record["native_execution"] for record in self.profiles})},
                 "by_resolution": {resolution: _profile_summary([
                     record for record in self.profiles if record["resolution"] == resolution])
                     for resolution in profile_resolutions}},

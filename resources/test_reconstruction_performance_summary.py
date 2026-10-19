@@ -38,7 +38,8 @@ class PerformanceSummaryTests(unittest.TestCase):
             }
             for resolution, detail in ((256, None), (256, stages), (512, stages)):
                 record = {"wall_seconds": 1., "device_ms": 20., "operations": 10,
-                          "training_resolution": resolution}
+                          "training_resolution": resolution,
+                          "native_execution": "direct_stage_profile" if detail else "frozen"}
                 if detail is not None:
                     record["native_stages"] = detail
                 recorder.record_profile(record)
@@ -61,6 +62,11 @@ class PerformanceSummaryTests(unittest.TestCase):
             self.assertEqual(grouped["256"]["sampled_views"], 2)
             self.assertEqual(grouped["256"]["native_stages"]["forward"]["sampled_views"], 1)
             self.assertEqual(grouped["512"]["native_stages"]["forward"]["sampled_views"], 1)
+            execution = report["kernel_profiles"]["by_native_execution"]
+            self.assertEqual(execution["frozen"]["sampled_views"], 1)
+            self.assertEqual(execution["frozen"]["native_stages"], {})
+            self.assertEqual(execution["direct_stage_profile"]["sampled_views"], 2)
+            self.assertEqual(execution["direct_stage_profile"]["totals"]["device_ms"], 40.)
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), report)
 
     def test_partial_and_invalid_stage_values_do_not_create_zero_samples(self):

@@ -29,6 +29,8 @@ from reconstruction_experiment import allocate_training_output, resumed_training
 from reconstruction_optimizer import FalcorOptimizer, OptimizerConfig
 from reconstruction_performance import PerformanceRecorder
 from reconstruction_progress import ProgressLine
+from reconstruction_reference import GPUReferenceCache
+from reconstruction_replay import NativeLossReplay
 from reconstruction_topology import TopologyManager, TopologySettings, CoarseToFineConfig
 
 
@@ -40,6 +42,8 @@ class TrainingSettings:
     profile_interval_epochs: int = 50  # Sample one view periodically and on entering each resolution; 0 disables.
     profile_stages: bool = True  # Synchronize native phase boundaries only in sampled views.
     reference_cache_mib: int = 1024  # Decoded float32 RGBA in host RAM; 0 disables caching.
+    gpu_reference_cache_mib: int = 1024  # Float32 reference planes on the GPU; 0 disables.
+    freeze_native: bool = True  # Replay native GPU work between topology changes.
     seed: int = 42
     shuffle: bool = True
     save_count: int = 3  # Total snapshots, including the final model.npz.
@@ -109,6 +113,8 @@ CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译�
 CONFIG.training.profile_interval_epochs = 50  # 每 50 轮及首次进入各分辨率时抽样记录内核耗时；0 关闭。
 CONFIG.training.profile_stages = True  # 仅在抽样视角细分前向、命中反向和候选梯度；会增加诊断开销。
 CONFIG.training.reference_cache_mib = 1024  # 内存缓存参考图，避免每轮重新解码；0 关闭。
+CONFIG.training.gpu_reference_cache_mib = 1024  # 显存缓存参考图；0 恢复逐视角上传。
+CONFIG.training.freeze_native = True  # 重放原生计算；拓扑变化后重新记录，分段诊断时旁路。
 
 CONFIG.schedule.enabled = True
 CONFIG.schedule.start_resolution = 256
@@ -158,6 +164,9 @@ def parse_arguments():
     parser.add_argument("--profile-stages", action=argparse.BooleanOptionalAction, default=None,
                         help="Synchronize and time native phases in sampled views; --no-profile-stages keeps only aggregate kernel profiling")
     parser.add_argument("--reference-cache-mib", type=int, help="RAM budget for decoded reference images in MiB (default: 1024); 0 disables caching")
+    parser.add_argument("--gpu-reference-cache-mib", type=int, help="GPU reference-image cache budget in MiB (default: 1024); 0 disables caching")
+    parser.add_argument("--freeze-native", action=argparse.BooleanOptionalAction, default=None,
+                        help="Replay native GPU work without repeated tracing (default: enabled); stage diagnostics run directly")
     parser.add_argument("--skip-evaluation", action="store_true", help="Save the final model without automatic train/test evaluation")
     parser.add_argument("--eval-spp", type=int, help="Samples per pixel for final evaluation (default: 64)")
     parser.add_argument("--eval-max-views", type=int, help="Evaluate the first N cameras of each split (default: 10)")
@@ -174,6 +183,8 @@ def apply_arguments(config, args, values):
         (args.profile_interval_epochs, "training", "profile_interval_epochs"),
         (args.profile_stages, "training", "profile_stages"),
         (args.reference_cache_mib, "training", "reference_cache_mib"),
+        (args.gpu_reference_cache_mib, "training", "gpu_reference_cache_mib"),
+        (args.freeze_native, "training", "freeze_native"),
         (args.eval_spp, "evaluation", "spp"),
         (args.eval_max_views, "evaluation", "max_views")):
         if value is not None:
@@ -193,7 +204,7 @@ def validate(config):
         value = getattr(config.training, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"training.{name} must be a positive integer")
-    for name in ("chunk_size", "profile_views", "profile_interval_epochs", "reference_cache_mib"):
+    for name in ("chunk_size", "profile_views", "profile_interval_epochs", "reference_cache_mib", "gpu_reference_cache_mib"):
         value = getattr(config.training, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"training.{name} must be a nonnegative integer")
@@ -201,6 +212,8 @@ def validate(config):
         raise ValueError("training.seed must be nonnegative")
     if not isinstance(config.training.profile_stages, bool):
         raise ValueError("training.profile_stages must be a boolean")
+    if not isinstance(config.training.freeze_native, bool):
+        raise ValueError("training.freeze_native must be a boolean")
     for name, value in asdict(config.gradient).items():
         if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError(f"Invalid gradient.{name}: {value}")
@@ -238,7 +251,8 @@ def effective_chunk_size(config):
 
 
 def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rendered_alpha=False,
-               collect_deletion_evidence=None, stage_profile=None):
+               collect_deletion_evidence=None, stage_profile=None, gpu_reference=None,
+               native_replay=None):
     """Compute a full view on the GPU; only transfer data needed by CPU consumers.
 
     Gradients stay on the GPU. Loss/validity are read once per view. Optional
@@ -246,6 +260,7 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
     Positive chunk sizes retain bounded intermediate storage and one Adam update.
     An optional output dictionary collects synchronized native phase diagnostics.
     This is enabled only for sampled views, never for ordinary training calls.
+    Optional run-owned reference/replay caches contain no checkpoint state.
     """
     count = config.render.width * config.render.height
     chunk_size = effective_chunk_size(config)
@@ -265,11 +280,21 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
         native_settings["collect_deletion_evidence"] = bool(collect_deletion_evidence)
     for begin in range(0, count, chunk_size):
         end = min(begin + chunk_size, count)
+        indices = dr.arange(mi.UInt32, end - begin) + dr.opaque(mi.UInt32, begin)
         ray = generate_ray_batch(config.render, view["camera"],
-            np.arange(begin, end, dtype=np.uint32), offsets[begin:end], mi, dr, prepared_camera=camera)
-        ref = reference[begin:end]
-        result = model.loss_and_grad(ray, mi.Color3f(mi.Float(ref[:, 0]), mi.Float(ref[:, 1]), mi.Float(ref[:, 2])),
-            mi.Float(ref[:, 3]), mi.Color3f(config.render.background), mi.Float(inverse_pdf[begin:end]), native_settings)
+            indices, offsets[begin:end], mi, dr, prepared_camera=camera)
+        if gpu_reference is None:
+            ref = reference[begin:end]
+            reference_rgb = mi.Color3f(*(mi.Float(ref[:, channel]) for channel in range(3)))
+            reference_alpha = mi.Float(ref[:, 3])
+        else:
+            reference_rgb, reference_alpha = gpu_reference.batch(begin, end)
+        # Without contour proposals the sampler returns exactly unit weights.
+        # Preserve CPU RNG consumption and offsets; avoid uploading a constant array.
+        pdf = mi.Float(inverse_pdf[begin:end]) if token is not None else dr.opaque(mi.Float, 1.)
+        arguments = (ray, reference_rgb, reference_alpha, mi.Color3f(config.render.background), pdf, native_settings)
+        result = (native_replay(model, *arguments) if native_replay is not None
+                  else model.loss_and_grad(*arguments))
         if stage_profile is not None:
             if "stage_profile" not in result:
                 raise RuntimeError("Native stage profiling is unavailable; rebuild this checkout's C++ bindings")
@@ -416,6 +441,8 @@ def run_training():
                   "actual_sampling": "per-pixel uniform, optionally contour-guided; frozen for a view"}}
     progress_line = ProgressLine()
     reference_cache = None
+    gpu_reference_cache = None
+    native_replay = None
     history_name = ("training-resume-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".jsonl"
                     if checkpoint else "training.jsonl")
     performance_name = ("performance-summary-" + Path(history_name).stem.removeprefix("training-") + ".json"
@@ -470,7 +497,9 @@ def run_training():
             alpha_readback="only contour history and scheduled growth evidence; no visualization readback",
             camera_parameters="opaque runtime inputs",
             gradients_stage_scope="forward paths, loss, hit/candidate gradients, reductions and readbacks",
-            native_stage_profiling="synchronized sampled views only" if config.training.profile_stages else "disabled")
+            native_stage_profiling="synchronized sampled views only; bypasses frozen replay" if config.training.profile_stages else "disabled",
+            freeze_native=config.training.freeze_native,
+            gpu_reference_cache_mib=config.training.gpu_reference_cache_mib)
         print(f"Training rays: {ray_count} per view, {batch_size} per batch, "
               f"{report['training_protocol']['batches_per_view']} batch(es) per update", flush=True)
         save_epochs = checkpoint_epochs(config.training.num_epochs, config.training.save_count)
@@ -482,8 +511,13 @@ def run_training():
         signature = dataset_signature(views, dataset, config.data.cameras)
         reference_cache = ReferenceImageCache(config.render.width, config.render.height, mi, np,
                                              config.training.reference_cache_mib)
+        gpu_reference_cache = GPUReferenceCache(config.render.width, config.render.height, mi, dr, np,
+                                                config.training.gpu_reference_cache_mib)
+        native_replay = NativeLossReplay(dr, enabled=config.training.freeze_native)
         print(f"Reference image cache: {config.training.reference_cache_mib} MiB RAM, "
+              f"{config.training.gpu_reference_cache_mib} MiB GPU, "
               "loaded on first use; dataset must remain unchanged during training", flush=True)
+        print("Native GPU replay:", "enabled" if config.training.freeze_native else "disabled", flush=True)
         rng = np.random.default_rng(config.training.seed)
         sampler = ContourSampler(np, **asdict(config.contour))
         completed, global_step = 0, 0
@@ -574,6 +608,7 @@ def run_training():
                 view = views[int(index)]
                 view_started = time.perf_counter()
                 rgba = reference_cache.get(view["reference_path"])
+                gpu_reference = gpu_reference_cache.get(view["reference_path"], rgba)
                 reference_done = time.perf_counter()
                 reasons = []
                 if processed_views < config.training.profile_views:
@@ -591,7 +626,8 @@ def run_training():
                     gradients, loss, rendered_alpha = train_view(model, view, rgba, config, sampler, rng, mi, dr, np,
                         need_rendered_alpha=growth_evidence_requested,
                         collect_deletion_evidence=deletion_evidence_collected,
-                        stage_profile=native_stages)
+                        stage_profile=native_stages, gpu_reference=gpu_reference,
+                        native_replay=native_replay)
                     gradients_done = time.perf_counter()
                     topology.observe_view(model, gradients, view_id=int(index), epoch=epoch,
                         camera=view["camera"], reference_alpha=rgba[..., 3], rendered_alpha=rendered_alpha)
@@ -612,6 +648,10 @@ def run_training():
                     profile = dict(epoch=epoch+1, progress=progress, camera=int(index)+1,
                                    training_resolution=training_resolution, active_voxels=int(model.active_voxel_count),
                                    sample_reasons=reasons, growth_evidence_requested=growth_evidence_requested,
+                                   native_execution=("direct_stage_profile" if native_stages is not None else
+                                                     "direct_empty_model" if config.training.freeze_native and not model.active_voxel_count else
+                                                     "frozen" if config.training.freeze_native else "direct"),
+                                   native_replay=native_replay.statistics(),
                                    wall_seconds=optimizer_done-view_started, stage_seconds=stage,
                                    **kernel_profile(history))
                     if native_stages is not None:
@@ -626,6 +666,9 @@ def run_training():
             new_state, event = topology.finish_epoch(model, optimizer, epoch+1)
             topology.before_refine_checkpoint = None
             if new_state is not None:
+                # Drop recordings retaining the old occupancy/parameter buffers,
+                # including same-size replacements and transitions after pruning.
+                native_replay.clear()
                 model = restore_model(new_state, mi)
             if event.get("refined", False):
                 # Falcor resets contour proposals whenever grid resolution changes.
@@ -637,6 +680,8 @@ def run_training():
                      "deletion_evidence_collected": deletion_evidence_collected,
                      "active_voxels": int(model.active_voxel_count), "topology": event,
                      "reference_cache": reference_cache.statistics(),
+                     "gpu_reference_cache": gpu_reference_cache.statistics(),
+                     "native_replay": native_replay.statistics(),
                      "view_stage_seconds": stage_totals,
                      "epoch_topology_seconds": time.perf_counter()-topology_started}
             with (output / history_name).open("a", encoding="utf-8") as stream:
@@ -651,7 +696,8 @@ def run_training():
                 save(output / f"epoch-{epoch+1:05d}.npz", epoch+1)
                 print("Saved checkpoint:", output / f"epoch-{epoch+1:05d}.npz", flush=True)
             performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
-            performance.write("running", training_status="running")
+            performance.write("running", training_status="running",
+                              gpu_reference_cache=entry["gpu_reference_cache"], native_replay=entry["native_replay"])
         performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
         training_loop_started = None
         # Publish only the completed reconstruction, using the same portable,
@@ -678,6 +724,12 @@ def run_training():
         progress_line.finish()
         if reference_cache is not None:
             report["reference_cache"] = reference_cache.statistics()
+        if gpu_reference_cache is not None:
+            report["gpu_reference_cache"] = gpu_reference_cache.statistics()
+            gpu_reference_cache.clear()
+        if native_replay is not None:
+            report["native_replay"] = native_replay.statistics()
+            native_replay.clear()
         if training_loop_started is not None:
             performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
         report["training_finished_utc"] = datetime.now(timezone.utc).isoformat()
@@ -685,7 +737,8 @@ def run_training():
             report["finished_utc"] = report["training_finished_utc"]
         (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
         performance.write(report["status"], training_status=report["training_status"],
-            reference_cache=report.get("reference_cache"), training_report=str(output / "training-report.json"))
+            reference_cache=report.get("reference_cache"), gpu_reference_cache=report.get("gpu_reference_cache"),
+            native_replay=report.get("native_replay"), training_report=str(output / "training-report.json"))
     return config, model_path, output, report, performance
 
 
@@ -733,6 +786,7 @@ def main():
         (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
         performance.write(report["status"], training_status=report["training_status"],
             evaluation=report["evaluation"], reference_cache=report.get("reference_cache"),
+            gpu_reference_cache=report.get("gpu_reference_cache"), native_replay=report.get("native_replay"),
             training_report=str(output / "training-report.json"), evaluation_report=str(evaluation_report))
     return 0 if report["status"] == "passed" else 1
 

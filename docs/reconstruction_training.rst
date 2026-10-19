@@ -66,6 +66,8 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
    CONFIG.training.profile_interval_epochs = 50  # 新分辨率及每 50 轮抽样一个视角
    CONFIG.training.profile_stages = True  # 抽样视角进一步诊断原生前向/两类反向阶段
    CONFIG.training.reference_cache_mib = 1024  # 参考图 CPU 内存缓存；0 关闭
+   CONFIG.training.gpu_reference_cache_mib = 1024  # 参考图显存缓存；0 恢复逐视角上传
+   CONFIG.training.freeze_native = True  # 重放原生计算，拓扑变化后重新记录
    CONFIG.schedule.enabled = True
    CONFIG.schedule.start_resolution = 256
    CONFIG.schedule.target_resolution = 512
@@ -100,7 +102,8 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 * ``model``：初始化边界、padding、SH 数量和固定分辨率。
 * ``render``：图像尺寸、裁剪面、背景、命中上限等；训练 ``spp`` 必须为 1。
 * ``training``：``num_epochs``、``chunk_size``、``profile_views``、``profile_interval_epochs``、
-  ``profile_stages``、``reference_cache_mib``、``seed``、``shuffle``、
+  ``profile_stages``、``reference_cache_mib``、``gpu_reference_cache_mib``、
+  ``freeze_native``、``seed``、``shuffle``、
   ``save_count``（默认 3，包含最后一次）和输出路径 ``output``；``None`` / JSON ``null``
   表示自动分配实验目录，字符串表示使用显式路径。
 * ``gradient``：alpha 损失、几何代理宽度/截断、边界和删除证据等参数。
@@ -174,13 +177,13 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 这仅用于检查程序能否完成训练与恢复，不是原始 256 → 512 正式实验的等价配置。
 训练和评价严格要求参考图尺寸与配置一致，不隐式缩放真值。
 
-参考图内存缓存
---------------
+参考图内存与显存缓存
+--------------------
 
 默认 ``training.reference_cache_mib=1024``，以 MiB 为单位限制训练参考图的 CPU 缓存。
 第一次访问一个视角时，仍通过原来的读取流程解码为线性 RGBA float32，并检查尺寸和有限值；
-后续访问直接复用只读数组，避免每个 epoch 重复读取和解码 PNG。缓存不占用 CUDA 显存，
-也不消除每次训练调用中的参考数据上传。100 张 800 × 800 RGBA float32 约占 976.6 MiB，
+后续访问直接复用只读数组，避免每个 epoch 重复读取和解码 PNG。这层缓存使用 CPU 内存；
+参考数据的重复上传由独立的显存缓存处理。100 张 800 × 800 RGBA float32 约占 976.6 MiB，
 默认容量可以全部容纳；这是图像数组的大小，不是整个训练进程的内存占用。
 
 容量不足时按最近使用顺序淘汰旧图，单张图片超过容量则不缓存。可通过
@@ -197,6 +200,43 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 ``capacity_bytes``、``resident_bytes``、``images``、``hits``、``misses``、``evictions``；
 命中、未命中与淘汰次数从本次进程开始累计，未命中表示实际调用了图片读取流程。
 关闭缓存时所有访问均为未命中，驻留图片数及字节数保持零。
+
+默认 ``training.gpu_reference_cache_mib=1024`` 将线性 RGB 和 alpha 的四个 float32
+通道另外保存在 GPU，整图直接复用，分批则在 GPU 上读取对应像素。使用
+``--gpu-reference-cache-mib 2048`` 调整容量，或 ``--gpu-reference-cache-mib 0``
+恢复原来的逐视角上传；CPU 缓存开关不受影响。容量不足时按最近使用顺序淘汰，单图超过
+总容量则使用原上传路径。两个缓存都开启时，100 张 800 × 800 图分别占约 976.6 MiB
+内存和显存。这里限制的是缓存持有图像的逻辑字节数，不包括 Dr.Jit 分配器保留的空间、
+仍被正在执行的调用引用的淘汰数组，以及模型、梯度和射线记录；不能据此推断显存峰值。
+
+CPU 参考图仍用于 contour 和生长证据。子像素随机采样继续使用原 NumPy 随机数流，
+偏移和需要时的 PDF 权重仍需上传；显存缓存只省掉固定参考图的重复上传，不改变采样、
+损失、梯度或逐视角更新。缓存不写入 checkpoint，恢复进程重新填充，并在自动评价前释放。
+``gpu_reference_cache`` 随逐轮日志、训练报告及性能汇总记录容量、驻留字节数、图片数、
+``hits``、``misses``、``uploads``、``uploaded_bytes`` 和 ``evictions``。
+上传统计只计算显存缓存负责的上传；关闭缓存或单图过大时原路径的上传不计入该字段。
+
+原生调用重放
+------------
+
+默认 ``training.freeze_native=True`` 使用 ``dr.freeze`` 记录原生 ``loss_and_grad``
+中的 GPU 工作，兼容的后续调用直接重放，减少重复追踪和组织计算图的主机开销。
+它不缓存渲染结果：模型参数、相机射线、参考图和 PDF 每次都是当前调用的输入，Adam
+替换后的参数立即参与下一视角。原来的解析外观梯度、几何代理梯度及每视角一次更新保持不变；
+这不是将算法改为普通自动微分，也不表示将全部计算融合成一个 GPU 内核。
+
+重放缓存按原生设置、输入宽度、网格和 SH 元数据区分记录，最多保留 8 个配置条目，
+每项最多 2 个 Dr.Jit 记录。生长、删除或升层重建模型时先清空旧记录；更换模型对象也会
+使记录失效，即使体素数相同。之后首次调用重新记录，checkpoint 恢复亦如此。
+缓存只属于本次进程，不保存到模型或优化器状态。``--no-freeze-native`` 可关闭，
+``--freeze-native`` 可显式开启；恢复训练时也可调整这两个缓存预算及重放开关。
+零活跃体素使用原生 CUDA 空模型路径，不参与重放；当前 Dr.Jit 对零长度模型缓冲的记录存在限制。
+
+``native_replay`` 记录 ``calls``、``recordings``、``replays``、``bypasses``、
+``entries``、``cached_recordings``、``clears``、``model_changes``、``evictions``、``empty_model_bypasses`` 等统计。
+``recordings`` 来自 Dr.Jit 实际记录计数，不能与内核编译未命中数混为一谈。
+预热后观察 ``replays`` 是否增长，并结合普通 epoch 耗时判断收益；首次记录和拓扑变化后的
+重新记录会有额外开销。设置 ``profile_stages`` 的抽样视角刻意旁路重放，详见性能诊断。
 
 整图提交、内核复用与回读
 ----------------------
@@ -218,6 +258,8 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 * 前向、梯度累加和 Adam 更新仍在 GPU；不把梯度数组复制到 CPU 来完成参数更新。
 * loss 与 loss/alpha/梯度的有限值检查先在 GPU 归约为两个标量，每个完整视角回读一次，
   用于进度记录和及时发现数值异常。显式分批时，不再逐批回读 loss 或整张 alpha。
+* 原生 ``set_parameters()`` 对本次更新的参数组先合并有限值检查，正常路径只读取一次
+  校验标志；失败时再定位具体参数组，且全部检查通过前不改变模型。
 * 原始 ``raw_alpha`` 只在 contour 采样器实际产生更新 token 时回读，用于更新采样历史。
 * 概率校正后的 alpha 只在本轮需要收集体素生长证据时回读；普通训练轮不搬运这张图。
 * 体素删除启用且进入证据收集阶段时，CPU 拓扑管理仍按视角读取证据，保留原来的跨视角
@@ -312,7 +354,9 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 以及每第 50 个 epoch，记录其第一个视角的内核信息。``--profile-views 3`` 还可额外记录
 本次进程最先处理的三个视角；``profile_views`` 默认仍为 0，两个条件命中同一视角时只记录一次。
 ``training.profile_stages=True`` 默认只在这些已经选中的抽样视角上增加原生分段计时，
-不会额外抽取视角。``--no-profile-stages`` 关闭分段，仍保留抽样视角的总内核统计。
+不会额外抽取视角。这些视角旁路 ``dr.freeze``，以保留原生阶段边界；普通视角仍使用重放。
+``--no-profile-stages`` 关闭分段，仍保留抽样视角的总内核统计，并允许抽样视角使用重放。
+若目的是测量重放后的训练吞吐，应使用后者；需要定位前向/反向时再保留分段诊断。
 若需要完全关闭内核抽样，可传 ``--profile-interval-epochs 0 --profile-views 0``，
 普通逐轮耗时及性能汇总仍保留。恢复时可调整这些性能测量参数，不改变算法设置。
 抽样有额外开销，比较优化前后速度时应使用相同的测量设置。
@@ -322,6 +366,10 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 代码生成时间 ``codegen_ms``、后端编译时间 ``backend_compile_ms`` 和设备执行时间
 ``device_ms``。设备时间取自 Dr.Jit kernel history，只涵盖所记录的操作；这是抽样数据，
 不能按它直接外推整个实验的 GPU 时间或多 GPU 加速比。
+记录的 ``native_execution`` 区分 ``frozen``、``direct``、``direct_stage_profile`` 和 ``direct_empty_model``，
+并附 ``native_replay`` 累计统计。逐轮 ``training.jsonl``、最终 ``training-report.json``
+及 ``performance-summary.json`` 也记录重放与显存参考缓存统计，便于确认优化实际启用。
+汇总的 ``kernel_profiles.by_native_execution`` 分开统计各执行路径，避免将分段诊断当成重放性能。
 
 开启分段后，抽样记录另有 ``native_stages``，包含：
 
@@ -398,6 +446,65 @@ Windows 在 ``reconstruction`` 工作区父目录执行：
 ``--save-arrays`` 可额外保存每个相机的原生结果和梯度数组，供不同版本数值对照。
 ``--cameras``、``--warmup`` 和 ``--repeats`` 可调整相机或重复次数。比较版本时保持
 这些设置、数据和硬件一致；此短基准不替代完整训练的逐轮耗时、收敛与最终评价验证。
+
+调用重放与显存缓存另有完整视角更新基准：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I resources/benchmark_reconstruction_execution.py \
+     --dataset datasets/lego --ablations
+
+该脚本默认使用相同的三个 800 × 800、1 spp Lego 视角，以及固定的初始化 256³ 拓扑。
+它计时 ``train_view`` 和一次 Adam 更新，包括 CPU 采样、射线构造、参考上传或缓存访问、
+原生前向/反向、标量检查回读以及 GPU 完成等待；不包含 PNG 解码、模型初始化、拓扑操作、
+checkpoint 或最终评价。一轮只遍历选定相机，不是完整 epoch。
+
+默认对比全部关闭和全部开启；``--ablations`` 额外测量仅开启重放、仅开启显存缓存。
+每种模式从相同模型、空 Adam 状态及相同随机种子开始，视角顺序一致，模式执行顺序轮换；
+预热更新在各模式中同样保留。默认预热 1 轮、测量 3 轮，报告同时核对 loss、最终模型和
+Adam 状态的数值误差。可调整 ``--cameras``、``--warmup``、``--repeats``、``--chunk-size``；
+``--gpu-cache-mib`` 必须足以容纳所有选定参考图。输出默认写入系统临时目录的
+``benchmark.json``，不生成重建实验或图片，不占用 E 编号。这个基准用于区分两项优化的
+收益，不能直接外推完整 1000 epoch 或跨设备的加速比。
+
+``--repeat-baseline`` 增加一组独立的原执行路径重复实验，可与 ``--ablations`` 合用，
+用于区分原路径自身的数值波动与新路径的差异。比较保留严格阈值，并记录每个数组的
+超差元素数、RMS、最大误差及对应数值；超差时报告 ``numerical_mismatch`` 并返回非零退出码，
+即使计时已经完成也不会把它标成数值验证通过。
+
+2026-10-19 本地 RTX 4060 Laptop、源码 CUDA 构建实测：以上三视角预热 2 轮、计时 5 轮，
+每模式共更新 21 次，其中 15 次参与计时。完整步骤墙钟中位数如下；该对照使用同一个已合并
+参数校验的 C++ 构建，不单独测量参数校验合并的收益。
+
+.. list-table:: 本地三视角短基准（毫秒/视角）
+   :header-rows: 1
+
+   * - 执行方式
+     - 中位数
+   * - 关闭重放和显存缓存
+     - 43.61
+   * - 独立重复原路径
+     - 44.92
+   * - 仅重放
+     - 44.58
+   * - 仅显存缓存
+     - 40.33
+   * - 两项开启
+     - 40.40
+
+本次合并路径比第一组耗时降低约 7.4%，重放单独没有显示稳定收益。合并路径记录 1 次、
+重放 20 次，三张参考图只上传 3 次。各组的 21 个 loss 完全相同，但多步参数/Adam 比较
+存在严格阈值超差：原路径重复运行的旋转数组 323036 个元素中 36 个超差，合并路径为 21 个；
+对应旋转最大绝对差分别约 ``1.90e-4`` 和 ``1.12e-4``，全部状态的最大差分别约 ``4.83e-4``
+和 ``1.12e-4``。因此本次真实场景基准报告保留 ``numerical_mismatch``，不能宣称多步结果逐位一致，
+也不能据此确认完整训练收敛等价。A100、512 阶段及完整 1000 epoch 的时间/收敛仍需实测。
+
+生成小场景的重放 45 项、参考缓存、参数事务、训练/跨执行模式断点恢复与升层、
+自动评价和现有性能回归均已通过；这些覆盖范围与上述真实场景多步严格对照应分开理解。
+另用相同的真实 Lego 初始化模型、相同射线/参考输入对三个视角单独比较，原路径重复与
+原路径/重放的原生梯度最大差均为 ``1.9e-6`` 至 ``3.8e-6``，通过 ``atol=1e-5, rtol=3e-5``
+检查；一次 Adam 后模型最大差不超过 ``4.77e-7``。提前求值射线也未消除原路径自身的差异。
+这些结果支持并行浮点累加及后续更新放大误差的解释，但不替代完整训练的收敛比较。
 
 重建结果目录
 ------------
@@ -478,7 +585,7 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
 ------------------
 
 首次使用原生训练、参数更新和 checkpoint 恢复接口，或修改底层 C++ 后，必须重新编译。
-原生分段计时接口、前向条件分支、候选提前拒绝和命中反向 GPU 逆序循环均涉及 C++ 修改，必须增量编译，
+原生分段计时接口、前向条件分支、候选提前拒绝、命中反向 GPU 逆序循环及参数校验合并均涉及 C++ 修改，必须增量编译，
 再启动使用新原生模块的进程；不能仅同步脚本后沿用旧模块。
 预编译 wheel 不包含这些原生接口，不能用于验证它们。在 ``reconstruction`` 工作区
 父目录的 PowerShell 中执行：
@@ -529,7 +636,9 @@ HPC Slurm
 
 这里显式选择整图提交，并诊断最先处理的三个视角及每第 10 轮的首个视角，
 便于区分前向与两类反向开销。省略这两个 profile 参数时，恢复默认的分辨率/每 50 轮抽样。
-需要保留内核总统计但关闭同步分段时添加 ``--no-profile-stages``。
+测量重放收益时添加 ``--no-profile-stages``，保留内核总统计并让抽样视角也执行重放。
+普通训练默认已开启 ``--freeze-native`` 和 1024 MiB 显存参考缓存。
+对照旧执行路径可添加 ``--no-freeze-native --gpu-reference-cache-mib 0``，其他配置应相同。
 已经运行的 HPC 进程不会自动加载新脚本，
 需同步后重新启动；如恢复已有实验，应使用已保存的完整 epoch checkpoint 和 ``--resume``，
 未保存的 epoch 进度仍需重算。实际显存峰值和 A100 提速幅度需要在服务器测量，不能由本地测试推断。
@@ -540,8 +649,9 @@ HPC Slurm
 ``SLURM_CPUS_PER_TASK`` 限制，未提供时使用 1 线程。没有 GPU 或源码绑定时不回退 CPU
 或 wheel。多个可见 GPU 不会自动产生多 GPU 训练。
 
-参考图缓存只需要额外 CPU 内存；当前 100 个 800 × 800 训练视角约需 1 GiB，
-无需为了这项优化增加 GPU 数量或 CPU 核数。增加 ``--cpus-per-task`` 会调整 Dr.Jit
+CPU 参考缓存和 GPU 参考缓存各自使用额外资源；当前 100 个 800 × 800 训练视角各约需 1 GiB，
+显存紧张时可减小或关闭 ``--gpu-reference-cache-mib``。无需为了这项优化增加 GPU 数量或
+CPU 核数。增加 ``--cpus-per-task`` 会调整 Dr.Jit
 线程预算，但不会自动并行 Python 拓扑循环或让同一训练使用多张 GPU。
 是否增加资源应根据后续轮次的 ``reference``、``gradients``、``topology_observation``
 及 ``epoch_topology_seconds`` 实测判断，不能只用未触发生长的第一轮推断整个训练。
@@ -819,6 +929,21 @@ Checkpoint 与 PSNR 的 CPU 单元测试不导入 GPU 后端，也不渲染数�
 校验和破坏、pickle 拒绝、元数据与形状错误，以及已知 PSNR、聚合定义和 sRGB 转换。
 也检查 contour 提案归一化、PDF 校正后的常量/alpha 积分、仅选中 bin 的原始 alpha
 历史更新，以及恢复随机数和历史状态后的采样与射线一致性；这些检查在 CPU 上执行。
+
+调用重放、显存参考缓存和参数校验另有生成数据回归。从已编译的仓库目录运行：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I resources/test_reconstruction_replay.py &&
+   "$HOME/envs/mitsuba/bin/python" -I resources/test_reconstruction_reference.py &&
+   "$HOME/envs/mitsuba/bin/python" -I resources/test_reconstruction_parameters.py
+
+Windows 在工作区父目录将解释器替换为 ``.\envs\mitsuba\Scripts\python.exe``，
+脚本路径改为 ``.\mitsuba\resources\...``。三个测试都只使用生成的数据和自动清理的临时目录，
+不写实验 ``outputs``。重放测试对照变化的相机、参考、参数、分批尾部、连续 Adam 更新、
+contour 状态、不同拓扑/边界/SH 和分段诊断旁路；显存缓存测试检查全图/分批数值一致、
+LRU 淘汰、容量统计和关闭路径；参数测试覆盖标量与 CUDA、非有限值/尺寸/键错误、
+失败事务不改变任何参数、部分更新及空模型。真实场景的吞吐仍使用上面的执行基准和训练日志测量。
 
 整图提交和相机内核复用有独立的 CUDA 小场景回归，可从工作区父目录运行：
 

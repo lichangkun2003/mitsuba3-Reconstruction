@@ -180,12 +180,19 @@ def main():
         assert cache["capacity_bytes"] == 1024 * 1024 * 1024
         assert cache["resident_bytes"] == 2 * 16 * 16 * 4 * 4
         assert (cache["images"], cache["hits"], cache["misses"], cache["evictions"]) == (2, 4, 2, 0)
+        gpu_cache = full_report["gpu_reference_cache"]
+        assert gpu_cache["resident_bytes"] == cache["resident_bytes"]
+        assert (gpu_cache["uploads"], gpu_cache["hits"], gpu_cache["misses"]) == (2, 4, 2)
+        replay = full_report["native_replay"]
+        assert replay["enabled"] and replay["bypasses"] == 2
+        assert replay["recordings"] >= 1 and replay["replays"] >= 1
         profiles = [json.loads(line) for line in Path(full_report["profile_file"]).read_text(encoding="utf-8").splitlines()]
         assert len(profiles) == 2
         assert [item["progress"] for item in profiles] == [1, 2]
         assert all(item["jit_kernels"] > 0 and item["wall_seconds"] > 0 for item in profiles)
         phase_names = {"forward", "hit_backward", "candidate_backward"}
         assert all(set(item["native_stages"]) == phase_names for item in profiles)
+        assert all(item["native_execution"] == "direct_stage_profile" for item in profiles)
         assert all(sum(stage["wall_seconds"] for stage in item["native_stages"].values())
                    <= item["stage_seconds"]["gradients"] + .001 for item in profiles)
         assert "Epoch 3/3 done | loss=" in (run / "full.log").read_text(encoding="utf-8")
@@ -200,6 +207,7 @@ def main():
         assert performance["by_resolution"]["4"]["completed_epochs"] == 3
         assert performance["overall"]["epoch_seconds"]["total"] == math.fsum(row["seconds"] for row in epoch_history)
         assert performance["kernel_profiles"]["overall"]["sampled_views"] == len(profiles)
+        assert performance["kernel_profiles"]["by_native_execution"]["direct_stage_profile"]["sampled_views"] == len(profiles)
         native_summary = performance["kernel_profiles"]["overall"]["native_stages"]
         assert set(native_summary) == phase_names
         for name in phase_names:
@@ -209,12 +217,16 @@ def main():
         assert len(performance["checkpoints"]) == 3
         assert performance["phase_seconds"]["evaluation"] > 0
         assert performance["details"]["evaluation"]["status"] == "passed"
+        assert performance["details"]["gpu_reference_cache"] == gpu_cache
+        assert performance["details"]["native_replay"] == replay
         report["checks"].append("three epochs save two intermediate checkpoints and final model without duplicate archives")
         check_automatic_evaluation(run / "full")
         saved_config = json.loads((run / "full" / "config.json").read_text(encoding="utf-8"))
         assert saved_config["render"]["spp"] == final["config"]["render"]["spp"] == 1
         assert saved_config["training"]["num_epochs"] == 3
         assert saved_config["training"]["reference_cache_mib"] == 1024
+        assert saved_config["training"]["gpu_reference_cache_mib"] == 1024
+        assert saved_config["training"]["freeze_native"] is True
         assert final["config"]["evaluation"]["spp"] == 64
         assert final["config"]["evaluation"]["max_views"] == 1
         report["checks"].append("automatic 64-spp evaluation selects the first view of each split without limiting training or replacing training config")
@@ -223,6 +235,7 @@ def main():
         run_process([sys.executable, "-I", str(entry), "--resume", str(run / "full" / "epoch-00001.npz"),
                      "--output-dir", str(run / "resumed"), "--build-dir", args.build_dir, "--gpu", str(args.gpu),
                      "--reference-cache-mib", "0", "--profile-views", "0", "--profile-interval-epochs", "0",
+                     "--gpu-reference-cache-mib", "0", "--no-freeze-native",
                      "--skip-evaluation"], "resume")
         resumed = load_checkpoint(run / "resumed" / "model.npz")
         assert {path.name for path in (run / "resumed").glob("*.npz")} == {"epoch-00002.npz", "model.npz"}
@@ -240,12 +253,16 @@ def main():
         assert uncached["capacity_bytes"] == uncached["resident_bytes"] == uncached["images"] == 0
         assert (uncached["hits"], uncached["misses"], uncached["evictions"]) == (0, 4, 0)
         assert resumed["config"]["training"]["reference_cache_mib"] == 0
+        assert resume_report["gpu_reference_cache"]["uploads"] == 0
+        assert resume_report["gpu_reference_cache"]["resident_bytes"] == 0
+        assert resume_report["native_replay"]["bypasses"] == 4
+        assert resume_report["native_replay"]["recordings"] == 0
         resume_performance = json.loads(Path(resume_report["performance_file"]).read_text(encoding="utf-8"))
         assert resume_performance["completed_epochs"] == 2 and resume_performance["first_epoch"] == 2
         assert Path(resume_report["performance_file"]).name.startswith("performance-summary-resume-")
         assert resume_performance["kernel_profiles"]["overall"]["sampled_views"] == 0
         assert "profile_file" not in resume_report
-        report["checks"].append("cached training and uncached epoch-boundary resume preserve model, optimizer and RNG state")
+        report["checks"].append("GPU-cached frozen training and uncached direct resume preserve model, optimizer and RNG state")
         run_process([sys.executable, "-I", str(entry), "--resume", str(run / "full" / "model.npz"),
                      "--output-dir", str(run / "already-finished" / "training"), "--build-dir", args.build_dir,
                      "--gpu", str(args.gpu), "--eval-spp", "2", "--eval-max-views", "10"], "already-finished")
@@ -303,7 +320,8 @@ def main():
         # separately retains compatibility with legacy pending-transition files.
         run_process([sys.executable, "-I", str(entry), "--resume", str(run / "coarse" / "epoch-00001.npz"),
                      "--output-dir", str(run / "coarse-resumed"), "--build-dir", args.build_dir,
-                     "--gpu", str(args.gpu), "--reference-cache-mib", "0"], "coarse-resume")
+                     "--gpu", str(args.gpu), "--reference-cache-mib", "0",
+                     "--gpu-reference-cache-mib", "0", "--no-freeze-native"], "coarse-resume")
         coarse_resumed = load_checkpoint(run / "coarse-resumed" / "model.npz")
         assert {path.name for path in (run / "coarse-resumed").glob("*.npz")} == {"epoch-00002.npz", "model.npz"}
         for key in coarse["model_state"]:

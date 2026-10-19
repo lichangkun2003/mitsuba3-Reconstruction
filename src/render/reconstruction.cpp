@@ -212,13 +212,23 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_parameters(
         {"rotations", size_t(m_active_count)*4},
         {"radiance_sh", size_t(m_active_count)*m_sh_count*3},
         {"opacity_sh", size_t(m_active_count)*m_opacity_sh_count}};
-    // Validate the complete transaction before changing any parameter.
+    // Validate the complete transaction before changing any parameter. Queue
+    // the reductions together and read one flag on the normal GPU path, rather
+    // than synchronizing after each of the five parameter groups.
+    Mask all_finite = true;
     for (const auto &[key, values] : parameters) {
         auto expected = sizes.find(key);
         if (expected == sizes.end() || values.size() != expected->second)
             Throw("VoxelReconstruction.set_parameters(): unknown key or wrong size: %s.", key.c_str());
-        if (values.size() && !dr::slice(dr::all(dr::isfinite(values))))
-            Throw("VoxelReconstruction.set_parameters(): non-finite %s.", key.c_str());
+        if (values.size())
+            all_finite &= dr::all(dr::isfinite(values));
+    }
+    if (!dr::slice(all_finite)) {
+        // Retain the precise offending group in errors. Extra synchronization
+        // is confined to the rejected transaction; no parameter has changed.
+        for (const auto &[key, values] : parameters)
+            if (values.size() && !dr::slice(dr::all(dr::isfinite(values))))
+                Throw("VoxelReconstruction.set_parameters(): non-finite %s.", key.c_str());
     }
     for (const auto &[key, values] : parameters) {
         if (key == "centers") m_centers = dr::detach(values);
