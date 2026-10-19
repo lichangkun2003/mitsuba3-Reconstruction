@@ -33,8 +33,7 @@ def run(mi, dr, np):
     config.schedule.total_epochs = 5
     config.topology.growth_warmup_epochs = 0
     config.topology.growth_interval = 1
-    config.topology.growth_max_candidates = 1
-    config.topology.growth_max_new_voxels = 1
+    assert config.topology.growth_rgb_normalization == "observed"
     config.topology.growth_rgb_min_support_views = 3
     config.training.profile_stages = False
     # Exercise the actual optimizer without allowing this wiring check to
@@ -62,9 +61,18 @@ def run(mi, dr, np):
     for epoch, cell in enumerate((74, 76)):
         replay.clear()
         assert manager.prepare_rgb_growth(model, epoch)
-        np.testing.assert_array_equal(manager.pending_growth["cells"], [cell])
-        assert int(model.growth_candidate_count) == 1
+        pending = manager.pending_growth
+        candidate_count = len(pending["cells"])
+        assert cell in pending["cells"]
+        assert candidate_count == pending["all_candidate_count"]
+        assert int(model.growth_candidate_count) == candidate_count
+        if epoch == 0:
+            # Both holes are installed together. Cameras only observe the
+            # first hole in this event, so evidence (not a budget) selects it.
+            assert 76 in pending["cells"] and candidate_count >= 2
         config.training.chunk_size = 0 if epoch == 0 else 5
+        expected_gain_sum = np.zeros(candidate_count, dtype=np.float64)
+        expected_observed_views = np.zeros(candidate_count, dtype=np.uint32)
         for view_id in range(3):
             view = {"index": view_id, "camera": {
                 "position": [(cell % 8) + .2, 1.5, -1.],
@@ -76,7 +84,13 @@ def run(mi, dr, np):
                 collect_deletion_evidence=False)
             assert math.isfinite(loss) and alpha is None
             assert set(("growth_gain", "growth_observed", "growth_unknown")) <= gradients.keys()
-            assert dr.width(gradients["growth_gain"]) == 1
+            assert dr.width(gradients["growth_gain"]) == candidate_count
+            gain = np.asarray(gradients["growth_gain"])
+            observed = np.asarray(gradients["growth_observed"])
+            unknown = np.asarray(gradients["growth_unknown"])
+            reliable = (observed > 0) & (unknown == 0) & np.isfinite(gain)
+            expected_gain_sum[reliable] += gain[reliable] / observed[reliable]
+            expected_observed_views += reliable.astype(np.uint32)
             manager.observe_rgb_growth(model, gradients, view_id, epoch, 16)
             optimizer.step(model, gradients, epoch=epoch, coarse_to_fine=False)
             if epoch == 1 and view_id == 0:
@@ -92,6 +106,10 @@ def run(mi, dr, np):
                 manager.load_state_dict(topology_state)
                 assert manager.prepare_rgb_growth(model, epoch)
                 assert manager.pending_growth["seen_views"] == {0}
+        pending = manager.state_dict()["pending_growth"]
+        assert pending["normalization"] == "observed"
+        np.testing.assert_allclose(pending["gain_sum"], expected_gain_sum, atol=2e-7, rtol=3e-6)
+        np.testing.assert_array_equal(pending["observed_views"], expected_observed_views)
         replacement, event = manager.finish_epoch(model, optimizer, epoch + 1)
         assert event["grown"] == 1, event
         assert event["growth_rgb"]["support_votes"] == 3, event

@@ -124,14 +124,13 @@ CONFIG.topology.enable_growth = True
 CONFIG.topology.enable_deletion = False
 CONFIG.topology.use_growth_evidence = False
 CONFIG.topology.use_rgb_growth = True  # 复用训练前向的 RGB 收益票，不额外渲染。
+CONFIG.topology.growth_rgb_normalization = "observed"  # 有效命中射线均值，再对可靠观测视角求均值。
 CONFIG.topology.growth_warmup_epochs = 20  # 最粗层级先优化 20 轮，再按生长周期检查。
 CONFIG.topology.growth_fine_warmup_epochs = 20  # 每个后续层级重新 warmup。
-CONFIG.topology.growth_max_candidates = 1024  # 每次检查的候选上限（初始实验值）。
-CONFIG.topology.growth_max_new_voxels = 128  # 每次新增上限（初始实验值）。
 CONFIG.topology.growth_rgb_min_support_views = 3
 CONFIG.topology.growth_rgb_max_conflict_views = 2  # 达到 2 个反对视角则拒绝。
-CONFIG.topology.growth_rgb_gain_epsilon = 1e-7  # 全图像素归一化 RGB 平方和的票阈值。
-CONFIG.topology.growth_rgb_min_mean_gain = 1e-7  # 所有训练视角的带符号平均收益门槛。
+CONFIG.topology.growth_rgb_gain_epsilon = 1e-7  # 有效命中射线的平均 RGB 收益票阈值（保留数值，单位已变）。
+CONFIG.topology.growth_rgb_min_mean_gain = 1e-7  # 可靠观测视角的带符号平均收益门槛。
 CONFIG.gradient.max_growth_hits = 8  # 单条射线的候选记录容量；溢出则弃权。
 CONFIG.schedule.enable_coarse_growth = True  # 分层训练的生长开关；分裂规则保持不变。
 CONFIG.training.chunk_size = 0  # 0 = 整图提交；显存不足时可显式改为 65536 等。
@@ -240,6 +239,8 @@ def validate(config):
         raise ValueError("training.rgb_only must be a boolean")
     if config.topology.use_rgb_growth and not config.training.rgb_only:
         raise ValueError("RGB growth evidence requires training.rgb_only=true")
+    if config.topology.growth_rgb_normalization not in ("observed", "full_image"):
+        raise ValueError("topology.growth_rgb_normalization must be 'observed' or 'full_image'")
     if config.training.rgb_only:
         if config.model.opacity_sh_count != 1:
             raise ValueError("RGB-only training requires model.opacity_sh_count=1 (DC logit only)")
@@ -560,6 +561,14 @@ def prepare_training_output(config, resume_path=None, checkpoint_config=None):
     return output
 
 
+def normalized_algorithm_group(name, values):
+    """Compare legacy saves with explicit defaults, without changing algorithms."""
+    defaults = {"topology": TopologySettings, "gradient": GradientSettings}
+    if values is not None and name in defaults:
+        return {**asdict(defaults[name]()), **values}
+    return values
+
+
 def validate_existing_model(path: Path, resumed_checkpoint: dict) -> None:
     """A resume must not replace another experiment's exported reconstruction."""
     if not path.exists():
@@ -567,7 +576,8 @@ def validate_existing_model(path: Path, resumed_checkpoint: dict) -> None:
     existing = load_checkpoint(path)
     previous = resumed_checkpoint["config"]
     for group in ("data", "model", "render", "gradient", "optimizer", "topology", "schedule", "contour"):
-        if existing["config"].get(group) != previous.get(group):
+        if (normalized_algorithm_group(group, existing["config"].get(group))
+                != normalized_algorithm_group(group, previous.get(group))):
             raise ValueError(f"Exported model belongs to a different {group} configuration: {path}; choose a new experiment directory")
     for key in ("num_epochs", "seed", "shuffle"):
         if existing["config"].get("training", {}).get(key) != previous.get("training", {}).get(key):
@@ -673,10 +683,7 @@ def run_training(distributed=None):
             previous = checkpoint["config"]
             current = asdict(config)
             for group in ("model", "render", "gradient", "optimizer", "topology", "contour"):
-                previous_group = previous[group]
-                if group in ("gradient", "topology"):
-                    defaults = GradientSettings() if group == "gradient" else TopologySettings()
-                    previous_group = {**asdict(defaults), **previous_group}
+                previous_group = normalized_algorithm_group(group, previous[group])
                 if current[group] != previous_group:
                     raise ValueError(f"Cannot change {group} while resuming; start a new run for a different algorithm")
             for key in ("seed", "shuffle", "save_count"):
@@ -694,7 +701,8 @@ def run_training(distributed=None):
                 # this file so a peer cannot race its replacement below.
                 previous_json = json.loads(json.dumps(previous))
                 for group in ("data", "model", "render", "gradient", "optimizer", "topology", "schedule", "contour"):
-                    if existing.get(group) != previous_json[group]:
+                    if (normalized_algorithm_group(group, existing.get(group))
+                            != normalized_algorithm_group(group, previous_json[group])):
                         raise ValueError("Resume output belongs to a different configuration; choose a new --output-dir")
         rgb_growth_enabled = config.topology.use_rgb_growth and config.topology.enable_growth and (
             not config.schedule.enabled or config.schedule.enable_coarse_growth)
@@ -711,6 +719,7 @@ def run_training(distributed=None):
             actual_sampling="per-pixel uniform" if config.training.rgb_only else "per-pixel uniform or contour-guided",
             growth_evidence=("same-DDA frozen candidate insertion; signed 1-spp RGB gain; no confirmation render"
                              if rgb_growth_enabled else "disabled" if config.training.rgb_only else "legacy alpha evidence"),
+            growth_normalization=config.topology.growth_rgb_normalization if rgb_growth_enabled else None,
             reported_loss="mean pixel RGB squared-error sum over channels, then mean over views"
                           if config.training.rgb_only else "mean RGB plus alpha loss over pixels and views")
         performance.metadata["config"] = asdict(config)
@@ -750,6 +759,7 @@ def run_training(distributed=None):
              + ("refinement + RGB growth" if rgb_growth_enabled else "refinement only")) if config.training.rgb_only
              else "legacy RGB + reference alpha", flush=True)
         if rgb_growth_enabled:
+            emit("RGB growth normalization:", config.topology.growth_rgb_normalization, flush=True)
             emit("RGB growth warmup (epochs per level):", config.topology.growth_warmup_epochs,
                  "coarse,", config.topology.growth_fine_warmup_epochs,
                  "fine; no extra forward render", flush=True)

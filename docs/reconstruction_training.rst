@@ -27,6 +27,7 @@ RGB-only 训练与在线生长（当前默认）
    CONFIG.topology.use_rgb_growth = True
    CONFIG.topology.growth_warmup_epochs = 20
    CONFIG.topology.growth_fine_warmup_epochs = 20
+   CONFIG.topology.growth_rgb_normalization = "observed"
    CONFIG.schedule.enable_coarse_growth = True
    CONFIG.contour.enabled = False
 
@@ -80,10 +81,27 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 需要额外的候选相交、临时记录和 GPU 归约计算，不能将其描述为零开销。
 训练仍为 1 spp；收益是有噪声的单样本证据，不宣称对无限采样平均颜色的平方误差无偏。
 
-完整视角先累加带符号收益，再按完整视角的像素数归一化；不同分批或 GPU 分片先 SUM
-合并收益与计数，再进行一次视角投票，不能各分片先投票。正收益为支持，负收益为反对，
-接近零或没有命中为中性。除了票数，还检查带符号的平均收益，不能仅靠很多微小正票
-掩盖严重负收益。整个流程不读取参考 alpha、不按 RGB 是否接近白色分类射线。
+当前新实验使用 ``growth_rgb_normalization="observed"``。对候选 ``t`` 和视角 ``v``，
+先把所有可靠命中射线的带符号收益相加，再除以这些射线的数量 ``M[v,t]``：
+
+.. code-block:: text
+
+   G[v,t] = sum_p(gain[v,p,t]) / M[v,t]
+
+分母包含正、负、零收益的全部可靠命中；未命中该候选的像素不计入。扩大图像中与候选
+无关的背景区域不会稀释它的分数。不同分批或 GPU 分片先 SUM 合并原始收益和计数，
+再归一化并投一次完整视角票，不能先平均分片均值，也不能各分片先投票。
+当 ``G > growth_rgb_gain_epsilon`` 时为支持票，``G < -growth_rgb_gain_epsilon``
+时为反对票，其余为中性。每个候选在一个视角最多各计一次。
+
+跨视角的最终收益对有可靠观测的视角取平均：``sum_v(G[v,t]) / reliable_views[t]``。
+不可见、未知或非有限数值的视角不进入该分母；可靠但收益为零的视角仍进入分母。
+默认至少需要 3 个支持视角、反对视角少于 2，并要求上述带符号平均收益超过
+``growth_rgb_min_mean_gain``，没有可靠观测的候选不会通过。任一视角产生非有限收益时，
+该视角不投票，且该候选因无效数值检查被拒绝。
+这衡量候选影响区域内的局部平均改善，不再代表整图平均 loss 的减少量；不同视角
+等权，也不是把所有视角的射线合在一起求均值。少量 1 spp 射线可能产生较大的均值，
+多视角检查不能完全消除这种噪声。整个流程不读取参考 alpha、不按 RGB 是否接近白色分类射线。
 
 射线达到实际命中上限、透射率提前终止，或候选记录容量溢出时，可能无法获得完整的
 候选后方信息。此时记录 ``growth_unknown``，不额外追踪补齐。对一个候选，只要某视角
@@ -94,32 +112,49 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 完整路径条件而失去该视角的票；这需要在真实实验中结合未知计数检查。
 当前仅支持均匀训练采样；原生证据遇到非单位采样权重同样弃权，不用于 contour 模式。
 
-配置集中在 ``train.py`` 顶部及 ``topology`` 配置组，以下是首版实验参数，不是理论保证：
+配置集中在 ``train.py`` 顶部及 ``topology`` 配置组，以下是当前实验参数，不是理论保证：
 
 .. code-block:: python
 
    CONFIG.topology.growth_warmup_epochs = 20
    CONFIG.topology.growth_fine_warmup_epochs = 20
-   CONFIG.topology.growth_max_candidates = 1024
-   CONFIG.topology.growth_max_new_voxels = 128
+   CONFIG.topology.growth_rgb_normalization = "observed"
    CONFIG.topology.growth_rgb_min_support_views = 3
    CONFIG.topology.growth_rgb_max_conflict_views = 2
    CONFIG.topology.growth_rgb_gain_epsilon = 1e-7
    CONFIG.topology.growth_rgb_min_mean_gain = 1e-7
    CONFIG.gradient.max_growth_hits = 8
 
-候选总数及每次新增数量有限，并继续遵守 ``topology.max_active_voxels``。
+生长不再截取前 1024 个候选或限制每次只新增 128 个体素。全部合法目标格参与
+评估，全部通过证据与提交时几何复核的目标格均可加入，仍受原来的
+``topology.max_active_voxels`` 总体素容量约束；候选总数与单次新增预算参数已删除。
+``gradient.max_growth_hits=8`` 是每条射线的临时候选记录容量，本次保持不变；增加
+候选数量可能增加相交开销及记录溢出导致的弃权。
+
+两个收益阈值仍为 ``1e-7``，但新模式中的单位改为每条可靠命中射线的 RGB 平方误差
+收益及其跨可靠视角均值，不能与旧的全图归一化阈值直接比较。阈值需结合真实实验检查。
+兼容模式 ``growth_rgb_normalization="full_image"`` 保留旧的“除以整图像素数，再除以
+全部训练视角数”的定义。恢复没有此字段的可兼容 checkpoint 时采用该兼容模式，续训
+不允许悄悄更换归一化。带已删除生长预算字段的旧配置及 checkpoint 会报错；比较新
+规则应使用当前配置新开实验。
+
 候选在 GPU 上逐视角累积票数与收益，事件结束时才读取候选统计进行决策；安装候选和
 拓扑更新仍有 CPU 几何准备、状态快照与传输。没有每视角整图回读来进行生长投票。
 通过后正常优化新体素的几何、radiance SH 与 DC opacity，新生体素按原成熟期等待后
 才能继续成为父体。当前不新增 RGB-only 删除规则。
 
-单个候选收益不是多个候选同时加入的联合收益；有限批量提交仍可能出现候选相互遮挡、
+``training.jsonl`` 的生长事件在 ``topology.growth_rgb`` 中记录归一化模式、几何／评估
+候选数、有效／未知射线与视角数，以及无观测、支持不足、反对、无效数值和均值阈值等
+拒绝数量。拒绝检查可能重叠，不能相加当作唯一被拒候选数；几何复核与总体素容量的
+拒绝数也分别记录，便于判断补洞仍慢是证据不足还是容量限制。
+
+单个候选收益不是多个候选同时加入的联合收益；批量提交仍可能出现候选相互遮挡、
 外层增厚或多层低 opacity 雾化。现有 RGB 优化可以降低错误候选的 opacity，但不保证
 一定淘汰它们。应通过生长数量、有效／未知证据、损失及图像对照评估此次实验。
 分裂保持不变，也不能用本次生长规则声称 RGB 已唯一确定几何。
 
-同步源码后必须重新编译 C++ 与 Python 绑定；RGB-only 启动会检查
+当前归一化与全局预算调整仅修改 Python，无需因这一调整重新编译。首次使用在线 RGB
+生长时仍需包含该接口的 C++ 与 Python 绑定；RGB-only 启动会检查
 ``mi.VoxelReconstruction.rgb_only_version``，启用生长还要求 ``rgb_growth_version >= 1``；
 旧二进制不能只更新 Python 后继续使用。
 从仓库目录启动新的单卡实验：
@@ -172,8 +207,10 @@ RGB-only checkpoint 同样不能切回旧监督模式。旧模型仍可通过
 有限差分、白色目标及 miss 的几何梯度、DC opacity、三通道缓存、1 → 2 分裂及负 loss
 拒绝。负平方误差会直接报错，不会被 clamp 为零；这项检查不能替代对双卡归约异常的调查。
 RGB 生长测试另外使用小型合成场景，对照显式插入候选的独立渲染验证虚拟收益，检查
-正／负／中性证据、参考 alpha 不变性、原图与梯度不变性、截断弃权、分片求和，以及
-粗细层 warmup。测试中的独立渲染仅是数值验证的参照，训练投票不执行这些额外渲染。
+正／负／中性证据、参考 alpha 不变性、原图与梯度不变性、截断弃权、分片先求和后
+归一化、局部归一化不随无关像素数变化、可靠视角分母、不限 1024／128 的生长规模、
+旧模式与 checkpoint 兼容，以及粗细层 warmup。测试中的独立渲染仅是数值验证的参照，
+训练投票不执行这些额外渲染。
 下文保留通用运行细节与旧实现说明，其中 alpha 监督、contour、旧生长／删除及 1000 轮
 示例属于 legacy 配置；当前实验以本节及当前 ``CONFIG`` 为准。
 

@@ -27,7 +27,7 @@ def initialize_statistics(pending, np):
         pending[name] = np.zeros(count, dtype=np.float32 if name.endswith("gain_sum") else np.uint32)
 
 
-def observe_numpy(pending, out, pixel_count, epsilon, np):
+def observe_numpy(pending, out, pixel_count, epsilon, np, normalization="full_image"):
     """CPU reference/fallback matching device accumulation and abstention."""
     count = len(pending["cells"])
     gain = np.asarray(out["growth_gain"], dtype=np.float32).reshape(-1)
@@ -37,8 +37,14 @@ def observe_numpy(pending, out, pixel_count, epsilon, np):
         raise ValueError("RGB growth evidence count differs from frozen candidate count")
     if np.any(observed < 0) or np.any(unknown < 0):
         raise ValueError("RGB growth ray counts must be nonnegative")
+    if normalization not in ("observed", "full_image"):
+        raise ValueError("RGB growth normalization must be 'observed' or 'full_image'")
     finite = np.isfinite(gain)
-    normalized = np.where(finite, gain, 0) / np.float32(pixel_count)
+    # Native counts include every reliable candidate hit, including negative
+    # and zero gains. An unseen candidate has no local mean and cannot vote.
+    denominator = (np.maximum(observed, 1).astype(np.float32) if normalization == "observed"
+                   else np.float32(pixel_count))
+    normalized = np.where(finite, gain, 0) / denominator
     eligible = finite & (observed > 0) & (unknown == 0)
     pending["raw_gain_sum"] += normalized
     pending["gain_sum"] += np.where(eligible, normalized, 0)
@@ -60,14 +66,18 @@ class RGBGrowthEvidenceDevice:
                        for name in RGB_STAT_FIELDS}
         dr.eval(*self.arrays.values())
 
-    def observe(self, out, pixel_count, epsilon):
+    def observe(self, out, pixel_count, epsilon, normalization="full_image"):
         dr, Float, UInt = self.dr, self.Float, self.UInt
         gain, observed, unknown = (out[name] for name in
                                    ("growth_gain", "growth_observed", "growth_unknown"))
         if any(dr.width(value) != self.count for value in (gain, observed, unknown)):
             raise ValueError("RGB growth evidence count differs from frozen candidate count")
+        if normalization not in ("observed", "full_image"):
+            raise ValueError("RGB growth normalization must be 'observed' or 'full_image'")
         finite = dr.isfinite(gain)
-        normalized = dr.select(finite, gain, 0) * dr.opaque(Float, 1. / pixel_count)
+        safe_gain = dr.select(finite, gain, 0)
+        normalized = (safe_gain / Float(dr.maximum(observed, 1)) if normalization == "observed"
+                      else safe_gain * dr.opaque(Float, 1. / pixel_count))
         eligible = finite & (observed > 0) & (unknown == 0)
         threshold = dr.opaque(Float, epsilon)
         increments = {

@@ -252,45 +252,96 @@ def check_warmup():
 
 
 def vote_fixture(np):
-    pending = {"cells": np.arange(5)}
+    pending = {"cells": np.arange(6)}
     initialize_statistics(pending, np)
     # Positive, negative, unknown despite a positive known subset, no hit,
-    # and a nonfinite result. Only the first two are eligible view votes.
-    out = {"growth_gain": np.asarray([4., -3., 20., 0., np.nan], np.float32),
-           "growth_observed": np.asarray([2, 5, 4, 0, 1], np.uint32),
-           "growth_unknown": np.asarray([0, 0, 1, 0, 0], np.uint32)}
+    # a nonfinite result, and a reliably observed zero gain. The last is a
+    # neutral observation and belongs in the reliable-view denominator.
+    out = {"growth_gain": np.asarray([4., -3., 20., 0., np.nan, 0.], np.float32),
+           "growth_observed": np.asarray([2, 5, 4, 0, 1, 3], np.uint32),
+           "growth_unknown": np.asarray([0, 0, 1, 0, 0, 0], np.uint32)}
     return pending, out
 
 
 def check_view_votes_numpy():
     import numpy as np
     pending, out = vote_fixture(np)
-    observe_numpy(pending, out, 100, .01, np)
-    np.testing.assert_array_equal(pending["support_views"], [1, 0, 0, 0, 0])
-    np.testing.assert_array_equal(pending["conflict_views"], [0, 1, 0, 0, 0])
-    np.testing.assert_array_equal(pending["observed_views"], [1, 1, 0, 0, 0])
-    np.testing.assert_array_equal(pending["unknown_views"], [0, 0, 1, 0, 0])
-    np.testing.assert_array_equal(pending["invalid_views"], [0, 0, 0, 0, 1])
-    np.testing.assert_allclose(pending["gain_sum"], [.04, -.03, 0., 0., 0.], atol=1e-8)
-    # Divide by full-image pixels, not observed rays; otherwise a tiny
-    # favorable subset could receive a larger vote than a broad harmful one.
-    assert pending["gain_sum"][0] != out["growth_gain"][0] / out["growth_observed"][0]
-    return {"full_image_normalization_signed_votes_and_whole_view_abstention": "passed"}
+    padded = copy.deepcopy(pending)
+    observe_numpy(pending, out, 100, .01, np, normalization="observed")
+    observe_numpy(padded, out, 640000, .01, np, normalization="observed")
+    np.testing.assert_array_equal(pending["support_views"], [1, 0, 0, 0, 0, 0])
+    np.testing.assert_array_equal(pending["conflict_views"], [0, 1, 0, 0, 0, 0])
+    np.testing.assert_array_equal(pending["observed_views"], [1, 1, 0, 0, 0, 1])
+    np.testing.assert_array_equal(pending["unknown_views"], [0, 0, 1, 0, 0, 0])
+    np.testing.assert_array_equal(pending["invalid_views"], [0, 0, 0, 0, 1, 0])
+    np.testing.assert_allclose(pending["gain_sum"], [2., -.6, 0., 0., 0., 0.], atol=3e-8)
+    for name, values in pending.items():
+        np.testing.assert_array_equal(values, padded[name], err_msg=name)
+    legacy, _ = vote_fixture(np)
+    observe_numpy(legacy, out, 100, .01, np, normalization="full_image")
+    np.testing.assert_allclose(legacy["gain_sum"], [.04, -.03, 0., 0., 0., 0.], atol=1e-8)
+    return {"observed_ray_normalization_is_independent_of_unrelated_pixels": "passed",
+            "signed_and_zero_gains_keep_all_valid_observations": "passed",
+            "unknown_nonfinite_and_unobserved_views_abstain": "passed",
+            "legacy_full_image_normalization_retained": "passed"}
+
+
+def check_unequal_shard_votes_numpy():
+    import numpy as np
+    pending = {"cells": np.arange(1)}
+    initialize_statistics(pending, np)
+    # One shard contains two ray gains [4, -1]; the other contains [0, 0, 0].
+    # Normalize only AFTER SUM: (4 - 1 + 0 + 0 + 0) / 5 = 0.6, not the
+    # unweighted mean of per-shard averages (1.5 + 0) / 2 = 0.75.
+    partials = [
+        {"growth_gain": np.asarray([3.], np.float32),
+         "growth_observed": np.asarray([2], np.uint32),
+         "growth_unknown": np.asarray([0], np.uint32)},
+        {"growth_gain": np.asarray([0.], np.float32),
+         "growth_observed": np.asarray([3], np.uint32),
+         "growth_unknown": np.asarray([0], np.uint32)},
+    ]
+    combined = {name: sum(item[name] for item in partials) for name in partials[0]}
+    observe_numpy(pending, combined, 640000, .7, np, normalization="observed")
+    np.testing.assert_allclose(pending["gain_sum"], [.6], atol=3e-8)
+    np.testing.assert_array_equal(pending["observed_views"], [1])
+    np.testing.assert_array_equal(pending["observed_rays"], [5])
+    np.testing.assert_array_equal(pending["support_views"], [0])
+    # Unknown evidence in either shard must invalidate the entire view.
+    combined["growth_unknown"][0] = 1
+    observe_numpy(pending, combined, 640000, .7, np, normalization="observed")
+    np.testing.assert_allclose(pending["gain_sum"], [.6], atol=3e-8)
+    np.testing.assert_array_equal(pending["observed_views"], [1])
+    np.testing.assert_array_equal(pending["unknown_views"], [1])
+    return {"unequal_shards_sum_raw_gain_and_all_valid_ray_counts_before_normalizing": "passed"}
 
 
 def check_view_votes_device(mi, dr, np):
-    pending, out = vote_fixture(np)
-    expected = copy.deepcopy(pending)
+    for normalization in ("observed", "full_image"):
+        pending, out = vote_fixture(np)
+        expected = copy.deepcopy(pending)
+        gpu = RGBGrowthEvidenceDevice(pending, mi.Float, mi.UInt32, dr, np)
+        device_out = {name: (mi.Float(value) if name == "growth_gain" else mi.UInt32(value))
+                      for name, value in out.items()}
+        for pixel_count in (100, 640000):
+            observe_numpy(expected, out, pixel_count, .01, np, normalization=normalization)
+            gpu.observe(device_out, pixel_count, .01, normalization=normalization)
+        actual = gpu.materialize()
+        for name, values in actual.items():
+            np.testing.assert_allclose(values, expected[name], atol=1e-8, rtol=2e-6, err_msg=name)
+    pending = {"cells": np.arange(1)}
+    initialize_statistics(pending, np)
     gpu = RGBGrowthEvidenceDevice(pending, mi.Float, mi.UInt32, dr, np)
-    device_out = {name: (mi.Float(value) if name == "growth_gain" else mi.UInt32(value))
-                  for name, value in out.items()}
-    for _ in range(2):
-        observe_numpy(expected, out, 100, .01, np)
-        gpu.observe(device_out, 100, .01)
+    combined = {"growth_gain": mi.Float(3.) + mi.Float(0.),
+                "growth_observed": mi.UInt32(2) + mi.UInt32(3),
+                "growth_unknown": mi.UInt32(0)}
+    gpu.observe(combined, 640000, .7, normalization="observed")
     actual = gpu.materialize()
-    for name, values in actual.items():
-        np.testing.assert_allclose(values, expected[name], atol=1e-8, rtol=2e-6, err_msg=name)
-    return {"GPU_vote_accumulation_matches_CPU_reference": "passed"}
+    np.testing.assert_allclose(actual["gain_sum"], [.6], atol=3e-8)
+    np.testing.assert_array_equal(actual["observed_views"], [1])
+    np.testing.assert_array_equal(actual["support_views"], [0])
+    return {"GPU_local_and_legacy_vote_accumulation_match_CPU_reference": "passed",
+            "GPU_unequal_shard_counts_normalize_once": "passed"}
 
 
 def check_native_replay(mi, dr, np):
@@ -343,7 +394,7 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--cpu-only", action="store_true", help="Check scheduling without loading CUDA")
     args = parser.parse_args()
-    checks = [check_warmup(), check_view_votes_numpy()]
+    checks = [check_warmup(), check_view_votes_numpy(), check_unequal_shard_votes_numpy()]
     for item in checks:
         print(json.dumps(item), flush=True)
     if not args.cpu_only:

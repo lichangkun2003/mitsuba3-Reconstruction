@@ -15,9 +15,16 @@
    CONFIG.topology.use_rgb_growth = True
    CONFIG.topology.growth_warmup_epochs = 20
    CONFIG.topology.growth_fine_warmup_epochs = 20
+   CONFIG.topology.growth_rgb_normalization = "observed"
 
-同步后需要增量编译 C++ 和绑定，启用生长要求 ``mi.VoxelReconstruction.rgb_growth_version >= 1``。
-完整投票定义、截断弃权、候选预算和局限见 ``docs/reconstruction_training.rst`` 开头。
+每视角按候选的有效命中射线数平均收益，跨视角只对可靠观测视角平均，保留负、零收益。
+先合并分批／多 GPU 的原始收益和计数，再归一化投票。全部合法候选参与评估，全部通过
+证据与几何复核的候选可新增，只保留原来的总体素容量限制。候选数量与单次新增预算
+参数已删除，带旧预算字段的配置及 checkpoint 会报错；比较新规则应使用当前配置新开实验。
+
+本次归一化与预算调整仅修改 Python；首次使用生长仍需已编译的
+``mi.VoxelReconstruction.rgb_growth_version >= 1``。完整投票定义、截断弃权、每射线
+记录容量与局限见 ``docs/reconstruction_training.rst`` 开头。
 仅运行十轮不会覆盖生长；检查一次默认生长事件可保留 ``--epochs 700``，另传
 ``--stop-after-epochs 31 --skip-evaluation``。这仍是新实验，不会修改已有结果。
 

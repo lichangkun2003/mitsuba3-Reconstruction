@@ -21,8 +21,9 @@ class TopologySettings:
     use_rgb_growth: bool = False
     growth_warmup_epochs: int = 20
     growth_fine_warmup_epochs: int = 20
-    growth_max_candidates: int = 1024
-    growth_max_new_voxels: int = 128
+    # Missing fields in historical checkpoints retain their old loss units.
+    # The current training CONFIG explicitly selects "observed".
+    growth_rgb_normalization: str = "full_image"
     growth_rgb_min_support_views: int = 3
     growth_rgb_max_conflict_views: int = 2
     growth_rgb_gain_epsilon: float = 1e-7
@@ -432,22 +433,23 @@ class TopologyManager:
             raise ValueError("Training requires 1..32767 distinct cameras")
         if not isinstance(cfg.use_rgb_growth, bool):
             raise ValueError("topology.use_rgb_growth must be a boolean")
+        if cfg.growth_rgb_normalization not in ("observed", "full_image"):
+            raise ValueError("topology.growth_rgb_normalization must be 'observed' or 'full_image'")
         for name, value in asdict(cfg).items():
-            if isinstance(value, bool):
+            if isinstance(value, bool) or name == "growth_rgb_normalization":
                 continue
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"topology.{name} must be finite and nonnegative")
         if any(getattr(cfg, name) < 1 for name in ("growth_interval", "evidence_interval", "deletion_interval",
                                                   "min_deletion_conflict_views", "max_active_voxels")):
             raise ValueError("Topology intervals, conflict count and capacity must be positive")
-        rgb_integer_fields = ("growth_warmup_epochs", "growth_fine_warmup_epochs", "growth_max_candidates",
-                              "growth_max_new_voxels", "growth_rgb_min_support_views",
+        rgb_integer_fields = ("growth_warmup_epochs", "growth_fine_warmup_epochs", "growth_rgb_min_support_views",
                               "growth_rgb_max_conflict_views")
         if any(not isinstance(getattr(cfg, name), int) or isinstance(getattr(cfg, name), bool)
                for name in rgb_integer_fields):
-            raise ValueError("RGB growth warmups, budgets and vote thresholds must be integers")
+            raise ValueError("RGB growth warmups and vote thresholds must be integers")
         if any(getattr(cfg, name) < 1 for name in rgb_integer_fields[2:]):
-            raise ValueError("RGB growth budgets and vote thresholds must be positive")
+            raise ValueError("RGB growth vote thresholds must be positive")
         if not 0 <= schedule.parent_opacity_threshold <= .99 or not 0 < schedule.opacity_optical_depth_scale <= 1:
             raise ValueError("Invalid refinement opacity configuration")
         if not 0 <= schedule.child_face_overlap <= .2 or schedule.coarse_growth_interval < 1:
@@ -628,7 +630,7 @@ class TopologyManager:
         return result
 
     def prepare_rgb_growth(self, model, epoch):
-        """Freeze/upload bounded candidates once, before this epoch's first trace.
+        """Freeze/upload legal candidates once, before this epoch's first trace.
 
         ``epoch`` is zero-based. The first coarse and fine events are local
         epoch 30 with the default 20-epoch warmup and 10-epoch interval.
@@ -650,10 +652,8 @@ class TopologyManager:
             checkpoint = model_checkpoint(model)
             proposals = self._generate_growth(checkpoint, boundary)
             cells, winners, counts = np.unique(proposals["cells"], return_index=True, return_counts=True)
-            # Prefer stronger geometric support; stable cell order resolves ties.
-            # All winners retain the exact legacy first legal parent geometry.
-            ranking = np.lexsort((cells, -counts))[:cfg.growth_max_candidates]
-            winners = winners[ranking]
+            # Evaluate every unique legal target, retaining the exact legacy
+            # first legal parent's geometry in deterministic cell order.
             pending = {name: values[winners].copy() for name, values in proposals.items()
                        if isinstance(values, np.ndarray)}
             count = len(winners)
@@ -664,8 +664,9 @@ class TopologyManager:
             alpha = float(np.clip(cfg.growth_initial_opacity, .01, .99))
             opacity[:, 0] = math.log(alpha / (1 - alpha)) * (2 * math.sqrt(math.pi))
             pending.update(radiance_sh=radiance, opacity_sh=opacity,
-                           geometric_support=counts[ranking].astype(np.uint32),
-                           mode="rgb", boundary=boundary, resolution=self.resolution,
+                           geometric_support=counts.astype(np.uint32),
+                           mode="rgb", normalization=cfg.growth_rgb_normalization,
+                           boundary=boundary, resolution=self.resolution,
                            all_candidate_count=len(cells), seen_views=set())
             for name in ("centers", "log_scales", "rotations"):
                 pending[name] = pending[name].astype(np.float32)
@@ -678,6 +679,7 @@ class TopologyManager:
             self._growth_world_cache = None
             self._growth_device = None
             self._rgb_growth_device = None
+        self._rgb_normalization(pending)
         if not len(pending["cells"]):
             model.clear_growth_candidates()
             return False
@@ -690,8 +692,8 @@ class TopologyManager:
 
         Any incomplete ray makes that candidate/view abstain: an unknown
         harmful ray must not be silently omitted from an otherwise positive
-        view. No-hit and invisible candidates are neutral. Full-image
-        normalization is retained, including views with no usable evidence.
+        view. In observed mode, no-hit and invisible candidates are excluded
+        from the denominator; reliable zero-gain views remain observations.
         """
         cfg, pending, np = self.settings, self.pending_growth, self.np
         if not cfg.use_rgb_growth or not self._growth_due(int(epoch) + 1):
@@ -703,6 +705,7 @@ class TopologyManager:
             raise ValueError("Unexpected RGB growth view ID or model topology")
         if not isinstance(pixel_count, int) or pixel_count < 1:
             raise ValueError("RGB growth requires a positive full-image pixel count")
+        normalization = self._rgb_normalization(pending)
         if view_id in pending["seen_views"]:
             return
         if len(pending["cells"]):
@@ -712,14 +715,24 @@ class TopologyManager:
                 if self._rgb_growth_device is None:
                     self._rgb_growth_device = (pending, RGBGrowthEvidenceDevice(
                         pending, type(out["growth_gain"]), type(out["growth_observed"]), dr, np))
-                self._rgb_growth_device[1].observe(out, pixel_count, cfg.growth_rgb_gain_epsilon)
+                self._rgb_growth_device[1].observe(out, pixel_count, cfg.growth_rgb_gain_epsilon,
+                                                   normalization=normalization)
                 self._device_statistics["rgb_growth_device_views"] += 1
             else:
                 from reconstruction_growth_rgb import observe_numpy
                 self._materialize_growth()
-                observe_numpy(pending, out, pixel_count, cfg.growth_rgb_gain_epsilon, np)
+                observe_numpy(pending, out, pixel_count, cfg.growth_rgb_gain_epsilon, np,
+                              normalization=normalization)
                 self._device_statistics["rgb_growth_cpu_views"] += 1
         pending["seen_views"].add(int(view_id))
+
+    def _rgb_normalization(self, pending):
+        """Never reinterpret statistics already accumulated by an older run."""
+        normalization = pending.get("normalization", "full_image")
+        if normalization != self.settings.growth_rgb_normalization:
+            raise ValueError("RGB growth pending evidence uses a different normalization; "
+                             "resume with its original topology configuration")
+        return normalization
 
     def _growth_world_points(self, pending, metadata):
         """Reuse the seven frozen proposal samples across views, never evidence.
@@ -886,34 +899,51 @@ class TopologyManager:
         self.count = new_count
 
     def _select_rgb_growth(self, model, checkpoint, boundary, event):
-        """Read bounded epoch statistics, recheck geometry, keep frozen params."""
+        """Read epoch statistics, recheck geometry, keep frozen parameters."""
         np, cfg, pending = self.np, self.settings, self.pending_growth
         selected = None
         if (pending is None or pending.get("mode") != "rgb" or
                 pending["boundary"] != boundary or pending["resolution"] != self.resolution):
-            event["growth_rgb"] = {"status": "no_prepared_candidates"}
+            event["growth_rgb"] = {"status": "no_prepared_candidates",
+                                   "normalization": cfg.growth_rgb_normalization}
             return checkpoint, selected
         count = len(pending["cells"])
         seen = len(pending["seen_views"])
-        mean_gain = pending["gain_sum"] / self.view_count
+        normalization = self._rgb_normalization(pending)
+        denominator = (np.maximum(pending["observed_views"], 1) if normalization == "observed"
+                       else self.view_count)
+        mean_gain = pending["gain_sum"] / denominator
+        observed = pending["observed_views"] > 0
+        supported = pending["support_views"] >= cfg.growth_rgb_min_support_views
+        unopposed = pending["conflict_views"] < cfg.growth_rgb_max_conflict_views
+        valid = pending["invalid_views"] == 0
+        beneficial = np.isfinite(mean_gain) & (mean_gain > cfg.growth_rgb_min_mean_gain)
         status = "no_candidates" if not count else ("complete" if seen == self.view_count else "incomplete_views")
-        detail = {"status": status,
+        detail = {"status": status, "normalization": normalization,
                   "geometric_candidates": pending["all_candidate_count"], "tested_candidates": count,
                   "views": seen, "support_votes": int(pending["support_views"].sum()),
                   "conflict_votes": int(pending["conflict_views"].sum()),
+                  "observed_views": int(pending["observed_views"].sum()),
                   "unknown_votes": int(pending["unknown_views"].sum()),
                   "invalid_votes": int(pending["invalid_views"].sum()),
+                  "candidates_with_observations": int(np.count_nonzero(observed)),
+                  "candidates_with_unknown_views": int(np.count_nonzero(pending["unknown_views"])),
                   "observed_rays": int(pending["observed_rays"].sum()),
                   "unknown_rays": int(pending["unknown_rays"].sum()),
                   "mean_gain_sum": float(mean_gain.sum()), "rgb_qualified": 0,
-                  "geometry_revalidated": 0}
+                  # Rejection gates are independent counts and may overlap.
+                  "rejected_no_observation": int(np.count_nonzero(~observed)),
+                  "rejected_support": int(np.count_nonzero(~supported)),
+                  "rejected_conflict": int(np.count_nonzero(~unopposed)),
+                  "rejected_invalid": int(np.count_nonzero(~valid)),
+                  "rejected_mean_gain": int(np.count_nonzero(~beneficial)),
+                  "geometry_revalidated": 0, "geometry_rejected": 0,
+                  "capacity_rejected": 0,
+                  "selected_candidates": 0}
         event["growth_rgb"] = detail
         if seen != self.view_count or not count:
             return checkpoint, selected
-        keep = ((pending["support_views"] >= cfg.growth_rgb_min_support_views) &
-                (pending["conflict_views"] < cfg.growth_rgb_max_conflict_views) &
-                (pending["invalid_views"] == 0) &
-                np.isfinite(mean_gain) & (mean_gain > cfg.growth_rgb_min_mean_gain))
+        keep = observed & supported & unopposed & valid & beneficial
         detail["rgb_qualified"] = int(np.count_nonzero(keep))
         if not np.any(keep):
             return checkpoint, selected
@@ -926,11 +956,14 @@ class TopologyManager:
         selected = {key: value[matches] for key, value in voted.items()}
         selected["parent_ids"] = parent_ids
         detail["geometry_revalidated"] = len(parent_ids)
+        detail["geometry_rejected"] = detail["rgb_qualified"] - len(parent_ids)
         capacity = max(0, cfg.max_active_voxels - self.count)
-        ranking = np.lexsort((selected["cells"], -selected["gain_sum"]))
-        winners = ranking[:min(capacity, cfg.growth_max_new_voxels)]
+        # Coverage must not bias a local-mean ranking when capacity is scarce.
+        ranking = np.lexsort((selected["cells"], -mean_gain[keep][matches]))
+        winners = ranking[:capacity]
         selected = {key: value[winners] for key, value in selected.items()}
-        detail["budget_selected"] = len(winners)
+        detail["capacity_rejected"] = len(ranking) - len(winners)
+        detail["selected_candidates"] = len(winners)
         return checkpoint, selected
 
     def finish_epoch(self, model, optimizer, completed_epochs: int):
@@ -944,6 +977,7 @@ class TopologyManager:
         if cfg.use_rgb_growth:
             model.clear_growth_candidates()
             event.update(growth_mode="rgb_online", growth_level_epoch=boundary - self.level_start_epoch,
+                         growth_rgb_normalization=cfg.growth_rgb_normalization,
                          growth_warmup_epochs=self.growth_warmup,
                          growth_warmup_active=boundary - self.level_start_epoch <= self.growth_warmup,
                          growth_evidence_requested=self._growth_due(boundary))
@@ -1087,3 +1121,5 @@ class TopologyManager:
         if self.pending_growth is not None:
             self.pending_growth["seen_views"] = set(self.pending_growth["seen_views"])
         self._validate()
+        if self.pending_growth is not None and self.pending_growth.get("mode") == "rgb":
+            self._rgb_normalization(self.pending_growth)
