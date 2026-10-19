@@ -121,7 +121,7 @@ CONFIG.training.freeze_native = True  # 重放原生计算；拓扑变化后重�
 CONFIG.schedule.enabled = True
 CONFIG.schedule.start_resolution = 256
 CONFIG.schedule.target_resolution = 512
-CONFIG.training.num_epochs = 1000  # 整个实验总轮数，每轮遍历全部训练视角。
+CONFIG.training.num_epochs = 700  # 整个实验总轮数，每轮遍历全部训练视角。
 CONFIG.training.save_count = 3  # 包含最终 model.npz，共保存三次。
 CONFIG.training.output = None  # 自动创建 outputs/场景-MM.DD-E编号/training。
 # 需要手动指定目录时，将 None 改为路径字符串，或传 --output-dir。
