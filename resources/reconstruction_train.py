@@ -894,21 +894,26 @@ def run_training(distributed=None):
 
 
 def main(distributed=None):
+    primary = distributed is None or distributed.rank == 0
+    emit = builtins.print if primary else lambda *a, **k: None
     config, model_path, output, report, performance = run_training(distributed)
     if report["training_status"] == "stopped":
         return 0
     if report["training_status"] != "passed":
         return 1
-    if not config.evaluation.enabled or (distributed is not None and distributed.rank != 0):
+    if not config.evaluation.enabled:
         return 0
     evaluation = final_evaluation_config(config, model_path)
     evaluation_report = model_path.parent / "evaluation-report.json"
     report["evaluation"] = {"status": "running", "spp": evaluation.spp,
         "max_views_per_split": evaluation.max_views, "splits": list(evaluation.splits),
+        "gpu_workers": distributed.world_size if distributed else 1,
         "output": evaluation.output_directory, "report": str(evaluation_report)}
-    (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
+    if primary:
+        (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
     limit = "all views" if evaluation.max_views is None else f"first {evaluation.max_views} views per split"
-    print(f"Starting final train/test evaluation: {evaluation.spp} spp, {limit}", flush=True)
+    emit(f"Starting final train/test evaluation: {evaluation.spp} spp, {limit}"
+         + (f", {distributed.world_size} GPUs by view" if distributed else ""), flush=True)
     evaluation_started = time.perf_counter()
     try:
         # run_training's model, optimizer and gradients are out of scope. Reclaim
@@ -920,11 +925,12 @@ def main(distributed=None):
         from reconstruction_evaluate import run_evaluation
         if distributed is not None:
             distributed.heartbeat("evaluation_start", force=True)
-        result = run_evaluation(evaluation, progress_callback=distributed.heartbeat if distributed else None)
+        result = run_evaluation(evaluation, progress_callback=distributed.heartbeat if distributed else None,
+                                distributed=distributed)
         report["evaluation"]["status"] = "passed" if result == 0 else "failed"
         report["status"] = "passed" if result == 0 else "failed"
         if result != 0:
-            print(f"Training completed and model is saved at {model_path}; "
+            emit(f"Training completed and model is saved at {model_path}; "
                   f"evaluation failed. See {evaluation_report}", file=sys.stderr, flush=True)
     except KeyboardInterrupt:
         report["status"] = "interrupted"
@@ -933,17 +939,20 @@ def main(distributed=None):
     except Exception:
         report["status"] = "failed"
         report["evaluation"].update(status="failed", error=traceback.format_exc())
-        print(report["evaluation"]["error"], file=sys.stderr, flush=True)
-        print(f"Training completed; the saved model is preserved at {model_path}", file=sys.stderr, flush=True)
+        emit(report["evaluation"]["error"], file=sys.stderr, flush=True)
+        emit(f"Training completed; the saved model is preserved at {model_path}", file=sys.stderr, flush=True)
+        if distributed is not None:
+            raise
     finally:
         performance.set_phase_seconds("evaluation", time.perf_counter()-evaluation_started)
         report["finished_utc"] = datetime.now(timezone.utc).isoformat()
-        (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
-        performance.write(report["status"], training_status=report["training_status"],
-            evaluation=report["evaluation"], reference_cache=report.get("reference_cache"),
-            gpu_reference_cache=report.get("gpu_reference_cache"), native_replay=report.get("native_replay"),
-            collective=report.get("collective"),
-            training_report=str(output / "training-report.json"), evaluation_report=str(evaluation_report))
+        if primary:
+            (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
+            performance.write(report["status"], training_status=report["training_status"],
+                evaluation=report["evaluation"], reference_cache=report.get("reference_cache"),
+                gpu_reference_cache=report.get("gpu_reference_cache"), native_replay=report.get("native_replay"),
+                collective=report.get("collective"),
+                training_report=str(output / "training-report.json"), evaluation_report=str(evaluation_report))
     return 0 if report["status"] == "passed" else 1
 
 

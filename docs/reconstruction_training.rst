@@ -665,11 +665,11 @@ Windows 默认构建目录为 ``mitsuba/build/Release``，Linux 为 ``mitsuba/bu
 ``datasets/lego``、checkpoint 与输出。共享配置使用相对路径；无需把本机绝对路径
 写入 Git。输出和缓存禁止放进源码仓库。
 
-同节点两张 GPU 训练（实验性）
+同节点两张 GPU 训练与评价（实验性）
 ----------------------------------------
 
 ``resources/reconstruction_multigpu.py`` 启动两个独立进程，分别使用调度器可见的逻辑
-GPU 0 和 1。当前仅支持 Linux Slurm、同一节点、两个训练进程。普通 Windows 本地训练
+GPU 0 和 1。当前仅支持 Linux Slurm、同一节点、两个工作进程。普通 Windows 本地训练
 继续使用 ``reconstruction_train.py``。这里没有承诺两倍加速：每个视角都需要梯度汇总，
 收益取决于射线计算量、模型大小、通信及同步成本。真实双 A100 的 NCCL 通信、数值一致性、
 完整收敛和速度尚需在服务器验证；本地的 CPU 模拟通信测试不等于真实双卡验证。
@@ -685,10 +685,25 @@ contour 提案，每张卡计算各自不重叠的半幅像素。每个像素仍
 拿到相同的完整视角梯度后，两份模型副本各执行相同的一次 Adam 更新，逻辑全局步数只加 1。
 浮点求和的分组和次序会改变，因此不保证与单卡逐位相同。
 
-rank 0 负责实验目录、日志、拓扑生长/删除/升层、checkpoint 及最终 train/test 评价；
+rank 0 负责实验目录、日志、拓扑生长/删除/升层及 checkpoint；
 拓扑改变后将模型与 Adam 状态同步给 rank 1，并清除旧的原生重放记录。需要 contour
-历史或生长证据时，额外合并预测 alpha；普通轮次不因此回读完整 RGB 图像。最终 64 spp
-评价目前仍由 rank 0 单卡执行，这部分耗时不会因训练使用两张卡而自动减半。
+历史或生长证据时，额外合并预测 alpha；普通轮次不因此回读完整 RGB 图像。
+
+完整训练结束后，两个进程继续执行最终 train/test 评价，默认仍为每个划分前十个视角、
+每视角 64 spp。评价把已选中的 train/test 视角合并为任务列表，再交错分给两个 rank；
+每张卡加载完整模型，独立渲染分到的整个视角。这里不拆分同一视角的 samples、不计算梯度，
+也不使用 NCCL。每个视角的 seed、64 spp 累积顺序、文件名和 PSNR 协议保持原样。
+只有 rank 0 写共享配置、汇总指标和报告，合并后的视角记录恢复为各划分原相机顺序，
+汇总指标由逐视角结果重新计算，不直接平均两个 rank 的平均 PSNR。
+
+``test_reconstruction_distributed_evaluation.py`` 已在本地用两个进程共享一张 RTX 4060
+验证：奇数视角数、无任务的第二进程、对端参考图失败、主进程独占共享报告，以及训练后
+两个进程自动执行 64 spp 评价。生成场景的 PNG、线性数组和指标与单进程结果一致。
+测试使用临时目录，不占用实验 outputs；它验证分工及数值，不代表双 A100 的加速幅度。
+
+.. code-block:: powershell
+
+   & '..\envs\mitsuba\Scripts\python.exe' -I resources/test_reconstruction_distributed_evaluation.py
 
 先申请同一节点的一项任务和两张 GPU，例如：
 
@@ -719,8 +734,10 @@ rank 0 负责实验目录、日志、拓扑生长/删除/升层、checkpoint 及
    cmake --build build --parallel "${SLURM_CPUS_PER_TASK:-1}" &&
    source build/setpath.sh
 
-本次新增了原生 CUDA 缓冲和流信息绑定，因此编译不可省略。运行时还需要与节点驱动
-兼容的 NCCL 动态库。优先使用集群现有 NCCL module 或系统库；若库不在默认搜索路径，
+首次启用双卡功能需要编译原生 CUDA 缓冲和流信息绑定。之后只修改 Python 评价流程时，
+无需重新编译已有且匹配当前源码的绑定；上述增量编译命令可以继续使用。双卡训练还需要
+与节点驱动兼容的 NCCL 动态库，单独双卡评价不需要 NCCL。优先使用集群现有 NCCL
+module 或系统库；若库不在默认搜索路径，
 可将 ``MITSUBA_NCCL_LIBRARY`` 设置为实际 ``libnccl.so.2`` 的绝对路径。已安装在项目
 Python 环境中的 NVIDIA NCCL 包也会被搜索。启动器不会自动安装依赖，不需要为本功能
 预先安装 PyTorch、CUDA Toolkit 或其他大型工具链；找不到库时明确报错。
@@ -779,12 +796,34 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
 相对路径，省略 ``--stop-after-epochs``。checkpoint 格式沿用单卡格式；它不是每个 rank
 各保存一份模型。恢复后的浮点结果仍需按数值容差和训练曲线检查。
 
+已有最终模型时，可在同一双卡资源分配中单独出图，无需重新训练。从仓库目录运行：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I resources/reconstruction_multigpu.py \
+     --evaluate --workers 2 --worker-timeout 600 \
+     --checkpoint outputs/lego-10.15-E1/model.npz \
+     --split both --spp 64 --max-views 10 \
+     --output-dir outputs/lego-10.15-E1
+
+把示例实验目录替换为实际目录。``--evaluate`` 将其余评价参数转交给
+``reconstruction_evaluate.py``，不进入训练流程；这里使用 ``--spp`` / ``--max-views``，
+而训练后自动评价仍使用 ``--eval-spp`` / ``--eval-max-views``。输出保存到同一实验目录的
+``train/``、``test/`` 和共享评价报告中，重跑会更新相应图片与指标。两种双卡入口都沿用
+同一份 Slurm 分配，16 个 CPU 分为每进程 8 个线程，不另起 Slurm 作业。
+
 双卡 ``training.jsonl`` 增加 ``epoch_communication_seconds``、
 ``epoch_communication_bytes`` 以及 ``collective`` 的累计统计。通信墙钟包含打包、物化、
 调用和同步等待，可能等待此前发出的 GPU 运算；它已经包含在 ``gradients`` 中，不能再次
 加到 epoch 总时间，也不能当作纯 NCCL 传输时间。``payload_bytes`` 及每轮的字节差值
 表示每个 rank 参与归约的逻辑输入字节数，不是 NVLink/PCIe 实际传输流量。
 抽样内核报告仍主要描述 rank 0 的 Dr.Jit 运算，NCCL 内核不会自动被归入 Dr.Jit 内核统计。
+
+双卡评价报告区分从开始到两边完成的总墙钟时间与各工作进程的分阶段耗时之和。
+两张卡上的渲染可以重叠，因此累加的渲染、参考图读取、指标和写图耗时不是整个评价的
+实际等待时长，也不能把它们再次加到总墙钟时间上。判断出图是否加快，应比较相同模型、
+视角和 spp 下的总墙钟；同时查看两个 rank 的任务数与耗时，判断是否存在负载不均。
+两个进程共用一张本地 GPU 的数值与输出语义检查，不代表真实双 A100 的速度验证。
 
 任一子进程失败、超时或收到中断，启动器会终止并回收同伴进程，避免一张卡一直等待归约。
 默认 ``--worker-timeout 600`` 表示某个进程连续 600 秒没有报告进展时终止；对于很慢的
@@ -894,6 +933,11 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 并保存每个视角的图片和 PSNR。相机按对应 JSON 顺序选择；不足十个时全取。
 这不限制训练视角或改变训练 1 spp。评价只读取 checkpoint，不更新模型或使用测试视角训练。
 默认主指标为线性 RGB PSNR，并同时报告 sRGB PSNR。
+
+单卡入口使用一张 GPU 出图；经 ``reconstruction_multigpu.py`` 启动的完整训练保留两个
+工作进程，把上述已选视角分配到两张卡独立出图。选择范围与每视角 spp 不变，不将
+``--eval-max-views 10`` 解释为每张卡各十个视角。双卡单独出图的 ``--evaluate`` 命令见
+上文“同节点两张 GPU 训练与评价”。
 
 如果评价失败，已经完成的 ``model.npz`` 保留，进程以非零状态退出；
 ``training-report.json`` 中的 ``training_status`` 与 ``evaluation`` 分别记录训练和评价结果，

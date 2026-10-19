@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 import json
+import io
 import math
 from pathlib import Path
 import platform
@@ -173,6 +174,313 @@ def aggregate_metrics(records):
     return result
 
 
+def render_evaluation_record(config, common, model, render, view, split, output,
+                             mi, dr, np, view_timing, stage_seconds):
+    """Render one whole view with the same seed, metrics and files in either mode."""
+    started = time.perf_counter()
+    index = int(view["index"])
+    seed = int(np.random.SeedSequence([config.seed, 0 if split == "train" else 1, index]).generate_state(1)[0])
+    with _wall_stage(view_timing, stage_seconds, "render_seconds"):
+        rgb, alpha = common.render_view(model, render, view["camera"], config.spp,
+                                       seed, config.chunk_size, mi, dr, np)
+    with _wall_stage(view_timing, stage_seconds, "reference_seconds"):
+        reference = common.read_reference(view["reference_path"], render.width, render.height, mi, np)
+        target = (reference[..., :3] * reference[..., 3:4]
+                  + (1 - reference[..., 3:4]) * np.asarray(render.background, dtype=np.float32))
+    with _wall_stage(view_timing, stage_seconds, "metrics_seconds"):
+        metrics = image_metrics(rgb, target, np)
+    prediction_path = output / split / f"{index:04d}.png"
+    with _wall_stage(view_timing, stage_seconds, "write_seconds"):
+        preview.write_png(prediction_path, rgb, mi, np)
+        if config.save_linear:
+            np.savez_compressed(output / split / f"{index:04d}.npz", rgb_linear=rgb, alpha=alpha)
+    return {"index": index, "reference": str(view["reference_path"]),
+            "prediction": str(prediction_path), "seed": seed,
+            "seconds": time.perf_counter() - started, "metrics": metrics, **view_timing}
+
+
+def evaluation_view_owner(task_index, world_size):
+    """Assign whole views after applying the global per-split view limit."""
+    if (type(task_index) is not int or task_index < 0
+            or type(world_size) is not int or world_size < 1):
+        raise ValueError("Evaluation task index must be nonnegative and world size positive")
+    return task_index % world_size
+
+
+def merge_evaluation_workers(workers, selected_indices_by_split, metric_color_space="linear"):
+    """Validate complete, disjoint camera coverage and aggregate individual views.
+
+    A failed worker may have partial coverage, which stays explicitly failed.
+    Stage times are sums of worker work; split seconds are the maximum worker
+    duration, not a synchronized measurement of the global split wall time.
+    """
+    if not workers or sorted(worker["rank"] for worker in workers) != list(range(len(workers))):
+        raise ValueError("Evaluation workers must contain each rank exactly once")
+    workers = sorted(workers, key=lambda worker: worker["rank"])
+    statuses = [worker["status"] for worker in workers]
+    if any(status not in ("passed", "failed", "interrupted") for status in statuses):
+        raise ValueError("Every evaluation worker must report a terminal status")
+    status = ("interrupted" if "interrupted" in statuses else
+              "failed" if "failed" in statuses else "passed")
+    splits, offset = {}, 0
+    for worker in workers:
+        if set(worker["splits"]) - set(selected_indices_by_split):
+            raise ValueError("Worker reported an unexpected evaluation split")
+    for split, indices in selected_indices_by_split.items():
+        indices = list(indices)
+        if (not indices or any(type(index) is not int or index < 0 for index in indices)
+                or len(indices) != len(set(indices))):
+            raise ValueError("Selected evaluation indices must be nonempty and unique")
+        owners = {index: evaluation_view_owner(offset + position, len(workers))
+                  for position, index in enumerate(indices)}
+        offset += len(indices)
+        records, durations = {}, {}
+        stages = dict.fromkeys(("render_seconds", "reference_seconds", "metrics_seconds", "write_seconds"), 0.)
+        template = None
+        for worker in workers:
+            part = worker["splits"].get(split)
+            if part is None:
+                continue
+            if template is None:
+                template = part
+            durations[str(worker["rank"])] = float(part.get("seconds", 0.))
+            for stage in stages:
+                stages[stage] += float(part.get("stage_seconds", {}).get(stage, 0.))
+            for record in part["views"]:
+                index = record["index"]
+                if type(index) is not int or index not in owners:
+                    raise ValueError(f"Unexpected evaluation view {split}/{index}")
+                if owners[index] != worker["rank"]:
+                    raise ValueError(f"Evaluation view {split}/{index} was rendered by the wrong rank")
+                if index in records:
+                    raise ValueError(f"Duplicate evaluation view {split}/{index}")
+                records[index] = record
+        missing = [index for index in indices if index not in records]
+        if status == "passed" and missing:
+            raise ValueError(f"Missing evaluation views in {split}: {missing}")
+        base = {} if template is None else {
+            key: template[key] for key in ("cameras", "max_views", "view_order", "available_view_count")
+            if key in template}
+        ordered = [records[index] for index in indices if index in records]
+        result = dict(base, views=ordered, selected_view_count=len(indices), evaluated_view_count=len(ordered),
+                      status="passed" if not missing else status, missing_indices=missing,
+                      seconds=max(durations.values(), default=0.), worker_seconds=durations,
+                      stage_seconds=stages,
+                      timing_scope="seconds=max worker split duration; stage_seconds=sum of worker work, not global wall")
+        if ordered:
+            result["aggregate"] = aggregate_metrics(ordered)
+        splits[split] = result
+    if metric_color_space not in ("linear", "srgb"):
+        raise ValueError("Unknown evaluation metric color space")
+    return {"status": status, "splits": splits}
+
+
+def _run_distributed_evaluation(config, distributed, progress_callback):
+    """Evaluate disjoint whole cameras on two devices without NCCL or image transfer."""
+    started = time.perf_counter()
+    primary = distributed.rank == 0
+    repository = Path(__file__).resolve().parents[1]
+    workspace = repository.parent
+    output = preview.workspace_path(config.output_directory, workspace)
+    if output.is_relative_to(repository):
+        raise ValueError("Keep evaluation outputs and caches outside the Git checkout")
+    if distributed.world_size != 2 or distributed.rank not in (0, 1):
+        raise ValueError("Distributed evaluation requires exactly two ranks")
+    report = {
+        "status": "running", "started_utc": datetime.now(timezone.utc).isoformat(),
+        "scope": "Source CUDA checkpoint evaluation; no parameter updates",
+        "python_executable": sys.executable, "python_version": platform.python_version(),
+        "requested_config": asdict(config),
+        "resolved": {"workspace": str(workspace), "output": str(output)}, "splits": {},
+        "distributed": {"world_size": distributed.world_size,
+            "partition": "whole views, global selected train/test task ordinal modulo world_size",
+            "sample_scope": "all spp for each image stay on its assigned GPU; no NCCL or image exchange"},
+        "timing": {
+            "measurement": "wall seconds via perf_counter; not pure GPU execution time",
+            "scope": "rank-zero wall through worker merge and metrics writing, excluding final report serialization",
+            "render_scope": "render_view including tracing/JIT, transfers and existing device waits/readbacks",
+            "worker_stage_scope": "sum of per-worker work; overlaps across GPUs and must not be added to global wall",
+            "split_scope": "split_seconds is max worker-local split duration, not synchronized global split wall",
+            "total_seconds": 0., "setup_seconds": None, "split_seconds": {},
+        },
+        "metric_protocol": {
+            "primary_color_space": config.metric_color_space,
+            "mse": "mean over all image pixels and RGB channels; no mask; peak value 1",
+            "linear": "unclamped floating linear RGB after alpha compositing",
+            "srgb": "linear RGB clipped to [0,1], IEC sRGB transfer, floating values before PNG quantization",
+            "aggregation": "arithmetic mean of all per-view PSNR; PSNR of mean MSE also reported separately; no rank averaging",
+            "view_selection": "first max_views cameras per split before sharding; None selects all",
+            "perfect_match": "PSNR is +infinity, encoded as null with an explicit boolean flag",
+        },
+    }
+    progress = ProgressLine() if primary else ProgressLine(stream=io.StringIO())
+    callback = progress_callback or distributed.heartbeat
+    plans, setup_error, setup_status = {}, None, "passed"
+    # Setup failures also take part in the same control exchange. A rank must
+    # not wait for camera records while its peer is still expecting a setup plan.
+    try:
+        validate_config(config)
+        import reconstruction_common as common
+        callback("evaluation setup")
+        mi, dr, np, dll_handles = common.initialize_runtime(config.runtime, output, report,
+            cuda_device=distributed.rank, cpu_threads=distributed.cpus_per_rank)
+        checkpoint_path = preview.workspace_path(config.checkpoint, workspace)
+        checkpoint = load_checkpoint(checkpoint_path)
+        report["checkpoint"] = {"path": str(checkpoint_path), "sha256": preview.file_sha256(checkpoint_path),
+            "model_metadata": checkpoint["model_metadata"],
+            "completed_epochs": checkpoint["training_state"].get("completed_epochs"),
+            "global_step": checkpoint["training_state"].get("global_step"), "provenance": checkpoint["provenance"]}
+        saved = checkpoint["config"]
+        render = preview.RenderConfig()
+        for key, value in saved.get("render", {}).items():
+            if key not in {item.name for item in fields(render)}:
+                raise ValueError(f"Unsupported checkpoint render setting: {key}")
+            setattr(render, key, value)
+        render.spp = config.spp
+        if config.background is not None:
+            render.background = config.background
+        preview.validate_config(preview.PreviewConfig(render=render, runtime=config.runtime))
+        dataset_value = config.dataset or saved.get("data", {}).get("dataset")
+        if not dataset_value:
+            raise ValueError("No dataset in the checkpoint; supply --dataset")
+        dataset = preview.workspace_path(dataset_value, workspace)
+        report["resolved"]["dataset"] = str(dataset)
+        report["render"] = asdict(render)
+        report["actual_sampling"] = {
+            "layout": "independent uniform subpixel samples per pixel/sample",
+            "seeding": "deterministic per split and view", "legacy_preview_pixel_sampling_ignored": render.pixel_sampling}
+        report["metric_protocol"]["background_linear_rgb"] = list(render.background)
+        model = common.restore_model(checkpoint, mi)
+        report["model_statistics"] = model.statistics()
+        for split in config.splits:
+            cameras_file = config.cameras[split] or saved.get("data", {}).get("cameras", "transforms_train.json")
+            views = common.load_views(dataset, cameras_file, render, np)
+            plans[split] = {"cameras": cameras_file, "available_view_count": len(views),
+                            "views": views[:config.max_views] if config.max_views is not None else views}
+            if not plans[split]["views"]:
+                raise ValueError(f"Empty camera split: {split}")
+    except KeyboardInterrupt:
+        setup_status, setup_error = "interrupted", traceback.format_exc()
+    except Exception:
+        setup_status, setup_error = "failed", traceback.format_exc()
+    setup = {"rank": distributed.rank, "status": setup_status, "error": setup_error,
+             "config": json.loads(json.dumps(asdict(config))),
+             "checkpoint_sha256": report.get("checkpoint", {}).get("sha256"), "plans": plans}
+    setups = distributed.gather(setup)
+    readiness = None
+    if primary:
+        try:
+            if any(worker["status"] != "passed" for worker in setups):
+                readiness = {"status": "interrupted" if any(worker["status"] == "interrupted" for worker in setups) else "failed",
+                             "error": "\n".join(f"rank {worker['rank']}: {worker['error']}" for worker in setups if worker["error"])}
+            else:
+                for worker in setups:
+                    for key in ("config", "checkpoint_sha256", "plans"):
+                        if worker[key] != setups[0][key]:
+                            raise ValueError(f"Evaluation workers disagree on {key}")
+                output.mkdir(parents=True, exist_ok=True)
+                for split in config.splits:
+                    (output / split).mkdir(parents=True, exist_ok=True)
+                (output / "evaluation-config.json").write_text(
+                    json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
+                readiness = {"status": "passed", "error": None}
+        except Exception:
+            readiness = {"status": "failed", "error": traceback.format_exc()}
+    readiness = distributed.broadcast(readiness)
+    report["timing"]["setup_seconds"] = time.perf_counter() - started
+    status, error = readiness["status"], readiness["error"]
+    task_offset = 0
+    if status == "passed":
+        try:
+            for split, plan in plans.items():
+                split_started = time.perf_counter()
+                all_views = plan["views"]
+                assigned = [view for ordinal, view in enumerate(all_views)
+                            if evaluation_view_owner(task_offset + ordinal, distributed.world_size) == distributed.rank]
+                task_offset += len(all_views)
+                records = []
+                stages = dict.fromkeys(("render_seconds", "reference_seconds", "metrics_seconds", "write_seconds"), 0.)
+                split_report = {"cameras": plan["cameras"], "views": records,
+                    "max_views": config.max_views, "view_order": "camera file order",
+                    "available_view_count": plan["available_view_count"], "selected_view_count": len(all_views),
+                    "assigned_view_count": len(assigned), "evaluated_view_count": 0, "status": "running",
+                    "seconds": 0., "stage_seconds": stages}
+                report["splits"][split] = split_report
+                try:
+                    for view in assigned:
+                        callback(f"evaluation rank {distributed.rank} {split} view {view['index']}")
+                        index = int(view["index"])
+                        view_timing = dict.fromkeys(stages, 0.)
+                        split_report["incomplete_view"] = {"index": index, "stage_seconds": view_timing}
+                        record = render_evaluation_record(config, common, model, render, view, split,
+                            output, mi, dr, np, view_timing, stages)
+                        record["rank"] = distributed.rank
+                        records.append(record)
+                        split_report.pop("incomplete_view", None)
+                        split_report["evaluated_view_count"] = len(records)
+                        progress.update(f"Eval rank 0 {split} {len(records)}/{len(assigned)} assigned views | {config.spp} spp")
+                    split_report["status"] = "passed"
+                except KeyboardInterrupt:
+                    split_report["status"] = "interrupted"
+                    raise
+                except Exception:
+                    split_report["status"] = "failed"
+                    raise
+                finally:
+                    split_report["seconds"] = time.perf_counter() - split_started
+        except KeyboardInterrupt:
+            status, error = "interrupted", traceback.format_exc()
+        except Exception:
+            status, error = "failed", traceback.format_exc()
+    progress.finish()
+    callback(f"evaluation rank {distributed.rank} merging {status}")
+    local = {"rank": distributed.rank, "status": status, "error": error, "splits": report["splits"],
+             "seconds": time.perf_counter() - started, "setup_seconds": report["timing"]["setup_seconds"],
+             "runtime": {key: report.get(key) for key in ("gpu", "cpu_threads", "worker_cuda", "python_executable",
+                         "mitsuba_version", "drjit_version", "actual_variant", "dlpack_device")}}
+    workers = distributed.gather(local)
+    outcome = None
+    if primary:
+        try:
+            report["distributed"]["workers"] = [{key: worker[key] for key in
+                ("rank", "status", "error", "seconds", "setup_seconds", "runtime")} for worker in workers]
+            if readiness["status"] == "passed":
+                selected = {split: [int(view["index"]) for view in plan["views"]] for split, plan in plans.items()}
+                report.update(merge_evaluation_workers(workers, selected, config.metric_color_space))
+                for split, result in report["splits"].items():
+                    (output / split / "metrics.json").write_text(
+                        json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+                    report["timing"]["split_seconds"][split] = result["seconds"]
+                    if result.get("aggregate"):
+                        score = result["aggregate"][config.metric_color_space]["mean_psnr_db"]
+                        text = "+inf" if score is None else f"{score:.4f}"
+                        print(f"Eval {split} {result['evaluated_view_count']}/{result['selected_view_count']} "
+                              f"| {config.spp} spp | mean PSNR({config.metric_color_space})={text} dB", flush=True)
+            else:
+                report.update(status=readiness["status"], error=readiness["error"])
+            errors = [f"rank {worker['rank']}: {worker['error']}" for worker in workers if worker["error"]]
+            if errors:
+                report["error"] = "\n".join(errors)
+        except Exception:
+            report.update(status="failed", error=traceback.format_exc())
+        report["timing"]["total_seconds"] = time.perf_counter() - started
+        report["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        try:
+            output.mkdir(parents=True, exist_ok=True)
+            report_path = output / "evaluation-report.json"
+            report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+            print("Report:", report_path, flush=True)
+        except Exception:
+            report.update(status="failed", error=traceback.format_exc())
+        if report["status"] != "passed":
+            print(report.get("error", "Distributed evaluation failed"), file=sys.stderr, flush=True)
+        outcome = report["status"]
+    outcome = distributed.broadcast(outcome)
+    if outcome == "interrupted":
+        raise KeyboardInterrupt
+    return 0 if outcome == "passed" else 1
+
+
 @contextmanager
 def _wall_stage(view_timing, split_timing, stage):
     """Measure elapsed host time, including any existing device waits/readbacks."""
@@ -185,8 +493,10 @@ def _wall_stage(view_timing, split_timing, stage):
         split_timing[stage] += elapsed
 
 
-def run_evaluation(config: EvaluationConfig, *, progress_callback=None) -> int:
+def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distributed=None) -> int:
     """Evaluate a saved model using the same validated runtime as the CLI."""
+    if distributed is not None:
+        return _run_distributed_evaluation(config, distributed, progress_callback)
     evaluation_started = time.perf_counter()
     repository = Path(__file__).resolve().parents[1]
     workspace = repository.parent
@@ -285,34 +595,15 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None) -> int:
                 for view in views:
                     if progress_callback is not None:
                         progress_callback(f"evaluation {split} view {view['index']}")
-                    started = time.perf_counter()
                     index = int(view["index"])
-                    seed = int(np.random.SeedSequence([config.seed, 0 if split == "train" else 1, index])
-                               .generate_state(1)[0])
                     view_timing = dict.fromkeys(stage_seconds, 0.0)
                     split_report["incomplete_view"] = {"index": index, "stage_seconds": view_timing}
-                    with _wall_stage(view_timing, stage_seconds, "render_seconds"):
-                        rgb, alpha = common.render_view(model, render, view["camera"], config.spp,
-                                                       seed, config.chunk_size, mi, dr, np)
-                    with _wall_stage(view_timing, stage_seconds, "reference_seconds"):
-                        reference = common.read_reference(view["reference_path"], render.width, render.height, mi, np)
-                        target = (reference[..., :3] * reference[..., 3:4]
-                                  + (1 - reference[..., 3:4]) * np.asarray(render.background, dtype=np.float32))
-                    with _wall_stage(view_timing, stage_seconds, "metrics_seconds"):
-                        metrics = image_metrics(rgb, target, np)
-                    prediction_path = split_output / f"{index:04d}.png"
-                    with _wall_stage(view_timing, stage_seconds, "write_seconds"):
-                        preview.write_png(prediction_path, rgb, mi, np)
-                        if config.save_linear:
-                            np.savez_compressed(split_output / f"{index:04d}.npz", rgb_linear=rgb, alpha=alpha)
-                    record = {"index": index, "reference": str(view["reference_path"]),
-                              "prediction": str(prediction_path), "seed": seed,
-                              "seconds": time.perf_counter() - started, "metrics": metrics,
-                              **view_timing}
+                    record = render_evaluation_record(config, common, model, render, view, split,
+                        output, mi, dr, np, view_timing, stage_seconds)
                     records.append(record)
                     del split_report["incomplete_view"]
                     split_report["evaluated_view_count"] = len(records)
-                    score = metrics[config.metric_color_space]["psnr_db"]
+                    score = record["metrics"][config.metric_color_space]["psnr_db"]
                     text = "+inf" if score is None else f"{score:.4f}"
                     progress.update(
                         f"Eval {split} {len(records)}/{len(views)} "
@@ -359,9 +650,9 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None) -> int:
     return 0 if report["status"] == "passed" else 1
 
 
-def main():
+def main(distributed=None):
     workspace = Path(__file__).resolve().parents[2]
-    return run_evaluation(parse_config(workspace))
+    return run_evaluation(parse_config(workspace), distributed=distributed)
 
 
 if __name__ == "__main__":

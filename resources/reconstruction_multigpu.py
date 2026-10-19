@@ -1,4 +1,4 @@
-"""Launch two reconstruction workers inside one Linux Slurm GPU allocation.
+"""Launch two reconstruction or evaluation workers in one Slurm GPU allocation.
 
 This parent process imports only the Python standard library. Both workers keep
 the scheduler's complete CUDA namespace, and the runtime selects logical device
@@ -69,6 +69,7 @@ class WorkerContext:
     event_queue: object = None
     _last_heartbeat: float = field(default=0., init=False, repr=False)
     _barrier_index: int = field(default=0, init=False, repr=False)
+    _gather_index: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self):
         if self.world_size != 2 or self.rank not in (0, 1):
@@ -101,6 +102,26 @@ class WorkerContext:
         self._barrier_index += 1
         self.heartbeat("barrier")
 
+    def gather(self, value):
+        """Gather small CPU results in rank order; rank 1 returns None.
+
+        Evaluation sends metrics and metadata here, never images or gradients.
+        The parent supervises both processes while either endpoint waits.
+        """
+        sequence = self._gather_index
+        self._gather_index += 1
+        if self.rank == 0:
+            message = self.connection.recv()
+            if (not isinstance(message, tuple) or len(message) != 3
+                    or message[:2] != ("gather", sequence)):
+                raise RuntimeError("Worker result gather order differs between ranks")
+            result = [value, message[2]]
+        else:
+            self.connection.send(("gather", sequence, value))
+            result = None
+        self.heartbeat("gather")
+        return result
+
     def heartbeat(self, stage, *, force=False):
         """Notify the parent of progress, at most once per second by default."""
         now = time.monotonic()
@@ -115,6 +136,12 @@ def _run_training(context, arguments):
     import reconstruction_train
     sys.argv = [str(Path(reconstruction_train.__file__).resolve()), *arguments]
     return reconstruction_train.main(distributed=context)
+
+
+def _run_evaluation(context, arguments):
+    import reconstruction_evaluate
+    sys.argv = [str(Path(reconstruction_evaluate.__file__).resolve()), *arguments]
+    return reconstruction_evaluate.main(distributed=context)
 
 
 def _worker_entry(rank, allocation, connection, events, arguments, worker_main):
@@ -214,7 +241,9 @@ def run_workers(arguments, allocation, *, worker_timeout=600., worker_main=_run_
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False,
-        epilog="All other arguments are forwarded to reconstruction_train.py on both ranks.")
+        epilog="Other arguments go to reconstruction_train.py, or reconstruction_evaluate.py with --evaluate.")
+    parser.add_argument("--evaluate", action="store_true",
+                        help="Render and evaluate a saved checkpoint on both GPUs without training or NCCL.")
     parser.add_argument("--workers", type=int, choices=(2,), default=2)
     parser.add_argument("--worker-timeout", type=float, default=600.,
                         help="Maximum seconds without a worker heartbeat (default: 600).")
@@ -223,10 +252,12 @@ def main(argv=None):
         parser.error("--worker-timeout must be finite and positive")
     try:
         allocation = validate_allocation()
-        print(f"Two-GPU training: logical devices 0 and 1, "
+        mode = "evaluation" if args.evaluate else "training"
+        print(f"Two-GPU {mode}: logical devices 0 and 1, "
               f"CUDA_VISIBLE_DEVICES={allocation.cuda_visible_devices!r}, "
               f"Dr.Jit CPU threads per worker={allocation.cpus_per_rank}", flush=True)
-        return run_workers(training_arguments, allocation, worker_timeout=args.worker_timeout)
+        return run_workers(training_arguments, allocation, worker_timeout=args.worker_timeout,
+                           worker_main=_run_evaluation if args.evaluate else _run_training)
     except (RuntimeError, ValueError) as error:
         print(str(error), file=sys.stderr, flush=True)
         return 1

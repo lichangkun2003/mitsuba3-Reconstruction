@@ -30,6 +30,12 @@ def _fake_success(context, arguments):
     assert value == {"sent_by": 0, "nested": [2, None, {"x": 4}]}
     context.barrier()
     context.barrier()
+    for index in range(2):
+        result = context.gather({"rank": context.rank, "step": index})
+        if context.rank == 0:
+            assert result == [{"rank": 0, "step": index}, {"rank": 1, "step": index}]
+        else:
+            assert result is None
     context.heartbeat("completed fake GPU work", force=True)
     (output / f"rank-{context.rank}.json").write_text(json.dumps({
         "rank": context.rank, "world_size": context.world_size,
@@ -129,6 +135,11 @@ def test_lifecycle(allocation):
         assert dict(os.environ) == before
         with patch("reconstruction_multigpu.sys.platform", "win32"), redirect_stderr(io.StringIO()):
             assert main(["--workers", "2", "--epochs", "3"]) == 1
+        with patch("reconstruction_multigpu.validate_allocation", return_value=allocation), \
+                patch("reconstruction_multigpu.run_workers", return_value=0) as launched:
+            assert main(["--evaluate", "--checkpoint", "model.npz", "--spp", "64"]) == 0
+            assert launched.call_args.args[0] == ["--checkpoint", "model.npz", "--spp", "64"]
+            assert launched.call_args.kwargs["worker_main"].__name__ == "_run_evaluation"
 
 
 def main_test():
@@ -136,7 +147,8 @@ def main_test():
     assert all(name not in sys.modules for name in ("drjit", "mitsuba", "cupy"))
     print(json.dumps({"status": "passed", "gpu_required": False,
                       "checks": ["allocation_validation", "scheduler_environment_preserved",
-                                 "spawn_without_cuda_import", "broadcast_and_barriers",
+                                 "spawn_without_cuda_import", "broadcast_gather_and_barriers",
+                                 "standalone_evaluation_dispatch",
                                  "training_arguments_forwarded", "peer_failure_cleanup",
                                  "timeout_cleanup", "heartbeat_progress", "windows_rejected"]}))
     return 0
