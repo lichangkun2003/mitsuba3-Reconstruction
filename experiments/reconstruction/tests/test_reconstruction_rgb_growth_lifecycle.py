@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 import reconstruction_topology as topology
+from reconstruction_growth_rgb import RGB_GROWTH_EVIDENCE_VERSION
 
 
 def seed_checkpoint():
@@ -110,18 +111,35 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         self.assertIsNone(self.model.overlay)
         self.assertIsNone(self.manager.pending_growth)
 
-    def test_unknown_or_conflicting_evidence_does_not_grow(self):
-        for gain, unknown in ((1., 1), (-1., 0)):
-            with self.subTest(gain=gain, unknown=unknown):
+    def test_unknown_only_conflicting_and_neutral_evidence_do_not_grow(self):
+        for gain, known, unknown in ((0., 0, 1), (-1., 1, 0), (-1., 1, 1), (0., 1, 1)):
+            with self.subTest(gain=gain, known=known, unknown=unknown):
                 self.manager = topology.TopologyManager(self.model, 3, self.settings, self.schedule)
                 pending = self.prepare()
-                self.observe_all(pending, gain=gain, unknown=unknown)
+                out = self.evidence(pending, gain=gain, unknown=unknown)
+                out["growth_observed"] *= known
+                for view_id in range(3):
+                    self.manager.observe_rgb_growth(self.model, out, view_id, 0, 100)
                 replacement, event = self.manager.finish_epoch(self.model, self.optimizer, 1)
                 self.assertIsNone(replacement)
                 self.assertEqual(event["grown"], 0)
                 self.assertEqual(len(self.optimizer.remaps), 0)
-                field = "unknown_votes" if unknown else "conflict_votes"
-                self.assertEqual(event["growth_rgb"][field], 3)
+                detail = event["growth_rgb"]
+                self.assertEqual(detail["views_with_unknown"], 3 if unknown else 0)
+                self.assertEqual(detail["conflict_votes"], 3 if gain < 0 else 0)
+                self.assertEqual(detail["observed_views"], 3 if known else 0)
+
+    def test_reliable_positive_rays_grow_despite_unknown_rays(self):
+        pending = self.prepare()
+        self.observe_all(pending, gain=1., unknown=1)
+        replacement, event = self.manager.finish_epoch(self.model, self.optimizer, 1)
+        self.assertIsNotNone(replacement)
+        self.assertEqual(event["grown"], 1)
+        detail = event["growth_rgb"]
+        self.assertEqual(detail["support_votes"], 3)
+        self.assertEqual(detail["views_with_unknown"], 3)
+        self.assertEqual(detail["observed_views"], 3)
+        self.assertAlmostEqual(detail["encountered_known_fraction"], .5)
 
     def test_incomplete_view_set_never_commits(self):
         pending = self.prepare()
@@ -143,6 +161,8 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         pending = self.prepare()
         self.manager.observe_rgb_growth(self.model, self.evidence(pending), 0, 0, 100)
         saved = self.manager.state_dict()
+        self.assertEqual(saved["rgb_growth_evidence_version"], RGB_GROWTH_EVIDENCE_VERSION)
+        self.assertEqual(saved["pending_growth"]["evidence_version"], RGB_GROWTH_EVIDENCE_VERSION)
         resumed = topology.TopologyManager(self.model, 3, self.settings, self.schedule)
         resumed.load_state_dict(saved)
         self.assertTrue(resumed.prepare_rgb_growth(self.model, 0))
@@ -157,7 +177,7 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         self.assertEqual(event["growth_rgb"]["normalization"], "observed")
         self.assertEqual(len(replacement["model_state"]["cell_indices"]), 3)
 
-    def test_observed_mean_excludes_unseen_and_unknown_but_includes_neutral(self):
+    def test_observed_mean_excludes_unseen_and_unknown_only_but_includes_neutral(self):
         # Exactly three supporting views plus one reliable neutral view. All
         # other views are invisible/unknown, and must not dilute the mean.
         for threshold, expected_growth in ((.07, 1), (.08, 0)):
@@ -167,11 +187,12 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
                 pending = self.prepare()
                 for view_id in range(100):
                     if view_id < 3:
-                        out = self.evidence(pending, gain=.1)
+                        out = self.evidence(pending, gain=.1, unknown=7)
                     elif view_id == 3:
                         out = self.evidence(pending, gain=0.)
                     elif view_id == 4:
-                        out = self.evidence(pending, gain=-99., unknown=1)
+                        out = self.evidence(pending, gain=0., unknown=1)
+                        out["growth_observed"].fill(0)
                     else:
                         out = self.evidence(pending, gain=0.)
                         out["growth_observed"].fill(0)
@@ -180,15 +201,17 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
                 self.assertEqual(event["grown"], expected_growth)
                 detail = event["growth_rgb"]
                 self.assertEqual(detail["observed_views"], 4)
-                self.assertEqual(detail["unknown_votes"], 1)
+                self.assertEqual(detail["views_with_unknown"], 4)
                 self.assertAlmostEqual(detail["mean_gain_sum"], .075, places=6)
 
-    def test_old_pending_checkpoint_keeps_full_image_units(self):
+    def test_current_version_without_normalization_key_keeps_full_image_units(self):
         self.settings.growth_rgb_normalization = "full_image"
         pending = self.prepare()
         self.manager.observe_rgb_growth(self.model, self.evidence(pending), 0, 0, 100)
         saved = self.manager.state_dict()
-        # A checkpoint with no normalization key retains full-image units.
+        # Evidence version is current; omitting the independent normalization
+        # key retains full-image units, not old unknown-veto semantics.
+        self.assertEqual(saved["rgb_growth_evidence_version"], RGB_GROWTH_EVIDENCE_VERSION)
         saved["settings"].pop("growth_rgb_normalization")
         saved["pending_growth"].pop("normalization")
         current = copy.deepcopy(self.settings)
@@ -210,6 +233,47 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         saved["settings"]["growth_rgb_normalization"] = "full_image"
         with self.assertRaisesRegex(ValueError, "different normalization"):
             self.manager.load_state_dict(saved)
+
+    def test_rgb_checkpoint_requires_current_evidence_version_even_without_pending(self):
+        self.prepare()
+        state = self.manager.state_dict()
+        for has_pending in (False, True):
+            for version in (None, 1, RGB_GROWTH_EVIDENCE_VERSION + 1):
+                with self.subTest(has_pending=has_pending, version=version):
+                    saved = copy.deepcopy(state)
+                    if not has_pending:
+                        saved["pending_growth"] = None
+                    if version is None:
+                        saved.pop("rgb_growth_evidence_version")
+                    else:
+                        saved["rgb_growth_evidence_version"] = version
+                    resumed = topology.TopologyManager(self.model, 3, self.settings, self.schedule)
+                    with self.assertRaisesRegex(ValueError, "evidence version"):
+                        resumed.load_state_dict(saved)
+
+    def test_pending_evidence_version_cannot_mix_old_view_statistics(self):
+        pending = self.prepare()
+        self.manager.observe_rgb_growth(self.model, self.evidence(pending), 0, 0, 100)
+        state = self.manager.state_dict()
+        for version in (None, 1, RGB_GROWTH_EVIDENCE_VERSION + 1):
+            with self.subTest(version=version):
+                saved = copy.deepcopy(state)
+                if version is None:
+                    saved["pending_growth"].pop("evidence_version")
+                else:
+                    saved["pending_growth"]["evidence_version"] = version
+                resumed = topology.TopologyManager(self.model, 3, self.settings, self.schedule)
+                with self.assertRaisesRegex(ValueError, "evidence version"):
+                    resumed.load_state_dict(saved)
+
+    def test_non_rgb_checkpoint_does_not_require_rgb_evidence_version(self):
+        self.settings.use_rgb_growth = False
+        self.manager = topology.TopologyManager(self.model, 3, self.settings, self.schedule)
+        saved = self.manager.state_dict()
+        saved.pop("rgb_growth_evidence_version", None)
+        resumed = topology.TopologyManager(self.model, 3, self.settings, self.schedule)
+        resumed.load_state_dict(saved)
+        self.assertFalse(resumed.settings.use_rgb_growth)
 
     def make_many_candidates(self, view_count=3):
         # Replicate the actual two-parent hole geometry, rather than mocking

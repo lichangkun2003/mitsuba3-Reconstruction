@@ -7,6 +7,8 @@ Only epoch boundaries/checkpoints materialize device statistics on the host.
 from __future__ import annotations
 
 
+RGB_GROWTH_EVIDENCE_VERSION = 2
+
 RGB_STAT_FIELDS = ("gain_sum", "raw_gain_sum", "support_views", "conflict_views",
                    "observed_views", "unknown_views", "invalid_views",
                    "observed_rays", "unknown_rays")
@@ -45,7 +47,10 @@ def observe_numpy(pending, out, pixel_count, epsilon, np, normalization="full_im
     denominator = (np.maximum(observed, 1).astype(np.float32) if normalization == "observed"
                    else np.float32(pixel_count))
     normalized = np.where(finite, gain, 0) / denominator
-    eligible = finite & (observed > 0) & (unknown == 0)
+    # Unknown rays abstain individually, without discarding reliable signed
+    # evidence from other rays in the same candidate/view. unknown_views is
+    # an overlapping diagnostic, not a count of discarded view votes.
+    eligible = finite & (observed > 0)
     pending["raw_gain_sum"] += normalized
     pending["gain_sum"] += np.where(eligible, normalized, 0)
     pending["support_views"] += (eligible & (normalized > epsilon)).astype(np.uint32)
@@ -78,7 +83,7 @@ class RGBGrowthEvidenceDevice:
         safe_gain = dr.select(finite, gain, 0)
         normalized = (safe_gain / Float(dr.maximum(observed, 1)) if normalization == "observed"
                       else safe_gain * dr.opaque(Float, 1. / pixel_count))
-        eligible = finite & (observed > 0) & (unknown == 0)
+        eligible = finite & (observed > 0)
         threshold = dr.opaque(Float, epsilon)
         increments = {
             "raw_gain_sum": normalized,

@@ -660,14 +660,14 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                           (boundary-ray.o[a])/dr::select(step[a]==0,1.f,d[a])));
     }
     struct State {
-        Mask active, growth_overflow;
+        Mask active;
         Vector3i cell;
         Vector3f next;
         Float entry, transmittance;
         Color3f color;
         UInt32 hits,candidates,iterations,growth_hits;
-        DRJIT_STRUCT(State,active,growth_overflow,cell,next,entry,transmittance,color,hits,candidates,iterations,growth_hits)
-    } state{active,Mask(false),cell,next,entry,Float(1.f),Color3f(0.f),UInt32(0),UInt32(0),UInt32(0),UInt32(0)};
+        DRJIT_STRUCT(State,active,cell,next,entry,transmittance,color,hits,candidates,iterations,growth_hits)
+    } state{active,cell,next,entry,Float(1.f),Color3f(0.f),UInt32(0),UInt32(0),UInt32(0),UInt32(0)};
     const float diagonal=std::sqrt(dr::square(m_max[0]-m_min[0])+dr::square(m_max[1]-m_min[1])+dr::square(m_max[2]-m_min[2]));
     dr::tie(state,records)=dr::while_loop(dr::make_tuple(state,records),
         [](const State &s,const Records &) {return s.active;},
@@ -719,10 +719,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                         for (uint32_t j=0; j<3; ++j)
                             dr::scatter(buffers->values,s.color[j],j*growth_stride+slot,stored);
                         dr::scatter(buffers->values,s.transmittance,3*growth_stride+slot,stored);
-                        // Do not silently favor the first records on overflow:
-                        // discarded candidates and every stored record become unknown.
+                        // Only a candidate without a stored record is unknown.
+                        // Earlier records keep their prefix and can use the
+                        // completed baseline suffix below. The finite record
+                        // budget therefore favors candidates earlier on the ray.
                         dr::scatter_reduce(ReduceOp::Add,buffers->unknown,UInt32(1),id,overflow);
-                        s.growth_overflow |= overflow;
                         s.growth_hits = dr::minimum(s.growth_hits+dr::select(hit,1u,0u),max_growth_hits);
                         return s;
                     },
@@ -912,7 +913,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         Mask exited = !dr::all(state.cell>=0) | !dr::all(state.cell<int(m_resolution)) |
                       (state.entry>=exit);
         Mask complete = exited & (state.iterations<=3*m_resolution+3) &
-                        !state.growth_overflow & (state.hits+1u<max_hits) &
+                        (state.hits+1u<max_hits) &
                         (weight==1.f) & dr::all(dr::isfinite(result.raw_rgb)) &
                         dr::all(dr::isfinite(reference_rgb));
         for (uint32_t k=0; k<max_growth_hits; ++k) {

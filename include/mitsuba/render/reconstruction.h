@@ -25,8 +25,8 @@ public:
 
     /// Version of the alpha-independent RGB training contract exposed to Python.
     static constexpr uint32_t rgb_only_version = 1;
-    /// Frozen empty-cell proposals observed by the existing training traversal.
-    static constexpr uint32_t rgb_growth_version = 1;
+    /// Frozen empty-cell proposals; overflow only invalidates unstored records.
+    static constexpr uint32_t rgb_growth_version = 2;
 
     VoxelReconstruction(const std::string &filename, uint32_t resolution,
                         const std::array<float, 3> &grid_min,
@@ -58,7 +58,7 @@ public:
         std::map<std::string, FloatBuffer> gradients;
         std::map<std::string, UIntBuffer> counters;
         /// Per-candidate single-insertion RGB loss gain and ray coverage.
-        /// Incomplete paths and record overflow contribute unknown, not votes.
+        /// Incomplete paths and unstored overflow candidates contribute unknown.
         std::map<std::string, FloatBuffer> growth_sums;
         std::map<std::string, UIntBuffer> growth_counts;
         /// Populated only by the diagnostic profile_stages setting.

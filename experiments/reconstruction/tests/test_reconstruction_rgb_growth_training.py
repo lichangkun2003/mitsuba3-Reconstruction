@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from preview import RuntimeConfig
 from reconstruction_common import UniformSampler, initialize_runtime, restore_model
+from reconstruction_growth_rgb import RGB_GROWTH_EVIDENCE_VERSION
 from reconstruction_optimizer import FalcorOptimizer
 from reconstruction_replay import NativeLossReplay
 from reconstruction_topology import TopologyManager, model_checkpoint
@@ -87,8 +88,7 @@ def run(mi, dr, np):
             assert dr.width(gradients["growth_gain"]) == candidate_count
             gain = np.asarray(gradients["growth_gain"])
             observed = np.asarray(gradients["growth_observed"])
-            unknown = np.asarray(gradients["growth_unknown"])
-            reliable = (observed > 0) & (unknown == 0) & np.isfinite(gain)
+            reliable = (observed > 0) & np.isfinite(gain)
             expected_gain_sum[reliable] += gain[reliable] / observed[reliable]
             expected_observed_views += reliable.astype(np.uint32)
             manager.observe_rgb_growth(model, gradients, view_id, epoch, 16)
@@ -97,6 +97,7 @@ def run(mi, dr, np):
                 # Resume after one full view: native overlays are rebuilt from
                 # portable pending state, and that view cannot be voted twice.
                 topology_state = manager.state_dict()
+                assert topology_state["rgb_growth_evidence_version"] == RGB_GROWTH_EVIDENCE_VERSION
                 optimizer_state = optimizer.state_dict()
                 replay.clear()
                 model = restore_model(model_checkpoint(model), mi)
@@ -108,12 +109,13 @@ def run(mi, dr, np):
                 assert manager.pending_growth["seen_views"] == {0}
         pending = manager.state_dict()["pending_growth"]
         assert pending["normalization"] == "observed"
+        assert pending["evidence_version"] == RGB_GROWTH_EVIDENCE_VERSION
         np.testing.assert_allclose(pending["gain_sum"], expected_gain_sum, atol=2e-7, rtol=3e-6)
         np.testing.assert_array_equal(pending["observed_views"], expected_observed_views)
         replacement, event = manager.finish_epoch(model, optimizer, epoch + 1)
         assert event["grown"] == 1, event
         assert event["growth_rgb"]["support_votes"] == 3, event
-        assert event["growth_rgb"]["unknown_votes"] == 0, event
+        assert event["growth_rgb"]["views_with_unknown"] == 0, event
         assert int(model.growth_candidate_count) == 0
         assert replacement is not None
         for group in optimizer.state_dict()["groups"].values():

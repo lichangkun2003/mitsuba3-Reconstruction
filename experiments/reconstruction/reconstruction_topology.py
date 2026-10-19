@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import math
 
+from reconstruction_growth_rgb import RGB_GROWTH_EVIDENCE_VERSION
+
 
 @dataclass
 class TopologySettings:
@@ -666,6 +668,7 @@ class TopologyManager:
             pending.update(radiance_sh=radiance, opacity_sh=opacity,
                            geometric_support=counts.astype(np.uint32),
                            mode="rgb", normalization=cfg.growth_rgb_normalization,
+                           evidence_version=RGB_GROWTH_EVIDENCE_VERSION,
                            boundary=boundary, resolution=self.resolution,
                            all_candidate_count=len(cells), seen_views=set())
             for name in ("centers", "log_scales", "rotations"):
@@ -690,10 +693,10 @@ class TopologyManager:
     def observe_rgb_growth(self, model, out, view_id, epoch, pixel_count):
         """Consume ONE full-view native statistic after chunk/rank reduction.
 
-        Any incomplete ray makes that candidate/view abstain: an unknown
-        harmful ray must not be silently omitted from an otherwise positive
-        view. In observed mode, no-hit and invisible candidates are excluded
-        from the denominator; reliable zero-gain views remain observations.
+        Unknown rays abstain individually. A view can vote from its reliable
+        positive, negative and zero-gain hits, even if other hits are unknown.
+        This is evidence conditional on reliable observations, not a claim
+        about missing rays. Unknown-only and invisible views cannot vote.
         """
         cfg, pending, np = self.settings, self.pending_growth, self.np
         if not cfg.use_rgb_growth or not self._growth_due(int(epoch) + 1):
@@ -728,6 +731,9 @@ class TopologyManager:
 
     def _rgb_normalization(self, pending):
         """Never reinterpret statistics already accumulated by an older run."""
+        if pending.get("evidence_version") != RGB_GROWTH_EVIDENCE_VERSION:
+            raise ValueError("RGB growth evidence version differs; start a new run "
+                             "or resume with the original code")
         normalization = pending.get("normalization", "full_image")
         if normalization != self.settings.growth_rgb_normalization:
             raise ValueError("RGB growth pending evidence uses a different normalization; "
@@ -918,18 +924,26 @@ class TopologyManager:
         unopposed = pending["conflict_views"] < cfg.growth_rgb_max_conflict_views
         valid = pending["invalid_views"] == 0
         beneficial = np.isfinite(mean_gain) & (mean_gain > cfg.growth_rgb_min_mean_gain)
+        known_rays = int(pending["observed_rays"].sum())
+        unknown_rays = int(pending["unknown_rays"].sum())
+        encountered_rays = known_rays + unknown_rays
         status = "no_candidates" if not count else ("complete" if seen == self.view_count else "incomplete_views")
         detail = {"status": status, "normalization": normalization,
+                  "evidence_version": RGB_GROWTH_EVIDENCE_VERSION,
                   "geometric_candidates": pending["all_candidate_count"], "tested_candidates": count,
                   "views": seen, "support_votes": int(pending["support_views"].sum()),
                   "conflict_votes": int(pending["conflict_views"].sum()),
                   "observed_views": int(pending["observed_views"].sum()),
-                  "unknown_votes": int(pending["unknown_views"].sum()),
+                  "views_with_unknown": int(pending["unknown_views"].sum()),
                   "invalid_votes": int(pending["invalid_views"].sum()),
                   "candidates_with_observations": int(np.count_nonzero(observed)),
                   "candidates_with_unknown_views": int(np.count_nonzero(pending["unknown_views"])),
-                  "observed_rays": int(pending["observed_rays"].sum()),
-                  "unknown_rays": int(pending["unknown_rays"].sum()),
+                  "observed_rays": known_rays,
+                  "unknown_rays": unknown_rays,
+                  # Candidate-hit observations encountered before DDA stopped;
+                  # unvisited regions are not covered by this diagnostic.
+                  "encountered_known_fraction": (known_rays / encountered_rays
+                                                 if encountered_rays else None),
                   "mean_gain_sum": float(mean_gain.sum()), "rgb_qualified": 0,
                   # Rejection gates are independent counts and may overlap.
                   "rejected_no_observation": int(np.count_nonzero(~observed)),
@@ -1090,6 +1104,7 @@ class TopologyManager:
         self._materialize_deletion_masks()
         self._materialize_growth()
         state = {"settings": asdict(self.settings), "schedule": asdict(self.schedule), "view_count": self.view_count,
+                 "rgb_growth_evidence_version": RGB_GROWTH_EVIDENCE_VERSION,
                  "opacity_warmup": self.opacity_warmup, "opacity_ramp": self.opacity_ramp,
                  "resolution": self.resolution, "schedule_start_resolution": self.schedule_start_resolution,
                  "level_start_epoch": self.level_start_epoch, "budgets": {str(key): value for key, value in self.budgets.items()},
@@ -1105,11 +1120,16 @@ class TopologyManager:
 
     def load_state_dict(self, state):
         import copy
+        if (state["settings"].get("use_rgb_growth", False) and
+                state.get("rgb_growth_evidence_version") != RGB_GROWTH_EVIDENCE_VERSION):
+            raise ValueError("RGB growth evidence version differs; start a new run "
+                             "or resume with the original code")
         self._growth_world_cache = None
         self._growth_device = None
         self._rgb_growth_device = None
         self._deletion_device = None
         state = copy.deepcopy(state)
+        state.pop("rgb_growth_evidence_version", None)
         if state["count"] != self.count or state["view_count"] != self.view_count:
             raise ValueError("Topology checkpoint dimensions do not match model or dataset")
         self.settings = TopologySettings(**state.pop("settings"))

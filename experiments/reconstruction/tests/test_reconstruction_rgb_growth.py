@@ -179,12 +179,36 @@ def check_partial_paths(mi, dr, np):
     model = restore_model(payload(np), mi)
     proposals = state(np, [0, 32])
     model.set_growth_candidates(device_state(proposals, mi))
-    for options in ({"max_hits": 1.}, {"transmittance_threshold": .8}, {"max_growth_hits": 1.}):
+    for options in ({"max_hits": 1.}, {"transmittance_threshold": .8}):
         result = evaluate(model, ray_at(mi), [.1, .2, .3], mi, dr, **options)
         np.testing.assert_array_equal(np.asarray(result["growth_observed"]), 0)
         np.testing.assert_array_equal(np.asarray(result["growth_gain"]), 0.)
         assert int(np.sum(np.asarray(result["growth_unknown"]))) > 0, options
-    return {"hit_cap_early_stop_and_candidate_overflow_abstain": "passed"}
+    complete = evaluate(model, ray_at(mi), [.1, .2, .3], mi, dr, max_growth_hits=2.)
+    limited = evaluate(model, ray_at(mi), [.1, .2, .3], mi, dr, max_growth_hits=1.)
+    np.testing.assert_array_equal(np.asarray(limited["growth_observed"]), [1, 0])
+    np.testing.assert_array_equal(np.asarray(limited["growth_unknown"]), [0, 1])
+    np.testing.assert_allclose(np.asarray(limited["growth_gain"])[0],
+                               np.asarray(complete["growth_gain"])[0], atol=2e-7, rtol=3e-6)
+    np.testing.assert_array_equal(np.asarray(limited["growth_gain"])[1], 0.)
+    assert_baseline_equal(complete, limited, np)
+    assert_baseline_equal(complete, evaluate(model, ray_at(mi), [.1, .2, .3], mi, dr, enabled=False), np)
+
+    # The second ray starts beyond candidate 0: candidate 32 has a retained
+    # record for this ray, despite being dropped from the first ray's record.
+    mixed_ray = mi.Ray3f(mi.Point3f(.5, .5, mi.Float([-1., 1.5])), mi.Vector3f(0., 0., 1.))
+    mixed_ray.maxt = 8.
+    mixed = evaluate(model, mixed_ray, [.1, .2, .3], mi, dr, max_growth_hits=1.)
+    known_ray = mi.Ray3f(mi.Point3f(.5, .5, 1.5), mi.Vector3f(0., 0., 1.))
+    known_ray.maxt = 8.
+    known = evaluate(model, known_ray, [.1, .2, .3], mi, dr, max_growth_hits=1.)
+    np.testing.assert_array_equal(np.asarray(mixed["growth_observed"]), [1, 1])
+    np.testing.assert_array_equal(np.asarray(mixed["growth_unknown"]), [0, 1])
+    np.testing.assert_allclose(np.asarray(mixed["growth_gain"])[1],
+                               np.asarray(known["growth_gain"])[1], atol=2e-7, rtol=3e-6)
+    return {"hit_cap_and_early_stop_still_abstain": "passed",
+            "candidate_overflow_only_marks_dropped_record_unknown": "passed",
+            "retained_gain_survives_other_unknown_rays": "passed"}
 
 
 def check_shards_and_candidate_validation(mi, dr, np):
@@ -252,14 +276,14 @@ def check_warmup():
 
 
 def vote_fixture(np):
-    pending = {"cells": np.arange(6)}
+    pending = {"cells": np.arange(9)}
     initialize_statistics(pending, np)
-    # Positive, negative, unknown despite a positive known subset, no hit,
-    # a nonfinite result, and a reliably observed zero gain. The last is a
-    # neutral observation and belongs in the reliable-view denominator.
-    out = {"growth_gain": np.asarray([4., -3., 20., 0., np.nan, 0.], np.float32),
-           "growth_observed": np.asarray([2, 5, 4, 0, 1, 3], np.uint32),
-           "growth_unknown": np.asarray([0, 0, 1, 0, 0, 0], np.uint32)}
+    # Known positive/negative, mixed known+unknown positive, no hit, invalid,
+    # known zero, mixed negative, mixed zero, and unknown-only. Unknown rays
+    # never cancel reliable positive, negative or zero observations.
+    out = {"growth_gain": np.asarray([4., -3., 20., 0., np.nan, 0., -6., 0., 0.], np.float32),
+           "growth_observed": np.asarray([2, 5, 4, 0, 1, 3, 2, 4, 0], np.uint32),
+           "growth_unknown": np.asarray([0, 0, 1, 0, 0, 0, 3, 2, 5], np.uint32)}
     return pending, out
 
 
@@ -269,20 +293,21 @@ def check_view_votes_numpy():
     padded = copy.deepcopy(pending)
     observe_numpy(pending, out, 100, .01, np, normalization="observed")
     observe_numpy(padded, out, 640000, .01, np, normalization="observed")
-    np.testing.assert_array_equal(pending["support_views"], [1, 0, 0, 0, 0, 0])
-    np.testing.assert_array_equal(pending["conflict_views"], [0, 1, 0, 0, 0, 0])
-    np.testing.assert_array_equal(pending["observed_views"], [1, 1, 0, 0, 0, 1])
-    np.testing.assert_array_equal(pending["unknown_views"], [0, 0, 1, 0, 0, 0])
-    np.testing.assert_array_equal(pending["invalid_views"], [0, 0, 0, 0, 1, 0])
-    np.testing.assert_allclose(pending["gain_sum"], [2., -.6, 0., 0., 0., 0.], atol=3e-8)
+    np.testing.assert_array_equal(pending["support_views"], [1, 0, 1, 0, 0, 0, 0, 0, 0])
+    np.testing.assert_array_equal(pending["conflict_views"], [0, 1, 0, 0, 0, 0, 1, 0, 0])
+    np.testing.assert_array_equal(pending["observed_views"], [1, 1, 1, 0, 0, 1, 1, 1, 0])
+    np.testing.assert_array_equal(pending["unknown_views"], [0, 0, 1, 0, 0, 0, 1, 1, 1])
+    np.testing.assert_array_equal(pending["invalid_views"], [0, 0, 0, 0, 1, 0, 0, 0, 0])
+    np.testing.assert_allclose(pending["gain_sum"], [2., -.6, 5., 0., 0., 0., -3., 0., 0.], atol=3e-8)
     for name, values in pending.items():
         np.testing.assert_array_equal(values, padded[name], err_msg=name)
     legacy, _ = vote_fixture(np)
     observe_numpy(legacy, out, 100, .01, np, normalization="full_image")
-    np.testing.assert_allclose(legacy["gain_sum"], [.04, -.03, 0., 0., 0., 0.], atol=1e-8)
+    np.testing.assert_allclose(legacy["gain_sum"], [.04, -.03, .2, 0., 0., 0., -.06, 0., 0.], atol=1e-8)
     return {"observed_ray_normalization_is_independent_of_unrelated_pixels": "passed",
             "signed_and_zero_gains_keep_all_valid_observations": "passed",
-            "unknown_nonfinite_and_unobserved_views_abstain": "passed",
+            "mixed_known_unknown_views_keep_positive_negative_and_zero_evidence": "passed",
+            "unknown_only_nonfinite_and_unobserved_views_abstain": "passed",
             "legacy_full_image_normalization_retained": "passed"}
 
 
@@ -307,11 +332,12 @@ def check_unequal_shard_votes_numpy():
     np.testing.assert_array_equal(pending["observed_views"], [1])
     np.testing.assert_array_equal(pending["observed_rays"], [5])
     np.testing.assert_array_equal(pending["support_views"], [0])
-    # Unknown evidence in either shard must invalidate the entire view.
+    # Unknown evidence in either shard must not erase the reliable rays.
     combined["growth_unknown"][0] = 1
     observe_numpy(pending, combined, 640000, .7, np, normalization="observed")
-    np.testing.assert_allclose(pending["gain_sum"], [.6], atol=3e-8)
-    np.testing.assert_array_equal(pending["observed_views"], [1])
+    np.testing.assert_allclose(pending["gain_sum"], [1.2], atol=6e-8)
+    np.testing.assert_array_equal(pending["observed_views"], [2])
+    np.testing.assert_array_equal(pending["observed_rays"], [10])
     np.testing.assert_array_equal(pending["unknown_views"], [1])
     return {"unequal_shards_sum_raw_gain_and_all_valid_ray_counts_before_normalizing": "passed"}
 
@@ -334,11 +360,12 @@ def check_view_votes_device(mi, dr, np):
     gpu = RGBGrowthEvidenceDevice(pending, mi.Float, mi.UInt32, dr, np)
     combined = {"growth_gain": mi.Float(3.) + mi.Float(0.),
                 "growth_observed": mi.UInt32(2) + mi.UInt32(3),
-                "growth_unknown": mi.UInt32(0)}
+                "growth_unknown": mi.UInt32(0) + mi.UInt32(7)}
     gpu.observe(combined, 640000, .7, normalization="observed")
     actual = gpu.materialize()
     np.testing.assert_allclose(actual["gain_sum"], [.6], atol=3e-8)
     np.testing.assert_array_equal(actual["observed_views"], [1])
+    np.testing.assert_array_equal(actual["unknown_views"], [1])
     np.testing.assert_array_equal(actual["support_views"], [0])
     return {"GPU_local_and_legacy_vote_accumulation_match_CPU_reference": "passed",
             "GPU_unequal_shard_counts_normalize_once": "passed"}
@@ -378,6 +405,10 @@ def check_native_replay(mi, dr, np):
     replay.clear()  # Driver must invalidate after replacing even the same count.
     after = compare_current()
     assert np.any(np.abs(np.asarray(before["growth_gain"]) - np.asarray(after["growth_gain"])) > 1e-6)
+    options["max_growth_hits"] = 1.
+    limited = compare_current()
+    np.testing.assert_array_equal(np.asarray(limited["growth_observed"]), [1, 0])
+    np.testing.assert_array_equal(np.asarray(limited["growth_unknown"]), [0, 1])
     model.clear_growth_candidates()
     replay.clear()
     compare_current()
@@ -401,7 +432,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix="mitsuba-rgb-growth-regression-") as temporary:
             mi, dr, np, handles = initialize_runtime(RuntimeConfig(args.build_dir, args.gpu),
                                                        Path(temporary), {})
-            assert int(getattr(mi.VoxelReconstruction, "rgb_growth_version", 0)) >= 1, \
+            assert int(getattr(mi.VoxelReconstruction, "rgb_growth_version", 0)) >= 2, \
                 "Rebuild this checkout before running RGB growth regression"
             for check in (check_counterfactual_and_invariance, check_positive_negative_neutral,
                           check_empty_baseline, check_partial_paths, check_shards_and_candidate_validation,

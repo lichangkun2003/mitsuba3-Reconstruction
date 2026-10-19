@@ -706,8 +706,9 @@ def run_training(distributed=None):
                         raise ValueError("Resume output belongs to a different configuration; choose a new --output-dir")
         rgb_growth_enabled = config.topology.use_rgb_growth and config.topology.enable_growth and (
             not config.schedule.enabled or config.schedule.enable_coarse_growth)
-        if rgb_growth_enabled and getattr(mi.VoxelReconstruction, "rgb_growth_version", 0) < 1:
-            raise RuntimeError("One-pass RGB growth requires new native bindings; incrementally rebuild this checkout")
+        if rgb_growth_enabled and getattr(mi.VoxelReconstruction, "rgb_growth_version", 0) < 2:
+            raise RuntimeError("Ray-local RGB growth evidence requires native rgb_growth_version >= 2; "
+                               "incrementally rebuild this checkout")
         report["requested_config"] = asdict(config)
         report["scope"] = ("RGB-only: DC opacity, bidirectional geometry surrogate, refinement"
                            + (" and one-pass RGB growth" if rgb_growth_enabled else " only")
@@ -720,6 +721,9 @@ def run_training(distributed=None):
             growth_evidence=("same-DDA frozen candidate insertion; signed 1-spp RGB gain; no confirmation render"
                              if rgb_growth_enabled else "disabled" if config.training.rgb_only else "legacy alpha evidence"),
             growth_normalization=config.topology.growth_rgb_normalization if rgb_growth_enabled else None,
+            growth_evidence_version=(mi.VoxelReconstruction.rgb_growth_version if rgb_growth_enabled else None),
+            growth_unknown_policy="exclude unknown rays; retain reliable rays from the same view"
+                                  if rgb_growth_enabled else None,
             reported_loss="mean pixel RGB squared-error sum over channels, then mean over views"
                           if config.training.rgb_only else "mean RGB plus alpha loss over pixels and views")
         performance.metadata["config"] = asdict(config)
