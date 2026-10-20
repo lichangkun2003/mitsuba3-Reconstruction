@@ -770,12 +770,14 @@ class TopologyManager:
             from reconstruction_growth_rgb import initialize_statistics
             checkpoint = model_checkpoint(model)
             proposals = self._generate_growth(checkpoint, boundary)
-            cells, winners, counts = np.unique(proposals["cells"], return_index=True, return_counts=True)
-            # Evaluate every unique legal target, retaining the exact legacy
-            # first legal parent's geometry in deterministic cell order.
-            pending = {name: values[winners].copy() for name, values in proposals.items()
+            # A cell can have different shape/color proposals from several
+            # parents. Keep them independent until after evidence and geometry
+            # revalidation: the first legal parent need not be beneficial.
+            order = np.lexsort((proposals["parent_cells"], proposals["cells"]))
+            pending = {name: values[order].copy() for name, values in proposals.items()
                        if isinstance(values, np.ndarray)}
-            count = len(winners)
+            cells, inverse, counts = np.unique(pending["cells"], return_inverse=True, return_counts=True)
+            count = len(order)
             state, metadata = checkpoint["model_state"], checkpoint["model_metadata"]
             radiance = np.zeros((count, metadata["sh_count"], 3), dtype=np.float32)
             radiance[:, 0] = state["radiance_sh"].reshape(self.count, metadata["sh_count"], 3)[pending["parent_ids"], 0]
@@ -783,11 +785,11 @@ class TopologyManager:
             alpha = float(np.clip(cfg.growth_initial_opacity, .01, .99))
             opacity[:, 0] = math.log(alpha / (1 - alpha)) * (2 * math.sqrt(math.pi))
             pending.update(radiance_sh=radiance, opacity_sh=opacity,
-                           geometric_support=counts.astype(np.uint32),
+                           geometric_support=counts[inverse].astype(np.uint32),
                            mode="rgb", normalization=cfg.growth_rgb_normalization,
                            evidence_version=RGB_GROWTH_EVIDENCE_VERSION,
                            boundary=boundary, resolution=self.resolution,
-                           all_candidate_count=len(cells), seen_views=set())
+                           all_candidate_count=count, candidate_cell_count=len(cells), seen_views=set())
             for name in ("centers", "log_scales", "rotations"):
                 pending[name] = pending[name].astype(np.float32)
             pending["candidate_state"] = {
@@ -1224,6 +1226,7 @@ class TopologyManager:
         detail = {"status": status, "normalization": normalization,
                   "evidence_version": RGB_GROWTH_EVIDENCE_VERSION,
                   "geometric_candidates": pending["all_candidate_count"], "tested_candidates": count,
+                  "candidate_cells": pending["candidate_cell_count"],
                   "views": seen, "support_votes": int(pending["support_views"].sum()),
                   "conflict_votes": int(pending["conflict_views"].sum()),
                   "observed_views": int(pending["observed_views"].sum()),
@@ -1238,6 +1241,7 @@ class TopologyManager:
                   "encountered_known_fraction": (known_rays / encountered_rays
                                                  if encountered_rays else None),
                   "mean_gain_sum": float(mean_gain.sum()), "rgb_qualified": 0,
+                  "rgb_qualified_cells": 0,
                   # Rejection gates are independent counts and may overlap.
                   "rejected_no_observation": int(np.count_nonzero(~observed)),
                   "rejected_support": int(np.count_nonzero(~supported)),
@@ -1245,6 +1249,7 @@ class TopologyManager:
                   "rejected_invalid": int(np.count_nonzero(~valid)),
                   "rejected_mean_gain": int(np.count_nonzero(~beneficial)),
                   "geometry_revalidated": 0, "geometry_rejected": 0,
+                  "geometry_revalidated_cells": 0, "same_cell_rejected": 0,
                   "capacity_rejected": 0,
                   "selected_candidates": 0}
         event["growth_rgb"] = detail
@@ -1252,6 +1257,7 @@ class TopologyManager:
             return checkpoint, selected
         keep = observed & supported & unopposed & valid & beneficial
         detail["rgb_qualified"] = int(np.count_nonzero(keep))
+        detail["rgb_qualified_cells"] = len(np.unique(pending["cells"][keep]))
         if not np.any(keep):
             return checkpoint, selected
         from reconstruction_growth_filter import generate_growth_for_targets, match_growth_parents
@@ -1264,9 +1270,20 @@ class TopologyManager:
         selected["parent_ids"] = parent_ids
         detail["geometry_revalidated"] = len(parent_ids)
         detail["geometry_rejected"] = detail["rgb_qualified"] - len(parent_ids)
+        # Select once per cell only AFTER each parent proposal has independently
+        # passed all view gates and current-geometry checks. No votes are pooled
+        # between siblings. Equal local mean gains use parent-cell order.
+        gains = mean_gain[keep][matches]
+        proposal_order = np.lexsort((selected["parent_cells"], -gains, selected["cells"]))
+        _, first = np.unique(selected["cells"][proposal_order], return_index=True)
+        per_cell = proposal_order[first]
+        detail["geometry_revalidated_cells"] = len(per_cell)
+        detail["same_cell_rejected"] = len(parent_ids) - len(per_cell)
+        selected = {key: value[per_cell] for key, value in selected.items()}
+        gains = gains[per_cell]
         capacity = max(0, cfg.max_active_voxels - self.count)
         # Coverage must not bias a local-mean ranking when capacity is scarce.
-        ranking = np.lexsort((selected["cells"], -mean_gain[keep][matches]))
+        ranking = np.lexsort((selected["cells"], -gains))
         winners = ranking[:capacity]
         selected = {key: value[winners] for key, value in selected.items()}
         detail["capacity_rejected"] = len(ranking) - len(winners)

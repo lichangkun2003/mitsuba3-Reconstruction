@@ -115,6 +115,8 @@ class PerformanceRecorder:
         topology = entry.get("topology", {})
         stages = {key: _number(value) for key, value in entry.get("view_stage_seconds", {}).items()}
         stages["epoch_topology"] = _number(entry.get("epoch_topology_seconds"))
+        if "epoch_coarse_render_seconds" in entry:
+            stages["coarse_render"] = _number(entry["epoch_coarse_render_seconds"])
         topology_event = bool(topology.get("refined") or topology.get("grown")
                               or topology.get("deleted") or topology.get("evidence_window_evaluated")
                               or entry.get("growth_evidence_requested"))

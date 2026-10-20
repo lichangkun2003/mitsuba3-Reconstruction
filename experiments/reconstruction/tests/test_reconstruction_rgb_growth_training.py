@@ -70,6 +70,8 @@ def run(mi, dr, np):
         candidate_count = len(pending["cells"])
         assert cell in pending["cells"]
         assert candidate_count == pending["all_candidate_count"]
+        assert candidate_count > pending["candidate_cell_count"]
+        assert pending["candidate_cell_count"] == len(np.unique(pending["cells"]))
         assert int(model.growth_candidate_count) == candidate_count
         if epoch == 0:
             # Both holes are installed together. Cameras only observe the
@@ -78,6 +80,7 @@ def run(mi, dr, np):
         config.training.chunk_size = 0 if epoch == 0 else 5
         expected_gain_sum = np.zeros(candidate_count, dtype=np.float64)
         expected_observed_views = np.zeros(candidate_count, dtype=np.uint32)
+        expected_support_views = np.zeros(candidate_count, dtype=np.uint32)
         for view_id in range(3):
             view = {"index": view_id, "camera": {
                 "position": [(cell % 8) + .2, 1.5, -1.],
@@ -95,6 +98,9 @@ def run(mi, dr, np):
             reliable = (observed > 0) & np.isfinite(gain)
             expected_gain_sum[reliable] += gain[reliable] / observed[reliable]
             expected_observed_views += reliable.astype(np.uint32)
+            supported = reliable & (gain / np.maximum(observed, 1) >
+                                    config.topology.growth_rgb_gain_epsilon)
+            expected_support_views += supported.astype(np.uint32)
             manager.observe_rgb_growth(model, gradients, view_id, epoch, 16)
             optimizer.step(model, gradients, epoch=epoch, coarse_to_fine=False)
             if epoch == 1 and view_id == 0:
@@ -116,9 +122,12 @@ def run(mi, dr, np):
         assert pending["evidence_version"] == RGB_GROWTH_EVIDENCE_VERSION
         np.testing.assert_allclose(pending["gain_sum"], expected_gain_sum, atol=2e-7, rtol=3e-6)
         np.testing.assert_array_equal(pending["observed_views"], expected_observed_views)
+        np.testing.assert_array_equal(pending["support_views"], expected_support_views)
         replacement, event = manager.finish_epoch(model, optimizer, epoch + 1)
         assert event["grown"] == 1, event
-        assert event["growth_rgb"]["support_votes"] == 3, event
+        assert event["growth_rgb"]["support_votes"] == int(expected_support_views.sum()), event
+        assert event["growth_rgb"]["rgb_qualified_cells"] == 1, event
+        assert event["growth_rgb"]["selected_candidates"] == 1, event
         assert event["growth_rgb"]["views_with_unknown"] == 0, event
         assert int(model.growth_candidate_count) == 0
         assert replacement is not None
@@ -127,6 +136,8 @@ def run(mi, dr, np):
         replay.clear()
         model = restore_model(replacement, mi)
         assert int(model.active_voxel_count) == n + epoch + 1
+        assert len(replacement["model_state"]["cell_indices"]) == len(
+            np.unique(replacement["model_state"]["cell_indices"]))
         events.append(event)
     # The saved policy must still freeze exactly the next global epoch after
     # restoring; starting the final window does not stop RGB/Adam updates.

@@ -21,7 +21,8 @@ from reconstruction_common import (WORKSPACE, REPOSITORY, initialize_runtime, mo
                                    restore_model, workspace_path, render_view, load_views)
 from preview import RuntimeConfig, RenderConfig
 from reconstruction_checkpoint import load_checkpoint, save_checkpoint
-from train import GradientSettings, TrainConfig, save_initial_training_view
+from train import (GradientSettings, TrainConfig, save_initial_training_view,
+                   save_coarse_training_view)
 
 
 def main():
@@ -350,6 +351,7 @@ def main():
 
         config["training"]["output"] = str(run / "coarse")
         config["schedule"] = {"enabled": True, "start_resolution": 4, "target_resolution": 8,
+                              "level_weights": [1, 2],
                               "enable_coarse_growth": False, "save_each_level": True}
         config["contour"] = {"enabled": True}
         config["evaluation"]["enabled"] = False
@@ -363,7 +365,10 @@ def main():
         coarse_report = json.loads((run / "coarse" / "training-report.json").read_text(encoding="utf-8"))
         assert coarse_report["initial_render"]["status"] == "skipped"
         assert coarse_report["initial_render"]["reason"] == "evaluation_disabled"
+        assert coarse_report["coarse_render"]["status"] == "skipped"
+        assert coarse_report["coarse_render"]["reason"] == "evaluation_disabled"
         assert not (run / "coarse" / "train" / "0000-initial.png").exists()
+        assert not (run / "coarse" / "train" / "0000-coarse.png").exists()
         coarse_performance = json.loads(Path(coarse_report["performance_file"]).read_text(encoding="utf-8"))
         assert coarse_performance["by_resolution"]["4"]["completed_epochs"] == 1
         assert coarse_performance["by_resolution"]["8"]["completed_epochs"] == 2
@@ -388,6 +393,70 @@ def main():
             np.testing.assert_allclose(coarse_resumed["training_state"]["contour_state"][view_id]["mean_alpha"],
                                        history["mean_alpha"], atol=2e-6)
         report["checks"].append("cached coarse-to-fine training and uncached post-refinement resume preserve contour and RNG without extra archives")
+
+        # With the current 6:4 budget, three epochs spend two epochs at the
+        # coarse resolution. The independent single-resolution run above has
+        # identical sampling, appearance rates and disabled geometry updates:
+        # its epoch-2 checkpoint is an oracle for the pre-split model.
+        config["training"]["output"] = str(run / "coarse-image")
+        config["schedule"]["level_weights"] = [6, 4]
+        config["contour"]["enabled"] = False
+        config["evaluation"].update(enabled=True, spp=2)
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        run_process([sys.executable, "-I", str(entry), "--config", str(config_path)], "coarse-image")
+        coarse_image_report = json.loads(
+            (run / "coarse-image" / "training-report.json").read_text(encoding="utf-8"))
+        coarse_record = coarse_image_report["coarse_render"]
+        coarse_image_path = run / "coarse-image" / "train" / "0000-coarse.png"
+        assert coarse_record["status"] == "passed"
+        assert Path(coarse_record["image"]) == coarse_image_path
+        assert (coarse_record["view_index"], coarse_record["completed_epochs"],
+                coarse_record["global_step"]) == (0, 2, 4)
+        assert (coarse_record["width"], coarse_record["height"],
+                coarse_record["resolution"]) == (16, 16, 4)
+        assert (coarse_record["spp"], coarse_record["seed"]) == (2, initial_seed)
+        assert coarse_record["seconds"] > 0
+        coarse_oracle = load_checkpoint(run / "full" / "epoch-00002.npz")
+        optimized_coarse_model = restore_model(coarse_oracle, mi)
+        assert coarse_record["active_voxels"] == int(optimized_coarse_model.active_voxel_count)
+        expected_coarse_rgb, _ = render_view(optimized_coarse_model, initial_render,
+            initial_views[0]["camera"], 2, initial_seed,
+            saved_config["evaluation"]["chunk_size"], mi, dr, np)
+        expected_coarse_png = mi.Bitmap(np.ascontiguousarray(
+            expected_coarse_rgb, dtype=np.float32)).convert(
+                mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.UInt8, True)
+        np.testing.assert_array_equal(np.asarray(mi.Bitmap(str(coarse_image_path))),
+                                      np.asarray(expected_coarse_png))
+        coarse_image_first = load_checkpoint(run / "coarse-image" / "epoch-00001.npz")
+        for key in first["model_state"]:
+            np.testing.assert_allclose(coarse_image_first["model_state"][key],
+                                       first["model_state"][key], atol=2e-6, rtol=2e-6)
+        assert coarse_image_first["training_state"]["rng_state"] == first["training_state"]["rng_state"]
+        coarse_image_refined = load_checkpoint(run / "coarse-image" / "epoch-00002.npz")
+        assert coarse_image_refined["model_metadata"]["resolution"] == 8
+        assert coarse_image_refined["training_state"]["rng_state"] == coarse_oracle["training_state"]["rng_state"]
+        coarse_image_history = [json.loads(line) for line in
+            (run / "coarse-image" / "training.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert coarse_image_history[1]["coarse_render"] == coarse_record
+        assert coarse_image_history[1]["epoch_coarse_render_seconds"] == coarse_record["seconds"]
+        assert coarse_image_history[1]["training_resolution"] == 4
+        assert coarse_image_history[1]["resolution"] == 8
+        assert coarse_image_history[1]["topology"]["refined"] is True
+        assert {path.name for path in (run / "coarse-image" / "train").glob("*.png")} == {
+            "0000-initial.png", "0000-coarse.png", "0000.png"}
+        # A repeat call must retain the historical coarse image, even if the
+        # currently available model is already refined and further optimized.
+        coarse_bytes = coarse_image_path.read_bytes()
+        coarse_image_final = load_checkpoint(run / "coarse-image" / "model.npz")
+        preserved_coarse = save_coarse_training_view(TrainConfig(),
+            restore_model(coarse_image_final, mi), initial_views,
+            run / "coarse-image" / "model.npz", mi, dr, np,
+            completed_epochs=3, global_step=6)
+        assert preserved_coarse["status"] == "skipped"
+        assert preserved_coarse["reason"] == "existing_image"
+        assert coarse_image_path.read_bytes() == coarse_bytes
+        report["checks"].append("coarse train-view-0 PNG matches optimized pre-split model, preserves sampling RNG, and is not overwritten")
+
         run_process([sys.executable, "-I", str(Path(__file__).resolve().parents[1] / "evaluate.py"),
                      "--checkpoint", str(run / "full" / "model.npz"), "--split", "both", "--spp", "2",
                      "--output-dir", str(run / "evaluation"), "--build-dir", args.build_dir,
@@ -408,6 +477,7 @@ def main():
         config["training"]["output"] = str(run / "device-topology")
         config["schedule"] = {"enabled": False}
         config["contour"] = {"enabled": False}
+        config["evaluation"]["enabled"] = False
         config["topology"] = {"enable_deletion": True, "enable_growth": True,
             "use_growth_evidence": True, "growth_interval": 1, "evidence_interval": 1,
             "growth_freeze_last_epochs": 0,

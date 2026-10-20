@@ -34,6 +34,7 @@ from reconstruction_performance import PerformanceRecorder
 from reconstruction_progress import ProgressLine
 from reconstruction_reference import GPUReferenceCache
 from reconstruction_replay import NativeLossReplay
+from reconstruction_growth_rgb import RGB_GROWTH_EVIDENCE_VERSION
 from reconstruction_topology import TopologyManager, TopologySettings, CoarseToFineConfig, level_budgets
 
 
@@ -147,7 +148,7 @@ CONFIG.topology.growth_rgb_min_support_views = 3
 CONFIG.topology.growth_rgb_max_conflict_views = 2  # 达到 2 个反对视角则拒绝。
 CONFIG.topology.growth_rgb_gain_epsilon = 1e-7  # 有效命中射线的平均 RGB 收益票阈值（保留数值，单位已变）。
 CONFIG.topology.growth_rgb_min_mean_gain = 1e-7  # 可靠观测视角的带符号平均收益门槛。
-CONFIG.gradient.max_growth_hits = 8  # 单条射线的候选记录容量；溢出则弃权。
+CONFIG.gradient.max_growth_hits = 8  # 单条射线的候选格记录容量；同格多父提案共享记录，溢出则弃权。
 CONFIG.schedule.enable_coarse_growth = True  # 分层训练的生长开关；分裂规则保持不变。
 CONFIG.training.chunk_size = 0  # 0 = 整图提交；显存不足时可显式改为 65536 等。
 CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译、缓存和 GPU 耗时。
@@ -372,6 +373,36 @@ def save_initial_training_view(config, model, views, model_path, mi, dr, np, *, 
         return dict(status="skipped", reason="evaluation_disabled")
     if path.exists():
         raise ValueError(f"Initial image already exists: {path}; choose a new experiment directory")
+    return _save_training_view_zero(config, model, views, path, mi, dr, np,
+                                    completed_epochs=0, global_step=0)
+
+
+def is_coarse_training_end(topology, completed_epochs):
+    """Capture the original coarse level only, before its refinement."""
+    return (topology.schedule.enabled
+            and topology.resolution == topology.schedule.start_resolution
+            and topology.resolution < topology.schedule.target_resolution
+            and completed_epochs >= topology.level_start_epoch + topology.level_budget)
+
+
+def save_coarse_training_view(config, model, views, model_path, mi, dr, np, *,
+                             completed_epochs, global_step):
+    """Render the optimized coarse model, never a replacement fine model."""
+    path = model_path.parent / "train" / "0000-coarse.png"
+    if not config.evaluation.enabled:
+        return dict(status="skipped", reason="evaluation_disabled")
+    if path.exists():
+        # A checkpoint preceding the split can revisit this boundary on resume.
+        # Preserve the original coarse-stage comparison image.
+        return dict(status="skipped", reason="existing_image", image=str(path),
+                    existing_image=True)
+    return _save_training_view_zero(config, model, views, path, mi, dr, np,
+                                    completed_epochs=completed_epochs, global_step=global_step)
+
+
+def _save_training_view_zero(config, model, views, path, mi, dr, np, *,
+                             completed_epochs, global_step):
+    """Use evaluation camera/seed settings without consuming training RNG."""
     view = next(view for view in views if view["index"] == 0)
     # Match evaluate.render_evaluation_record's train camera 0 sample sequence.
     seed = int(np.random.SeedSequence([config.evaluation.seed, 0, 0]).generate_state(1)[0])
@@ -380,7 +411,8 @@ def save_initial_training_view(config, model, views, model_path, mi, dr, np, *, 
                          seed, config.evaluation.chunk_size, mi, dr, np)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_png(path, rgb, mi, np)
-    return dict(status="passed", image=str(path), view_index=0, completed_epochs=0, global_step=0,
+    return dict(status="passed", image=str(path), view_index=0,
+                completed_epochs=completed_epochs, global_step=global_step,
                 spp=config.evaluation.spp, seed=seed,
                 width=config.render.width, height=config.render.height,
                 resolution=int(model.resolution), active_voxels=int(model.active_voxel_count),
@@ -667,7 +699,8 @@ def prepare_training_output(config, resume_path=None, checkpoint_config=None):
         raise ValueError("Keep checkpoints, logs and caches outside the Git checkout")
     if resume_path is None and (any(path.exists() for path in (
             output / "latest.npz", output / "training.jsonl", model_path,
-            model_path.parent / "train" / "0000-initial.png"))
+            model_path.parent / "train" / "0000-initial.png",
+            model_path.parent / "train" / "0000-coarse.png"))
             or any(output.glob("epoch-*.npz"))):
         raise ValueError("Training output already contains a run; choose --output-dir or resume its checkpoint")
     output.mkdir(parents=True, exist_ok=True)
@@ -827,8 +860,8 @@ def run_training(distributed=None):
                         raise ValueError("Resume output belongs to a different configuration; choose a new --output-dir")
         rgb_growth_enabled = config.topology.use_rgb_growth and config.topology.enable_growth and (
             not config.schedule.enabled or config.schedule.enable_coarse_growth)
-        if rgb_growth_enabled and getattr(mi.VoxelReconstruction, "rgb_growth_version", 0) < 2:
-            raise RuntimeError("Ray-local RGB growth evidence requires native rgb_growth_version >= 2; "
+        if rgb_growth_enabled and getattr(mi.VoxelReconstruction, "rgb_growth_version", 0) < RGB_GROWTH_EVIDENCE_VERSION:
+            raise RuntimeError("Multi-parent RGB growth evidence requires native rgb_growth_version >= 3; "
                                "incrementally rebuild this checkout")
         rgb_deletion_enabled = config.topology.use_rgb_deletion and config.topology.enable_deletion
         low_opacity_deletion_enabled = config.topology.use_low_opacity_deletion and config.topology.enable_deletion
@@ -853,7 +886,7 @@ def run_training(distributed=None):
                 "RGBA decoded to linear, then composited onto white; only RGB retained"
                                      if config.training.rgb_only else "linear RGBA; composed inside native training"),
             actual_sampling="per-pixel uniform" if config.training.rgb_only else "per-pixel uniform or contour-guided",
-            growth_evidence=("same-DDA frozen candidate insertion; signed 1-spp RGB gain; no confirmation render"
+            growth_evidence=("same-DDA independent parent proposals; per-cell winner after signed 1-spp RGB votes; no confirmation render"
                              if rgb_growth_enabled else "disabled" if config.training.rgb_only else "legacy alpha evidence"),
             growth_normalization=config.topology.growth_rgb_normalization if rgb_growth_enabled else None,
             growth_evidence_version=(mi.VoxelReconstruction.rgb_growth_version if rgb_growth_enabled else None),
@@ -976,6 +1009,33 @@ def run_training(distributed=None):
         topology = TopologyManager(model, len(views), settings=config.topology,
             schedule=replace(config.schedule, save_each_level=False),
             opacity_warmup=config.optimizer.opacity_warmup_epochs, opacity_ramp=config.optimizer.opacity_ramp_epochs)
+        coarse_path = model_path.parent / "train" / "0000-coarse.png"
+        if not config.evaluation.enabled:
+            report["coarse_render"] = dict(status="skipped", reason="evaluation_disabled")
+        elif (not config.schedule.enabled
+              or config.schedule.start_resolution == config.schedule.target_resolution):
+            report["coarse_render"] = dict(status="skipped", reason="no_coarse_level")
+        elif int(model.resolution) != config.schedule.start_resolution:
+            report["coarse_render"] = dict(status="skipped", reason="coarse_stage_already_completed",
+                                          image=str(coarse_path), existing_image=coarse_path.is_file())
+        else:
+            report["coarse_render"] = dict(status="pending", image=str(coarse_path))
+
+        def capture_coarse_image(completed_epochs):
+            if not primary or not is_coarse_training_end(topology, completed_epochs):
+                return None
+            if config.evaluation.enabled:
+                progress_line.finish()
+                emit(f"Rendering coarse voxel model before refinement: train view 0, "
+                     f"{config.evaluation.spp} spp", flush=True)
+            record = save_coarse_training_view(
+                config, model, views, model_path, mi, dr, np,
+                completed_epochs=completed_epochs, global_step=global_step)
+            report["coarse_render"] = record
+            if record["status"] == "passed":
+                emit("Coarse voxel image:", record["image"], flush=True)
+            return record
+
         if checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             topology.load_state_dict(checkpoint["training_state"]["topology_state"])
@@ -983,6 +1043,7 @@ def run_training(distributed=None):
             # making additional pre-refinement snapshots under the new policy.
             topology.schedule.save_each_level = False
             if primary and checkpoint["training_state"].get("pending_epoch_transition", False):
+                capture_coarse_image(completed)
                 replacement, transition = topology.finish_epoch(model, optimizer, completed)
                 if replacement is not None:
                     model = restore_model(replacement, mi)
@@ -1172,13 +1233,18 @@ def run_training(distributed=None):
                     performance.record_profile(profile)
             progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} "
                                  f"| view {len(views)}/{len(views)} (100%) | updating topology...", force=True)
+            coarse_render = capture_coarse_image(epoch+1)
             topology_started = time.perf_counter()
             new_state, event = topology.finish_epoch(model, optimizer, epoch+1) if primary else (None, None)
             topology.before_refine_checkpoint = None
             if distributed is not None:
                 transition = distributed.broadcast((new_state, event,
-                    optimizer.state_dict() if new_state is not None else None) if primary else None)
-                new_state, event, new_optimizer = transition
+                    optimizer.state_dict() if new_state is not None else None,
+                    coarse_render) if primary else None)
+                new_state, event, new_optimizer, coarse_render = transition
+                if coarse_render is not None:
+                    report["coarse_render"] = coarse_render
+                    distributed.heartbeat("coarse_render_finished", force=True)
             if new_state is not None:
                 # Drop recordings retaining the old occupancy/parameter buffers,
                 # including same-size replacements and transitions after pruning.
@@ -1206,6 +1272,9 @@ def run_training(distributed=None):
                      "view_stage_seconds": stage_totals,
                      "epoch_growth_prepare_seconds": growth_prepare_seconds,
                      "epoch_topology_seconds": time.perf_counter()-topology_started}
+            if coarse_render is not None:
+                entry["coarse_render"] = coarse_render
+                entry["epoch_coarse_render_seconds"] = coarse_render.get("seconds", 0.)
             if collective is not None:
                 communication_after = collective.statistics()
                 entry["collective"] = communication_after

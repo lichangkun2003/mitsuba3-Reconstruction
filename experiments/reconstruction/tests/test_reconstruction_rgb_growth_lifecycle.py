@@ -73,7 +73,13 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         self.assertTrue(self.manager.prepare_rgb_growth(self.model, 0))
         pending = self.manager.pending_growth
         self.assertIn(74, pending["cells"])
-        self.assertEqual(len(pending["cells"]), len(np.unique(pending["cells"])))
+        self.assertGreater(len(pending["cells"]), len(np.unique(pending["cells"])))
+        self.assertEqual(pending["all_candidate_count"], len(pending["cells"]))
+        self.assertEqual(pending["candidate_cell_count"], len(np.unique(pending["cells"])))
+        order = np.lexsort((pending["parent_cells"], pending["cells"]))
+        np.testing.assert_array_equal(order, np.arange(len(order)))
+        self.assertEqual(len(set(zip(pending["cells"], pending["parent_cells"]))),
+                         len(pending["cells"]))
         self.assertTrue(np.all(pending["geometric_support"] >= 2))
         # RGB keeps 26-neighbor/evidence penetration rules even though legacy
         # use_growth_evidence is off, without ever requiring reference alpha.
@@ -81,7 +87,10 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         return pending
 
     def evidence(self, pending, *, gain=1., unknown=0):
-        selected = pending["cells"] == 74
+        # Most lifecycle cases intentionally vote for ONE parent proposal.
+        # Siblings in the same target cell must retain independent statistics.
+        selected = np.zeros(len(pending["cells"]), dtype=bool)
+        selected[np.flatnonzero(pending["cells"] == 74)[0]] = True
         return {"growth_gain": np.where(selected, gain, 0).astype(np.float32),
                 "growth_observed": selected.astype(np.uint32),
                 "growth_unknown": np.where(selected, unknown, 0).astype(np.uint32)}
@@ -221,8 +230,10 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         self.assertEqual(resumed.settings.growth_rgb_normalization, "full_image")
         for view_id in (1, 2):
             resumed.observe_rgb_growth(self.model, self.evidence(pending), view_id, 0, 100)
-        target = resumed.pending_growth["cells"] == 74
-        np.testing.assert_allclose(resumed.pending_growth["gain_sum"][target], [.03])
+        target = np.flatnonzero(resumed.pending_growth["cells"] == 74)[0]
+        np.testing.assert_allclose(resumed.pending_growth["gain_sum"][target], .03)
+        siblings = np.flatnonzero(resumed.pending_growth["cells"] == 74)[1:]
+        np.testing.assert_array_equal(resumed.pending_growth["gain_sum"][siblings], 0.)
         _, event = resumed.finish_epoch(self.model, self.optimizer, 1)
         self.assertEqual(event["grown"], 1)
         self.assertAlmostEqual(event["growth_rgb"]["mean_gain_sum"], .01, places=6)
@@ -238,7 +249,7 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         self.prepare()
         state = self.manager.state_dict()
         for has_pending in (False, True):
-            for version in (None, 1, RGB_GROWTH_EVIDENCE_VERSION + 1):
+            for version in (None, 1, 2, RGB_GROWTH_EVIDENCE_VERSION + 1):
                 with self.subTest(has_pending=has_pending, version=version):
                     saved = copy.deepcopy(state)
                     if not has_pending:
@@ -255,7 +266,7 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         pending = self.prepare()
         self.manager.observe_rgb_growth(self.model, self.evidence(pending), 0, 0, 100)
         state = self.manager.state_dict()
-        for version in (None, 1, RGB_GROWTH_EVIDENCE_VERSION + 1):
+        for version in (None, 1, 2, RGB_GROWTH_EVIDENCE_VERSION + 1):
             with self.subTest(version=version):
                 saved = copy.deepcopy(state)
                 if version is None:
@@ -306,22 +317,26 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
     def test_evaluate_and_commit_every_legal_candidate(self):
         pending = self.make_many_candidates()
         count = len(pending["cells"])
+        cell_count = len(np.unique(pending["cells"]))
         self.assertEqual(count, pending["all_candidate_count"])
+        self.assertGreater(count, cell_count)
         self.observe_every_candidate(pending)
         initial_count = self.manager.count
         replacement, event = self.manager.finish_epoch(self.model, self.optimizer, 1)
-        self.assertEqual(event["grown"], count)
-        self.assertEqual(len(replacement["model_state"]["cell_indices"]), initial_count + count)
+        self.assertEqual(event["grown"], cell_count)
+        cells = replacement["model_state"]["cell_indices"]
+        self.assertEqual(len(cells), initial_count + cell_count)
+        self.assertEqual(len(cells), len(np.unique(cells)))
         detail = event["growth_rgb"]
         for key in ("capacity_rejected", "geometry_rejected"):
             self.assertEqual(detail[key], 0)
-        self.assertEqual(detail["selected_candidates"], count)
+        self.assertEqual(detail["selected_candidates"], cell_count)
 
     def test_capacity_ranking_uses_local_mean_not_sum_or_coverage(self):
         pending = self.make_many_candidates()
         count = len(pending["cells"])
         self.settings.max_active_voxels = self.manager.count + 1
-        low, high = np.argsort(pending["cells"])[:2]
+        low, high = np.unique(pending["cells"], return_index=True)[1][:2]
         out = {"growth_gain": np.zeros(count, np.float32),
                "growth_observed": np.zeros(count, np.uint32),
                "growth_unknown": np.zeros(count, np.uint32)}
@@ -340,7 +355,7 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         pending = self.make_many_candidates(view_count=5)
         count = len(pending["cells"])
         self.settings.max_active_voxels = self.manager.count + 1
-        low, high = np.argsort(pending["cells"])[:2]
+        low, high = np.unique(pending["cells"], return_index=True)[1][:2]
         out = {"growth_gain": np.zeros(count, np.float32),
                "growth_observed": np.zeros(count, np.uint32),
                "growth_unknown": np.zeros(count, np.uint32)}
@@ -358,6 +373,111 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         replacement, event = self.manager.finish_epoch(self.model, self.optimizer, 1)
         self.assertEqual(event["grown"], 1)
         self.assertEqual(replacement["model_state"]["cell_indices"][-1], target_cell)
+        self.assertEqual(event["growth_rgb"]["capacity_rejected"], 1)
+
+    def test_later_parent_can_grow_when_first_parent_is_harmful(self):
+        pending = self.prepare()
+        first, second = np.flatnonzero(pending["cells"] == 74)
+        self.assertNotEqual(pending["parent_cells"][first], pending["parent_cells"][second])
+        out = self.evidence(pending, gain=-10.)
+        out["growth_gain"][second] = 2.
+        out["growth_observed"][second] = 1
+        for view in range(3):
+            self.manager.observe_rgb_growth(self.model, out, view, 0, 640000)
+        replacement, event = self.manager.finish_epoch(self.model, self.optimizer, 1)
+        self.assertEqual(event["grown"], 1)
+        self.assertEqual(event["growth_rgb"]["rgb_qualified"], 1)
+        self.assertEqual(event["growth_rgb"]["conflict_votes"], 3)
+        self.assertEqual(replacement["model_state"]["cell_indices"][-1], 74)
+        for name in ("centers", "log_scales", "rotations", "radiance_sh", "opacity_sh"):
+            expected = pending[name][second].reshape(-1)
+            np.testing.assert_array_equal(replacement["model_state"][name][-len(expected):], expected)
+
+    def test_same_cell_selects_highest_local_mean_then_parent_cell_on_ties(self):
+        for gains, expected_parent in (((1., 2.), 75), ((2., 2.), 73)):
+            with self.subTest(gains=gains):
+                self.manager = topology.TopologyManager(self.model, 3, self.settings, self.schedule)
+                pending = self.prepare()
+                ids = np.flatnonzero(pending["cells"] == 74)
+                out = self.evidence(pending)
+                out["growth_gain"][ids] = gains
+                out["growth_observed"][ids] = 1
+                for view in range(3):
+                    self.manager.observe_rgb_growth(self.model, out, view, 0, 100)
+                replacement, event = self.manager.finish_epoch(self.model, self.optimizer, 1)
+                self.assertEqual(event["grown"], 1)
+                self.assertEqual(event["growth_rgb"]["rgb_qualified"], 2)
+                self.assertEqual(event["growth_rgb"]["capacity_rejected"], 0)
+                winner = ids[np.flatnonzero(pending["parent_cells"][ids] == expected_parent)[0]]
+                expected = pending["centers"][winner].reshape(-1)
+                np.testing.assert_array_equal(replacement["model_state"]["centers"][-3:], expected)
+
+    def test_siblings_cannot_pool_supporting_views(self):
+        pending = self.prepare()
+        first, second = np.flatnonzero(pending["cells"] == 74)
+        for view in range(3):
+            out = self.evidence(pending, gain=0.)
+            out["growth_observed"].fill(0)
+            chosen = first if view < 2 else second
+            out["growth_gain"][chosen] = 1.
+            out["growth_observed"][chosen] = 1
+            self.manager.observe_rgb_growth(self.model, out, view, 0, 100)
+        np.testing.assert_array_equal(pending["support_views"][[first, second]], [2, 1])
+        replacement, event = self.manager.finish_epoch(self.model, self.optimizer, 1)
+        self.assertIsNone(replacement)
+        self.assertEqual(event["grown"], 0)
+        self.assertEqual(event["growth_rgb"]["rgb_qualified"], 0)
+
+    def test_invalid_best_parent_does_not_hide_revalidated_second_choice(self):
+        # Three valid parents surround target 74. After voting the highest-gain
+        # parent retracts, but the other two still satisfy geometric support.
+        state = self.checkpoint["model_state"]
+        state["cell_indices"] = np.append(state["cell_indices"], np.uint32(66))
+        for name, width in (("centers", 3), ("log_scales", 3), ("rotations", 4),
+                            ("radiance_sh", 12), ("opacity_sh", 1)):
+            state[name] = np.concatenate((state[name], state[name][:width].copy()))
+        self.model = Model(self.checkpoint)
+        self.manager = topology.TopologyManager(self.model, 3, self.settings, self.schedule)
+        pending = self.prepare()
+        ids = np.flatnonzero(pending["cells"] == 74)
+        by_parent = dict(zip(pending["parent_cells"][ids], ids))
+        self.assertEqual(set(by_parent), {66, 73, 75})
+        out = self.evidence(pending, gain=0.)
+        out["growth_observed"].fill(0)
+        for parent, gain in ((73, 3.), (75, 2.)):
+            out["growth_gain"][by_parent[parent]] = gain
+            out["growth_observed"][by_parent[parent]] = 1
+        for view in range(3):
+            self.manager.observe_rgb_growth(self.model, out, view, 0, 100)
+        state["log_scales"][:3] = np.log(.1)
+        replacement, event = self.manager.finish_epoch(self.model, self.optimizer, 1)
+        self.assertEqual(event["grown"], 1)
+        self.assertEqual(event["growth_rgb"]["rgb_qualified"], 2)
+        self.assertEqual(event["growth_rgb"]["geometry_revalidated"], 1)
+        self.assertEqual(event["growth_rgb"]["geometry_rejected"], 1)
+        np.testing.assert_array_equal(replacement["model_state"]["centers"][-3:],
+                                      pending["centers"][by_parent[75]])
+
+    def test_capacity_is_applied_after_same_cell_competition(self):
+        pending = self.make_many_candidates()
+        self.settings.max_active_voxels = self.manager.count + 2
+        cells, firsts = np.unique(pending["cells"], return_index=True)
+        out = {name: np.zeros(len(pending["cells"]), dtype=dtype)
+               for name, dtype in (("growth_gain", np.float32),
+                                   ("growth_observed", np.uint32),
+                                   ("growth_unknown", np.uint32))}
+        first_siblings = np.flatnonzero(pending["cells"] == cells[0])
+        self.assertGreater(len(first_siblings), 1)
+        out["growth_gain"][first_siblings] = 10.
+        out["growth_observed"][first_siblings] = 1
+        out["growth_gain"][firsts[1:3]] = [2., 1.]
+        out["growth_observed"][firsts[1:3]] = 1
+        for view in range(3):
+            self.manager.observe_rgb_growth(self.model, out, view, 0, 100)
+        replacement, event = self.manager.finish_epoch(self.model, self.optimizer, 1)
+        self.assertEqual(event["grown"], 2)
+        np.testing.assert_array_equal(np.sort(replacement["model_state"]["cell_indices"][-2:]),
+                                      cells[:2])
         self.assertEqual(event["growth_rgb"]["capacity_rejected"], 1)
 
 

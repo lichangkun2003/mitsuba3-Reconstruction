@@ -25,8 +25,9 @@ public:
 
     /// Version of the alpha-independent RGB training contract exposed to Python.
     static constexpr uint32_t rgb_only_version = 1;
-    /// Frozen empty-cell proposals; overflow only invalidates unstored records.
-    static constexpr uint32_t rgb_growth_version = 2;
+    /// Multiple independent parent proposals per empty cell; record capacity
+    /// counts intersected cells, and overflow only invalidates unstored cells.
+    static constexpr uint32_t rgb_growth_version = 3;
     /// Per-hit single-removal RGB gains on complete baseline paths.
     static constexpr uint32_t rgb_deletion_version = 1;
 
@@ -46,8 +47,9 @@ public:
     /// Replace continuous parameters without changing occupancy or array sizes.
     void set_parameters(const std::map<std::string, FloatBuffer> &parameters);
 
-    /// Install immutable hypothetical cells. They never change trace(), actual
-    /// parameter buffers, occupancy snapshots, or the training image/gradient.
+    /// Install immutable hypothetical proposals, allowing repeated target cells.
+    /// Each input row retains its own evidence index. They never change trace(),
+    /// actual parameter buffers, occupancy snapshots, or the training image/gradient.
     void set_growth_candidates(const UIntBuffer &cell_indices,
                                const std::map<std::string, FloatBuffer> &parameters);
     void clear_growth_candidates();
@@ -123,14 +125,17 @@ private:
     uint32_t m_growth_count = 0;
     // Frozen-function traversal in this Dr.Jit version requires nonempty
     // buffers. These inert placeholders are never addressed when count is zero.
-    UIntBuffer m_growth_cells = dr::zeros<UIntBuffer>(1);
+    // Cells are unique scatter destinations. Per-proposal linked lists preserve
+    // original evidence IDs while sharing one path record for each target cell.
+    UIntBuffer m_growth_cells = dr::zeros<UIntBuffer>(1),
+               m_growth_next = dr::zeros<UIntBuffer>(1);
     FloatBuffer m_growth_centers = dr::zeros<FloatBuffer>(1),
                 m_growth_log_scales = dr::zeros<FloatBuffer>(1),
                 m_growth_rotations = dr::zeros<FloatBuffer>(1),
                 m_growth_radiance = dr::zeros<FloatBuffer>(1),
                 m_growth_opacity = dr::zeros<FloatBuffer>(1);
     MI_TRAVERSE_CB(Object, m_index, m_cells, m_centers, m_log_scales,
-                   m_rotations, m_radiance, m_opacity, m_growth_cells,
+                   m_rotations, m_radiance, m_opacity, m_growth_cells, m_growth_next,
                    m_growth_centers, m_growth_log_scales, m_growth_rotations,
                    m_growth_radiance, m_growth_opacity)
 };

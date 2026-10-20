@@ -175,6 +175,96 @@ def check_empty_baseline(mi, dr, np):
     return {"hypothetical_candidate_in_empty_native_model": "passed"}
 
 
+def check_same_cell_proposals(mi, dr, np):
+    """Each parent shape is a distinct counterfactual, not a pooled voxel."""
+    base = payload(np)
+    model = restore_model(base, mi)
+    # More sibling shapes than the default record budget, plus two proposals in
+    # a later cell. Candidate IDs deliberately interleave the two cell groups.
+    cells = [0, 32, 0, 0, 32] + [0] * 9
+    colors = [[.05 + .01 * i, .12 + .005 * i, .2 + .01 * i]
+              for i in range(len(cells))]
+    colors[2] = [4., 4., 4.]  # Reliable but harmful sibling in the SAME cell.
+    proposals = state(np, cells, colors, [.35] * len(cells))
+    proposals["centers"][:3] = [.85, .85, .5]
+    proposals["log_scales"][:3] = math.log(.08)  # First sibling misses the ray.
+    # A different parent's shape intersects and explains the target exactly.
+    proposals["log_scales"][9:12] = np.log([.25, .3, .35])
+    ray = ray_at(mi)
+    target = rendered(inserted(base, proposals, 3, np, mi), ray, mi, dr, np)[:, 0]
+    baseline_rgb = rendered(model, ray, mi, dr, np)[:, 0]
+    baseline = evaluate(model, ray, target.tolist(), mi, dr, enabled=False)
+    baseline_loss = float(np.sum((baseline_rgb - target) ** 2))
+    model.set_growth_candidates(device_state(proposals, mi))
+    self_count = len(cells)
+    assert int(model.growth_candidate_count) == self_count
+    complete = evaluate(model, ray, target.tolist(), mi, dr, max_growth_hits=2.)
+    expected = []
+    for index in range(self_count):
+        inserted_rgb = rendered(inserted(base, proposals, index, np, mi), ray, mi, dr, np)[:, 0]
+        expected.append(baseline_loss - float(np.sum((inserted_rgb - target) ** 2)))
+    np.testing.assert_allclose(np.asarray(complete["growth_gain"]), expected,
+                               atol=1e-6, rtol=3e-5)
+    expected_observed = np.ones(self_count, np.uint32)
+    expected_observed[0] = 0
+    np.testing.assert_array_equal(np.asarray(complete["growth_observed"]), expected_observed)
+    np.testing.assert_array_equal(np.asarray(complete["growth_unknown"]), 0)
+    assert float(np.asarray(complete["growth_gain"])[2]) < 0.
+    assert float(np.asarray(complete["growth_gain"])[3]) > 0.
+    assert_baseline_equal(baseline, complete, np)
+    np.testing.assert_array_equal(rendered(model, ray, mi, dr, np)[:, 0], baseline_rgb)
+
+    # A cell is recorded once; its many sibling proposals cannot consume slots
+    # or silently hide the better parent. Only the farther CELL overflows.
+    limited = evaluate(model, ray, target.tolist(), mi, dr, max_growth_hits=1.)
+    near = np.asarray(cells) == 0
+    far = ~near
+    observed = np.asarray(limited["growth_observed"])
+    np.testing.assert_array_equal(observed[near], expected_observed[near])
+    assert int(observed[near].sum()) > 8
+    np.testing.assert_array_equal(observed[far], 0)
+    np.testing.assert_array_equal(np.asarray(limited["growth_unknown"])[near], 0)
+    np.testing.assert_array_equal(np.asarray(limited["growth_unknown"])[far], 1)
+    np.testing.assert_allclose(np.asarray(limited["growth_gain"])[near],
+                               np.asarray(complete["growth_gain"])[near],
+                               atol=1e-6, rtol=3e-5)
+    np.testing.assert_array_equal(np.asarray(limited["growth_gain"])[far], 0.)
+    assert_baseline_equal(complete, limited, np)
+
+    # Stats stay proposal-indexed through ray chunks/shards, including a miss.
+    xs = [.5, .55, 1.5]
+    combined = evaluate(model, ray_at(mi, mi.Float(xs)), target.tolist(), mi, dr,
+                        max_growth_hits=1.)
+    parts = [evaluate(model, ray_at(mi, x), target.tolist(), mi, dr, max_growth_hits=1.)
+             for x in xs]
+    for name in ("growth_gain", "growth_observed", "growth_unknown"):
+        np.testing.assert_allclose(np.asarray(combined[name]),
+                                   sum(np.asarray(part[name]) for part in parts),
+                                   atol=2e-6, rtol=3e-5, err_msg=name)
+
+    # Invalid replacement must preserve the complete linked grouping/evidence.
+    malformed = copy.deepcopy(proposals)
+    malformed["cell_indices"][3] = 16  # Occupied model cell.
+    try:
+        model.set_growth_candidates(device_state(malformed, mi))
+    except (RuntimeError, ValueError):
+        pass
+    else:
+        raise AssertionError("Occupied same-cell proposal was accepted")
+    after = evaluate(model, ray, target.tolist(), mi, dr, max_growth_hits=1.)
+    assert int(model.growth_candidate_count) == self_count
+    for name in ("growth_gain", "growth_observed", "growth_unknown"):
+        np.testing.assert_array_equal(np.asarray(after[name]), np.asarray(limited[name]))
+    model.clear_growth_candidates()
+    assert int(model.growth_candidate_count) == 0
+    assert_baseline_equal(baseline, evaluate(model, ray, target.tolist(), mi, dr), np)
+    return {"same_cell_shapes_match_independent_insertion_oracles": "passed",
+            "missed_and_harmful_first_parents_do_not_hide_beneficial_sibling": "passed",
+            "more_than_eight_siblings_share_one_cell_record_without_truncation": "passed",
+            "interleaved_proposal_ids_and_chunk_reduction_remain_independent": "passed",
+            "invalid_duplicate_overlay_replacement_preserves_all_evidence": "passed"}
+
+
 def check_partial_paths(mi, dr, np):
     model = restore_model(payload(np), mi)
     proposals = state(np, [0, 32])
@@ -228,7 +318,7 @@ def check_shards_and_candidate_validation(mi, dr, np):
     np.testing.assert_array_equal(np.asarray(weighted["growth_unknown"]), 1)
     original = rendered(model, ray_at(mi), mi, dr, np)
     malformed = []
-    for cells in ([16], [64], [0, 0]):
+    for cells in ([16], [64]):
         malformed.append(state(np, cells))
     wrong_size = state(np, [0])
     wrong_size["centers"] = wrong_size["centers"][:2]
@@ -409,6 +499,22 @@ def check_native_replay(mi, dr, np):
     limited = compare_current()
     np.testing.assert_array_equal(np.asarray(limited["growth_observed"]), [1, 0])
     np.testing.assert_array_equal(np.asarray(limited["growth_unknown"]), [0, 1])
+    # Same proposal count, different linked cell membership. Clearing the
+    # replay must refresh all cell heads/links rather than preserving old IDs.
+    proposals = state(np, [0, 0], [[.1, .2, .3], [.6, .4, .2]])
+    model.set_growth_candidates(device_state(proposals, mi))
+    replay.clear()
+    siblings = compare_current()
+    np.testing.assert_array_equal(np.asarray(siblings["growth_observed"]), [1, 1])
+    np.testing.assert_array_equal(np.asarray(siblings["growth_unknown"]), [0, 0])
+    assert abs(float(np.asarray(siblings["growth_gain"])[0]) -
+               float(np.asarray(siblings["growth_gain"])[1])) > 1e-5
+    proposals["cell_indices"] = np.asarray([32, 0], np.uint32)
+    model.set_growth_candidates(device_state(proposals, mi))
+    replay.clear()
+    regrouped = compare_current()
+    np.testing.assert_array_equal(np.asarray(regrouped["growth_observed"]), [0, 1])
+    np.testing.assert_array_equal(np.asarray(regrouped["growth_unknown"]), [1, 0])
     model.clear_growth_candidates()
     replay.clear()
     compare_current()
@@ -416,7 +522,8 @@ def check_native_replay(mi, dr, np):
     assert replay.statistics()["bypasses"] >= 2
     return {"direct_vs_frozen_native_with_growth_enabled_and_disabled": "passed",
             "empty_requested_growth_outputs_use_safe_direct_path": "passed",
-            "same_count_candidate_replace_and_clear_replay_invalidation": "passed"}
+            "same_count_candidate_replace_and_clear_replay_invalidation": "passed",
+            "same_count_cell_grouping_and_reordering_replay_invalidation": "passed"}
 
 
 def main():
@@ -432,10 +539,11 @@ def main():
         with tempfile.TemporaryDirectory(prefix="mitsuba-rgb-growth-regression-") as temporary:
             mi, dr, np, handles = initialize_runtime(RuntimeConfig(args.build_dir, args.gpu),
                                                        Path(temporary), {})
-            assert int(getattr(mi.VoxelReconstruction, "rgb_growth_version", 0)) >= 2, \
+            assert int(getattr(mi.VoxelReconstruction, "rgb_growth_version", 0)) >= 3, \
                 "Rebuild this checkout before running RGB growth regression"
             for check in (check_counterfactual_and_invariance, check_positive_negative_neutral,
-                          check_empty_baseline, check_partial_paths, check_shards_and_candidate_validation,
+                          check_empty_baseline, check_same_cell_proposals, check_partial_paths,
+                          check_shards_and_candidate_validation,
                           check_view_votes_device, check_native_replay):
                 checks.append(check(mi, dr, np))
                 print(json.dumps(checks[-1]), flush=True)

@@ -7,7 +7,8 @@ Only epoch boundaries/checkpoints materialize device statistics on the host.
 from __future__ import annotations
 
 
-RGB_GROWTH_EVIDENCE_VERSION = 2
+# Version 3 retains every parent proposal and shares ray records by target cell.
+RGB_GROWTH_EVIDENCE_VERSION = 3
 
 RGB_STAT_FIELDS = ("gain_sum", "raw_gain_sum", "support_views", "conflict_views",
                    "observed_views", "unknown_views", "invalid_views",
