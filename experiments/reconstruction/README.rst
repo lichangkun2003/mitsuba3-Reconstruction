@@ -314,6 +314,12 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 新实验在全局最后 100 轮冻结生长和删除，继续以 1 spp 优化已有体素。
 最终出图为 64 spp，训练集与测试集各取前 10 个视角。
 
+新实验还会在第一次参数更新前，将训练相机 JSON 中视角 0 的初始化体素图保存为
+``outputs/场景-日期-E编号/train/0000-initial.png``，可与最终 ``train/0000.png`` 对照。
+两图使用相同分辨率、背景、评价随机种子约定及 ``--eval-spp``（默认 64），训练保持 1 spp。
+双卡仅由 rank 0 保存初始化图；恢复训练不会覆盖它，也不会把恢复后的模型作为初始化重新出图。
+``--skip-evaluation`` 同时跳过初始化图和最终评价。
+
 旧 alpha 监督 checkpoint 不能直接切换为 RGB-only 续训，应新开实验；旧模型仍可
 单独评价。完整说明见 `训练与评价文档 <../../docs/reconstruction_training.rst>`_、
 `初始化预览文档 <../../docs/reconstruction_preview.rst>`_ 和

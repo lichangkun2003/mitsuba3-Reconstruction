@@ -18,10 +18,10 @@ import traceback
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reconstruction_common import (WORKSPACE, REPOSITORY, initialize_runtime, model_metadata,
-                                   restore_model, workspace_path, render_view)
+                                   restore_model, workspace_path, render_view, load_views)
 from preview import RuntimeConfig, RenderConfig
 from reconstruction_checkpoint import load_checkpoint, save_checkpoint
-from train import GradientSettings
+from train import GradientSettings, TrainConfig, save_initial_training_view
 
 
 def main():
@@ -150,7 +150,7 @@ def main():
                 raise AssertionError(f"{name} unexpectedly succeeded")
             return result
 
-        def check_automatic_evaluation(directory, *, spp=64, count=1, max_views=1):
+        def check_automatic_evaluation(directory, *, spp=64, count=1, max_views=1, initial=False):
             evaluation = json.loads((directory / "evaluation-report.json").read_text(encoding="utf-8"))
             assert evaluation["status"] == "passed"
             assert evaluation["render"]["spp"] == spp
@@ -159,8 +159,10 @@ def main():
             for split in ("train", "test"):
                 assert evaluation["splits"][split]["aggregate"]["view_count"] == count
                 assert [view["index"] for view in evaluation["splits"][split]["views"]] == list(range(count))
-                assert {path.name for path in (directory / split).glob("*.png")} == {
-                    f"{index:04d}.png" for index in range(count)}
+                expected_images = {f"{index:04d}.png" for index in range(count)}
+                if split == "train" and initial:
+                    expected_images.add("0000-initial.png")
+                assert {path.name for path in (directory / split).glob("*.png")} == expected_images
                 assert (directory / split / "metrics.json").is_file()
             saved_evaluation = json.loads((directory / "evaluation-config.json").read_text(encoding="utf-8"))
             assert saved_evaluation["spp"] == spp
@@ -225,7 +227,7 @@ def main():
         assert performance["details"]["gpu_reference_cache"] == gpu_cache
         assert performance["details"]["native_replay"] == replay
         report["checks"].append("three epochs save two intermediate checkpoints and final model without duplicate archives")
-        check_automatic_evaluation(run / "full")
+        check_automatic_evaluation(run / "full", initial=True)
         saved_config = json.loads((run / "full" / "config.json").read_text(encoding="utf-8"))
         assert saved_config["render"]["spp"] == final["config"]["render"]["spp"] == 1
         assert saved_config["training"]["num_epochs"] == 3
@@ -235,6 +237,42 @@ def main():
         assert final["config"]["evaluation"]["spp"] == 64
         assert final["config"]["evaluation"]["max_views"] == 1
         report["checks"].append("automatic 64-spp evaluation selects the first view of each split without limiting training or replacing training config")
+        # Reconstruct the point-cloud initialization independently, not from any
+        # optimized checkpoint, and compare the actual encoded PNG pixels.
+        initial_record = full_report["initial_render"]
+        initial_path = run / "full" / "train" / "0000-initial.png"
+        initial_seed = int(np.random.SeedSequence(
+            [saved_config["evaluation"]["seed"], 0, 0]).generate_state(1)[0])
+        assert initial_record["status"] == "passed"
+        assert Path(initial_record["image"]) == initial_path
+        assert (initial_record["view_index"], initial_record["completed_epochs"],
+                initial_record["global_step"]) == (0, 0, 0)
+        assert (initial_record["spp"], initial_record["seed"]) == (64, initial_seed)
+        assert (initial_record["width"], initial_record["height"], initial_record["resolution"]) == (16, 16, 4)
+        assert initial_record["seconds"] > 0
+        model_config = saved_config["model"]
+        lower, upper = np.asarray(model_config["bounds_min"]), np.asarray(model_config["bounds_max"])
+        center, half = (lower + upper) / 2, (upper - lower) / 2 * model_config["bounds_padding"]
+        initialized = mi.VoxelReconstruction(str(dataset / saved_config["data"]["point_cloud"]), 4,
+            (center-half).tolist(), (center+half).tolist(), model_config["opacity_threshold"],
+            model_config["sh_count"], model_config["opacity_sh_count"])
+        assert initial_record["active_voxels"] == int(initialized.active_voxel_count)
+        initial_render = RenderConfig(**saved_config["render"])
+        initial_views = load_views(dataset, saved_config["data"]["cameras"], initial_render, np)
+        expected_rgb, _ = render_view(initialized, initial_render, initial_views[0]["camera"],
+            64, initial_seed, saved_config["evaluation"]["chunk_size"], mi, dr, np)
+        expected_png = mi.Bitmap(np.ascontiguousarray(expected_rgb, dtype=np.float32)).convert(
+            mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.UInt8, True)
+        np.testing.assert_array_equal(np.asarray(mi.Bitmap(str(initial_path))), np.asarray(expected_png))
+        # Resuming into the same experiment must preserve the true initial
+        # image, even though the model passed to the helper is now optimized.
+        initial_bytes = initial_path.read_bytes()
+        preserved = save_initial_training_view(TrainConfig(), restore_model(final, mi), initial_views,
+            run / "full" / "model.npz", mi, dr, np, resumed=True)
+        assert preserved["status"] == "skipped" and preserved["reason"] == "resumed_checkpoint"
+        assert preserved["existing_image"] is True
+        assert initial_path.read_bytes() == initial_bytes
+        report["checks"].append("train view 0 initial PNG matches untouched point-cloud initialization and is preserved on resume")
         if np.array_equal(first["model_state"]["radiance_sh"], final["model_state"]["radiance_sh"]):
             raise AssertionError("Full-epoch training did not change radiance parameters")
         run_process([sys.executable, "-I", str(entry), "--resume", str(run / "full" / "epoch-00001.npz"),
@@ -255,6 +293,8 @@ def main():
         resume_report = json.loads((run / "resumed" / "training-report.json").read_text(encoding="utf-8"))
         assert resume_report["training_status"] == "passed"
         assert resume_report["evaluation"]["status"] == "skipped"
+        assert resume_report["initial_render"]["status"] == "skipped"
+        assert not (run / "resumed" / "train" / "0000-initial.png").exists()
         uncached = resume_report["reference_cache"]
         assert uncached["capacity_bytes"] == uncached["resident_bytes"] == uncached["images"] == 0
         assert (uncached["hits"], uncached["misses"], uncached["evictions"]) == (0, 4, 0)
@@ -281,6 +321,10 @@ def main():
         for key in final["model_state"]:
             np.testing.assert_array_equal(completed_export["model_state"][key], final["model_state"][key])
         check_automatic_evaluation(run / "already-finished", spp=2, count=2, max_views=10)
+        completed_report = json.loads((run / "already-finished" / "training" / "training-report.json").read_text(encoding="utf-8"))
+        assert completed_report["initial_render"]["status"] == "skipped"
+        assert completed_report["initial_render"]["reason"] == "resumed_checkpoint"
+        assert completed_report["initial_render"]["existing_image"] is False
         assert not (run / "already-finished" / "config.json").exists()
         exported_config = json.loads((run / "already-finished" / "training" / "config.json").read_text(encoding="utf-8"))
         assert exported_config["render"]["spp"] == 1
@@ -317,6 +361,9 @@ def main():
         after_refine = load_checkpoint(run / "coarse" / "epoch-00001.npz")
         assert after_refine["model_metadata"]["resolution"] == 8
         coarse_report = json.loads((run / "coarse" / "training-report.json").read_text(encoding="utf-8"))
+        assert coarse_report["initial_render"]["status"] == "skipped"
+        assert coarse_report["initial_render"]["reason"] == "evaluation_disabled"
+        assert not (run / "coarse" / "train" / "0000-initial.png").exists()
         coarse_performance = json.loads(Path(coarse_report["performance_file"]).read_text(encoding="utf-8"))
         assert coarse_performance["by_resolution"]["4"]["completed_epochs"] == 1
         assert coarse_performance["by_resolution"]["8"]["completed_epochs"] == 2

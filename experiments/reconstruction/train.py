@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from preview import DataConfig, ModelConfig, RenderConfig, RuntimeConfig, PreviewConfig, validate_config
 from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, UniformSampler, ReferenceImageCache,
     generate_ray_batch, prepare_camera, initialize_runtime, load_views, model_metadata,
-    restore_model, workspace_path, file_sha256)
+    restore_model, workspace_path, file_sha256, render_view, write_png)
 from reconstruction_checkpoint import load_checkpoint, save_checkpoint
 from reconstruction_color import validate_reference_compositing
 from reconstruction_experiment import allocate_training_output, resumed_training_output
@@ -340,6 +340,33 @@ def final_evaluation_config(config, model_path):
         output_directory=str(model_path.parent), runtime=config.runtime)
 
 
+def save_initial_training_view(config, model, views, model_path, mi, dr, np, *, resumed=False):
+    """Render the fresh point-cloud initialization without touching training RNG."""
+    path = model_path.parent / "train" / "0000-initial.png"
+    if resumed:
+        # The original initialization is unavailable in a trained checkpoint.
+        # Preserve an existing image; never relabel a restored model as initial.
+        return dict(status="skipped", reason="resumed_checkpoint", image=str(path),
+                    existing_image=path.is_file())
+    if not config.evaluation.enabled:
+        return dict(status="skipped", reason="evaluation_disabled")
+    if path.exists():
+        raise ValueError(f"Initial image already exists: {path}; choose a new experiment directory")
+    view = next(view for view in views if view["index"] == 0)
+    # Match evaluate.render_evaluation_record's train camera 0 sample sequence.
+    seed = int(np.random.SeedSequence([config.evaluation.seed, 0, 0]).generate_state(1)[0])
+    started = time.perf_counter()
+    rgb, _ = render_view(model, config.render, view["camera"], config.evaluation.spp,
+                         seed, config.evaluation.chunk_size, mi, dr, np)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_png(path, rgb, mi, np)
+    return dict(status="passed", image=str(path), view_index=0, completed_epochs=0, global_step=0,
+                spp=config.evaluation.spp, seed=seed,
+                width=config.render.width, height=config.render.height,
+                resolution=int(model.resolution), active_voxels=int(model.active_voxel_count),
+                seconds=time.perf_counter()-started)
+
+
 def make_sampler(config, np):
     return UniformSampler(np) if config.training.rgb_only else ContourSampler(np, **asdict(config.contour))
 
@@ -619,7 +646,8 @@ def prepare_training_output(config, resume_path=None, checkpoint_config=None):
     if output.is_relative_to(REPOSITORY) or model_path.is_relative_to(REPOSITORY):
         raise ValueError("Keep checkpoints, logs and caches outside the Git checkout")
     if resume_path is None and (any(path.exists() for path in (
-            output / "latest.npz", output / "training.jsonl", model_path))
+            output / "latest.npz", output / "training.jsonl", model_path,
+            model_path.parent / "train" / "0000-initial.png"))
             or any(output.glob("epoch-*.npz"))):
         raise ValueError("Training output already contains a run; choose --output-dir or resume its checkpoint")
     output.mkdir(parents=True, exist_ok=True)
@@ -948,6 +976,18 @@ def run_training(distributed=None):
             del initial
             distributed.barrier()
             distributed.heartbeat("replicas_initialized", force=True)
+
+        if primary:
+            if checkpoint is None and config.evaluation.enabled:
+                emit(f"Rendering initial voxel model: train view 0, {config.evaluation.spp} spp", flush=True)
+            report["initial_render"] = save_initial_training_view(
+                config, model, views, model_path, mi, dr, np, resumed=checkpoint is not None)
+            if report["initial_render"]["status"] == "passed":
+                emit("Initial voxel image:", report["initial_render"]["image"], flush=True)
+        if distributed is not None:
+            # Only rank 0 renders this one image; peers wait before any update.
+            report["initial_render"] = distributed.broadcast(report.get("initial_render"))
+            distributed.heartbeat("initial_render_finished", force=True)
 
         def save(path, epochs):
             if not primary:

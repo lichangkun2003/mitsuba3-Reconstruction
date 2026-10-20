@@ -375,7 +375,7 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 评价报告的 ``actual_sampling`` 单独记录此约定。
 
 1 spp 随机预测的均方误差包含采样方差项，因此一般不等于先对无限多个样本求均值、
-再计算图像均方误差。训练采用用户确定的 1 spp 目标；多 spp 只用于训练后出图与评价，
+再计算图像均方误差。训练采用用户确定的 1 spp 目标；多 spp 用于初始化对照图及训练后出图与评价，
 不声称两种损失完全等价。
 
 新 RGB-only 实验使用 ``data.reference_compositing="srgb"``。对于标记为 sRGB 的输入
@@ -424,7 +424,7 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
    CONFIG.training.num_epochs = 1000
    CONFIG.training.save_count = 3
    CONFIG.training.output = None  # 自动创建 outputs/场景-月.日-E编号/training
-   CONFIG.evaluation.enabled = True  # 完成全部训练并保存 model.npz 后自动出图
+   CONFIG.evaluation.enabled = True  # 保存初始化对照图，并在训练完成后自动出图
    CONFIG.evaluation.spp = 64
    CONFIG.evaluation.max_views = 10  # train/test 各取相机 JSON 中前十个视角
 
@@ -462,11 +462,12 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 * ``schedule``：coarse-to-fine 开关和分辨率计划；启用时由此组决定起始分辨率。
 * ``contour``：训练时可选的 contour 重要性采样。
 * ``runtime``：源码构建目录和本地 GPU 编号。
-* ``evaluation``：训练结束后出图设置，默认 ``enabled=True``、``spp=64``、
+* ``evaluation``：初始化对照图及训练结束后出图设置，默认 ``enabled=True``、``spp=64``、
   ``max_views=10``、``chunk_size=65536``、``seed=42``，测试相机文件由
   ``test_cameras="transforms_test.json"`` 指定；``max_views=None`` 表示全部视角。
 
-仅想训练时可传 ``--skip-evaluation``，或设置 ``CONFIG.evaluation.enabled=False``。
+仅想训练时可传 ``--skip-evaluation``，或设置 ``CONFIG.evaluation.enabled=False``，
+同时跳过初始化对照图与最终评价。
 ``--eval-spp`` 和 ``--eval-max-views`` 可分别覆盖自动评价的采样数与每个划分的视角上限。
 训练后评价使用当前实验最终保存的 ``model.npz``，不再初始化体素、不更新参数；
 评价设置保存在实验根目录的 ``evaluation-config.json``，训练自己的 ``training/config.json``
@@ -954,7 +955,9 @@ Adam 状态的数值误差。可调整 ``--cameras``、``--warmup``、``--repeat
        performance-summary.json  # 自动更新的本次进程耗时汇总
        training.jsonl            # 逐轮耗时、损失和拓扑事件
        profile-training.jsonl    # 稀疏抽样的内核性能记录
-     train/             # 最终模型的训练集视角 PNG 和 metrics.json
+     train/             # 初始化对照图、最终模型训练集视角 PNG 和 metrics.json
+       0000-initial.png  # 第一次参数更新前，训练相机索引 0 的初始化体素图
+       0000.png         # 同一相机下的最终重建图
      test/              # 最终模型的测试集视角 PNG 和 metrics.json
      evaluation-config.json
      evaluation-report.json
@@ -1349,6 +1352,14 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 
 多 spp 出图与指标
 -----------------
+
+新实验默认在点云初始化完成、第一次参数更新前，额外保存
+``train/0000-initial.png``。视角 0 指训练相机 JSON 中的第一个相机，与训练打乱顺序无关。
+该图使用 ``evaluation.spp``（默认 64，可由 ``--eval-spp`` 覆盖），
+分辨率、背景及随机种子约定与最终 ``train/0000.png`` 一致，便于前后对照；
+独立的出图采样不会改变训练随机序列，训练仍为 1 spp。
+双卡训练只由 rank 0 保存这一张图。恢复 checkpoint 时保留已有初始化图，
+若缺失也不把恢复后的模型当作初始化模型重新出图。``--skip-evaluation`` 同时关闭此功能。
 
 训练入口默认在保存最终模型后调用评价流程，使用 64 spp 渲染 train/test 各前十个视角，
 并保存每个视角的图片和 PSNR。相机按对应 JSON 顺序选择；不足十个时全取。
