@@ -450,6 +450,7 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
    CONFIG.schedule.enabled = True
    CONFIG.schedule.start_resolution = 256
    CONFIG.schedule.target_resolution = 512
+   CONFIG.schedule.level_weights = (6, 4)  # 两项依次是粗层、细层的轮数权重
    CONFIG.training.num_epochs = 1000
    CONFIG.training.save_count = 3
    CONFIG.training.output = None  # 自动创建 outputs/场景-月.日-E编号/training
@@ -471,6 +472,18 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 当前默认是 lego、800 × 800、1 spp、1000 个 epoch、
 随机种子 42、整个实验保存三次（含最终模型）。修改 ``--epochs`` 同时设置分辨率调度的
 总训练预算，因此不能把不同预算的早期阶段当成相同调度。
+两层默认按 ``schedule.level_weights = (6, 4)`` 分配：
+1000 轮为 256 层级 600 轮、512 层级 400 轮；700 轮为 420／280 轮。
+不能整除时，粗层按比例四舍五入，细层使用剩余轮数；两层各至少一轮，总数保持不变。
+两项权重适用于相邻的粗、细两层（目标分辨率是起点的两倍）；单层模式使用全部轮数。
+旧配置和 checkpoint 中显式保存的四项权重仍按原插值规则分配，以保持恢复时的升层边界；
+新实验无需填写中间两项。旧的四项 JSON 会覆盖当前两项默认值，比较新比例应新开实验。
+启动时 ``Training epochs by resolution`` 打印最终各层预算。
+
+以默认 1000 轮为例，第 1–600 轮在 256 层级训练，第 601–1000 轮在 512 层级训练。
+512 层级仍保留生长，升层后重新 warmup 20 轮；最后第 901–1000 轮冻结生长和删除。
+这 100 轮包含在细层的 400 轮内，不是额外增加的训练轮数。
+
 训练完成后默认以 64 spp 评价 train/test 各前十个视角；某划分不足十个时使用全部视角。
 这里的顺序是对应相机 JSON 的原始顺序，不是训练打乱后的访问顺序。
 出图数量不限制训练：每个 epoch 仍遍历全部训练相机，始终为 1 spp。
@@ -520,7 +533,7 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
    * - ``COARSE_TO_FINE_TOTAL_ITERATIONS``
      - ``training.num_epochs``，入口同步至 ``schedule.total_epochs``
    * - ``COARSE_TO_FINE_LEVEL_WEIGHTS``
-     - ``schedule.level_weights``
+     - ``schedule.level_weights``，新实验为粗／细两项权重，默认 ``(6, 4)``
    * - ``SH_COUNT`` / ``SH_OPACITY_COUNT``
      - ``model.sh_count`` / ``model.opacity_sh_count``；均指系数个数
    * - ``GEOMETRY_TWO_SIDED_BOUNDARY``

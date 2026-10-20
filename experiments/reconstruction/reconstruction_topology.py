@@ -78,7 +78,7 @@ class CoarseToFineConfig:
     start_resolution: int = 256
     target_resolution: int = 512
     total_epochs: int = 1000
-    level_weights: tuple[int, int, int, int] = (19, 12, 14, 25)
+    level_weights: tuple[int, int] = (6, 4)  # Coarse and fine epoch weights.
     parent_opacity_threshold: float = 0.
     opacity_optical_depth_scale: float = .65
     child_face_overlap: float = .1
@@ -89,8 +89,8 @@ class CoarseToFineConfig:
     save_each_level: bool = True
 
 
-def level_budgets(start: int, target: int, total: int, weights=(19, 12, 14, 25)) -> dict[int, int]:
-    """Integer interpolation from CoarseToFine.cpp, including one epoch per level."""
+def level_budgets(start: int, target: int, total: int, weights=(6, 4)) -> dict[int, int]:
+    """Allocate coarse/fine epochs; retain four-weight legacy checkpoint budgets."""
     if (start < 1 or target < start or target > 1024 or
             start & (start - 1) or target & (target - 1)):
         raise ValueError("Coarse-to-fine requires power-of-two start <= target <= 1024")
@@ -98,10 +98,22 @@ def level_budgets(start: int, target: int, total: int, weights=(19, 12, 14, 25))
     while resolutions[-1] < target:
         resolutions.append(resolutions[-1] * 2)
     count = len(resolutions)
-    if total < count or total > 1000000 or len(weights) != 4 or any(w <= 0 for w in weights):
-        raise ValueError("Invalid coarse-to-fine total or four positive level weights")
+    if (total < count or total > 1000000 or len(weights) not in (2, 4)
+            or any(type(w) is not int or w <= 0 for w in weights)):
+        raise ValueError("Invalid coarse-to-fine total or level weights: use two positive integers")
     if count == 1:
         return {start: total}
+    if len(weights) == 2:
+        if count != 2:
+            raise ValueError("Two level weights require exactly two resolutions (target = 2 * start)")
+        # Round the coarse share to the nearest epoch (ties round up), give
+        # the remainder to the fine level, and keep at least one epoch each.
+        denominator = sum(weights)
+        coarse = (2 * total * weights[0] + denominator) // (2 * denominator)
+        coarse = max(1, min(total - 1, coarse))
+        return {start: coarse, target: total - coarse}
+    # Older checkpoints/configs used four interpolated weights and reserved
+    # one epoch per level first. Preserve their original transition epochs.
     values = []
     for level in range(count):
         segment, fraction = divmod(3 * level, count - 1)

@@ -269,9 +269,10 @@ class TopologyTests(unittest.TestCase):
         return TopologyManager(model, 8, cfg, CoarseToFineConfig(enabled=False, total_epochs=30), 0, 0)
 
     def test_level_budgets_exact_integer_totals(self):
-        self.assertEqual(level_budgets(256, 512, 1000), {256: 431, 512: 569})
+        self.assertEqual(level_budgets(256, 512, 1000), {256: 600, 512: 400})
+        self.assertEqual(level_budgets(256, 512, 1000, (19, 12, 14, 25)), {256: 431, 512: 569})
         for start in (1, 16, 128, 256, 512):
-            budgets = level_budgets(start, 512, 1000)
+            budgets = level_budgets(start, 512, 1000, (19, 12, 14, 25))
             self.assertEqual(sum(budgets.values()), 1000)
             self.assertGreaterEqual(min(budgets.values()), 1)
 

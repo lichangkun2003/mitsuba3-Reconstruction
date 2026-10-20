@@ -107,10 +107,10 @@ class RGBDeletionLifecycleTests(unittest.TestCase):
             self.assertTrue(manager.collect_deletion(boundary - 1), boundary)
         manager = self.manager(scheduled=True)
         self.assertTrue(manager.collect_deletion(29))  # Coarse evidence is enabled.
-        self.assertFalse(manager.collect_deletion(301))  # Split boundary.
-        manager.resolution, manager.level_start_epoch = 16, 302
-        self.assertFalse(manager.collect_deletion(321))  # Fine local epoch 20.
-        self.assertTrue(manager.collect_deletion(331))   # Fine local epoch 30.
+        self.assertFalse(manager.collect_deletion(419))  # Split boundary.
+        manager.resolution, manager.level_start_epoch = 16, 420
+        self.assertFalse(manager.collect_deletion(439))  # Fine local epoch 20.
+        self.assertTrue(manager.collect_deletion(449))   # Fine local epoch 30.
         self.assertFalse(manager.collect_deletion(601))  # Global tail overrides.
 
     def test_two_complete_windows_remove_and_preserve_survivor_adam(self):
@@ -248,11 +248,11 @@ class RGBDeletionLifecycleTests(unittest.TestCase):
         self.observe(manager, 30)
         self.finish(manager, 30)
         self.observe(manager, 40, views=[0])
-        replacement, event = self.finish(manager, 302)
+        replacement, event = self.finish(manager, 420)
         self.assertTrue(event["refined"])
         self.assertEqual(event["deleted"], 0)
         self.assertEqual(manager.resolution, 16)
-        self.assertEqual(manager.level_start_epoch, 302)
+        self.assertEqual(manager.level_start_epoch, 420)
         self.assertIsNone(manager.pending_rgb_deletion)
         self.assertIsNone(manager.rgb_deletion_last_boundary)
         self.assertFalse(np.any(manager.rgb_deletion_streak))

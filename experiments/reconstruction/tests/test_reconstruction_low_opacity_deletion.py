@@ -143,7 +143,7 @@ class LowOpacityDeletionTests(unittest.TestCase):
     def test_refinement_resets_streaks_and_restarts_per_level_warmup(self):
         manager = self.manager(scheduled=True)
         self.finish(manager, 30)
-        replacement, event = self.finish(manager, 302)
+        replacement, event = self.finish(manager, 420)
         self.assertTrue(event["refined"])
         self.assertIsNone(manager.low_opacity_deletion_last_boundary)
         self.assertFalse(np.any(manager.low_opacity_deletion_streak))
@@ -151,8 +151,8 @@ class LowOpacityDeletionTests(unittest.TestCase):
                          len(replacement["model_state"]["cell_indices"]))
         self.model = SnapshotModel(replacement)
         with patch.object(self.model, "snapshot", side_effect=AssertionError("fine warmup readback")):
-            self.assertIsNone(self.finish(manager, 322)[0])
-        replacement, event = self.finish(manager, 332)
+            self.assertIsNone(self.finish(manager, 440)[0])
+        replacement, event = self.finish(manager, 450)
         self.assertIsNone(replacement)
         self.assertEqual(manager.low_opacity_deletion_streak.max(), 1)
 

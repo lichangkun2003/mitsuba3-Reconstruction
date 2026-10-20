@@ -34,7 +34,7 @@ from reconstruction_performance import PerformanceRecorder
 from reconstruction_progress import ProgressLine
 from reconstruction_reference import GPUReferenceCache
 from reconstruction_replay import NativeLossReplay
-from reconstruction_topology import TopologyManager, TopologySettings, CoarseToFineConfig
+from reconstruction_topology import TopologyManager, TopologySettings, CoarseToFineConfig, level_budgets
 
 
 @dataclass
@@ -160,6 +160,7 @@ CONFIG.training.freeze_native = True  # 重放原生计算；拓扑变化后重�
 CONFIG.schedule.enabled = True
 CONFIG.schedule.start_resolution = 256
 CONFIG.schedule.target_resolution = 512
+CONFIG.schedule.level_weights = (6, 4)  # 粗、细层级轮数比例；1000 轮分成 600 / 400。
 CONFIG.training.num_epochs = 1000  # 整个实验总轮数，每轮遍历全部训练视角。
 CONFIG.training.save_count = 3  # 包含最终 model.npz，共保存三次。
 CONFIG.training.output = None  # 自动创建 outputs/场景-MM.DD-E编号/training。
@@ -256,6 +257,9 @@ def apply_arguments(config, args, values):
 
 def validate(config):
     validate_config(PreviewConfig(data=config.data, model=config.model, render=config.render, runtime=config.runtime))
+    if config.schedule.enabled:
+        level_budgets(config.schedule.start_resolution, config.schedule.target_resolution,
+                      config.schedule.total_epochs, config.schedule.level_weights)
     if config.render.spp != 1:
         raise ValueError("Training requires exactly 1 spp per view; use evaluate.py for multi-spp images")
     if list(config.render.background) != [1., 1., 1.]:
@@ -985,6 +989,8 @@ def run_training(distributed=None):
                 if transition.get("refined", False):
                     sampler = make_sampler(config, np)
                 topology.before_refine_checkpoint = None
+
+        emit("Training epochs by resolution:", json.dumps(topology.budgets), flush=True)
 
         if distributed is not None:
             # Establish a canonical model/Adam/RNG before the first collective,

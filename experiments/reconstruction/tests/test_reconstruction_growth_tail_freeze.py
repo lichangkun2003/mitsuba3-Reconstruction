@@ -62,13 +62,13 @@ class GrowthTailFreezeTests(unittest.TestCase):
         for rgb in (True, False):
             with self.subTest(rgb=rgb):
                 manager = self.manager(rgb=rgb, scheduled=True)
-                self.assertEqual(manager.budgets, {8: 302, 16: 398})
+                self.assertEqual(manager.budgets, {8: 420, 16: 280})
                 # The end of the coarse level is not the end of training.
-                self.assertTrue(manager._growth_due(301))
-                self.assertFalse(manager.growth_frozen(302))
-                self.assertFalse(manager._growth_due(302))  # Existing refine boundary.
+                self.assertTrue(manager._growth_due(419))
+                self.assertFalse(manager.growth_frozen(420))
+                self.assertFalse(manager._growth_due(420))  # Existing refine boundary.
                 manager.resolution = 16
-                manager.level_start_epoch = 302
+                manager.level_start_epoch = 420
                 self.assertTrue(manager._growth_due(600))
                 self.assertFalse(manager._growth_due(601))
                 self.assertTrue(manager.growth_frozen(601))
@@ -175,7 +175,7 @@ class GrowthTailFreezeTests(unittest.TestCase):
                 self.model, Optimizer(), manager.level_budget)
             self.assertTrue(event["refined"])
             self.assertEqual(event["grown"], 0)
-            self.assertEqual(manager.level_start_epoch, 302)
+            self.assertEqual(manager.level_start_epoch, 420)
             self.assertEqual(manager.resolution, 16)
             self.assertEqual(event["growth_frozen"], freeze > 0)
             results.append(replacement)
@@ -186,7 +186,7 @@ class GrowthTailFreezeTests(unittest.TestCase):
     def test_resume_retains_global_window_and_legacy_missing_field_means_zero(self):
         manager = self.manager(scheduled=True)
         manager.resolution = 16
-        manager.level_start_epoch = 302
+        manager.level_start_epoch = 420
         state = manager.state_dict()
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
@@ -196,7 +196,7 @@ class GrowthTailFreezeTests(unittest.TestCase):
                 # A fresh experiment default must not overwrite saved policy.
                 resumed = self.manager(freeze=100, scheduled=True)
                 resumed.load_state_dict(saved)
-                self.assertEqual(resumed.level_start_epoch, 302)
+                self.assertEqual(resumed.level_start_epoch, 420)
                 self.assertEqual(resumed.schedule.total_epochs, 700)
                 self.assertEqual(
                     resumed.settings.growth_freeze_last_epochs, 0 if legacy else 100)

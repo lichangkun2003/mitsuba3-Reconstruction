@@ -34,10 +34,95 @@ def _stdlib_only(name, *args, **kwargs):
 
 with mock.patch.object(builtins, "__import__", side_effect=_stdlib_only):
     import reconstruction_experiment as experiment
+    from reconstruction_topology import CoarseToFineConfig, level_budgets
     import train as train
 
 
 DAY = date(2026, 10, 15)
+
+
+class ResolutionScheduleTests(unittest.TestCase):
+    def test_new_experiments_use_six_to_four_for_actual_epoch_total(self):
+        for total, expected in ((1000, {256: 600, 512: 400}),
+                                (700, {256: 420, 512: 280})):
+            with self.subTest(total=total):
+                config = deepcopy(train.CONFIG)
+                with mock.patch.object(sys, "argv", ["train.py", "--epochs", str(total)]):
+                    args = train.parse_arguments()
+                train.apply_arguments(config, args, {})
+                train.validate(config)
+                schedule = config.schedule
+                self.assertEqual(level_budgets(
+                    schedule.start_resolution, schedule.target_resolution,
+                    schedule.total_epochs, schedule.level_weights), expected)
+
+    def test_ratio_rounding_preserves_total_and_at_least_one_epoch_per_level(self):
+        for total, weights, expected in (
+                (701, (6, 4), {256: 421, 512: 280}),
+                (5, (1, 1), {256: 3, 512: 2}),
+                (2, (99, 1), {256: 1, 512: 1}),
+                (3, (1, 99), {256: 1, 512: 2}),
+                (3, (99, 1), {256: 2, 512: 1})):
+            with self.subTest(total=total, weights=weights):
+                self.assertEqual(level_budgets(256, 512, total, weights),
+                                 expected)
+
+    def test_explicit_legacy_four_weights_preserve_old_budgets(self):
+        self.assertEqual(CoarseToFineConfig().level_weights, (6, 4))
+        legacy_weights = (19, 12, 14, 25)
+        self.assertEqual(level_budgets(256, 512, 1000, legacy_weights),
+                         {256: 431, 512: 569})
+        for start in (128, 256, 512):
+            budgets = level_budgets(start, 512, 1000, legacy_weights)
+            self.assertEqual(sum(budgets.values()), 1000)
+            self.assertGreaterEqual(min(budgets.values()), 1)
+
+    def test_single_level_and_fine_stage_resume_construction(self):
+        self.assertEqual(level_budgets(512, 512, 1000, (6, 4)),
+                         {512: 1000})
+
+    def test_two_weights_require_valid_values_and_two_levels(self):
+        for weights in ((0, 4), (-1, 4), (True, 4), (6, False),
+                        ("6", 4), (float("nan"), 4), (float("inf"), 4),
+                        (), (1,), (1, 2, 3), (1, 2, 3, 4, 5)):
+            with self.subTest(weights=weights):
+                with self.assertRaises(ValueError):
+                    level_budgets(256, 512, 1000, weights)
+        with self.assertRaises(ValueError):
+            level_budgets(128, 512, 1000, (6, 4))
+        with self.assertRaises(ValueError):
+            level_budgets(256, 512, 1, (6, 4))
+
+    def test_invalid_new_schedule_is_rejected_before_training(self):
+        config = deepcopy(train.CONFIG)
+        config.schedule.start_resolution = 128
+        with self.assertRaises(ValueError):
+            train.validate(config)
+        config.schedule.level_weights = (19, 12, 14, 25)
+        train.validate(config)
+
+    def test_legacy_checkpoint_schedule_restores_four_weights(self):
+        saved = asdict(CoarseToFineConfig(level_weights=(19, 12, 14, 25)))
+        config = deepcopy(train.CONFIG)
+        train.update(config, {"schedule": saved})
+        self.assertEqual(asdict(config.schedule), saved)
+        self.assertEqual(level_budgets(
+            config.schedule.start_resolution, config.schedule.target_resolution,
+            config.schedule.total_epochs, config.schedule.level_weights),
+            {256: 431, 512: 569})
+        self.assertNotEqual(asdict(train.CONFIG.schedule), saved)
+
+    def test_two_weights_can_be_overridden_in_json(self):
+        config = deepcopy(train.CONFIG)
+        with mock.patch.object(sys, "argv", ["train.py", "--epochs", "1000"]):
+            args = train.parse_arguments()
+        train.apply_arguments(
+            config, args, json.loads('{"schedule": {"level_weights": [7, 3]}}'))
+        train.validate(config)
+        self.assertEqual(level_budgets(
+            config.schedule.start_resolution, config.schedule.target_resolution,
+            config.schedule.total_epochs, config.schedule.level_weights),
+            {256: 700, 512: 300})
 
 
 class ExperimentOutputTests(unittest.TestCase):

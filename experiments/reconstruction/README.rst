@@ -5,6 +5,21 @@
 切换场景修改 ``CONFIG.data.dataset``，或传入 ``--dataset datasets/lego``；
 命令行参数覆盖配置文件与默认配置。RTX 5090 Windows 主机使用这个单卡入口。
 
+两层迭代比例也在 ``train.py`` 顶部配置：
+
+.. code-block:: python
+
+   CONFIG.schedule.start_resolution = 256
+   CONFIG.schedule.target_resolution = 512
+   CONFIG.schedule.level_weights = (6, 4)  # 分别是粗层、细层的轮数权重
+   CONFIG.training.num_epochs = 1000
+
+默认 1000 轮为 256 层级 600 轮、512 层级 400 轮；传 ``--epochs 700`` 时为
+420／280 轮。不能整除时，粗层四舍五入，细层取剩余轮数，每层至少一轮。
+新实验用两项权重；四项旧配置和 checkpoint 仍按旧分配算法恢复，不自动改成 6:4。
+启动日志会打印各分辨率的轮数。512 层级继续允许生长，两层各 warmup 20 轮；
+整个训练末尾 100 轮冻结生长和删除，继续优化参数。
+
 参考图协议由 ``CONFIG.data.reference_compositing = "srgb"`` 控制。新实验对 sRGB PNG
 先在编码空间用 alpha 合成白背景，再解码为线性 RGB；渲染、训练损失、梯度和拓扑收益
 始终在线性空间计算。普通 RGB 图直接解码；线性 EXR 继续在线性空间合成。
