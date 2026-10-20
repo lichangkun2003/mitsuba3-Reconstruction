@@ -1,10 +1,10 @@
 体素重建训练、保存与评价
 ======================
 
-RGB-only 训练与在线生长（当前默认）
-----------------------------------
+RGB-only 训练、在线生长与删除（当前默认）
+----------------------------------------
 
-本阶段从新的初始化开始，使用 800 × 800、每像素 1 spp、总计 700 个 epoch。
+本阶段从新的初始化开始，使用 800 × 800、每像素 1 spp、总计 1000 个 epoch。
 每个 epoch 遍历全部训练视角；单卡和双卡使用相同总轮数及 coarse-to-fine 调度。
 常用参数集中在 ``experiments/reconstruction/train.py`` 顶部的 ``CONFIG`` 赋值区，
 切换场景修改 ``CONFIG.data.dataset``，不要修改预览脚本的 ``CONFIG``。
@@ -12,17 +12,19 @@ RGB-only 训练与在线生长（当前默认）
 .. code-block:: python
 
    CONFIG.training.rgb_only = True
+   CONFIG.data.reference_compositing = "srgb"
    CONFIG.model.opacity_sh_count = 1
    CONFIG.render.width = CONFIG.render.height = 800
    CONFIG.render.spp = 1
-   CONFIG.training.num_epochs = 700
+   CONFIG.training.num_epochs = 1000
    CONFIG.gradient.alpha_loss_weight = 0
    CONFIG.gradient.alpha_geometry_weight = 0
    CONFIG.gradient.background_carve_weight = 0
    CONFIG.gradient.geometry_transition_only = False
    CONFIG.gradient.geometry_two_sided_boundary = False
    CONFIG.topology.enable_growth = True
-   CONFIG.topology.enable_deletion = False
+   CONFIG.topology.enable_deletion = True
+   CONFIG.topology.use_rgb_deletion = True
    CONFIG.topology.use_growth_evidence = False
    CONFIG.topology.use_rgb_growth = True
    CONFIG.topology.growth_warmup_epochs = 20
@@ -32,8 +34,10 @@ RGB-only 训练与在线生长（当前默认）
    CONFIG.schedule.enable_coarse_growth = True
    CONFIG.contour.enabled = False
 
-损失仅为线性 RGB 的平方误差。读取 RGBA 图片时先按白底合成一次，随后只保留三个 RGB
-通道；普通 RGB 图片可直接使用。源图片的 alpha 仅参与这一步图像合成，不再作为训练
+损失仅为线性 RGB 的平方误差。新实验默认 ``data.reference_compositing="srgb"``：
+读取 sRGB RGBA 图片时，先将编码空间的 RGB 与白底按 alpha 合成，再解码为线性 RGB，
+随后只保留三个 RGB 通道；普通 RGB 图片直接解码为线性 RGB。
+源图片的 alpha 仅参与这一步图像合成，不再作为训练
 监督、几何门控、采样依据或删除证据。预测背景固定为白色。底层
 ``loss_and_grad(..., reference_rgb, reference_alpha, ..., {"rgb_only": 1})``
 要求 ``reference_rgb`` 已完成合成，并完全忽略兼容签名中的 ``reference_alpha``。
@@ -46,11 +50,12 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 本阶段仍使用 1 spp 的同样本残差，尚未实现多 spp 前缀估计器，也不声明其对无限采样
 平均图像 RGB 目标无偏。
 
-训练启用下面的 RGB 生长，继续关闭删除，保留已有分辨率调度及父体到子体的分裂。
+训练启用下面的 RGB 生长与删除，保留已有分辨率调度及父体到子体的分裂。
 分裂仍使用原有拟合与 opacity 衰减规则，本次不修改。分裂可能改变前向图像，不能视为严格
 保持渲染结果。RGB-only 去掉了 alpha 约束，RGB loss 的下降本身不能证明几何或 opacity
 唯一可辨识。要复现之前的无生长基线，同时关闭 ``topology.enable_growth``、
-``topology.use_rgb_growth`` 和 ``schedule.enable_coarse_growth``。
+``topology.use_rgb_growth`` 和 ``schedule.enable_coarse_growth``，并关闭
+``topology.enable_deletion`` 与 ``topology.use_rgb_deletion``。
 
 在线 RGB 生长：复用训练前向，不增加验证渲染
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -72,11 +77,12 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 停止准备生长候选、收集生长证据及提交新增体素，继续以 1 spp 优化已有体素。
 这是全局末尾窗口，不是每个分辨率层级各冻结 100 轮：总计 700 轮时冻结第 601–700 轮，
 总计 1000 轮时冻结第 901–1000 轮。设为 ``0`` 关闭这一额外窗口；大于或等于总轮数时
-整个训练都不生长。原来的层内 20 轮 warmup、分裂时机和层级预算均不变，删除仍关闭。
+整个训练都不生长。原来的层内 20 轮 warmup、分裂时机和层级预算均不变。
+删除有独立的末尾冻结配置，当前也为 100 轮，见下文。
 ``--stop-after-epochs`` 只暂停运行，不会重新定义完整训练的末尾。
 
 100 轮是用于检查末尾新增体素是否来不及优化的初始对照设置，不保证消除轮毂模糊；
-当前默认总轮数仍为 700。该设置保存在配置与 checkpoint 中，续训沿用保存值，
+当前默认总轮数为 1000。该设置保存在配置与 checkpoint 中，续训沿用保存值，
 不允许中途悄悄修改拓扑配置。可兼容的旧 checkpoint 若没有此字段，按 ``0`` 恢复，
 不会自动套用新实验的 100 轮；比较此规则应新开实验。
 
@@ -164,7 +170,7 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 候选在 GPU 上逐视角累积票数与收益，事件结束时才读取候选统计进行决策；安装候选和
 拓扑更新仍有 CPU 几何准备、状态快照与传输。没有每视角整图回读来进行生长投票。
 通过后正常优化新体素的几何、radiance SH 与 DC opacity，新生体素按原成熟期等待后
-才能继续成为父体。当前不新增 RGB-only 删除规则。
+才能继续成为父体。RGB-only 删除另外使用下面的收益与保护规则。
 
 ``training.jsonl`` 的生长事件在 ``topology.growth_rgb`` 中记录归一化模式、几何／评估
 候选数、有效／未知射线与视角数，以及无观测、支持不足、反对、无效数值和均值阈值等
@@ -180,18 +186,98 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 一定淘汰它们。应通过生长数量、有效／未知证据、损失及图像对照评估此次实验。
 分裂保持不变，也不能用本次生长规则声称 RGB 已唯一确定几何。
 
+在线 RGB 删除：复用命中反向，不增加 DDA
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+删除判断不再使用参考 alpha、前景／背景射线分类或旧的 alpha 冲突票。
+在现有命中反向循环中，令 ``T`` 为某体素命中前的透射率，``a`` 为其 opacity，
+``c`` 为它的颜色，``B`` 为从该命中之后看向射线末端的合成颜色（包含背景），
+``C`` 为当前完整预测，``y`` 为参考 RGB。单独移除这个体素的颜色变化及收益为：
+
+.. code-block:: text
+
+   dc   = T * a * (B - c)
+   gain = ||C - y||^2 - ||C + dc - y||^2
+        = -2 * dot(C - y, dc) - dot(dc, dc)
+
+这里使用三个 RGB 通道平方误差的和，与训练原生 loss 一致，不额外除以 3。
+收益大于零表示在当前射线及参数下，单独删除降低误差；负收益表示保留更好。
+``B`` 已由反向合成提供，不通过除以 ``1-a`` 反推，因此不会在 opacity 接近 1 时引入
+该除法的不稳定。删除不重新追踪、不延长已结束的 DDA、不额外保存一套后缀；但会增加
+GPU 上的算术、按体素归约和事件统计，并非零开销。
+
+确定收益仅来自正常离开网格或到达 ``ray.maxt`` 的完整基线路径，且采样权重为 1、
+相关数值有限。因透射率或实际命中容量提前停止的路径，在删除后可能露出未访问区域，
+相应命中只计 ``deletion_unknown``；未知按射线弃权，不取消其他可靠射线的证据。
+删除减少命中数并增加透射率，所以不套用生长的“新增一个命中的剩余容量”或
+“插入后最终透射率仍高于阈值”检查。没有命中、只有未知记录或聚合收益无效的视角
+不能提供删除支持；未知不是无害证明。
+
+每视角先 SUM 合并分批／多 GPU 的 ``deletion_gain``、``deletion_observed`` 和
+``deletion_unknown``，再以可靠命中数归一化收益，正、负、零收益均参与。视角均值超过
+``deletion_rgb_gain_epsilon`` 为支持票，低于其负值为反对票，其余中性；
+跨视角再对可靠观测视角均值求平均，可靠零收益视角仍计入分母。
+当前要求至少 3 个支持视角、没有反对视角，且跨视角带符号平均收益大于 ``1e-7``。
+这里的反对是一个视角的可靠命中平均收益为负，不是任意单条负收益射线直接否决。
+任一视角出现非有限聚合收益时，该体素本窗口不通过。
+
+配置集中在 ``train.py`` 的 ``CONFIG.topology``：
+
+.. code-block:: python
+
+   CONFIG.topology.enable_deletion = True
+   CONFIG.topology.use_rgb_deletion = True
+   CONFIG.topology.deletion_warmup_epochs = 20
+   CONFIG.topology.deletion_interval = 10
+   CONFIG.topology.deletion_protection_epochs = 20
+   CONFIG.topology.deletion_freeze_last_epochs = 100
+   CONFIG.topology.deletion_rgb_confirmation_windows = 2
+   CONFIG.topology.deletion_rgb_min_support_views = 3
+   CONFIG.topology.deletion_rgb_max_conflict_views = 1
+   CONFIG.topology.deletion_rgb_gain_epsilon = 1e-7
+   CONFIG.topology.deletion_rgb_min_mean_gain = 1e-7
+
+每个分辨率层级先 warmup 20 轮，然后第 30、40、50 等轮收集证据，每个窗口只包含
+该轮的全部训练视角。体素连续两个完整证据窗口通过才删除，中间不通过或缺少窗口会
+重置连续计数。因此初始体素最早可在层内第 40 轮删除；新生体素另外先保护 20 个完整
+训练轮次。删除后的格子沿用原冷却期，避免立即被重新生长；升层后重新 warmup，
+证据与连续确认状态重置。删除与生长都在 epoch 边界处理，幸存体素保留 Adam 状态。
+
+全局最后 100 轮停止收集及提交删除，配合生长冻结让已有体素继续优化；1000 轮对应
+第 901–1000 轮。``deletion_freeze_last_epochs=0`` 关闭该窗口，大于或等于总轮数时全程
+不删除。``--stop-after-epochs`` 不改变这个全局窗口。分裂规则、训练的 1 spp 不变。
+本规则只删除持续有正 RGB 收益证据的体素，**不因没有观测、零收益或 opacity 较低而删除**。
+
+``training.jsonl`` 的 ``topology.deletion_rgb`` 记录有效／未知命中、支持／反对、
+保护期、拒绝原因、等待确认与已确认数量；``topology.deleted`` 是本次实际删除数。
+这些拒绝原因可能重叠，不能求和当作被拒绝的唯一体素数。可靠比例仍仅覆盖已遇到的
+命中，未访问区域不在分母中。条件观测均值不能保证未知区域无损。
+
+训练仍然每视角更新一次参数，所以不同视角的证据对应不同的在线参数快照，不是
+同一个固定模型的全数据集联合删除损失。多个体素各自删除有益，也可能一起删除后
+损害图像；两窗口确认、反对票及新生保护降低误删风险，但不构成联合下降证明。
+当前不额外渲染验证联合删除，也不保证恢复轮毂细节或消除白雾，应通过新实验对照检查。
+
+源码版本、续训与启动
+~~~~~~~~~~~~~~~~~~~~
+
 此前按射线处理未知证据时修改了原生候选记录溢出规则，需要相应的 C++ 与绑定。
 RGB-only 启动会检查 ``mi.VoxelReconstruction.rgb_only_version``，启用生长还要求
 ``rgb_growth_version >= 2``；旧二进制不能只更新 Python 后继续使用。
-checkpoint 保存内部证据版本，旧 RGB 生长训练不能直接续训为本次证据规则，应新开实验；
+本次 RGB 删除另要求 ``mi.VoxelReconstruction.rgb_deletion_version >= 1``，
+**同步代码后必须增量编译，再启动新进程**。末尾冻结本身虽是 Python 调度，不能因此省略
+新增原生删除接口所需的编译。
+checkpoint 保存内部证据版本，使用旧版 RGB 生长证据规则的训练不能直接升级续训，应新开实验；
 旧模型仍可独立评价，证据版本不改变已保存的体素渲染参数。
-末尾生长冻结只修改 Python 调度，已有上述版本的源码构建无需再次编译。
+可兼容旧 checkpoint 缺少 ``use_rgb_deletion`` 时恢复为 ``False``，保留原来已保存的
+删除开关与调度，原先关闭删除的 RGB 实验不会自动启用新删除。要比较新规则，使用
+当前配置新开实验，不在旧 checkpoint 上切换算法。
 从仓库目录启动新的单卡实验：
 
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
-     --rgb-only --dataset datasets/lego --epochs 700 --chunk-size 0 \
+     --rgb-only --dataset datasets/lego --epochs 1000 --chunk-size 0 \
      --eval-spp 64 --eval-max-views 10
 
 在已经分配同节点两张 GPU 的 Linux Slurm 作业内启动新的双卡实验：
@@ -200,20 +286,21 @@ checkpoint 保存内部证据版本，旧 RGB 生长训练不能直接续训为�
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --workers 2 --worker-timeout 600 \
-     --rgb-only --dataset datasets/lego --epochs 700 --chunk-size 0 \
+     --rgb-only --dataset datasets/lego --epochs 1000 --chunk-size 0 \
      --eval-spp 64 --eval-max-views 10
 
 两条命令都自动创建新的实验目录。需要短跑时添加 ``--stop-after-epochs 10``，保持
-``--epochs 700``，避免改变完整调度。训练后的 64 spp 只用于评价出图，不改变训练 spp。
+``--epochs 1000``，避免改变完整调度。训练后的 64 spp 只用于评价出图，不改变训练 spp。
 双卡平台要求和资源分配方式见下文“同节点两张 GPU 训练与评价”。
-十轮只检查正常训练路径，不会触发默认 warmup 后的生长；检查第一次生长应改用
-``--stop-after-epochs 31 --skip-evaluation``。从仓库根目录执行 Windows 短跑：
+十轮只检查正常训练路径，不会触发默认 warmup 后的生长或删除。
+第一次生长／删除证据在第 30 轮；观察删除的第二次确认机会可短跑 41 轮，
+但是否实际删除仍取决于收益证据。从仓库根目录执行 Windows 短跑：
 
 .. code-block:: powershell
 
    & '..\envs\mitsuba\Scripts\python.exe' -I .\experiments\reconstruction\train.py `
-     --rgb-only --dataset datasets/lego --epochs 700 --chunk-size 0 `
-     --stop-after-epochs 31 --skip-evaluation --no-profile-stages
+     --rgb-only --dataset datasets/lego --epochs 1000 --chunk-size 0 `
+     --stop-after-epochs 41 --skip-evaluation --no-profile-stages
 
 已有 alpha 监督 checkpoint 禁止切换为 RGB-only 后续训，包含没有记录
 ``training.rgb_only`` 的旧 checkpoint；应从初始化开始新的 RGB-only 实验。
@@ -231,6 +318,10 @@ RGB-only checkpoint 同样不能切回旧监督模式。旧模型仍可通过
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_growth.py
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_growth_lifecycle.py
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_growth_training.py
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_deletion.py
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_deletion_driver.py
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_deletion_lifecycle.py
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_deletion_training.py
 
 该测试不打开真实数据集或既有实验，覆盖参考 alpha 不变性、RGB L2 的颜色与 opacity
 有限差分、白色目标及 miss 的几何梯度、DC opacity、三通道缓存、1 → 2 分裂及负 loss
@@ -242,8 +333,12 @@ RGB 生长测试另外使用小型合成场景，对照显式插入候选的独�
 旧归一化兼容与证据版本不匹配时的续训拒绝，以及粗细层 warmup。
 测试中的独立渲染仅是数值验证的参照，
 训练投票不执行这些额外渲染。
-下文保留通用运行细节与旧实现说明，其中 alpha 监督、contour、旧生长／删除及 1000 轮
-示例属于 legacy 配置；当前实验以本节及当前 ``CONFIG`` 为准。
+RGB 删除回归以实际移除体素后重新渲染的结果校验收益，覆盖正／负／零收益、
+提前终止与完整边界、未知与可靠射线混合、接近不透明的命中、禁用时的图像与梯度
+不变性、分片 SUM、原生重放、空模型和非法设置。生成场景检查不替代真实 Lego 的
+删除效果或多卡服务器吞吐测试。
+下文保留通用运行细节与旧实现说明，其中 alpha 监督、contour 和旧生长／删除规则
+属于 legacy 配置；当前实验以本节及当前 ``CONFIG`` 为准。
 
 单卡训练入口为 ``experiments/reconstruction/train.py``，实验性的同节点双卡启动器为
 ``experiments/reconstruction/train_multigpu.py``，评价入口为
@@ -283,10 +378,20 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 再计算图像均方误差。训练采用用户确定的 1 spp 目标；多 spp 只用于训练后出图与评价，
 不声称两种损失完全等价。
 
-训练的参考 RGBA 先解码为线性 RGB，随后严格沿用 Falcor 的固定白底公式
-``reference_rgb * alpha + (1 - alpha)``；该训练目标不随 ``render.background`` 改变。
-训练默认预测背景也为白色，与这一目标一致。底层接口若传入黑色预测背景，仅改变预测，
-不会将训练参考同步改成黑底，因此不应把它当作相同目标下的背景切换。
+新 RGB-only 实验使用 ``data.reference_compositing="srgb"``。对于标记为 sRGB 的输入
+（通常为 PNG），设原始编码 RGB 为 ``s``、alpha 为 ``a``，sRGB 解码函数为 ``D``，
+白底参考为 ``D(a*s + (1-a))``；合成在输入编码空间进行，随后只把线性 RGB 送给训练。
+渲染、损失、梯度，以及生长和删除收益仍全部在线性空间计算，不在 sRGB 上优化。
+对于线性输入（如未标记 sRGB 的 EXR），继续在线性空间合成；不会给线性数据套用 sRGB 解码。
+背景参数仍表示线性 RGB；评价若指定非白背景，编码空间合成前先把背景编码到 sRGB。
+
+``data.reference_compositing="linear"`` 保留旧协议：先解码，再按
+``a*D(s)+(1-a)`` 合成白底。这两个协议在半透明、抗锯齿边缘不等价。
+新协议统一的是参考图准备方式，不等价于 NeRF／3DGS 的 sRGB 训练损失。
+模式随配置和 checkpoint 保存：旧 checkpoint 缺少该字段时按 ``linear`` 续训和评价，
+不会被新的脚本默认值悄悄改变。续训不允许切换参考协议；比较新旧协议应新开实验。
+训练的预览、CPU／GPU 参考缓存及自动评价均使用对应配置中的同一协议。
+
 训练脚本明确要求 ``render.background=[1,1,1]``，非白背景会报错，防止意外优化不一致的目标。
 评价是独立流程：评价时的背景设置会同时用于预测与参考合成。此前预览默认黑底，
 比较实验必须明确对齐实际背景，不能仅凭 pass 名称认为设置相同。
@@ -511,12 +616,14 @@ legacy 模式的 CPU 参考图仍用于 contour 和旧生长证据；当前 RGB 
 * 原始 ``raw_alpha`` 只在 contour 采样器实际产生更新 token 时回读，用于更新采样历史。
 * legacy 模式中，概率校正后的 alpha 只在本轮需要收集旧生长证据时分配，训练入口直接传给 GPU 投票，
   不再先下载整张图。参考 alpha 复用 GPU 参考缓存；缓存关闭时按需上传。
-* 删除证据在 GPU 的跨视角 bitset 中累积，同一相机重复命中仍只计一次。
+* legacy 删除证据在 GPU 的跨视角 bitset 中累积，同一相机重复命中仍只计一次。
   到证据窗口边界才统计唯一视角数并交给原来的候选判定；保存、恢复和体素重排保持原状态格式。
 * legacy 生长证据的七个冻结采样点上传一次，各视角在 GPU 上投影并投票，在 epoch 边界取回票数。
   背景否决、前景支持门槛和完整视角集合检查保留。contour 的历史更新仍使用原 CPU 路径。
 * 当前 RGB 生长不走上述 alpha／七点投影路径；它在同次训练前向中计算每候选收益，
   GPU 上累计完整视角票数，到生长轮结束才读取候选级统计。
+* 当前 RGB 删除复用命中反向，GPU 上按体素累计可靠收益与视角票，到证据轮末读取
+  统计、更新连续确认次数；不为投票回读完整图像。
 
 这些调整不在训练的每个视角或每个 epoch 内出图。完成全部训练并保存最终模型后，
 训练入口调用评价脚本共用的流程，生成多 spp 图片和 PSNR。
@@ -538,6 +645,8 @@ legacy 训练启用删除/生长时，分别检查 ``deletion_device_views`` / `
 没有启用的步骤保持零。阶段耗时仍是包含异步等待的墙钟时间。
 当前 RGB 生长对应 ``rgb_growth_device_views``、``rgb_growth_cpu_views`` 和
 ``rgb_growth_readback_bytes``，不要用旧 alpha 生长计数判断 RGB 生长是否执行。
+RGB 删除对应 ``rgb_deletion_device_views``、``rgb_deletion_cpu_views`` 和
+``rgb_deletion_readback_bytes``，与旧 alpha 删除计数分开。
 
 此前这一性能优化没有修改原生接口，但当前新增在线 RGB 生长修改了 C++ 与绑定，必须重新编译。
 当前默认 RGB 生长与旧 alpha 生长算法不同，不能直接将它们的耗时差解释为同算法提速。
@@ -602,12 +711,14 @@ legacy 训练启用删除/生长时，分别检查 ``deletion_device_views`` / `
 每视角一次参数更新；没有改变算法或引入空区层次加速结构。实际收益取决于设备、
 射线分布和场景稀疏程度，不能保证 A100 的端到端吞吐提升。
 
-默认 256 → 512 调度在 256 阶段不消费删除证据。训练现在将实际证据需求传给原生
+legacy 的 256 → 512 调度在 256 阶段不消费删除证据。训练将其实际证据需求传给原生
 ``collect_deletion_evidence``，跳过这些未使用的计算；进入需要收集删除证据的目标
 分辨率后照常计算，跨视角累计、删除阈值、保护期与执行时机保持不变。256 阶段的生长
 仍然启用；跳过删除证据不等于关闭生长或删除功能。
+当前 RGB 删除使用独立的 ``collect_rgb_deletion_evidence``，粗细层都可在各自 warmup
+后的事件轮收集，规则见文首，不能套用上述 legacy 的“仅精细层”限制。
 
-生长证据期间，每批冻结候选的中心和六个轴向采样点在世界空间中只计算一次，后续
+legacy 生长证据期间，每批冻结候选的中心和六个轴向采样点在世界空间中只计算一次，后续
 视角复用这七点。每个视角仍重新投影并读取当前参考/渲染 alpha，不缓存或跳过证据；
 轮末仍依据当时的模型重新生成合法候选。父格与候选格的配对匹配改为无碰撞的 uint64
 键和排序查找，保持配对含义及候选原顺序。派生几何缓存不写入 checkpoint，候选批次
@@ -636,7 +747,8 @@ legacy 训练启用删除/生长时，分别检查 ``deletion_device_views`` / `
   分析普通轮次与生长/删除/细分轮次的差别。还记录初始化、checkpoint 保存、自动评价
   的耗时、运行环境和源码版本信息，便于区分训练计算与出图、保存等开销。
   拓扑事件轮包括生长证据采集轮、轮末证据评估轮及实际发生增删/细分的轮次；
-  512 阶段每轮常规采集删除证据，本身不将该轮归为拓扑事件轮。
+  legacy 的 512 阶段每轮常规采集删除证据，本身不将该轮归为拓扑事件轮；
+  当前 RGB 删除的周期证据评估轮由独立删除事件记录。
 * ``profile-training.jsonl``：稀疏抽样的 Dr.Jit 内核统计，用于判断编译、缓存和设备执行开销；
   不对所有训练视角开启详细内核记录。
 
@@ -901,11 +1013,12 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
    cmake --build .\mitsuba\build --config Release --parallel 2
    if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
    & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\train.py `
-     --dataset datasets/lego --epochs 10
+     --dataset datasets/lego --epochs 1000 --stop-after-epochs 10 --no-profile-stages
 
-训练 10 轮表示每个视角都会被访问 10 次。省略 ``--output-dir`` 时使用默认的自动实验目录。
-训练完成并保存模型后会自动生成 train/test 各前十个视角的 64 spp 图片和 PSNR。
-上述命令仍启用配置中的分辨率调度；
+上述命令保留 1000 轮分辨率调度，仅执行前 10 轮，即每个视角被访问 10 次，
+保存可续训 checkpoint，不生成最终评价。省略 ``--output-dir`` 时自动分配新实验目录。
+完整实验去掉 ``--stop-after-epochs 10``，结束并保存模型后会自动生成 train/test
+各前十个视角的 64 spp 图片和 PSNR。
 要使用前面的固定小网格例子，应将 JSON 保存到工作区，例如 ``train-config.json``，
 再以 ``--config train-config.json`` 运行。
 
@@ -984,7 +1097,7 @@ contour/Adam/RNG 状态和单卡/双进程之间的 checkpoint 恢复；生产�
 
 双卡拆分的是同一视角内的像素射线。两个进程保持相同模型、相机顺序、CPU 随机采样及
 contour 提案，每张卡计算各自不重叠的半幅像素。每个像素仍为 1 spp，每个 epoch
-仍遍历全部视角。通过 NCCL 在 GPU 上将梯度、有效计数和损失做 SUM 归约，布尔删除证据
+仍遍历全部视角。通过 NCCL 在 GPU 上将梯度、有效计数和损失做 SUM 归约，legacy 布尔删除证据
 用 MAX 合并，有限值状态合并检查。梯度不除以卡数，也不把不同视角组成新的训练 batch。
 拿到相同的完整视角梯度后，两份模型副本各执行相同的一次 Adam 更新，逻辑全局步数只加 1。
 浮点求和的分组和次序会改变，因此不保证与单卡逐位相同。
@@ -993,6 +1106,8 @@ rank 0 负责实验目录、日志、拓扑生长/删除/升层及 checkpoint；
 拓扑改变后将模型与 Adam 状态同步给 rank 1，并清除旧的原生重放记录。需要 contour
 历史或 legacy 生长证据时，额外合并预测 alpha；当前 RGB 生长只合并候选级
 ``growth_gain``、``growth_observed``、``growth_unknown``，然后由 rank 0 投一次完整视角票。
+RGB 删除同样对 ``deletion_gain``、``deletion_observed``、``deletion_unknown`` 做 SUM，
+在 rank 0 按完整视角的可靠命中数归一化，不能先投分片票再合并。
 普通轮次不因此回读完整 RGB 图像。
 
 完整训练结束后，两个进程继续执行最终 train/test 评价，默认仍为每个划分前十个视角、
@@ -1238,7 +1353,9 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 训练入口默认在保存最终模型后调用评价流程，使用 64 spp 渲染 train/test 各前十个视角，
 并保存每个视角的图片和 PSNR。相机按对应 JSON 顺序选择；不足十个时全取。
 这不限制训练视角或改变训练 1 spp。评价只读取 checkpoint，不更新模型或使用测试视角训练。
-默认主指标为线性 RGB PSNR，并同时报告 sRGB PSNR。
+默认主指标为 sRGB PSNR，并同时报告线性 RGB PSNR；这不改变线性训练损失。
+评价的参考合成默认继承 checkpoint 中的 ``data.reference_compositing``，
+缺字段的旧 checkpoint 使用 ``linear``。单卡、双卡及训练后的自动评价共用此规则。
 
 单卡入口使用一张 GPU 出图；经 ``train_multigpu.py`` 启动的完整训练保留两个
 工作进程，把上述已选视角分配到两张卡独立出图。选择范围与每视角 spp 不变，不将
@@ -1268,6 +1385,11 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 ``--test-cameras`` 覆盖。数据集默认继承 checkpoint 的相对路径，也可用 ``--dataset``
 指定当前机器上的同一数据。运行环境按当前平台重新选择，不继承另一台机器的 build
 绝对路径。``--background R G B`` 同时修改预测与真值的线性 RGB 背景；默认沿用训练。
+``--metric-color-space linear`` 可切换显示的主指标，两个颜色空间的指标始终保留。
+独立评价的 ``--reference-compositing srgb``／``linear`` 可显式覆盖参考协议，
+用于对照时请写入新的输出目录；它会改变真值和指标，不能与原协议分数直接混用。
+``evaluation-report.json`` 的 ``metric_protocol`` 记录实际协议及其来源
+（checkpoint、旧 checkpoint 默认或显式覆盖），训练后的自动评价不作此覆盖。
 独立评价入口省略 ``--max-views`` 时默认评价所选划分的全部视角（除非 ``--config`` 中另有设置）；
 训练入口的自动评价默认上限为十个，两者用途不同。报告同时记录划分总视角数、实际选中
 的视角及其数量；前十个视角的平均 PSNR 是子集指标，不能当作完整训练集或测试集的结果。
@@ -1292,9 +1414,10 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 PSNR 的具体约定：
 
 * MSE 对整张图的所有像素与 RGB 三个通道取平均；不应用前景 mask，峰值取 1。
-* 线性指标使用未裁剪的浮点线性 RGB；真值先按相同背景进行 alpha 合成。
+* 线性指标使用未裁剪的浮点线性 RGB；真值按保存或显式指定的参考协议准备。
 * sRGB 指标先将合成后的线性 RGB 裁剪到 [0, 1]，再应用 sRGB 传递函数。
-  仍使用浮点数据，不从 8 位 PNG 重新读回计算。
+  新 ``srgb`` 参考协议对 sRGB 图片等价于取编码空间的合成参考（允许浮点转换误差）。
+  仍使用浮点数据，不从 8 位 PNG 重新读回计算；预测的多 spp 平均在线性空间完成。
 * 报告逐图 PSNR 的算术平均，也单独报告平均 MSE 对应的 PSNR；两者不混用。
 * 完全相同图像的 PSNR 为正无穷，JSON 使用 ``null`` 和对应布尔标志表示，避免写入
   非标准的 ``Infinity``。
@@ -1324,8 +1447,9 @@ PNG 用于显示；进行论文或其他实现的 PSNR 对比时，应明确选�
   的资源处理分支；正常 Adam 数学规则保留。
 * 相机证据使用动态 bitset，支持不超过 32767 个视角；不采用 Falcor 默认编译容量 128。
 * 随机数序列、浮点归约顺序及跨 GPU 数值不同；不能声称逐位相同。
-* 按本次约定训练固定每视角 1 spp，未复制原训练多 spp 路径；训练入口强制白底以匹配
-  原参考合成公式，多 spp 及可配置背景用于独立评价。
+* 按本次约定训练固定每视角 1 spp，未复制原训练多 spp 路径；训练入口强制白底。
+  新实验参考图采用 sRGB 输入先合成、再解码的协议，训练仍优化线性 RGB；
+  旧 ``linear`` 协议可显式选择。多 spp 及可配置背景用于独立评价。
 
 本地验证记录与复现命令
 ----------------------

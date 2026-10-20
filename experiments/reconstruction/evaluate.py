@@ -37,7 +37,8 @@ class EvaluationConfig:
     max_views: int | None = None  # First N cameras per split; None evaluates all.
     seed: int = 42
     chunk_size: int = 65536
-    metric_color_space: str = "linear"
+    metric_color_space: str = "srgb"
+    reference_compositing: str | None = None  # None: checkpoint protocol; legacy missing field means linear.
     background: tuple[float, float, float] | None = None  # None: checkpoint setting.
     save_linear: bool = False
     output_directory: str = "outputs/mitsuba/reconstruction-evaluation"
@@ -74,6 +75,8 @@ def parse_config(workspace):
     parser.add_argument("--seed", type=int)
     parser.add_argument("--chunk-size", type=int)
     parser.add_argument("--metric-color-space", choices=("linear", "srgb"))
+    parser.add_argument("--reference-compositing", choices=("linear", "srgb"),
+                        help="Override checkpoint reference preprocessing; training always optimizes linear RGB")
     parser.add_argument("--background", nargs=3, type=float, metavar=("R", "G", "B"))
     parser.add_argument("--save-linear", action="store_true", default=None)
     parser.add_argument("--output-dir")
@@ -85,7 +88,7 @@ def parse_config(workspace):
     if args.config:
         _update_config(config, json.loads(preview.workspace_path(args.config, workspace).read_text(encoding="utf-8")))
     for name in ("checkpoint", "dataset", "spp", "max_views", "seed", "chunk_size",
-                 "metric_color_space", "background", "save_linear"):
+                 "metric_color_space", "reference_compositing", "background", "save_linear"):
         value = getattr(args, name)
         if value is not None:
             setattr(config, name, value)
@@ -125,6 +128,8 @@ def validate_config(config):
         raise ValueError("Each selected split requires a camera JSON filename")
     if config.metric_color_space not in ("linear", "srgb"):
         raise ValueError("metric_color_space must be linear or srgb")
+    if config.reference_compositing not in (None, "linear", "srgb"):
+        raise ValueError("reference_compositing must be None, linear or srgb")
     if config.background is not None and (
             len(config.background) != 3 or any(not math.isfinite(x) or not 0 <= x <= 1
                                              for x in config.background)):
@@ -174,8 +179,34 @@ def aggregate_metrics(records):
     return result
 
 
+def resolve_reference_compositing(config, checkpoint_config):
+    """Preserve old checkpoint targets unless the caller explicitly overrides them."""
+    if config.reference_compositing is not None:
+        mode, source = config.reference_compositing, "evaluation_override"
+    else:
+        saved_data = checkpoint_config.get("data", {})
+        mode = saved_data.get("reference_compositing", "linear")
+        source = "checkpoint" if "reference_compositing" in saved_data else "legacy_checkpoint_default"
+    if mode not in ("linear", "srgb"):
+        raise ValueError(f"Unsupported checkpoint reference compositing: {mode!r}")
+    return mode, source
+
+
+def reference_metric_protocol(mode, source):
+    return {
+        "reference_compositing": mode,
+        "reference_compositing_source": source,
+        "reference_preprocessing": (
+            "sRGB sources: composite encoded RGB and encoded background, then decode to linear RGB; "
+            "linear sources: composite in linear RGB" if mode == "srgb" else
+            "decode source RGB to linear RGB, then alpha composite with the linear background"),
+        "reference_alpha_usage": "reference preparation only; no foreground/background labels or metric masks",
+        "training_loss_color_space": "linear",
+    }
+
+
 def render_evaluation_record(config, common, model, render, view, split, output,
-                             mi, dr, np, view_timing, stage_seconds):
+                             mi, dr, np, view_timing, stage_seconds, *, reference_compositing=None):
     """Render one whole view with the same seed, metrics and files in either mode."""
     started = time.perf_counter()
     index = int(view["index"])
@@ -184,9 +215,11 @@ def render_evaluation_record(config, common, model, render, view, split, output,
         rgb, alpha = common.render_view(model, render, view["camera"], config.spp,
                                        seed, config.chunk_size, mi, dr, np)
     with _wall_stage(view_timing, stage_seconds, "reference_seconds"):
-        reference = common.read_reference(view["reference_path"], render.width, render.height, mi, np)
-        target = (reference[..., :3] * reference[..., 3:4]
-                  + (1 - reference[..., 3:4]) * np.asarray(render.background, dtype=np.float32))
+        target = common.read_reference(
+            view["reference_path"], render.width, render.height, mi, np,
+            rgb_only=True, background=render.background,
+            reference_compositing=(reference_compositing if reference_compositing is not None
+                                   else config.reference_compositing or "linear"))
     with _wall_stage(view_timing, stage_seconds, "metrics_seconds"):
         metrics = image_metrics(rgb, target, np)
     prediction_path = output / split / f"{index:04d}.png"
@@ -259,7 +292,8 @@ def merge_evaluation_workers(workers, selected_indices_by_split, metric_color_sp
         if status == "passed" and missing:
             raise ValueError(f"Missing evaluation views in {split}: {missing}")
         base = {} if template is None else {
-            key: template[key] for key in ("cameras", "max_views", "view_order", "available_view_count")
+            key: template[key] for key in ("cameras", "max_views", "view_order", "available_view_count",
+                                          "metric_protocol")
             if key in template}
         ordered = [records[index] for index in indices if index in records]
         result = dict(base, views=ordered, selected_view_count=len(indices), evaluated_view_count=len(ordered),
@@ -306,7 +340,7 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
         "metric_protocol": {
             "primary_color_space": config.metric_color_space,
             "mse": "mean over all image pixels and RGB channels; no mask; peak value 1",
-            "linear": "unclamped floating linear RGB after alpha compositing",
+            "linear": "unclamped floating linear RGB targets prepared under reference_compositing",
             "srgb": "linear RGB clipped to [0,1], IEC sRGB transfer, floating values before PNG quantization",
             "aggregation": "arithmetic mean of all per-view PSNR; PSNR of mean MSE also reported separately; no rank averaging",
             "view_selection": "first max_views cameras per split before sharding; None selects all",
@@ -331,6 +365,8 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
             "completed_epochs": checkpoint["training_state"].get("completed_epochs"),
             "global_step": checkpoint["training_state"].get("global_step"), "provenance": checkpoint["provenance"]}
         saved = checkpoint["config"]
+        reference_compositing, reference_source = resolve_reference_compositing(config, saved)
+        report["metric_protocol"].update(reference_metric_protocol(reference_compositing, reference_source))
         render = preview.RenderConfig()
         for key, value in saved.get("render", {}).items():
             if key not in {item.name for item in fields(render)}:
@@ -401,6 +437,7 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
                 records = []
                 stages = dict.fromkeys(("render_seconds", "reference_seconds", "metrics_seconds", "write_seconds"), 0.)
                 split_report = {"cameras": plan["cameras"], "views": records,
+                    "metric_protocol": report["metric_protocol"],
                     "max_views": config.max_views, "view_order": "camera file order",
                     "available_view_count": plan["available_view_count"], "selected_view_count": len(all_views),
                     "assigned_view_count": len(assigned), "evaluated_view_count": 0, "status": "running",
@@ -413,7 +450,8 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
                         view_timing = dict.fromkeys(stages, 0.)
                         split_report["incomplete_view"] = {"index": index, "stage_seconds": view_timing}
                         record = render_evaluation_record(config, common, model, render, view, split,
-                            output, mi, dr, np, view_timing, stages)
+                            output, mi, dr, np, view_timing, stages,
+                            reference_compositing=reference_compositing)
                         record["rank"] = distributed.rank
                         records.append(record)
                         split_report.pop("incomplete_view", None)
@@ -520,7 +558,7 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
         "metric_protocol": {
             "primary_color_space": config.metric_color_space,
             "mse": "mean over all image pixels and RGB channels; no mask; peak value 1",
-            "linear": "unclamped floating linear RGB after alpha compositing",
+            "linear": "unclamped floating linear RGB targets prepared under reference_compositing",
             "srgb": "linear RGB clipped to [0,1], IEC sRGB transfer, floating values before PNG quantization",
             "aggregation": "arithmetic mean of per-view PSNR; PSNR of mean MSE also reported separately",
             "view_selection": "first max_views cameras per split in camera file order; None selects all",
@@ -540,6 +578,8 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
                                  "global_step": checkpoint["training_state"].get("global_step"),
                                  "provenance": checkpoint["provenance"]}
         saved = checkpoint["config"]
+        reference_compositing, reference_source = resolve_reference_compositing(config, saved)
+        report["metric_protocol"].update(reference_metric_protocol(reference_compositing, reference_source))
         render = preview.RenderConfig()
         for key, value in saved.get("render", {}).items():
             if key not in {item.name for item in fields(render)}:
@@ -577,6 +617,7 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
                 ("render_seconds", "reference_seconds", "metrics_seconds", "write_seconds"), 0.0)
             split_report = {
                 "cameras": cameras_file, "views": records,
+                "metric_protocol": report["metric_protocol"],
                 "max_views": config.max_views, "view_order": "camera file order",
                 "evaluated_view_count": 0, "status": "running",
                 "seconds": 0.0, "stage_seconds": stage_seconds,
@@ -599,7 +640,8 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
                     view_timing = dict.fromkeys(stage_seconds, 0.0)
                     split_report["incomplete_view"] = {"index": index, "stage_seconds": view_timing}
                     record = render_evaluation_record(config, common, model, render, view, split,
-                        output, mi, dr, np, view_timing, stage_seconds)
+                        output, mi, dr, np, view_timing, stage_seconds,
+                        reference_compositing=reference_compositing)
                     records.append(record)
                     del split_report["incomplete_view"]
                     split_report["evaluated_view_count"] = len(records)

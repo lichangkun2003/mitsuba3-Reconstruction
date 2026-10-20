@@ -482,6 +482,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         {"transmittance_threshold", .01f}, {"max_hits", 16.f},
         {"max_candidates", 16.f}, {"entry_offset_fraction", 0.f},
         {"profile_stages", 0.f}, {"rgb_only", 0.f},
+        {"collect_rgb_deletion_evidence", 0.f},
         {"collect_growth_evidence", 0.f}, {"max_growth_hits", 8.f}};
     for (const auto &[key, value] : settings) {
         if (cfg.find(key) == cfg.end() || !std::isfinite(value) || value < 0.f)
@@ -489,6 +490,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         cfg[key] = value;
     }
     const bool rgb_only = cfg["rgb_only"] != 0.f;
+    const bool collect_rgb_deletion = cfg["collect_rgb_deletion_evidence"] != 0.f;
+    if (collect_rgb_deletion && !rgb_only)
+        Throw("VoxelReconstruction.loss_and_grad(): RGB deletion evidence requires RGB-only mode.");
     const bool growth_requested = cfg["collect_growth_evidence"] != 0.f;
     const bool collect_growth = growth_requested && m_growth_count != 0;
     const uint32_t max_growth_hits = uint32_t(cfg["max_growth_hits"]);
@@ -525,6 +529,10 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 dr::schedule(value);
             for (const auto &[key, value] : result.growth_counts)
                 dr::schedule(value);
+            for (const auto &[key, value] : result.deletion_sums)
+                dr::schedule(value);
+            for (const auto &[key, value] : result.deletion_counts)
+                dr::schedule(value);
             dr::eval();
         }
     };
@@ -549,6 +557,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             result.growth_sums["growth_gain"] = dr::zeros<FloatBuffer>(0);
             result.growth_counts["growth_observed"] = dr::zeros<UIntBuffer>(0);
             result.growth_counts["growth_unknown"] = dr::zeros<UIntBuffer>(0);
+        }
+        if (collect_rgb_deletion) {
+            result.deletion_sums["deletion_gain"] = dr::zeros<FloatBuffer>(0);
+            result.deletion_counts["deletion_observed"] = dr::zeros<UIntBuffer>(0);
+            result.deletion_counts["deletion_unknown"] = dr::zeros<UIntBuffer>(0);
         }
         if (profiler.enabled()) {
             evaluate_result(result);
@@ -952,6 +965,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         result.gradients[name]=dr::zeros<FloatBuffer>(size);
     for(const auto *key:{"appearance_valid","geometry_valid","background_carve_valid","foreground_evidence","background_evidence"})
         result.counters[key]=dr::zeros<UIntBuffer>(m_active_count);
+    if (collect_rgb_deletion) {
+        result.deletion_sums["deletion_gain"] = dr::zeros<FloatBuffer>(m_active_count);
+        result.deletion_counts["deletion_observed"] = dr::zeros<UIntBuffer>(m_active_count);
+        result.deletion_counts["deletion_unknown"] = dr::zeros<UIntBuffer>(m_active_count);
+    }
     if (!m_active_count) {
         if (profiler.enabled()) {
             evaluate_result(result);
@@ -1026,6 +1044,22 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
 
     // Hit records stay read-only inside the symbolic reverse loop. Separate
     // suffix storage avoids a gather-after-scatter evaluation at every hit.
+    Mask deletion_complete(false);
+    Color3f deletion_residual(0.f);
+    if (collect_rgb_deletion) {
+        // Removing an actual hit can reveal an untraced suffix after opacity
+        // or capacity termination. Only a normally exited baseline certifies
+        // that the recorded suffix is complete; no extra traversal is done.
+        // Removal reduces hit count and increases T, so insertion's spare-hit
+        // capacity and reduced-final-T checks do not apply.
+        Mask exited = !dr::all(state.cell>=0) | !dr::all(state.cell<int(m_resolution)) |
+                      (state.entry>=exit);
+        deletion_complete = exited & (state.iterations<=3*m_resolution+3) &
+                            (weight==1.f) & dr::isfinite(inverse_pdf) &
+                            dr::all(dr::isfinite(result.raw_rgb)) &
+                            dr::all(dr::isfinite(reference_rgb));
+        deletion_residual = result.raw_rgb-reference_rgb;
+    }
     struct ReverseState {
         Int32 hit;
         Color3f behind;
@@ -1033,15 +1067,20 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         FloatBuffer suffix;
         GradientMap gradients;
         CounterMap counters;
-        DRJIT_STRUCT(ReverseState,hit,behind,after,suffix,gradients,counters)
+        GradientMap deletion_sums;
+        CounterMap deletion_counts;
+        DRJIT_STRUCT(ReverseState,hit,behind,after,suffix,gradients,counters,
+                     deletion_sums,deletion_counts)
     } reverse{dr::full<Int32>(int(max_hits)-1,width),background,Float(1.f),
               dr::zeros<FloatBuffer>(size_t(hit_stride)*4),
-              std::move(result.gradients),std::move(result.counters)};
+              std::move(result.gradients),std::move(result.counters),
+              std::move(result.deletion_sums),std::move(result.deletion_counts)};
     dr::tie(reverse)=dr::while_loop(dr::make_tuple(std::move(reverse)),
         [](const ReverseState &s) { return s.hit>=0; },
         [this,hit_records=records.hit,hit_ids=records.hit_id,hit_count=state.hits,
          ray_count,hit_stride,lane,clean,dcolor,dalpha,d,weight,is_background,
-         is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry,rgb_only](ReverseState &s) {
+         is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry,rgb_only,
+         collect_rgb_deletion,deletion_complete,deletion_residual](ReverseState &s) {
             Mask valid=UInt32(s.hit)<hit_count;
             UInt32 slot=UInt32(s.hit)*ray_count+lane,id=dr::gather<UInt32>(hit_ids,slot,valid);
             Vector3f offset;Color3f radiance;
@@ -1077,6 +1116,24 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 dr::scatter_reduce(ReduceOp::Or,s.counters["background_evidence"],UInt32(1),id,
                     visible&is_background&(delta_loss<-cfg.at("min_removal_loss_delta")));
             }
+            if (collect_rgb_deletion) {
+                // Exact single-removal color change on a complete baseline:
+                // C_without - C = T_before * alpha * (suffix - radiance).
+                // Use the existing reverse suffix directly, including when
+                // alpha approaches one; never divide by (1-alpha).
+                Color3f dc = before*opacity*(s.behind-radiance);
+                Float gain = -2.f*dr::dot(deletion_residual,dc)-dr::squared_norm(dc);
+                Mask known = valid & deletion_complete & dr::isfinite(before) &
+                             dr::isfinite(opacity) & dr::all(dr::isfinite(radiance)) &
+                             dr::all(dr::isfinite(s.behind)) &
+                             dr::all(dr::isfinite(dc)) & dr::isfinite(gain);
+                dr::scatter_reduce(ReduceOp::Add,s.deletion_sums["deletion_gain"],
+                    dr::detach(gain),id,known);
+                dr::scatter_reduce(ReduceOp::Add,s.deletion_counts["deletion_observed"],
+                    UInt32(1),id,known);
+                dr::scatter_reduce(ReduceOp::Add,s.deletion_counts["deletion_unknown"],
+                    UInt32(1),id,valid&!known);
+            }
             add_geometry(s.gradients,s.counters,id,offset,gmin,before,opacity,radiance,s.behind,s.after,valid,true);
             s.behind=dr::select(valid,clean(opacity*radiance+(1.f-opacity)*s.behind),s.behind);
             s.after=dr::select(valid,dr::clip(clean(s.after*(1.f-opacity)),0.f,1.f),s.after);
@@ -1089,12 +1146,16 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         },"Voxel reconstruction reverse paths");
     result.gradients=std::move(reverse.gradients);
     result.counters=std::move(reverse.counters);
+    result.deletion_sums=std::move(reverse.deletion_sums);
+    result.deletion_counts=std::move(reverse.deletion_counts);
     // Loop traversal includes maps, while schedule() needs their buffers
     // explicitly. Materialize all reverse outputs at the existing stage boundary.
     if constexpr (dr::is_jit_v<Float>) {
         dr::schedule(reverse.suffix);
         for(const auto &[name,value]:result.gradients) dr::schedule(value);
         for(const auto &[name,value]:result.counters) dr::schedule(value);
+        for(const auto &[name,value]:result.deletion_sums) dr::schedule(value);
+        for(const auto &[name,value]:result.deletion_counts) dr::schedule(value);
     }
     if (profiler.enabled()) {
         evaluate_result(result);

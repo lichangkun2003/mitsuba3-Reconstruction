@@ -5,11 +5,20 @@
 切换场景修改 ``CONFIG.data.dataset``，或传入 ``--dataset datasets/lego``；
 命令行参数覆盖配置文件与默认配置。RTX 5090 Windows 主机使用这个单卡入口。
 
-当前为 RGB-only 训练加在线 RGB 生长：保留原来两个合法父体支持、有限边界接触和
+参考图协议由 ``CONFIG.data.reference_compositing = "srgb"`` 控制。新实验对 sRGB PNG
+先在编码空间用 alpha 合成白背景，再解码为线性 RGB；渲染、训练损失、梯度和拓扑收益
+始终在线性空间计算。普通 RGB 图直接解码；线性 EXR 继续在线性空间合成。
+预览、训练与评价共用读图实现。参考 alpha 仅用于这一预处理步骤。
+``"linear"`` 保留旧的“先解码、再合成”目标，半透明边缘与新协议不同。
+旧 checkpoint 缺少该字段时仍按 ``linear`` 续训与评价；比较新协议应新开实验。
+默认评价主指标改为 sRGB PSNR，同时保留线性 PSNR；不改变训练的损失空间。
+
+当前为 RGB-only 训练加在线 RGB 生长与删除：保留原来两个合法父体支持、有限边界接触和
 外伸的候选规则，利用正常训练前向计算候选的虚拟插入 RGB 收益，不额外渲染确认。
 粗层、细层分别先冻结生长 20 轮，之后按 10 轮周期处理；各层第一次事件在第 30 轮。
-完整训练的最后 100 轮停止生长，只继续优化已有体素。
-分裂机制不变，删除仍关闭，训练保持 1 spp。配置位置：
+删除复用已有命中反向中的后缀颜色，判断单独移除体素是否降低 RGB 误差，不另做前向。
+完整训练的最后 100 轮同时停止生长和删除，继续优化已有体素。
+分裂机制不变，训练保持 1 spp。配置位置：
 
 .. code-block:: python
 
@@ -18,12 +27,23 @@
    CONFIG.topology.growth_fine_warmup_epochs = 20
    CONFIG.topology.growth_freeze_last_epochs = 100
    CONFIG.topology.growth_rgb_normalization = "observed"
+   CONFIG.topology.enable_deletion = True
+   CONFIG.topology.use_rgb_deletion = True
+   CONFIG.topology.deletion_warmup_epochs = 20
+   CONFIG.topology.deletion_interval = 10
+   CONFIG.topology.deletion_protection_epochs = 20
+   CONFIG.topology.deletion_freeze_last_epochs = 100
+   CONFIG.topology.deletion_rgb_confirmation_windows = 2
+   CONFIG.topology.deletion_rgb_min_support_views = 3
+   CONFIG.topology.deletion_rgb_max_conflict_views = 1
+   CONFIG.topology.deletion_rgb_gain_epsilon = 1e-7
+   CONFIG.topology.deletion_rgb_min_mean_gain = 1e-7
 
 末尾冻结按全局总轮数计算：700 轮实验冻结第 601–700 轮，1000 轮实验冻结第 901–1000 轮，
 期间不准备生长候选、不收集生长证据，也不提交新增体素。设为 ``0`` 关闭该窗口；
 设为大于或等于总轮数时，全程不生长。层级预算、分裂及层内 warmup 不变，
 ``--stop-after-epochs`` 不会将暂停位置当作完整训练的结尾。
-100 轮是初始对照设置，不保证消除细节模糊；当前默认总轮数仍为 700。
+100 轮是初始对照设置，不保证消除细节模糊；当前默认总轮数为 1000。
 续训保留 checkpoint 保存的拓扑配置，缺少此字段的可兼容旧 checkpoint 按 ``0`` 恢复；
 启用新规则应新开实验，不在旧实验中途修改。
 
@@ -37,13 +57,31 @@
 
 可靠射线均值带有条件选择偏差，不是完整视角收益的无偏估计。日志记录已遇到候选命中的
 可靠比例，未访问的候选不计入覆盖率；该比例仅用于分析，不设置新门槛。
+删除收益为 ``dc=T*a*(B-c)``、``gain=-2*dot(C-reference_rgb,dc)-dot(dc,dc)``：
+``B`` 是已有反向中的后方合成颜色，``T`` 为命中前透射率，``a``／``c`` 是该体素的
+opacity／颜色。不需要除以 ``1-a``，也不重新追踪，但会增加 GPU 算术与统计归约。
+仅正常退出网格或到达 ``ray.maxt`` 的完整路径、单位采样权重和有限数值提供证据；
+因透射率或容量提前终止时，删除可能暴露未追踪区域，对应射线弃权。
+删除同样先按可靠命中数求视角均值，再按可靠观测视角求均值；不因未知射线取消整票。
+每个层级前 20 轮不收集删除证据，第 30、40 等事件轮各遍历全部训练视角。
+默认至少 3 个支持视角、没有可靠均值为负的反对视角、跨视角收益超过 ``1e-7``，
+且连续两个事件窗口通过才删除；新生体素额外保护 20 个完整轮次。
+无观测、零收益或低 opacity 均不会单独触发删除。
+
+这些是在线参数快照上的单体素收益，不是固定模型的联合删除证明。多体素分别有益、
+一起删除仍可能有害；未知区域也不被可靠射线的均值覆盖。应对照实际图像，不能保证
+轮毂改善。更完整的公式、事件日志和局限见训练文档。
+
 此前按射线处理未知证据时修改了 C++ 的记录溢出处理，源码构建需满足
-``mi.VoxelReconstruction.rgb_growth_version >= 2``。旧 RGB 生长 checkpoint 不能直接
-续训为新证据规则，但旧模型仍可独立评价。完整投票定义、截断弃权、每射线记录容量与
+``mi.VoxelReconstruction.rgb_growth_version >= 2``。使用更早版本 RGB 生长证据的 checkpoint
+不能直接升级续训，但旧模型仍可独立评价。完整投票定义、截断弃权、每射线记录容量与
 局限见 ``docs/reconstruction_training.rst`` 开头。
-末尾生长冻结仅修改 Python 调度，已有上述版本时无需重新编译 C++。
-仅运行十轮不会覆盖生长；检查一次默认生长事件可保留 ``--epochs 700``，另传
-``--stop-after-epochs 31 --skip-evaluation``。这仍是新实验，不会修改已有结果。
+本次新增原生 RGB 删除，要求 ``mi.VoxelReconstruction.rgb_deletion_version >= 1``，
+同步后必须增量编译。旧 checkpoint 缺少 ``use_rgb_deletion`` 时按 ``False`` 恢复，
+保留原有已保存配置，不自动给原来关闭删除的实验启用此机制；启用应新开实验。
+仅运行十轮不会覆盖生长／删除；保留 ``--epochs 1000``，另传
+``--stop-after-epochs 41 --skip-evaluation`` 可覆盖前两次证据事件，
+是否生长或删除仍取决于数据。这是新实验，不会修改已有结果。
 
 目录导航
 --------
@@ -202,27 +240,63 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 单卡实验命令
 ------------
 
-先短跑十轮，保留完整实验的 700 轮调度预算：
+先短跑十轮，保留完整实验的 1000 轮调度预算：
 
 .. code-block:: powershell
 
    & '..\envs\mitsuba\Scripts\python.exe' -I .\experiments\reconstruction\train.py `
-     --dataset datasets/lego --gpu 0 --epochs 700 --stop-after-epochs 10 `
+     --dataset datasets/lego --gpu 0 --epochs 1000 --stop-after-epochs 10 `
      --chunk-size 0 --no-profile-stages
 
 此短跑保存可续训 checkpoint，不发布最终 ``model.npz`` 或自动执行最终评价。
-新开完整的 700 轮实验：
+新开完整的 1000 轮实验：
 
 .. code-block:: powershell
 
    & '..\envs\mitsuba\Scripts\python.exe' -I .\experiments\reconstruction\train.py `
-     --dataset datasets/lego --gpu 0 --epochs 700 --chunk-size 0 `
+     --dataset datasets/lego --gpu 0 --epochs 1000 --chunk-size 0 `
      --no-profile-stages --eval-spp 64 --eval-max-views 10
 
 ``--no-profile-stages`` 关闭分段诊断，使抽样视角也能使用原生重放，适合速度比较。
 若需要定位前向与反向耗时，可重新开启 ``--profile-stages``。
 短跑与完整命令分别创建新实验；若要接着短跑训练，使用其实际 checkpoint 路径传给
 ``--resume``，不要把短跑命令重复执行当作续训。
+
+已部署主机同步与增量编译
+----------------------
+
+先将本地修改提交并 push，再在运行机器更新。若旧训练仍使用同一源码／构建目录，
+先等它结束再更新。Windows PowerShell 在仓库根目录执行：
+
+.. code-block:: powershell
+
+   git -c submodule.recurse=false pull --ff-only
+   if ($LASTEXITCODE -ne 0) { throw 'Pull failed' }
+   git submodule update --init --recursive
+   if ($LASTEXITCODE -ne 0) { throw 'Submodule update failed' }
+   cmake --build build --config Release --parallel 2
+   if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+
+随后运行上一节的单卡训练命令。HPC 在已经获得 GPU 的 Slurm 作业终端执行：
+
+.. code-block:: bash
+
+   test -n "${SLURM_JOB_ID:-}" &&
+   source /apps/local/conda_init.sh &&
+   conda activate "$HOME/envs/mitsuba" &&
+   cd "$HOME/projects/reconstruction/mitsuba" &&
+   git -c submodule.recurse=false pull --ff-only &&
+   git submodule update --init --recursive &&
+   cmake --build build --parallel "${SLURM_CPUS_PER_TASK:-1}" &&
+   source build/setpath.sh
+
+编译完成后新开单卡实验，保持调度器分配的 GPU：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
+     --dataset datasets/lego --epochs 1000 --chunk-size 0 \
+     --no-profile-stages --eval-spp 64 --eval-max-views 10
 
 实验输出仍自动分配为 ``outputs/场景-MM.DD-E编号/``，其中 ``E`` 表示实验编号。
 最终 ``model.npz``、训练日志与训练／测试视角评价结果存于同一次实验目录。
@@ -232,10 +306,12 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 当前算法范围
 ------------
 
-当前默认是 RGB-only 加在线生长：800 × 800、每视角 1 spp、opacity 仅优化 DC。
-参考 alpha 只在读取时参与白底合成，之后不参与训练监督或筛选。
-启用同次训练前向中的 RGB 生长证据，粗、细层各 warmup 20 轮；关闭删除，保留 256 → 512 分裂。
-新实验在全局最后 100 轮冻结生长，继续以 1 spp 优化已有体素。
+当前默认是 RGB-only 加在线生长与删除：800 × 800、每视角 1 spp、opacity 仅优化 DC。
+参考 alpha 只在读取时参与白底合成，之后不参与训练监督或筛选；sRGB 图片先合成再解码，
+训练输入仍为线性 RGB。
+启用同次训练前向中的 RGB 生长证据，以及已有反向中的 RGB 删除证据，
+每个层级各 warmup 20 轮；保留 256 → 512 分裂。
+新实验在全局最后 100 轮冻结生长和删除，继续以 1 spp 优化已有体素。
 最终出图为 64 spp，训练集与测试集各取前 10 个视角。
 
 旧 alpha 监督 checkpoint 不能直接切换为 RGB-only 续训，应新开实验；旧模型仍可

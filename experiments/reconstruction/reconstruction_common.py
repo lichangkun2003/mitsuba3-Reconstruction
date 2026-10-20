@@ -8,6 +8,8 @@ import math
 from pathlib import Path
 import sys
 
+from reconstruction_color import reference_from_bitmap, validate_reference_compositing
+
 from preview import (
     REPOSITORY, WORKSPACE, PreviewConfig, RenderConfig, RuntimeConfig, configure_drjit_threads,
     file_sha256, load_camera, prepare_runtime, source_provenance,
@@ -87,36 +89,25 @@ def load_views(dataset: Path, cameras_file: str, render: RenderConfig, np) -> li
     return views
 
 
-def read_reference(path, width, height, mi, np, *, rgb_only=False, background=(1, 1, 1)):
-    """Decode linear targets; RGB-only mode discards alpha after compositing.
-
-    Bitmap conversion supplies alpha=1 for ordinary RGB files. The RGBA
-    default remains available for legacy alpha-supervised experiments.
-    """
-    bitmap = mi.Bitmap(str(path)).convert(mi.Bitmap.PixelFormat.RGBA, mi.Struct.Type.Float32, False)
-    rgba = np.array(bitmap, dtype=np.float32, copy=True)
-    if rgba.shape != (height, width, 4):
-        raise ValueError(f"Reference dimensions {rgba.shape} differ from {(height, width, 4)}: {path}; no implicit resampling")
-    if not np.isfinite(rgba).all() or np.any(rgba[..., 3] < 0) or np.any(rgba[..., 3] > 1):
-        raise ValueError(f"Reference contains nonfinite values or invalid alpha: {path}")
-    if rgb_only:
-        background = np.asarray(background, dtype=np.float32)
-        if background.shape != (3,) or not np.isfinite(background).all():
-            raise ValueError("Reference background must contain three finite values")
-        alpha = rgba[..., 3:4]
-        return np.ascontiguousarray(rgba[..., :3] * alpha + background * (1 - alpha))
-    return rgba
+def read_reference(path, width, height, mi, np, *, rgb_only=False, background=(1, 1, 1),
+                   reference_compositing="linear"):
+    """Read linear targets with the selected reference compositing convention."""
+    return reference_from_bitmap(
+        mi.Bitmap(str(path)), mi, np, rgb_only=rgb_only, background=background,
+        reference_compositing=reference_compositing, width=width, height=height, path=path)
 
 
 class ReferenceImageCache:
     """Bounded RAM cache of linear targets; RGB-only entries retain no alpha."""
 
     def __init__(self, width, height, mi, np, capacity_mib=1024, *,
-                 rgb_only=False, background=(1, 1, 1)):
+                 rgb_only=False, background=(1, 1, 1), reference_compositing="linear"):
         if isinstance(capacity_mib, bool) or not isinstance(capacity_mib, int) or capacity_mib < 0:
             raise ValueError("reference_cache_mib must be a nonnegative integer")
         self.width, self.height, self.mi, self.np = width, height, mi, np
         self.rgb_only, self.background = rgb_only, background
+        validate_reference_compositing(reference_compositing)
+        self.reference_compositing = reference_compositing
         self.capacity_bytes = capacity_mib * 1024 * 1024
         self.resident_bytes = 0
         self.hits = self.misses = self.evictions = 0
@@ -126,15 +117,18 @@ class ReferenceImageCache:
         if self.capacity_bytes == 0:
             self.misses += 1
             return read_reference(path, self.width, self.height, self.mi, self.np,
-                                  rgb_only=self.rgb_only, background=self.background)
-        key = (str(Path(path).resolve()), self.width, self.height)
+                                  rgb_only=self.rgb_only, background=self.background,
+                                  reference_compositing=self.reference_compositing)
+        key = (str(Path(path).resolve()), self.width, self.height, self.rgb_only,
+               tuple(self.background), self.reference_compositing)
         if key in self._images:
             self.hits += 1
             self._images.move_to_end(key)
             return self._images[key]
         self.misses += 1
         rgba = read_reference(key[0], self.width, self.height, self.mi, self.np,
-                              rgb_only=self.rgb_only, background=self.background)
+                              rgb_only=self.rgb_only, background=self.background,
+                              reference_compositing=self.reference_compositing)
         if rgba.nbytes <= self.capacity_bytes:
             while self.resident_bytes + rgba.nbytes > self.capacity_bytes:
                 _, old = self._images.popitem(last=False)

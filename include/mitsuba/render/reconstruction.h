@@ -27,6 +27,8 @@ public:
     static constexpr uint32_t rgb_only_version = 1;
     /// Frozen empty-cell proposals; overflow only invalidates unstored records.
     static constexpr uint32_t rgb_growth_version = 2;
+    /// Per-hit single-removal RGB gains on complete baseline paths.
+    static constexpr uint32_t rgb_deletion_version = 1;
 
     VoxelReconstruction(const std::string &filename, uint32_t resolution,
                         const std::array<float, 3> &grid_min,
@@ -61,6 +63,10 @@ public:
         /// Incomplete paths and unstored overflow candidates contribute unknown.
         std::map<std::string, FloatBuffer> growth_sums;
         std::map<std::string, UIntBuffer> growth_counts;
+        /// Optional per-voxel single-removal RGB gain and ray coverage.
+        /// Truncated or invalid paths abstain without affecting other rays.
+        std::map<std::string, FloatBuffer> deletion_sums;
+        std::map<std::string, UIntBuffer> deletion_counts;
         /// Populated only by the diagnostic profile_stages setting.
         std::map<std::string, std::map<std::string, double>> stage_profile;
     };
@@ -70,7 +76,9 @@ public:
     /// With settings["rgb_only"] != 0, reference_rgb is the composited target
     /// and reference_alpha is ignored (including its width and values). This
     /// mode uses RGB loss and the ungated sigmoid-distance geometry proxy;
-    /// alpha supervision, background carving, and deletion evidence are off.
+    /// alpha supervision, background carving, and legacy deletion evidence
+    /// are off. collect_rgb_deletion_evidence explicitly enables RGB-only
+    /// single-removal evidence using the existing reverse traversal.
     /// Internal opacity, transmittance, and returned rendered alpha remain active.
     TrainingResult loss_and_grad(const Ray3f &ray, const Color3f &reference_rgb,
                                  const Float &reference_alpha,

@@ -118,6 +118,10 @@ MI_PY_EXPORT(VoxelReconstruction) {
                 result[nb::str(key.c_str())] = value;
             for (const auto &[key, value] : values.growth_counts)
                 result[nb::str(key.c_str())] = value;
+            for (const auto &[key, value] : values.deletion_sums)
+                result[nb::str(key.c_str())] = value;
+            for (const auto &[key, value] : values.deletion_counts)
+                result[nb::str(key.c_str())] = value;
             if (!values.stage_profile.empty())
                 result["stage_profile"] = values.stage_profile;
             return result;
@@ -126,7 +130,8 @@ MI_PY_EXPORT(VoxelReconstruction) {
            "settings"_a = std::map<std::string, float>(),
            "Explicit gradients summed over rays. With settings['rgb_only']=1, reference_rgb "
            "is the composited target, reference_alpha is ignored, and alpha supervision, "
-           "background carving, deletion evidence, and geometry direction gates are disabled.")
+           "background carving, legacy deletion evidence, and geometry direction gates are disabled. "
+           "collect_rgb_deletion_evidence enables RGB-only removal evidence without another trace.")
         .def("trace", &Model::trace, "ray"_a, "background"_a = Color3f(0.f),
              "transmittance_threshold"_a = .01f, "max_hits"_a = 16,
              "entry_offset_fraction"_a = 0.f)
@@ -151,5 +156,6 @@ MI_PY_EXPORT(VoxelReconstruction) {
            "Treat these arrays as read-only.");
     cls.attr("rgb_only_version") = nb::int_(Model::rgb_only_version);
     cls.attr("rgb_growth_version") = nb::int_(Model::rgb_growth_version);
+    cls.attr("rgb_deletion_version") = nb::int_(Model::rgb_deletion_version);
     drjit::bind_traverse(cls);
 }

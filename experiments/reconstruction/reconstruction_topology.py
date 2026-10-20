@@ -11,11 +11,23 @@ from dataclasses import asdict, dataclass
 import math
 
 from reconstruction_growth_rgb import RGB_GROWTH_EVIDENCE_VERSION
+from reconstruction_deletion_rgb import RGB_DELETION_EVIDENCE_VERSION
 
 
 @dataclass
 class TopologySettings:
     enable_deletion: bool = True
+    # Optional RGB-only removal evidence. Historical checkpoints retain the
+    # foreground/background deletion rule unless this field is explicitly set.
+    use_rgb_deletion: bool = False
+    deletion_warmup_epochs: int = 20
+    deletion_protection_epochs: int = 20
+    deletion_freeze_last_epochs: int = 0
+    deletion_rgb_min_support_views: int = 3
+    deletion_rgb_max_conflict_views: int = 1
+    deletion_rgb_gain_epsilon: float = 1e-7
+    deletion_rgb_min_mean_gain: float = 1e-7
+    deletion_rgb_confirmation_windows: int = 2
     enable_growth: bool = True
     use_growth_evidence: bool = True
     # RGB candidates are inserted virtually during the existing training trace.
@@ -426,6 +438,8 @@ class TopologyManager:
                                    "growth_count_readback_bytes": 0}
         self._device_statistics.update(rgb_growth_device_views=0, rgb_growth_cpu_views=0,
                                        rgb_growth_readback_bytes=0)
+        self._device_statistics.update(rgb_deletion_device_views=0, rgb_deletion_cpu_views=0,
+                                       rgb_deletion_readback_bytes=0)
         self.before_refine_checkpoint = None
         self.completed_windows = 0
         self._validate()
@@ -437,6 +451,21 @@ class TopologyManager:
             raise ValueError("Training requires 1..32767 distinct cameras")
         if not isinstance(cfg.use_rgb_growth, bool):
             raise ValueError("topology.use_rgb_growth must be a boolean")
+        if not isinstance(cfg.use_rgb_deletion, bool):
+            raise ValueError("topology.use_rgb_deletion must be a boolean")
+        for name in ("deletion_warmup_epochs", "deletion_protection_epochs",
+                     "deletion_freeze_last_epochs", "deletion_rgb_min_support_views",
+                     "deletion_rgb_max_conflict_views", "deletion_rgb_confirmation_windows"):
+            value = getattr(cfg, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"topology.{name} must be a nonnegative integer")
+        if any(getattr(cfg, name) < 1 for name in (
+                "deletion_rgb_min_support_views", "deletion_rgb_max_conflict_views",
+                "deletion_rgb_confirmation_windows")):
+            raise ValueError("RGB deletion vote and confirmation thresholds must be positive")
+        if cfg.use_rgb_deletion and (not isinstance(cfg.deletion_interval, int) or
+                                    isinstance(cfg.deletion_interval, bool)):
+            raise ValueError("RGB deletion interval must be an integer")
         if cfg.growth_rgb_normalization not in ("observed", "full_image"):
             raise ValueError("topology.growth_rgb_normalization must be 'observed' or 'full_image'")
         if (not isinstance(cfg.growth_freeze_last_epochs, int) or
@@ -476,6 +505,19 @@ class TopologyManager:
         self._deletion_eligible = np.zeros(count, dtype=np.int64)
         self.growth_birth = np.zeros(count, dtype=np.int64)
         self.growth_wait_start = np.zeros(count, dtype=np.int64)
+        self.pending_rgb_deletion = None
+        self._rgb_deletion_device = None
+        self.rgb_deletion_streak = np.zeros(count, dtype=np.uint32)
+        self.rgb_deletion_last_boundary = None
+
+    def _materialize_rgb_deletion(self):
+        if self._rgb_deletion_device is not None:
+            pending, device = self._rgb_deletion_device
+            if pending is self.pending_rgb_deletion:
+                arrays = device.materialize()
+                self._device_statistics["rgb_deletion_readback_bytes"] += sum(
+                    value.nbytes for value in arrays.values())
+            self._rgb_deletion_device = None
 
     def _materialize_deletion_masks(self):
         if self._deletion_device is not None:
@@ -546,8 +588,29 @@ class TopologyManager:
         return self.level_start_epoch if self.schedule.enabled else self.opacity_warmup + self.opacity_ramp
 
     def collect_deletion(self, epoch):
+        if self.settings.use_rgb_deletion:
+            return self._rgb_deletion_due(int(epoch) + 1)
         return (self.settings.enable_deletion and epoch >= self.evidence_start and
                 (not self.schedule.enabled or self.resolution == self.schedule.target_resolution))
+
+    def deletion_frozen(self, boundary):
+        count = self.settings.deletion_freeze_last_epochs
+        return count > 0 and boundary > max(0, self.schedule.total_epochs - count)
+
+    def _rgb_deletion_due(self, boundary):
+        cfg = self.settings
+        if (not cfg.use_rgb_deletion or not cfg.enable_deletion or
+                self.deletion_frozen(boundary)):
+            return False
+        local_epoch = boundary - self.level_start_epoch
+        # Refinement replaces all rows and resets evidence. Avoid collecting
+        # statistics that would immediately be discarded at that boundary.
+        if (self.schedule.enabled and self.resolution < self.schedule.target_resolution and
+                local_epoch >= self.level_budget):
+            return False
+        return (1 <= boundary <= self.schedule.total_epochs and
+                local_epoch > cfg.deletion_warmup_epochs and
+                (local_epoch - cfg.deletion_warmup_epochs) % cfg.deletion_interval == 0)
 
     def growth_frozen(self, boundary):
         """Whether a one-based epoch lies in the global growth-free training tail.
@@ -756,6 +819,122 @@ class TopologyManager:
                              "resume with its original topology configuration")
         return normalization
 
+    def observe_rgb_deletion(self, model, out, view_id, epoch, pixel_count):
+        """Consume full-view removal sums after ray-chunk/rank SUM reduction.
+
+        Statistics stay on the GPU until a topology boundary/checkpoint.
+        Unknown rays do not veto other reliable rays; no missing observation
+        provides a positive removal vote.
+        """
+        if not self.collect_deletion(epoch) or not self.settings.use_rgb_deletion:
+            return
+        np, cfg, boundary = self.np, self.settings, int(epoch) + 1
+        if not 0 <= view_id < self.view_count or int(model.active_voxel_count) != self.count:
+            raise ValueError("Unexpected RGB deletion view ID or model topology")
+        if not isinstance(pixel_count, int) or pixel_count < 1:
+            raise ValueError("RGB deletion requires a positive full-image pixel count")
+        pending = self.pending_rgb_deletion
+        if (pending is None or pending["boundary"] != boundary or
+                pending["resolution"] != self.resolution):
+            from reconstruction_deletion_rgb import initialize_pending
+            self._rgb_deletion_device = None
+            pending = initialize_pending(self.count, boundary, self.resolution, np)
+            self.pending_rgb_deletion = pending
+        if view_id in pending["seen_views"]:
+            return
+        if self.count:
+            dr = _cuda_array(out["deletion_gain"])
+            if dr is not None:
+                from reconstruction_deletion_rgb import RGBDeletionEvidenceDevice
+                if self._rgb_deletion_device is None:
+                    self._rgb_deletion_device = (pending, RGBDeletionEvidenceDevice(
+                        pending, type(out["deletion_gain"]), type(out["deletion_observed"]), dr, np))
+                self._rgb_deletion_device[1].observe(
+                    out, pixel_count, cfg.deletion_rgb_gain_epsilon)
+                self._device_statistics["rgb_deletion_device_views"] += 1
+            else:
+                from reconstruction_deletion_rgb import observe_numpy
+                self._materialize_rgb_deletion()
+                observe_numpy(pending, out, pixel_count, cfg.deletion_rgb_gain_epsilon, np)
+                self._device_statistics["rgb_deletion_cpu_views"] += 1
+        pending["seen_views"].add(int(view_id))
+
+    def _evaluate_rgb_deletion(self, boundary, event):
+        """Confirm removals using consecutive complete, reliable view windows."""
+        np, cfg, pending = self.np, self.settings, self.pending_rgb_deletion
+        if not self._rgb_deletion_due(boundary):
+            return None
+        self._materialize_rgb_deletion()
+        matching = (pending is not None and pending["boundary"] == boundary and
+                    pending["resolution"] == self.resolution)
+        if not matching:
+            from reconstruction_deletion_rgb import initialize_pending
+            pending = initialize_pending(self.count, boundary, self.resolution, np)
+        from reconstruction_deletion_rgb import validate_pending
+        validate_pending(pending, self.count, self.resolution, self.view_count, np)
+        views = len(pending["seen_views"])
+        complete = views == self.view_count
+        mean_gain = pending["gain_sum"] / np.maximum(pending["observed_views"], 1)
+        observed = pending["observed_views"] > 0
+        supported = pending["support_views"] >= cfg.deletion_rgb_min_support_views
+        unopposed = pending["conflict_views"] < cfg.deletion_rgb_max_conflict_views
+        valid = (pending["invalid_views"] == 0) & np.isfinite(mean_gain)
+        beneficial = mean_gain > cfg.deletion_rgb_min_mean_gain
+        # A voxel born after boundary b is protected for complete epochs
+        # b+1 .. b+protection; it becomes eligible at b+protection+1.
+        mature = ((self.growth_birth == 0) |
+                  (boundary - self.growth_birth >= cfg.deletion_protection_epochs))
+        qualified = observed & supported & unopposed & valid & beneficial & mature
+        if not complete:
+            qualified.fill(False)
+        previous = self.rgb_deletion_streak.copy()
+        consecutive = self.rgb_deletion_last_boundary == boundary - cfg.deletion_interval
+        if not consecutive:
+            self.rgb_deletion_streak.fill(0)
+        self.rgb_deletion_streak = np.where(
+            qualified, np.minimum(self.rgb_deletion_streak.astype(np.uint64) + 1,
+                                  cfg.deletion_rgb_confirmation_windows), 0).astype(np.uint32)
+        self.rgb_deletion_last_boundary = boundary
+        selected = self.rgb_deletion_streak >= cfg.deletion_rgb_confirmation_windows
+        known_rays = int(pending["observed_rays"].sum())
+        unknown_rays = int(pending["unknown_rays"].sum())
+        total_rays = known_rays + unknown_rays
+        event["deletion_rgb"] = {
+            "status": "complete" if complete else "incomplete_views",
+            "evidence_version": RGB_DELETION_EVIDENCE_VERSION,
+            "normalization": "observed", "views": views, "required_views": self.view_count,
+            "tested_voxels": self.count, "eligible_voxels": int(np.count_nonzero(mature)),
+            "protected_voxels": int(np.count_nonzero(~mature)),
+            "support_votes": int(pending["support_views"].sum()),
+            "conflict_votes": int(pending["conflict_views"].sum()),
+            "observed_views": int(pending["observed_views"].sum()),
+            "views_with_unknown": int(pending["unknown_views"].sum()),
+            "invalid_votes": int(pending["invalid_views"].sum()),
+            "voxels_with_observations": int(np.count_nonzero(observed)),
+            "voxels_with_unknown_views": int(np.count_nonzero(pending["unknown_views"])),
+            "observed_rays": known_rays, "unknown_rays": unknown_rays,
+            "encountered_known_fraction": known_rays / total_rays if total_rays else None,
+            "mean_gain_sum": float(np.where(np.isfinite(mean_gain), mean_gain, 0).sum()),
+            # These gates overlap; they are not a partition of all voxels.
+            "rejected_no_observation": int(np.count_nonzero(~observed)),
+            "rejected_support": int(np.count_nonzero(~supported)),
+            "rejected_conflict": int(np.count_nonzero(~unopposed)),
+            "rejected_invalid": int(np.count_nonzero(~valid)),
+            "rejected_mean_gain": int(np.count_nonzero(~beneficial)),
+            "rgb_qualified": int(np.count_nonzero(qualified)),
+            "confirmation_windows": cfg.deletion_rgb_confirmation_windows,
+            "previous_window_consecutive": consecutive,
+            "streak_reset": int(np.count_nonzero((previous > 0) &
+                                               (~qualified | (not consecutive)))),
+            "awaiting_confirmation": int(np.count_nonzero(qualified & ~selected)),
+            "confirmed": int(np.count_nonzero(selected)),
+            "deleted": 0,
+            "max_streak": int(self.rgb_deletion_streak.max()) if self.count else 0,
+        }
+        self.pending_rgb_deletion = None
+        self._rgb_deletion_device = None
+        return selected
+
     def _growth_world_points(self, pending, metadata):
         """Reuse the seven frozen proposal samples across views, never evidence.
 
@@ -825,7 +1004,7 @@ class TopologyManager:
         np = self.np
         if not 0 <= view_id < self.view_count or int(model.active_voxel_count) != self.count:
             raise ValueError("Unexpected view ID or model topology")
-        if self.collect_deletion(epoch):
+        if not self.settings.use_rgb_deletion and self.collect_deletion(epoch):
             dr = _cuda_array(out["foreground_evidence"])
             if dr is not None and _cuda_array(out["background_evidence"]) is not None:
                 if self._deletion_device is None:
@@ -872,6 +1051,8 @@ class TopologyManager:
 
     def _evaluate_deletion(self, boundary):
         np, cfg = self.np, self.settings
+        if cfg.use_rgb_deletion:
+            return False
         if not self.collect_deletion(boundary) or boundary <= self.evidence_start or (boundary - self.evidence_start) % cfg.evidence_interval:
             return False
         if self._deletion_device is not None:
@@ -909,7 +1090,8 @@ class TopologyManager:
         self._materialize_deletion_masks()
         kept = len(survivors)
         for name in ("foreground_masks", "background_masks", "qualified", "candidates",
-                     "deletion_eligible", "growth_birth", "growth_wait_start"):
+                     "deletion_eligible", "growth_birth", "growth_wait_start",
+                     "rgb_deletion_streak"):
             old = getattr(self, name)
             resized = np.zeros((new_count,) + old.shape[1:], dtype=old.dtype)
             resized[:kept] = old[survivors]
@@ -1013,6 +1195,14 @@ class TopologyManager:
                          growth_warmup_epochs=self.growth_warmup,
                          growth_warmup_active=boundary - self.level_start_epoch <= self.growth_warmup,
                          growth_evidence_requested=self._growth_due(boundary))
+        if cfg.use_rgb_deletion:
+            event.update(deletion_mode="rgb_online",
+                         deletion_level_epoch=boundary - self.level_start_epoch,
+                         deletion_warmup_epochs=cfg.deletion_warmup_epochs,
+                         deletion_warmup_active=boundary - self.level_start_epoch <= cfg.deletion_warmup_epochs,
+                         deletion_frozen=self.deletion_frozen(boundary),
+                         deletion_freeze_last_epochs=cfg.deletion_freeze_last_epochs,
+                         deletion_evidence_requested=self._rgb_deletion_due(boundary))
         checkpoint = None
         level_done = boundary - self.level_start_epoch >= self.level_budget
         if schedule.enabled and self.resolution < schedule.target_resolution and level_done:
@@ -1034,19 +1224,28 @@ class TopologyManager:
             optimizer.remap(np.empty(0, dtype=np.uint32), self.count)
             event.update(refined=True, resolution=self.resolution, active_voxel_count=self.count)
             return replacement, event
-        event["evidence_window_evaluated"] = self._evaluate_deletion(boundary)
+        rgb_delete = self._evaluate_rgb_deletion(boundary, event) if cfg.use_rgb_deletion else None
+        event["evidence_window_evaluated"] = (
+            rgb_delete is not None if cfg.use_rgb_deletion else self._evaluate_deletion(boundary))
         final = level_done if schedule.enabled else boundary >= schedule.total_epochs
         first = self.evidence_start + 2 * cfg.evidence_interval
         periodic = boundary >= first and (boundary - first) % cfg.deletion_interval == 0
-        if np.any(self.candidates) and (periodic or final) and self.collect_deletion(boundary):
+        delete = (rgb_delete if cfg.use_rgb_deletion else
+                  self.candidates if (periodic or final) and self.collect_deletion(boundary)
+                  else None)
+        if delete is not None and np.any(delete):
             checkpoint = model_checkpoint(model)
             old_cells = checkpoint["model_state"]["cell_indices"]
-            for cell in old_cells[self.candidates]:
+            for cell in old_cells[delete]:
                 self.cooldown[int(cell)] = boundary + cfg.deletion_cooldown_epochs
-            survivors = np.flatnonzero(~self.candidates).astype(np.uint32)
+            survivors = np.flatnonzero(~delete).astype(np.uint32)
             event["deleted"] = self.count - len(survivors)
             checkpoint = self._take_rows(checkpoint, survivors)
-            optimizer.remap(survivors, len(survivors), reset_radiance=True)
+            if cfg.use_rgb_deletion:
+                optimizer.remap(survivors, len(survivors))
+                event["deletion_rgb"]["deleted"] = event["deleted"]
+            else:
+                optimizer.remap(survivors, len(survivors), reset_radiance=True)
             self._remap_lifecycle(survivors, len(survivors), boundary)
             self.foreground_masks.fill(0)
             self.background_masks.fill(0)
@@ -1113,6 +1312,8 @@ class TopologyManager:
         self._growth_world_cache = None
         self._growth_device = None
         self._rgb_growth_device = None
+        self.pending_rgb_deletion = None
+        self._rgb_deletion_device = None
         self.cooldown = {cell: expiry for cell, expiry in self.cooldown.items() if expiry > boundary}
         event.update(finished=final, active_voxel_count=self.count)
         return checkpoint, event
@@ -1121,19 +1322,26 @@ class TopologyManager:
         import copy
         self._materialize_deletion_masks()
         self._materialize_growth()
+        self._materialize_rgb_deletion()
         state = {"settings": asdict(self.settings), "schedule": asdict(self.schedule), "view_count": self.view_count,
                  "rgb_growth_evidence_version": RGB_GROWTH_EVIDENCE_VERSION,
+                 "rgb_deletion_evidence_version": RGB_DELETION_EVIDENCE_VERSION,
                  "opacity_warmup": self.opacity_warmup, "opacity_ramp": self.opacity_ramp,
                  "resolution": self.resolution, "schedule_start_resolution": self.schedule_start_resolution,
                  "level_start_epoch": self.level_start_epoch, "budgets": {str(key): value for key, value in self.budgets.items()},
                  "cooldown": {str(key): value for key, value in self.cooldown.items()}, "completed_windows": self.completed_windows,
-                 "count": self.count, "pending_growth": self.pending_growth}
+                 "count": self.count, "pending_growth": self.pending_growth,
+                 "pending_rgb_deletion": self.pending_rgb_deletion,
+                 "rgb_deletion_streak": self.rgb_deletion_streak,
+                 "rgb_deletion_last_boundary": self.rgb_deletion_last_boundary}
         for name in ("foreground_masks", "background_masks", "qualified", "candidates",
                      "deletion_eligible", "growth_birth", "growth_wait_start"):
             state[name] = getattr(self, name)
         state = copy.deepcopy(state)
         if state["pending_growth"] is not None:
             state["pending_growth"]["seen_views"] = sorted(state["pending_growth"]["seen_views"])
+        if state["pending_rgb_deletion"] is not None:
+            state["pending_rgb_deletion"]["seen_views"] = sorted(state["pending_rgb_deletion"]["seen_views"])
         return state
 
     def load_state_dict(self, state):
@@ -1142,12 +1350,24 @@ class TopologyManager:
                 state.get("rgb_growth_evidence_version") != RGB_GROWTH_EVIDENCE_VERSION):
             raise ValueError("RGB growth evidence version differs; start a new run "
                              "or resume with the original code")
+        if state["settings"].get("use_rgb_deletion", False):
+            if state.get("rgb_deletion_evidence_version") != RGB_DELETION_EVIDENCE_VERSION:
+                raise ValueError("RGB deletion evidence version differs; start a new run "
+                                 "or resume with the original code")
+            if any(name not in state for name in (
+                    "pending_rgb_deletion", "rgb_deletion_streak", "rgb_deletion_last_boundary")):
+                raise ValueError("RGB deletion lifecycle state is incomplete")
         self._growth_world_cache = None
         self._growth_device = None
         self._rgb_growth_device = None
         self._deletion_device = None
+        self._rgb_deletion_device = None
+        self.pending_rgb_deletion = None
+        self.rgb_deletion_streak = self.np.zeros(self.count, dtype=self.np.uint32)
+        self.rgb_deletion_last_boundary = None
         state = copy.deepcopy(state)
         state.pop("rgb_growth_evidence_version", None)
+        state.pop("rgb_deletion_evidence_version", None)
         if state["count"] != self.count or state["view_count"] != self.view_count:
             raise ValueError("Topology checkpoint dimensions do not match model or dataset")
         self.settings = TopologySettings(**state.pop("settings"))
@@ -1158,6 +1378,22 @@ class TopologyManager:
         self.cooldown = {int(key): value for key, value in self.cooldown.items()}
         if self.pending_growth is not None:
             self.pending_growth["seen_views"] = set(self.pending_growth["seen_views"])
+        if self.pending_rgb_deletion is not None:
+            self.pending_rgb_deletion["seen_views"] = set(self.pending_rgb_deletion["seen_views"])
         self._validate()
         if self.pending_growth is not None and self.pending_growth.get("mode") == "rgb":
             self._rgb_normalization(self.pending_growth)
+        streak = self.np.asarray(self.rgb_deletion_streak)
+        if (streak.shape != (self.count,) or
+                not self.np.issubdtype(streak.dtype, self.np.integer) or
+                self.np.any(streak < 0)):
+            raise ValueError("RGB deletion confirmation dimensions or values differ")
+        if (self.rgb_deletion_last_boundary is not None and
+                (not isinstance(self.rgb_deletion_last_boundary, int) or
+                 isinstance(self.rgb_deletion_last_boundary, bool) or
+                 self.rgb_deletion_last_boundary < 1)):
+            raise ValueError("RGB deletion previous boundary must be a positive integer")
+        if self.pending_rgb_deletion is not None:
+            from reconstruction_deletion_rgb import validate_pending
+            validate_pending(self.pending_rgb_deletion, self.count, self.resolution,
+                             self.view_count, self.np)

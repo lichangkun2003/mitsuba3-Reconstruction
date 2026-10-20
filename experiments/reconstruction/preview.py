@@ -23,6 +23,11 @@ import sys
 import time
 import traceback
 
+# Python -I excludes the script directory; only explicitly add our own sources.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from reconstruction_color import reference_from_bitmap, validate_reference_compositing
+
 REPOSITORY = Path(__file__).resolve().parents[2]
 WORKSPACE = REPOSITORY.parent
 
@@ -33,6 +38,7 @@ class DataConfig:
     point_cloud: str = "init_points.ply"  # Relative to dataset.
     cameras: str = "transforms_train.json"  # Relative to dataset.
     camera_index: int = 0
+    reference_compositing: str = "linear"  # Missing field in old checkpoints keeps the old convention.
 
 
 @dataclass
@@ -85,6 +91,7 @@ class PreviewConfig:
 
 # This is the single user-editable configuration entry point.
 CONFIG = PreviewConfig()
+CONFIG.data.reference_compositing = "srgb"  # Composite encoded PNG colors, then decode for linear rendering.
 
 
 def file_sha256(path: Path) -> str:
@@ -117,6 +124,7 @@ def source_provenance(repository: Path) -> dict:
         "src/render/CMakeLists.txt",
         "src/render/python/CMakeLists.txt",
         "experiments/reconstruction/preview.py",
+        "experiments/reconstruction/reconstruction_color.py",
         "experiments/reconstruction/tests/test_reconstruction.py",
     ):
         try:
@@ -152,6 +160,7 @@ def parse_config(workspace: Path) -> PreviewConfig:
     parser.add_argument("--point-cloud")
     parser.add_argument("--cameras")
     parser.add_argument("--camera-index", type=int)
+    parser.add_argument("--reference-compositing", choices=("linear", "srgb"))
     parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)
     parser.add_argument("--spp", type=int)
@@ -170,6 +179,7 @@ def parse_config(workspace: Path) -> PreviewConfig:
     mapping = {
         "dataset": ("data", "dataset"), "point_cloud": ("data", "point_cloud"),
         "cameras": ("data", "cameras"), "camera_index": ("data", "camera_index"),
+        "reference_compositing": ("data", "reference_compositing"),
         "grid_resolution": ("model", "grid_resolution"),
         "output_dir": ("output", "directory"), "save_model": ("output", "save_model"),
         "build_dir": ("runtime", "build_dir"), "gpu": ("runtime", "gpu"),
@@ -184,6 +194,7 @@ def parse_config(workspace: Path) -> PreviewConfig:
 
 
 def validate_config(config: PreviewConfig) -> None:
+    validate_reference_compositing(config.data.reference_compositing)
     for name in ("width", "height", "spp", "max_hits"):
         value = getattr(config.render, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -512,15 +523,28 @@ def main() -> int:
         write_png(output / "preview-white.png", white, mi, np)
         write_png(output / "alpha.png", alpha_np, mi, np, srgb=False)
 
-        reference_bitmap = mi.Bitmap(str(reference_path)).convert(mi.Bitmap.PixelFormat.RGBA, mi.Struct.Type.Float32, False)
-        reference = np.array(reference_bitmap, copy=True)
-        reference_white = reference[..., :3] * reference[..., 3:4] + (1 - reference[..., 3:4])
+        reference_bitmap = mi.Bitmap(str(reference_path))
+        reference = reference_from_bitmap(reference_bitmap, mi, np, path=reference_path)
+        reference_white = reference_from_bitmap(
+            reference_bitmap, mi, np, rgb_only=True, background=(1, 1, 1),
+            reference_compositing=config.data.reference_compositing, path=reference_path)
         write_png(output / "reference-white.png", reference_white, mi, np)
         report["reference_shape"] = list(reference.shape)
         report["reference_resampled"] = False
+        report["reference_color_protocol"] = {
+            "requested_compositing": config.data.reference_compositing,
+            "source_srgb": bool(reference_bitmap.srgb_gamma()),
+            "effective_compositing": (
+                "srgb" if config.data.reference_compositing == "srgb"
+                and reference_bitmap.srgb_gamma() else "linear"),
+            "target_space": "linear", "background_linear": [1, 1, 1],
+            "alpha_usage": "reference compositing only",
+            "linear_source_policy": "linear compositing; preserve EXR/HDR values",
+        }
         np.savez_compressed(output / "render.npz", rgb_linear=rgb_np, alpha=alpha_np,
                             hit_count_sum=hits_np, rgb_white_linear=white,
-                            pixel_offsets=np.asarray(offsets), reference_rgba_linear=reference)
+                            pixel_offsets=np.asarray(offsets), reference_rgba_linear=reference,
+                            reference_white_linear=reference_white)
         if config.output.save_model:
             snapshot = model.snapshot()
             dr.eval(*snapshot.values())

@@ -27,6 +27,7 @@ from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, Unifor
     generate_ray_batch, prepare_camera, initialize_runtime, load_views, model_metadata,
     restore_model, workspace_path, file_sha256)
 from reconstruction_checkpoint import load_checkpoint, save_checkpoint
+from reconstruction_color import validate_reference_compositing
 from reconstruction_experiment import allocate_training_output, resumed_training_output
 from reconstruction_optimizer import FalcorOptimizer, OptimizerConfig
 from reconstruction_performance import PerformanceRecorder
@@ -108,6 +109,7 @@ CONFIG = TrainConfig()
 CONFIG.data.dataset = "datasets/lego"
 CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
+CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再解码；渲染与损失仍在线性空间。
 
 CONFIG.render.width = 800
 CONFIG.render.height = 800
@@ -121,7 +123,17 @@ CONFIG.gradient.geometry_transition_only = False  # hit/miss 均保留正负 RGB
 CONFIG.gradient.geometry_two_sided_boundary = False  # 保留原 sigmoid，不叠加额外带宽门控。
 CONFIG.contour.enabled = False  # 所有像素均匀采样，不读取 alpha 轮廓标签。
 CONFIG.topology.enable_growth = True
-CONFIG.topology.enable_deletion = False
+CONFIG.topology.enable_deletion = True
+CONFIG.topology.use_rgb_deletion = True  # 复用正常反向合成，按移除单体素的 RGB 收益投票。
+CONFIG.topology.deletion_warmup_epochs = 20  # 每个层级先优化 20 轮，再按周期收集一轮全部视角。
+CONFIG.topology.deletion_interval = 10
+CONFIG.topology.deletion_protection_epochs = 20  # 新生体素先优化 20 轮。
+CONFIG.topology.deletion_freeze_last_epochs = 100  # 末尾停止删除，配合生长冻结稳定优化。
+CONFIG.topology.deletion_rgb_confirmation_windows = 2  # 连续两个证据窗口达标才删除。
+CONFIG.topology.deletion_rgb_min_support_views = 3
+CONFIG.topology.deletion_rgb_max_conflict_views = 1  # 一个可靠反对视角即可阻止本窗口删除。
+CONFIG.topology.deletion_rgb_gain_epsilon = 1e-7
+CONFIG.topology.deletion_rgb_min_mean_gain = 1e-7
 CONFIG.topology.use_growth_evidence = False
 CONFIG.topology.use_rgb_growth = True  # 复用训练前向的 RGB 收益票，不额外渲染。
 CONFIG.topology.growth_rgb_normalization = "observed"  # 有效命中射线均值，再对可靠观测视角求均值。
@@ -227,6 +239,12 @@ def apply_arguments(config, args, values):
         # Explicit legacy supervision must not inherit the current RGB-only
         # experiment's growth mode. An explicit incompatible JSON still errors.
         config.topology.use_rgb_growth = False
+    if (not config.training.rgb_only and
+            "use_rgb_deletion" not in values.get("topology", {})):
+        config.topology.use_rgb_deletion = False
+    if (not config.training.rgb_only and
+            "reference_compositing" not in values.get("data", {})):
+        config.data.reference_compositing = "linear"
     config.schedule.total_epochs = config.training.num_epochs
 
 
@@ -238,8 +256,28 @@ def validate(config):
         raise ValueError("Falcor's training reference is composited onto white; training requires background [1,1,1]. Evaluation background is configurable.")
     if not isinstance(config.training.rgb_only, bool):
         raise ValueError("training.rgb_only must be a boolean")
+    if not config.training.rgb_only and config.data.reference_compositing != "linear":
+        raise ValueError("data.reference_compositing='srgb' requires RGB-only training; "
+                         "legacy alpha-supervised training uses linear compositing")
     if config.topology.use_rgb_growth and not config.training.rgb_only:
         raise ValueError("RGB growth evidence requires training.rgb_only=true")
+    if not isinstance(config.topology.use_rgb_deletion, bool):
+        raise ValueError("topology.use_rgb_deletion must be a boolean")
+    if config.topology.use_rgb_deletion and not config.training.rgb_only:
+        raise ValueError("RGB deletion evidence requires training.rgb_only=true")
+    for name in ("deletion_warmup_epochs", "deletion_protection_epochs", "deletion_freeze_last_epochs"):
+        value = getattr(config.topology, name)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"topology.{name} must be a nonnegative integer")
+    for name in ("deletion_interval", "deletion_rgb_confirmation_windows",
+                 "deletion_rgb_min_support_views", "deletion_rgb_max_conflict_views"):
+        value = getattr(config.topology, name)
+        if type(value) is not int or value < 1:
+            raise ValueError(f"topology.{name} must be a positive integer")
+    for name in ("deletion_rgb_gain_epsilon", "deletion_rgb_min_mean_gain"):
+        value = getattr(config.topology, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"topology.{name} must be finite and nonnegative")
     if config.topology.growth_rgb_normalization not in ("observed", "full_image"):
         raise ValueError("topology.growth_rgb_normalization must be 'observed' or 'full_image'")
     if (type(config.topology.growth_freeze_last_epochs) is not int or
@@ -255,12 +293,13 @@ def validate(config):
             "gradient.geometry_transition_only": config.gradient.geometry_transition_only,
             "gradient.geometry_two_sided_boundary": config.gradient.geometry_two_sided_boundary,
             "contour.enabled": config.contour.enabled,
-            "topology.enable_deletion": config.topology.enable_deletion,
             "topology.use_growth_evidence": config.topology.use_growth_evidence,
         }
         enabled = [name for name, value in disabled.items() if value != 0]
         if enabled:
             raise ValueError("RGB-only training requires these settings to be zero/false: " + ", ".join(enabled))
+        if config.topology.enable_deletion and not config.topology.use_rgb_deletion:
+            raise ValueError("RGB-only deletion requires topology.use_rgb_deletion=true; legacy alpha deletion is unavailable")
         if not config.topology.use_rgb_growth and (config.topology.enable_growth or config.schedule.enable_coarse_growth):
             raise ValueError("RGB-only growth requires topology.use_rgb_growth=true; legacy alpha growth is unavailable")
     if (isinstance(config.gradient.max_growth_hits, bool) or not isinstance(config.gradient.max_growth_hits, int)
@@ -314,12 +353,25 @@ def validate_resume_supervision(config, checkpoint):
                          "or explicit --no-rgb-only resume.")
 
 
+def resolve_resume_reference_compositing(config, checkpoint, overrides):
+    """Keep a saved target protocol, including the pre-field linear default."""
+    saved = checkpoint["config"].get("data", {}).get("reference_compositing", "linear")
+    validate_reference_compositing(saved)
+    requested = overrides.get("data", {}).get("reference_compositing", saved)
+    validate_reference_compositing(requested)
+    if requested != saved:
+        raise ValueError("Cannot change data.reference_compositing while resuming; "
+                         "start a new experiment for different reference targets")
+    config.data.reference_compositing = saved
+
+
 def settings(config):
     result = asdict(config.gradient)
     result.update(rgb_only=config.training.rgb_only,
         foreground_alpha_min=config.topology.foreground_alpha_min,
         background_alpha_max=config.topology.background_alpha_max,
-        collect_deletion_evidence=config.topology.enable_deletion,
+        collect_deletion_evidence=config.topology.enable_deletion and not config.topology.use_rgb_deletion,
+        collect_rgb_deletion_evidence=config.topology.enable_deletion and config.topology.use_rgb_deletion,
         transmittance_threshold=config.render.transmittance_threshold,
         max_hits=config.render.max_hits, entry_offset_fraction=config.render.entry_offset_fraction)
     return result
@@ -379,7 +431,9 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
     if collect_deletion_evidence is not None:
         # The topology schedule decides whether these counters have a consumer.
         # Disabling unused counters does not disable loss/appearance/geometry terms.
-        native_settings["collect_deletion_evidence"] = bool(collect_deletion_evidence)
+        native_settings["collect_deletion_evidence"] = bool(collect_deletion_evidence) and not config.topology.use_rgb_deletion
+        native_settings["collect_rgb_deletion_evidence"] = bool(collect_deletion_evidence) and config.topology.use_rgb_deletion
+    rgb_deletion_requested = native_settings["collect_rgb_deletion_evidence"]
     for begin in range(pixel_begin, pixel_end, chunk_size):
         end = min(begin + chunk_size, pixel_end)
         indices = dr.arange(mi.UInt32, end - begin) + dr.opaque(mi.UInt32, begin)
@@ -428,6 +482,12 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
                     raise RuntimeError("RGB growth evidence is unavailable; rebuild this source checkout")
                 accumulator[key] = accumulator.get(key, 0) + result[key]
             finite &= dr.all(dr.isfinite(result["growth_gain"]))
+        if rgb_deletion_requested:
+            for key in ("deletion_gain", "deletion_observed", "deletion_unknown"):
+                if key not in result:
+                    raise RuntimeError("RGB deletion evidence is unavailable; rebuild this source checkout")
+                accumulator[key] = accumulator.get(key, 0) + result[key]
+            finite &= dr.all(dr.isfinite(result["deletion_gain"]))
         # Materialize per-chunk sums; never retain all image path records/graphs.
         dr.eval(total_loss, finite, *[x for x in (raw_alpha, estimated_alpha) if x is not None],
                 *accumulator["gradients"].values(),
@@ -436,6 +496,8 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
         finite &= dr.all(dr.isfinite(gradient))
     if "growth_gain" in accumulator:
         finite &= dr.all(dr.isfinite(accumulator["growth_gain"]))
+    if "deletion_gain" in accumulator:
+        finite &= dr.all(dr.isfinite(accumulator["deletion_gain"]))
     finite &= dr.isfinite(total_loss)
     return accumulator, total_loss, finite, raw_alpha, estimated_alpha
 
@@ -498,6 +560,8 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
             finite &= dr.all(dr.isfinite(gradient))
         if "growth_gain" in accumulator:
             finite &= dr.all(dr.isfinite(accumulator["growth_gain"]))
+        if "deletion_gain" in accumulator:
+            finite &= dr.all(dr.isfinite(accumulator["deletion_gain"]))
         finite &= dr.isfinite(total_loss)
         partial = accumulator, total_loss, finite, raw_alpha, estimated_alpha
     return finalize_view(partial, view, config, sampler, token, mi, dr, np,
@@ -567,6 +631,8 @@ def prepare_training_output(config, resume_path=None, checkpoint_config=None):
 
 def normalized_algorithm_group(name, values):
     """Compare legacy saves with explicit defaults, without changing algorithms."""
+    if name == "data" and values is not None:
+        return {"reference_compositing": "linear", **values}
     defaults = {"topology": TopologySettings, "gradient": GradientSettings}
     if values is not None and name in defaults:
         return {**asdict(defaults[name]()), **values}
@@ -610,6 +676,7 @@ def run_training(distributed=None):
     checkpoint = load_checkpoint(resume_path) if resume_path is not None else None
     if checkpoint is not None:
         validate_resume_supervision(config, checkpoint)
+        resolve_resume_reference_compositing(config, checkpoint, overrides)
     output = prepare_training_output(config, resume_path, checkpoint["config"] if checkpoint else None) if primary else None
     if distributed is not None:
         location, config.training.output = distributed.broadcast(
@@ -671,6 +738,7 @@ def run_training(distributed=None):
             runtime, training_output = config.runtime, config.training.output
             # Fields introduced after a checkpoint must use their legacy
             # dataclass defaults, not the latest experiment's CONFIG switches.
+            config.data = DataConfig()
             config.topology = TopologySettings()
             config.gradient = GradientSettings()
             update(config, checkpoint["config"])
@@ -680,6 +748,7 @@ def run_training(distributed=None):
             config.runtime, config.training.output = runtime, training_output
             apply_arguments(config, args, overrides)
             validate_resume_supervision(config, checkpoint)
+            resolve_resume_reference_compositing(config, checkpoint, overrides)
             # JSON may request automatic naming with null; keep the already
             # selected location instead of restoring null or a stale host path.
             config.training.output = training_output
@@ -713,13 +782,25 @@ def run_training(distributed=None):
         if rgb_growth_enabled and getattr(mi.VoxelReconstruction, "rgb_growth_version", 0) < 2:
             raise RuntimeError("Ray-local RGB growth evidence requires native rgb_growth_version >= 2; "
                                "incrementally rebuild this checkout")
+        rgb_deletion_enabled = config.topology.use_rgb_deletion and config.topology.enable_deletion
+        if rgb_deletion_enabled and getattr(mi.VoxelReconstruction, "rgb_deletion_version", 0) < 1:
+            raise RuntimeError("RGB deletion evidence requires native rgb_deletion_version >= 1; "
+                               "incrementally rebuild this checkout")
         report["requested_config"] = asdict(config)
         report["scope"] = ("RGB-only: DC opacity, bidirectional geometry surrogate, refinement"
-                           + (" and one-pass RGB growth" if rgb_growth_enabled else " only")
+                           + (" and one-pass RGB growth" if rgb_growth_enabled else "")
+                           + (" and RGB deletion from existing reverse paths" if rgb_deletion_enabled else "")
                            if config.training.rgb_only else "Legacy Falcor NoLightTransport alpha-supervised training")
         report["training_protocol"].update(
             rgb_only=config.training.rgb_only,
-            reference_preprocessing=("RGBA composited onto white at decode; only RGB retained"
+            render_color_space="linear",
+            loss_color_space="linear",
+            reference_compositing=config.data.reference_compositing,
+            reference_preprocessing=(
+                "sRGB-encoded sources: composite RGB with background in sRGB, then decode RGB to linear; "
+                "linear sources: composite in linear; retain only RGB"
+                if config.training.rgb_only and config.data.reference_compositing == "srgb" else
+                "RGBA decoded to linear, then composited onto white; only RGB retained"
                                      if config.training.rgb_only else "linear RGBA; composed inside native training"),
             actual_sampling="per-pixel uniform" if config.training.rgb_only else "per-pixel uniform or contour-guided",
             growth_evidence=("same-DDA frozen candidate insertion; signed 1-spp RGB gain; no confirmation render"
@@ -731,6 +812,16 @@ def run_training(distributed=None):
             growth_freeze_last_epochs=config.topology.growth_freeze_last_epochs,
             growth_freeze_start_epoch=(max(1, config.training.num_epochs - config.topology.growth_freeze_last_epochs + 1)
                                        if config.topology.growth_freeze_last_epochs else None),
+            deletion_evidence=("single-removal RGB gain from complete normal training paths; no extra trace"
+                               if rgb_deletion_enabled else "disabled" if config.training.rgb_only else "legacy alpha evidence"),
+            deletion_evidence_version=(mi.VoxelReconstruction.rgb_deletion_version if rgb_deletion_enabled else None),
+            deletion_normalization="reliable-hit mean per view, then reliable-view mean" if rgb_deletion_enabled else None,
+            deletion_unknown_policy="unknown rays abstain individually; unobserved is not removable" if rgb_deletion_enabled else None,
+            deletion_confirmation_windows=config.topology.deletion_rgb_confirmation_windows if rgb_deletion_enabled else None,
+            deletion_freeze_last_epochs=config.topology.deletion_freeze_last_epochs,
+            deletion_freeze_start_epoch=(max(1, config.training.num_epochs - config.topology.deletion_freeze_last_epochs + 1)
+                                         if config.topology.deletion_freeze_last_epochs else None),
+            deletion_batch_policy="independent online votes; not a guarantee of joint loss decrease" if rgb_deletion_enabled else None,
             reported_loss="mean pixel RGB squared-error sum over channels, then mean over views"
                           if config.training.rgb_only else "mean RGB plus alpha loss over pixels and views")
         performance.metadata["config"] = asdict(config)
@@ -757,7 +848,8 @@ def run_training(distributed=None):
         signature = dataset_signature(views, dataset, config.data.cameras)
         reference_cache = ReferenceImageCache(config.render.width, config.render.height, mi, np,
                                              config.training.reference_cache_mib,
-                                             rgb_only=config.training.rgb_only, background=config.render.background)
+                                             rgb_only=config.training.rgb_only, background=config.render.background,
+                                             reference_compositing=config.data.reference_compositing)
         gpu_reference_cache = GPUReferenceCache(config.render.width, config.render.height, mi, dr, np,
                                                 config.training.gpu_reference_cache_mib,
                                                 rgb_only=config.training.rgb_only)
@@ -766,8 +858,11 @@ def run_training(distributed=None):
               f"{config.training.gpu_reference_cache_mib} MiB GPU, "
               "loaded on first use; dataset must remain unchanged during training", flush=True)
         emit("Native GPU replay:", "enabled" if config.training.freeze_native else "disabled", flush=True)
+        emit("Reference compositing:", config.data.reference_compositing,
+             "| rendering and RGB loss: linear", flush=True)
         emit("Training supervision:", ("RGB only; DC opacity; "
-             + ("refinement + RGB growth" if rgb_growth_enabled else "refinement only")) if config.training.rgb_only
+             + "refinement" + (" + RGB growth" if rgb_growth_enabled else "")
+             + (" + RGB deletion" if rgb_deletion_enabled else "")) if config.training.rgb_only
              else "legacy RGB + reference alpha", flush=True)
         if rgb_growth_enabled:
             emit("RGB growth normalization:", config.topology.growth_rgb_normalization, flush=True)
@@ -777,6 +872,14 @@ def run_training(distributed=None):
             if config.topology.growth_freeze_last_epochs:
                 emit("RGB growth final freeze:", config.topology.growth_freeze_last_epochs,
                      "epochs; no growth from epoch", report["training_protocol"]["growth_freeze_start_epoch"],
+                     "through", config.training.num_epochs, flush=True)
+        if rgb_deletion_enabled:
+            emit("RGB deletion:", config.topology.deletion_warmup_epochs, "warmup epochs per level;",
+                 config.topology.deletion_interval, "epoch interval;",
+                 config.topology.deletion_rgb_confirmation_windows, "consecutive evidence windows;",
+                 config.topology.deletion_protection_epochs, "newborn protection epochs", flush=True)
+            if config.topology.deletion_freeze_last_epochs:
+                emit("RGB deletion final freeze: epochs", report["training_protocol"]["deletion_freeze_start_epoch"],
                      "through", config.training.num_epochs, flush=True)
         rng = np.random.default_rng(config.training.seed)
         sampler = make_sampler(config, np)
@@ -947,7 +1050,10 @@ def run_training(distributed=None):
                     if primary and rgb_growth_requested:
                         topology.observe_rgb_growth(model, gradients, view_id=int(index), epoch=epoch,
                                                     pixel_count=ray_count)
-                    elif primary and not config.training.rgb_only:
+                    if primary and rgb_deletion_enabled and deletion_evidence_collected:
+                        topology.observe_rgb_deletion(model, gradients, view_id=int(index), epoch=epoch,
+                                                      pixel_count=ray_count)
+                    if primary and not config.training.rgb_only:
                         topology.observe_view(model, gradients, view_id=int(index), epoch=epoch,
                             camera=view["camera"],
                             reference_alpha=gpu_reference.alpha if gpu_reference is not None else rgba[..., 3],
@@ -972,6 +1078,7 @@ def run_training(distributed=None):
                     profile = dict(epoch=epoch+1, progress=progress, camera=int(index)+1,
                                    training_resolution=training_resolution, active_voxels=int(model.active_voxel_count),
                                    sample_reasons=reasons, growth_evidence_requested=growth_evidence_requested,
+                                   rgb_deletion_evidence_requested=rgb_deletion_enabled and deletion_evidence_collected,
                                    native_execution=("direct_stage_profile" if native_stages is not None else
                                                      "direct_empty_model" if config.training.freeze_native and not model.active_voxel_count else
                                                      "frozen" if config.training.freeze_native else "direct"),
@@ -1011,6 +1118,7 @@ def run_training(distributed=None):
                      "growth_evidence_requested": growth_evidence_requested,
                      "rgb_growth_evidence_requested": rgb_growth_requested,
                      "deletion_evidence_collected": deletion_evidence_collected,
+                     "rgb_deletion_evidence_requested": rgb_deletion_enabled and deletion_evidence_collected,
                      "active_voxels": int(model.active_voxel_count), "topology": event,
                      "reference_cache": reference_cache.statistics(),
                      "gpu_reference_cache": gpu_reference_cache.statistics(),

@@ -223,16 +223,15 @@ class ExperimentOutputTests(unittest.TestCase):
                    ("gradient", "geometry_transition_only", True),
                    ("gradient", "geometry_two_sided_boundary", True),
                    ("contour", "enabled", True),
-                   ("topology", "enable_growth", True),
-                   ("topology", "enable_deletion", True),
+                   ("topology", "use_rgb_growth", False),
+                   ("topology", "use_rgb_deletion", False),
                    ("topology", "use_growth_evidence", True),
-                   ("schedule", "enable_coarse_growth", True),
                    ("model", "opacity_sh_count", 9))
         for group, key, value in changes:
             with self.subTest(setting=f"{group}.{key}"):
                 changed = deepcopy(config)
                 setattr(getattr(changed, group), key, value)
-                with self.assertRaisesRegex(ValueError, "RGB-only phase 1 requires"):
+                with self.assertRaisesRegex(ValueError, "RGB-only"):
                     train.validate(changed)
 
     def test_resume_cannot_silently_change_supervision_mode(self):
