@@ -28,7 +28,8 @@ from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, Unifor
     restore_model, workspace_path, file_sha256, render_view, write_png)
 from reconstruction_checkpoint import load_checkpoint, save_checkpoint
 from reconstruction_color import validate_reference_compositing
-from reconstruction_experiment import allocate_training_output, resumed_training_output
+from reconstruction_experiment import (allocate_training_output, resumed_training_output,
+                                       finalize_training_output, relocate_experiment_paths)
 from reconstruction_optimizer import FalcorOptimizer, OptimizerConfig
 from reconstruction_performance import PerformanceRecorder
 from reconstruction_progress import ProgressLine
@@ -312,7 +313,6 @@ def validate(config):
         raise ValueError("topology.deletion_opacity_threshold must be finite and strictly between 0 and 1")
     if config.topology.growth_rgb_normalization not in ("observed", "full_image"):
         raise ValueError("topology.growth_rgb_normalization must be 'observed' or 'full_image'")
-    validate_growth_opacity(config.topology, config.model.opacity_sh_count)
     if (type(config.topology.growth_freeze_last_epochs) is not int or
             config.topology.growth_freeze_last_epochs < 0):
         raise ValueError("topology.growth_freeze_last_epochs must be a nonnegative integer")
@@ -335,6 +335,7 @@ def validate(config):
             raise ValueError("RGB-only deletion requires topology.use_rgb_deletion=true; legacy alpha deletion is unavailable")
         if not config.topology.use_rgb_growth and (config.topology.enable_growth or config.schedule.enable_coarse_growth):
             raise ValueError("RGB-only growth requires topology.use_rgb_growth=true; legacy alpha growth is unavailable")
+    validate_growth_opacity(config.topology, config.model.opacity_sh_count)
     if (config.topology.enable_deletion and config.topology.use_low_opacity_deletion
             and config.model.opacity_sh_count != 1):
         raise ValueError("Low-opacity deletion requires model.opacity_sh_count=1 (DC logit only)")
@@ -790,6 +791,87 @@ def validate_existing_model(path: Path, resumed_checkpoint: dict) -> None:
         raise ValueError(f"Exported model belongs to a different training dataset: {path}; choose a new experiment directory")
 
 
+def resumed_reconstruction_time(checkpoint):
+    """Recover elapsed active wall time without including time between runs."""
+    if checkpoint is None:
+        return 0., True
+    state = checkpoint["training_state"]
+    if "reconstruction_seconds" not in state:
+        return 0., state.get("completed_epochs", 0) == 0
+    seconds = state["reconstruction_seconds"]
+    if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds) or seconds < 0):
+        raise ValueError("Checkpoint reconstruction_seconds must be finite and nonnegative")
+    complete = state.get("reconstruction_time_complete", True)
+    if not isinstance(complete, bool):
+        raise ValueError("Checkpoint reconstruction_time_complete must be a boolean")
+    return float(seconds), complete
+
+
+def finalize_experiment_output(config, model_path, output, report, performance, distributed=None):
+    """Name completed experiments only after training closes its output handles."""
+    if report["training_status"] != "passed" or report.get("trained_epochs_this_run", 0) == 0:
+        return model_path, output
+    primary = distributed is None or distributed.rank == 0
+    old_root = model_path.parent
+    if distributed is not None:
+        distributed.barrier()
+    result = None
+    if primary:
+        seconds = report["reconstruction_seconds"]
+        renamed = output
+        naming = dict(status="unchanged", original=str(old_root), path=str(old_root),
+                      seconds=seconds, minutes=max(1, math.ceil(seconds / 60)))
+        try:
+            renamed = finalize_training_output(output, seconds, WORKSPACE)
+            if renamed != output:
+                naming.update(status="renamed", path=str(final_model_path(renamed).parent))
+        except OSError as error:
+            # A cosmetic rename must never overwrite another result or discard
+            # a successfully saved reconstruction.
+            naming.update(status="failed", error=str(error))
+            print(f"Experiment directory rename skipped: {error}", file=sys.stderr, flush=True)
+        portable = (renamed.relative_to(WORKSPACE).as_posix()
+                    if renamed.is_relative_to(WORKSPACE) else str(renamed))
+        result = str(final_model_path(renamed)), str(renamed), portable, naming
+    if distributed is not None:
+        result = distributed.broadcast(result)
+    new_model, new_output, portable, naming = result
+    model_path, output = Path(new_model), Path(new_output)
+    new_root = model_path.parent
+    if new_root != old_root:
+        relocated = relocate_experiment_paths(report, old_root, new_root, WORKSPACE)
+        report.clear()
+        report.update(relocated)
+        performance.path = Path(relocate_experiment_paths(
+            str(performance.path), old_root, new_root, WORKSPACE))
+        for name in ("metadata", "checkpoints", "epochs", "profiles"):
+            setattr(performance, name, relocate_experiment_paths(
+                getattr(performance, name), old_root, new_root, WORKSPACE))
+    config.training.output = portable
+    report["experiment_directory"] = naming
+    performance.metadata["reconstruction_seconds"] = report["reconstruction_seconds"]
+    performance.metadata["reconstruction_time_complete"] = report.get("reconstruction_time_complete", True)
+    if primary:
+        # Model/checkpoint bytes and append-only history remain immutable.
+        # Resume locates them by their actual path, as after a machine transfer.
+        (output / "config.json").write_text(
+            json.dumps(asdict(config), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        (output / "training-report.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        performance.write(report["status"], training_status=report["training_status"],
+            reference_cache=report.get("reference_cache"), gpu_reference_cache=report.get("gpu_reference_cache"),
+            native_replay=report.get("native_replay"), collective=report.get("collective"),
+            topology_execution=report.get("topology_execution"),
+            training_report=str(output / "training-report.json"))
+        if naming["status"] == "renamed":
+            print("Completed experiment:", new_root, flush=True)
+            print("Reconstruction time:", f"{naming['minutes']}min (before final evaluation)", flush=True)
+            if not report.get("reconstruction_time_complete", True):
+                print("Timing excludes unrecorded work before the legacy checkpoint.", flush=True)
+    return model_path, output
+
+
 def run_training(distributed=None):
     """Finish and save training before releasing its GPU state for evaluation."""
     run_started = time.perf_counter()
@@ -804,6 +886,7 @@ def run_training(distributed=None):
     apply_arguments(config, args, overrides)
     resume_path = workspace_path(args.resume, WORKSPACE) if args.resume else None
     checkpoint = load_checkpoint(resume_path) if resume_path is not None else None
+    prior_seconds, time_complete = resumed_reconstruction_time(checkpoint)
     if checkpoint is not None:
         validate_resume_supervision(config, checkpoint)
         resolve_resume_reference_compositing(config, checkpoint, overrides)
@@ -816,6 +899,10 @@ def run_training(distributed=None):
     emit("Training output:", output, flush=True)
     emit("Final reconstructed model:", model_path, flush=True)
     report = {"status": "running", "training_status": "running", "evaluation": {"status": "not_started"},
+              "trained_epochs_this_run": 0,
+              "reconstruction_time_complete": time_complete,
+              "reconstruction_time_scope": "Active wall time through final model export, before final evaluation; "
+                                           "resume adds time recorded at its checkpoint and excludes downtime.",
               "started_utc": datetime.now(timezone.utc).isoformat(),
               "scope": "Falcor NoLightTransport 1-spp full-view training; explicit geometry surrogate gradients",
               "falcor_reference_commit": "398f634ec788bbb2e86a6f4d0ab78d41158d9905",
@@ -1176,6 +1263,10 @@ def run_training(distributed=None):
                 training_state={"completed_epochs": epochs, "global_step": global_step,
                     "rng_state": rng.bit_generator.state, "contour_state": sampler.state_dict(),
                     "topology_state": topology_state, "dataset_signature": signature,
+                    # Sample before serialization; a resumed checkpoint cannot
+                    # recover the time spent writing that same checkpoint.
+                    "reconstruction_seconds": prior_seconds + time.perf_counter() - run_started,
+                    "reconstruction_time_complete": time_complete,
                     "pending_epoch_transition": False},
                 optimizer_state=optimizer_state, config=asdict(config), provenance=report["provenance"])
             report["checkpoint"] = str(path)
@@ -1370,6 +1461,7 @@ def run_training(distributed=None):
                 with (output / history_name).open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(entry) + "\n")
             report["last_epoch"] = entry
+            report["trained_epochs_this_run"] = epoch + 1 - completed
             performance.record_epoch(entry)
             last_training_resolution = training_resolution
             progress_line.finish(f"Epoch {epoch+1}/{config.training.num_epochs} done "
@@ -1437,6 +1529,7 @@ def run_training(distributed=None):
         if training_loop_started is not None:
             performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
         report["training_finished_utc"] = datetime.now(timezone.utc).isoformat()
+        report["reconstruction_seconds"] = prior_seconds + time.perf_counter() - run_started
         if report["status"] != "running":
             report["finished_utc"] = report["training_finished_utc"]
         if primary:
@@ -1457,6 +1550,8 @@ def main(distributed=None):
         return 0
     if report["training_status"] != "passed":
         return 1
+    model_path, output = finalize_experiment_output(
+        config, model_path, output, report, performance, distributed)
     if not config.evaluation.enabled:
         return 0
     evaluation = final_evaluation_config(config, model_path)

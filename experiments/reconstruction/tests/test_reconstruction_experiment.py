@@ -154,6 +154,160 @@ class ExperimentOutputTests(unittest.TestCase):
         self.assertEqual(sentinel.read_bytes(), b"existing reconstruction")
         self.assertEqual(self.allocate(), root / "lego-10.15-E12/training")
 
+    def test_completed_duration_names_reserve_daily_indices_across_scenes(self):
+        root = self.workspace / "outputs"
+        for name in ("lego-10.15-E2-20min", "ficus-10.15-E9",
+                     "hotdog-10.15-E10-3min", "hotdog-10.14-E90-10min",
+                     "lego-10.15-E80-3min-backup"):
+            (root / name).mkdir(parents=True)
+        self.assertEqual(self.allocate(), root / "lego-10.15-E11/training")
+
+    def test_completed_experiment_rename_preserves_all_artifacts(self):
+        output = self.allocate()
+        old_root = output.parent
+        artifacts = {
+            "model.npz": b"reconstructed voxel state",
+            "training/training.jsonl": b"training history",
+            "train/0000.png": b"train image",
+            "test/0000.png": b"test image",
+        }
+        for relative, contents in artifacts.items():
+            path = old_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
+        result = experiment.finalize_training_output(output, 1200, self.workspace)
+        self.assertEqual(result, self.workspace / "outputs/lego-10.15-E0-20min/training")
+        self.assertFalse(old_root.exists())
+        self.assertTrue(result.is_dir())
+        for relative, contents in artifacts.items():
+            self.assertEqual((result.parent / relative).read_bytes(), contents)
+        self.assertEqual(self.allocate().parent.name, "lego-10.15-E1")
+
+    def test_completion_minutes_round_up_with_minimum_one(self):
+        for seconds, minutes in ((0, 1), (.1, 1), (59.99, 1),
+                                 (60, 1), (60.001, 2), (119.99, 2),
+                                 (120, 2), (1200.1, 21)):
+            with self.subTest(seconds=seconds):
+                result = experiment.finalize_training_output(self.allocate(), seconds, self.workspace)
+                self.assertTrue(result.parent.name.endswith(f"-{minutes}min"))
+
+    def test_completion_rejects_invalid_duration_without_moving_output(self):
+        output = self.allocate()
+        for seconds in (-1, float("inf"), float("-inf"), float("nan"),
+                        True, False, "60", None):
+            with self.subTest(seconds=seconds):
+                with self.assertRaisesRegex(ValueError, "finite nonnegative"):
+                    experiment.finalize_training_output(output, seconds, self.workspace)
+                self.assertTrue(output.is_dir())
+
+    def test_completion_preserves_existing_destination_file_or_directory(self):
+        for kind in ("file", "directory"):
+            with self.subTest(kind=kind):
+                output = self.allocate()
+                destination = output.parent.with_name(output.parent.name + "-2min")
+                if kind == "directory":
+                    destination.mkdir()
+                    sentinel = destination / "model.npz"
+                else:
+                    sentinel = destination
+                sentinel.write_bytes(b"existing completed experiment")
+                with self.assertRaises(FileExistsError):
+                    experiment.finalize_training_output(output, 120, self.workspace)
+                self.assertTrue(output.is_dir())
+                self.assertEqual(sentinel.read_bytes(), b"existing completed experiment")
+
+    def test_completion_is_idempotent_and_can_update_previous_duration(self):
+        output = self.allocate()
+        completed = experiment.finalize_training_output(output, 120, self.workspace)
+        self.assertEqual(experiment.finalize_training_output(
+            completed, 120, self.workspace), completed)
+        updated = experiment.finalize_training_output(completed, 121, self.workspace)
+        self.assertEqual(updated.parent.name, "lego-10.15-E0-3min")
+        self.assertFalse(completed.exists())
+        self.assertTrue(updated.is_dir())
+
+    def test_completion_leaves_custom_and_outside_directories_unchanged(self):
+        for relative in ("outputs/custom/training", "outputs/lego-10.15-E0/custom",
+                         "outputs/nested/lego-10.15-E0/training",
+                         "elsewhere/lego-10.15-E0/training"):
+            with self.subTest(relative=relative):
+                output = self.workspace / relative
+                output.mkdir(parents=True)
+                sentinel = output / "model.npz"
+                sentinel.write_bytes(b"preserve custom experiment")
+                self.assertEqual(experiment.finalize_training_output(
+                    output, 120, self.workspace), output)
+                self.assertEqual(sentinel.read_bytes(), b"preserve custom experiment")
+
+    def test_completion_refuses_symlink_experiment_and_training(self):
+        root = self.workspace / "outputs"
+        root.mkdir()
+        elsewhere = self.workspace / "elsewhere"
+        (elsewhere / "training").mkdir(parents=True)
+        link = root / "lego-10.15-E0"
+        try:
+            link.symlink_to(elsewhere, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"Creating directory symlinks is unavailable: {error}")
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            experiment.finalize_training_output(link / "training", 120, self.workspace)
+        second = root / "lego-10.15-E1"
+        second.mkdir()
+        (second / "training").symlink_to(elsewhere / "training", target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            experiment.finalize_training_output(second / "training", 120, self.workspace)
+        self.assertTrue((elsewhere / "training").is_dir())
+
+    def test_relocation_preserves_metadata_forms_and_input(self):
+        old = self.workspace / "outputs/lego-10.15-E3"
+        new = self.workspace / "outputs/lego-10.15-E3-20min"
+        old_relative = "outputs/lego-10.15-E3"
+        new_relative = "outputs/lego-10.15-E3-20min"
+        metadata = {
+            "absolute": str(old / "training/training.jsonl"),
+            "relative": old_relative + "/training",
+            "nested": [old.as_posix(), (old_relative.replace("/", "\\") + r"\train\0000.png", 7)],
+            "unrelated": "Rendering result: " + old.as_posix(),
+            "similar": old_relative + "-backup/model.npz",
+            "historical": r"Z:\another-machine\outputs\lego-10.15-E3\training",
+            "parent_traversal": old_relative + "/../other/model.npz",
+            "non_string": old / "model.npz",
+        }
+        original = deepcopy(metadata)
+        result = experiment.relocate_experiment_paths(metadata, old, new, self.workspace)
+        self.assertEqual(metadata, original)
+        self.assertEqual(result["absolute"], str(new / "training/training.jsonl"))
+        self.assertEqual(result["relative"], new_relative + "/training")
+        self.assertEqual(result["nested"], [
+            new.as_posix(), (new_relative.replace("/", "\\") + r"\train\0000.png", 7)])
+        for key in ("unrelated", "similar", "historical", "parent_traversal", "non_string"):
+            self.assertEqual(result[key], metadata[key])
+
+    def test_relocation_does_not_rewrite_historical_copied_paths(self):
+        copied = self.workspace / "outputs/lego-10.15-E3"
+        new = copied.with_name("lego-10.15-E3-20min")
+        values = [
+            "/home/other/projects/outputs/lego-10.15-E3/model.npz",
+            r"E:\old-host\outputs\lego-10.15-E3\model.npz",
+            "outputs/lego-10.15-E30/model.npz",
+            "model.npz",
+        ]
+        self.assertEqual(experiment.relocate_experiment_paths(
+            values, copied, new, self.workspace), values)
+
+    def test_relocation_normalizes_windows_slashes_and_case(self):
+        old = Path(r"D:\workspace\outputs\lego-10.15-E3")
+        new = Path(r"D:\workspace\outputs\lego-10.15-E3-20min")
+        workspace = Path(r"D:\workspace")
+        values = [r"d:\WORKSPACE\outputs\lego-10.15-E3\model.npz",
+                  "D:/workspace/outputs/lego-10.15-E3/training",
+                  r"outputs\lego-10.15-E3\training"]
+        self.assertEqual(experiment.relocate_experiment_paths(
+            values, old, new, workspace), [
+                r"D:\workspace\outputs\lego-10.15-E3-20min\model.npz",
+                "D:/workspace/outputs/lego-10.15-E3-20min/training",
+                r"outputs\lego-10.15-E3-20min\training"])
+
     def test_other_days_invalid_names_and_files_do_not_set_daily_counter(self):
         root = self.workspace / "outputs"
         for name in ("lego-10.14-E100", "lego-10.16-E100", "cache",
