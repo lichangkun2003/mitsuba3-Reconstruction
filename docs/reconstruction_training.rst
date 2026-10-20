@@ -35,7 +35,8 @@ RGB-only 训练、在线生长与删除（当前默认）
    CONFIG.schedule.enable_coarse_growth = True
    CONFIG.contour.enabled = False
 
-损失仅为线性 RGB 的平方误差。新实验默认 ``data.reference_compositing="srgb"``：
+默认损失为线性 RGB 的平方误差；可显式开启下面的 Distortion 正则。
+新实验默认 ``data.reference_compositing="srgb"``：
 读取 sRGB RGBA 图片时，先将编码空间的 RGB 与白底按 alpha 合成，再解码为线性 RGB，
 随后只保留三个 RGB 通道；普通 RGB 图片直接解码为线性 RGB。
 源图片的 alpha 仅参与这一步图像合成，不再作为训练
@@ -60,6 +61,92 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 RGB 收益与持续低 opacity 两条删除分支，总开关关闭时两者均不执行。
 当前 RGB-only 训练入口保留 RGB 删除分支；可单独将 ``use_low_opacity_deletion=False``
 以对照新增清理规则的影响。
+
+可选 Distortion：约束沿射线分散的贡献
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+在 ``CONFIG.gradient.distortion_loss_weight``、JSON 的
+``gradient.distortion_loss_weight`` 或命令行 ``--distortion-weight`` 设置权重。
+默认 ``0`` 保留原实验；首轮对照可用 ``0.01``，它是待验证的起点，
+不代表对本模型已经调好的最优值。该项从第一轮开始生效，升层时权重不变。
+更改权重应新开实验，续训使用 checkpoint 保存的权重，不能中途悄悄切换目标。
+需重新编译 C++，非零权重要求 ``mi.VoxelReconstruction.distortion_version >= 1``。
+
+.. code-block:: powershell
+
+   # 在仓库根目录增量编译，完成后用原训练命令附加 --distortion-weight 0.01。
+   cmake --build build --config Release --parallel 8
+   if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+
+   # 使用本机独立环境的解释器；以下路径适用于 Conda 环境布局。
+   & "..\envs\mitsuba\python.exe" -u -I .\experiments\reconstruction\train.py `
+     --dataset datasets/hotdog --gpu 0 --epochs 1000 --chunk-size 0 `
+     --profile-views 0 --profile-interval-epochs 0 --no-profile-stages `
+     --distortion-weight 0.01 --eval-spp 64 --eval-max-views 10
+
+若本机是 venv 布局，解释器改为 ``..\envs\mitsuba\Scripts\python.exe``。
+双卡入口 ``train_multigpu.py`` 同样透传此选项；仍先 SUM 合并同一视角的
+像素分片梯度与损失，不按卡数重复平均。
+
+**定义。** 当前体素每次 hard hit 提供一个 opacity，而不是一段连续密度。
+因此采用离散点对距离正则，参考
+`mip-NeRF 360 的跨区间贡献项 <https://arxiv.org/html/2111.12077v3>`_，
+但不包含其连续区间宽度项，也不照搬
+`2DGS 附录 A 的 NDC 平方距离实现 <https://arxiv.org/html/2403.17888v2#A1>`_。
+对于已经实际记录的命中：
+
+.. math::
+
+   w_i = T_i\alpha_i,\qquad
+   s_i = \frac{t_i-t_{\mathrm{entry}}}{D_{\mathrm{grid}}},\qquad
+   L_{\mathrm{dist}}=2\sum_{i<j}w_iw_j|s_i-s_j|.
+
+``D_grid`` 是固定场景网格 AABB 的世界空间对角线长度，不随 256 → 512 升层变化。
+``t_entry`` 是当前射线进入网格的固定深度。``t_i`` 取当前体素裁剪段内、
+椭球二次型取得最小值的位置，即现有 ``xStar`` 对应的深度，既不是体素中心，
+也不是新的椭球表面交点。深度按归一化射线方向的世界距离计算；
+由于每个点位于自己的网格段内，命中顺序同时是非递减深度顺序。
+网格整体等比例缩放时，归一化深度差保持不变；它不是无界场景的深度收缩方案。
+
+RGB-only 的每像素目标为：
+
+.. math::
+
+   L = \|\mathbf C-\mathbf R\|_2^2+\lambda_{\mathrm{dist}}L_{\mathrm{dist}}.
+
+不除以累计 opacity、不把背景作为额外命中，也不使用参考 alpha 或前景掩码。
+零命中、单命中时该正则为零；非单位 inverse PDF 对路径正则及其梯度只乘一次，
+当前均匀 1 spp 训练的该权重恒为 1。和 RGB 一样，原生梯度按像素求和，
+报告中的 loss 按全图像素数平均，再跨训练视角平均。
+
+**计算与反向。** 前向在现有命中合成中累积权重和深度的一阶矩；
+反向沿已有命中记录计算前缀／后缀贡献，时间复杂度为每条路径 O(K)。
+不增加一次 DDA、渲染或整图 CPU 回读，但启用时增加深度记录、GPU 运算和归约。
+权重为零时不分配额外深度记录，也不计算此正则。
+
+反向同时包含 opacity 对后续透射率的影响，以及深度对中心、log-scale 和局部旋转
+tangent 的导数。深度最小点位于网格段内部时使用解析导数；被段端点 clamp 时，
+这一深度的几何导数为零。梯度对应固定命中集合与排序内的分段光滑目标，
+不声称对 hard hit/miss、提前终止或拓扑变化进行了精确微分。
+该正则不给 near-miss 增加新的代理梯度，radiance 梯度仍来自 RGB；
+现有 RGB 几何代理及优化器的学习率、限幅保持原规则。
+
+透射率阈值或命中容量截断时，只正则当前渲染实际保留的命中前缀，不延长追踪。
+在线生长／删除仍采用 RGB 单体素收益，不把 Distortion 混入拓扑投票：
+因此一次拓扑提交不是对新总损失下降的保证。
+
+**日志与对照。** ``training.jsonl`` 每轮记录 ``mean_rgb_loss``、
+``mean_distortion_loss``（未乘 lambda）、``mean_weighted_distortion_loss``，
+``mean_loss`` 为总目标。非零权重时使用已有小型摘要一次回读这些量；
+零权重的 ``mean_distortion_loss=0`` 表示该项未计算，不能当作场景已经没有厚层。
+原生 ``loss_and_grad`` 同样返回逐射线 ``rgb_loss``、``distortion_loss`` 和总 ``loss``。
+
+应对照相同场景、随机种子、轮数、拓扑配置下的 ``0`` 与 ``0.01`` 实验，
+检查 train/test 图、PSNR、洞口及厚层，而不只比较总 loss。
+该项鼓励有效贡献集中，但降低 opacity 同样可以降低它；它不能为零命中洞口创造
+候选，也不能证明留下的是正确表面。过强权重可能损失细结构或加重破洞。
+小型数值回归位于 ``tests/test_reconstruction_distortion.py``，包括独立路径公式、
+opacity／深度几何有限差分、分批及重放；完整场景的改善需另行验证。
 
 在线 RGB 生长：复用训练前向，不增加验证渲染
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

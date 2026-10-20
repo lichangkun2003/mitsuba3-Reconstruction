@@ -58,6 +58,7 @@ class TrainingSettings:
 @dataclass
 class GradientSettings:
     alpha_loss_weight: float = .5
+    distortion_loss_weight: float = 0.  # Optional hard-hit depth concentration; 0 preserves the baseline.
     geometry_tau_voxel_fraction: float = .12
     geometry_grad_clamp: float = 5
     alpha_geometry_weight: float = .1
@@ -120,6 +121,7 @@ CONFIG.model.opacity_sh_count = 1  # 仅优化 DC logit；opacity = sigmoid(Y0 *
 CONFIG.gradient.alpha_loss_weight = 0.
 CONFIG.gradient.alpha_geometry_weight = 0.
 CONFIG.gradient.background_carve_weight = 0.
+CONFIG.gradient.distortion_loss_weight = 0.  # 显式使用 --distortion-weight 0.01 开启深度集中正则；0 为原基线。
 CONFIG.gradient.geometry_transition_only = False  # hit/miss 均保留正负 RGB 几何信号。
 CONFIG.gradient.geometry_two_sided_boundary = False  # 保留原 sigmoid，不叠加额外带宽门控。
 CONFIG.contour.enabled = False  # 所有像素均匀采样，不读取 alpha 轮廓标签。
@@ -198,6 +200,8 @@ def parse_arguments():
     parser.add_argument("--resume", help="Resume a completed-epoch checkpoint")
     parser.add_argument("--rgb-only", action=argparse.BooleanOptionalAction, default=None,
                         help="Use RGB-only training (CONFIG default); requires DC opacity and disabled reference-alpha priors")
+    parser.add_argument("--distortion-weight", type=float,
+                        help="Nonnegative hard-hit distortion loss weight (default: 0, disabled); try 0.01 for an ablation")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--stop-after-epochs", type=int,
                         help="Stop after N additional complete epochs, saving a resumable checkpoint without changing the full schedule or publishing model.npz")
@@ -233,6 +237,7 @@ def apply_arguments(config, args, values):
         (args.gpu_reference_cache_mib, "training", "gpu_reference_cache_mib"),
         (args.freeze_native, "training", "freeze_native"),
         (args.rgb_only, "training", "rgb_only"),
+        (getattr(args, "distortion_weight", None), "gradient", "distortion_loss_weight"),
         (args.eval_spp, "evaluation", "spp"),
         (args.eval_max_views, "evaluation", "max_views")):
         if value is not None:
@@ -340,6 +345,8 @@ def validate(config):
         raise ValueError("training.profile_stages must be a boolean")
     if not isinstance(config.training.freeze_native, bool):
         raise ValueError("training.freeze_native must be a boolean")
+    if isinstance(config.gradient.distortion_loss_weight, bool):
+        raise ValueError("gradient.distortion_loss_weight must be finite and nonnegative")
     for name, value in asdict(config.gradient).items():
         if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError(f"Invalid gradient.{name}: {value}")
@@ -446,6 +453,10 @@ def resolve_resume_reference_compositing(config, checkpoint, overrides):
 
 def settings(config):
     result = asdict(config.gradient)
+    if config.gradient.distortion_loss_weight == 0:
+        # The disabled path stays usable with existing native builds and keeps
+        # its original replay key. The native default is also zero.
+        result.pop("distortion_loss_weight")
     result.update(rgb_only=config.training.rgb_only,
         foreground_alpha_min=config.topology.foreground_alpha_min,
         background_alpha_max=config.topology.background_alpha_max,
@@ -501,6 +512,9 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
     raw_alpha = allocate(mi.Float, count) if token is not None else None
     estimated_alpha = allocate(mi.Float, count) if need_rendered_alpha else None
     accumulator = {"gradients": {}}
+    distortion_enabled = config.gradient.distortion_loss_weight > 0
+    if distortion_enabled:
+        accumulator.update(rgb_loss_sum=mi.Float(0), distortion_loss_sum=mi.Float(0))
     total_loss, finite = mi.Float(0), mi.Bool(True)
     camera = prepare_camera(config.render, view["camera"], mi, dr)
     native_settings = settings(config)
@@ -543,6 +557,12 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
                     value = float(value) if name == "wall_seconds" or name.endswith("_ms") else int(value)
                     totals[name] = totals.get(name, 0) + value
         total_loss += dr.sum(result["loss"])
+        if distortion_enabled:
+            for name in ("rgb_loss", "distortion_loss"):
+                if name not in result:
+                    raise RuntimeError("Distortion loss components are unavailable; incrementally rebuild this source checkout")
+                accumulator[name + "_sum"] += dr.sum(result[name])
+                finite &= dr.all(dr.isfinite(result[name]))
         finite &= dr.all(dr.isfinite(result["raw_alpha"])) & dr.all(dr.isfinite(result["alpha"]))
         for name, target in (("raw_alpha", raw_alpha), ("alpha", estimated_alpha)):
             if target is not None:
@@ -578,18 +598,25 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
     if "deletion_gain" in accumulator:
         finite &= dr.all(dr.isfinite(accumulator["deletion_gain"]))
     finite &= dr.isfinite(total_loss)
+    if distortion_enabled:
+        finite &= dr.isfinite(accumulator["rgb_loss_sum"]) & dr.isfinite(accumulator["distortion_loss_sum"])
     return accumulator, total_loss, finite, raw_alpha, estimated_alpha
 
 
-def finalize_view(partial, view, config, sampler, token, mi, dr, np, *, alpha_on_device=False):
+def finalize_view(partial, view, config, sampler, token, mi, dr, np, *, alpha_on_device=False,
+                  loss_components=None):
     """Validate a globally reduced view and observe its contour history once."""
     accumulator, total_loss, finite, raw_alpha, estimated_alpha = partial
     count = config.render.width * config.render.height
     # Read loss and the combined validity flag together, rather than performing
     # a separate host synchronization for every parameter group and ray batch.
-    summary = dr.zeros(mi.Float, 2)
+    distortion_enabled = config.gradient.distortion_loss_weight > 0
+    summary = dr.zeros(mi.Float, 4 if distortion_enabled else 2)
     dr.scatter(summary, total_loss / count, 0)
     dr.scatter(summary, mi.Float(finite), 1)
+    if distortion_enabled:
+        dr.scatter(summary, accumulator.pop("rgb_loss_sum") / count, 2)
+        dr.scatter(summary, accumulator.pop("distortion_loss_sum") / count, 3)
     dr.eval(summary)
     host_summary = np.asarray(summary)
     mean_loss = float(host_summary[0])
@@ -598,6 +625,16 @@ def finalize_view(partial, view, config, sampler, token, mi, dr, np, *, alpha_on
     if mean_loss < 0:
         raise RuntimeError(f"Negative squared-error loss at training view {view['index']}: {mean_loss}; "
                            "check GPU reduction/readback correctness before continuing")
+    if loss_components is not None:
+        # Distortion is deliberately not evaluated at weight zero. In RGB-only
+        # mode the baseline total is already the pure RGB loss, without another
+        # reduction or host transfer. Legacy alpha loss cannot be separated here.
+        rgb_loss = float(host_summary[2]) if distortion_enabled else mean_loss if config.training.rgb_only else None
+        distortion_loss = float(host_summary[3]) if distortion_enabled else 0.
+        if (rgb_loss is not None and not math.isfinite(rgb_loss)) or not math.isfinite(distortion_loss):
+            raise RuntimeError(f"Nonfinite loss component at training view {view['index']}")
+        loss_components.update(rgb_loss=rgb_loss, distortion_loss=distortion_loss,
+                               weighted_distortion_loss=config.gradient.distortion_loss_weight * distortion_loss)
     if raw_alpha is not None:
         sampler.observe(token, np.asarray(raw_alpha))
     # Topology voting consumes the device image directly. Keep the host return
@@ -611,7 +648,7 @@ def finalize_view(partial, view, config, sampler, token, mi, dr, np, *, alpha_on
 def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rendered_alpha=False,
                collect_deletion_evidence=None, stage_profile=None, gpu_reference=None,
                native_replay=None, collective=None, alpha_on_device=False,
-               collect_growth_evidence=False):
+               collect_growth_evidence=False, loss_components=None):
     """Compute one full-view gradient, optionally over synchronized pixel shards.
 
     All ranks consume the same full-view sampling stream and contour history.
@@ -642,9 +679,11 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
         if "deletion_gain" in accumulator:
             finite &= dr.all(dr.isfinite(accumulator["deletion_gain"]))
         finite &= dr.isfinite(total_loss)
+        if config.gradient.distortion_loss_weight > 0:
+            finite &= dr.isfinite(accumulator["rgb_loss_sum"]) & dr.isfinite(accumulator["distortion_loss_sum"])
         partial = accumulator, total_loss, finite, raw_alpha, estimated_alpha
     return finalize_view(partial, view, config, sampler, token, mi, dr, np,
-                         alpha_on_device=alpha_on_device)
+                         alpha_on_device=alpha_on_device, loss_components=loss_components)
 
 
 def kernel_profile(history):
@@ -860,6 +899,10 @@ def run_training(distributed=None):
                         raise ValueError("Resume output belongs to a different configuration; choose a new --output-dir")
         rgb_growth_enabled = config.topology.use_rgb_growth and config.topology.enable_growth and (
             not config.schedule.enabled or config.schedule.enable_coarse_growth)
+        distortion_enabled = config.gradient.distortion_loss_weight > 0
+        if distortion_enabled and getattr(mi.VoxelReconstruction, "distortion_version", 0) < 1:
+            raise RuntimeError("Distortion loss requires native distortion_version >= 1; "
+                               "incrementally rebuild this Mitsuba source checkout")
         if rgb_growth_enabled and getattr(mi.VoxelReconstruction, "rgb_growth_version", 0) < RGB_GROWTH_EVIDENCE_VERSION:
             raise RuntimeError("Multi-parent RGB growth evidence requires native rgb_growth_version >= 3; "
                                "incrementally rebuild this checkout")
@@ -873,11 +916,23 @@ def run_training(distributed=None):
                            + (" and one-pass RGB growth" if rgb_growth_enabled else "")
                            + (" and RGB deletion from existing reverse paths" if rgb_deletion_enabled else "")
                            + (" and persistent low-opacity pruning" if low_opacity_deletion_enabled else "")
+                           + (" and hard-hit distortion loss" if distortion_enabled else "")
                            if config.training.rgb_only else "Legacy Falcor NoLightTransport alpha-supervised training")
         report["training_protocol"].update(
             rgb_only=config.training.rgb_only,
             render_color_space="linear",
             loss_color_space="linear",
+            distortion={
+                "enabled": distortion_enabled,
+                "weight": config.gradient.distortion_loss_weight,
+                "native_version": getattr(mi.VoxelReconstruction, "distortion_version", 0),
+                "formula": "2 * sum(i<j, w_i*w_j*abs(s_i-s_j)); w_i=T_i*opacity_i",
+                "depth": "hard-hit ellipsoid quadratic-minimum depth, relative to ray-grid entry, divided by grid diagonal",
+                "samples": "actual recorded hard hits only; no background sample or interval-width term",
+                "estimator": "one inverse_pdf factor; sum gradients, mean loss over all view pixels",
+                "topology_evidence": "RGB-only insertion/removal gains remain unchanged",
+                "zero_weight": "not computed; logged distortion values are zero, not measurements",
+            },
             reference_compositing=config.data.reference_compositing,
             reference_preprocessing=(
                 "sRGB-encoded sources: composite RGB with background in sRGB, then decode RGB to linear; "
@@ -914,8 +969,9 @@ def run_training(distributed=None):
             deletion_freeze_start_epoch=(max(1, config.training.num_epochs - config.topology.deletion_freeze_last_epochs + 1)
                                          if config.topology.deletion_freeze_last_epochs else None),
             deletion_batch_policy="independent online votes; not a guarantee of joint loss decrease" if rgb_deletion_enabled else None,
-            reported_loss="mean pixel RGB squared-error sum over channels, then mean over views"
-                          if config.training.rgb_only else "mean RGB plus alpha loss over pixels and views")
+            reported_loss=("mean pixel RGB squared-error sum over channels, then mean over views"
+                           if config.training.rgb_only else "mean RGB plus alpha loss over pixels and views")
+                          + (" + weight * mean hard-hit distortion" if distortion_enabled else ""))
         performance.metadata["config"] = asdict(config)
         batch_size = effective_chunk_size(config)
         ray_count = config.render.width * config.render.height
@@ -952,6 +1008,8 @@ def run_training(distributed=None):
         emit("Native GPU replay:", "enabled" if config.training.freeze_native else "disabled", flush=True)
         emit("Reference compositing:", config.data.reference_compositing,
              "| rendering and RGB loss: linear", flush=True)
+        emit("Distortion loss:", f"weight={config.gradient.distortion_loss_weight:g}; "
+             + ("hard-hit pairwise depth concentration" if distortion_enabled else "disabled"), flush=True)
         emit("Training supervision:", ("RGB only; DC opacity; "
              + "refinement" + (" + RGB growth" if rgb_growth_enabled else "")
              + (" + RGB deletion" if rgb_deletion_enabled else "")) if config.training.rgb_only
@@ -1157,6 +1215,8 @@ def run_training(distributed=None):
             interval = config.training.profile_interval_epochs
             order = rng.permutation(len(views)) if config.training.shuffle else np.arange(len(views))
             epoch_loss = 0.
+            epoch_rgb_loss = 0. if config.training.rgb_only or distortion_enabled else None
+            epoch_distortion_loss = 0.
             stage_totals = dict(reference=0., gradients=0., topology_observation=0., optimizer=0.)
             communication_before = collective.statistics() if collective is not None else None
             progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} | view 0/{len(views)} (0%) "
@@ -1177,6 +1237,7 @@ def run_training(distributed=None):
                         reasons.append("periodic_epoch")
                 profiling = bool(reasons)
                 native_stages = {} if profiling and config.training.profile_stages else None
+                loss_components = {}
                 # Sparse kernel-history samples add instrumentation. Wall timings
                 # below include tracing, compilation, transfers and waits.
                 with dr.kernel_history() if profiling else nullcontext() as history:
@@ -1185,7 +1246,8 @@ def run_training(distributed=None):
                         collect_deletion_evidence=deletion_evidence_collected,
                         collect_growth_evidence=rgb_growth_requested,
                         stage_profile=native_stages, gpu_reference=gpu_reference,
-                        native_replay=native_replay, collective=collective, alpha_on_device=True)
+                        native_replay=native_replay, collective=collective, alpha_on_device=True,
+                        loss_components=loss_components)
                     gradients_done = time.perf_counter()
                     if primary and rgb_growth_requested:
                         topology.observe_rgb_growth(model, gradients, view_id=int(index), epoch=epoch,
@@ -1211,6 +1273,9 @@ def run_training(distributed=None):
                 if distributed is not None:
                     distributed.heartbeat(f"epoch {epoch+1} view {progress}")
                 epoch_loss += loss
+                if epoch_rgb_loss is not None:
+                    epoch_rgb_loss += loss_components["rgb_loss"]
+                epoch_distortion_loss += loss_components["distortion_loss"]
                 progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} "
                     f"| view {progress}/{len(views)} ({100*progress/len(views):.0f}%) "
                     f"| cam {int(index)+1} | loss={loss:.6f} | {optimizer_done-view_started:.2f}s/view")
@@ -1223,6 +1288,7 @@ def run_training(distributed=None):
                                                      "direct_empty_model" if config.training.freeze_native and not model.active_voxel_count else
                                                      "frozen" if config.training.freeze_native else "direct"),
                                    native_replay=native_replay.statistics(),
+                                   loss=loss, **loss_components,
                                    wall_seconds=optimizer_done-view_started, stage_seconds=stage,
                                    **kernel_profile(history))
                     if native_stages is not None:
@@ -1257,6 +1323,10 @@ def run_training(distributed=None):
                 # Falcor resets contour proposals whenever grid resolution changes.
                 sampler = make_sampler(config, np)
             entry = {"epoch": epoch+1, "global_step": global_step, "mean_loss": epoch_loss / len(views),
+                     "mean_rgb_loss": epoch_rgb_loss / len(views) if epoch_rgb_loss is not None else None,
+                     "mean_distortion_loss": epoch_distortion_loss / len(views),
+                     "mean_weighted_distortion_loss": config.gradient.distortion_loss_weight * epoch_distortion_loss / len(views),
+                     "distortion_loss_weight": config.gradient.distortion_loss_weight,
                      "rgb_only": config.training.rgb_only,
                      "seconds": time.perf_counter()-started, "resolution": int(model.resolution),
                      "training_resolution": training_resolution, "active_voxels_before": active_voxels_before,

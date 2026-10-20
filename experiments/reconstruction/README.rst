@@ -121,6 +121,24 @@ RGB 分支不因无观测、零收益或低 opacity 删除。
 ``--stop-after-epochs 41 --skip-evaluation`` 可覆盖前两次证据事件，
 是否生长或删除仍取决于数据。这是新实验，不会修改已有结果。
 
+Distortion 对照实验
+-------------------
+
+保持现有生长、删除和 1 spp 配置，在原训练命令后添加
+``--distortion-weight 0.01`` 可尝试沿射线贡献集中正则；``0`` 为默认值，恢复原目标。
+代码配置位置为 ``CONFIG.gradient.distortion_loss_weight``。
+它使用实际 hard hit 的 ``T*opacity`` 和归一化深度点对距离，反向同时更新 opacity
+与深度相关几何，不增加一次前向，也不使用参考 alpha。它不直接给空洞创建新候选。
+
+本功能修改了 C++，同步源码后先执行
+``cmake --build build --config Release --parallel 8``，要求
+``mi.VoxelReconstruction.distortion_version >= 1``，再新开实验。
+权重保存在 checkpoint 中；开启与关闭应分别运行，不在续训时更改。
+``training.jsonl`` 分开记录 RGB、未加权 Distortion、加权 Distortion 和总 loss，
+便于与原实验比较；``0.01`` 是待验证的初始权重，不保证改善 PSNR 或补洞。
+公式、截断路径语义、梯度范围及运行示例见
+``docs/reconstruction_training.rst`` 的“可选 Distortion”一节。
+
 目录导航
 --------
 

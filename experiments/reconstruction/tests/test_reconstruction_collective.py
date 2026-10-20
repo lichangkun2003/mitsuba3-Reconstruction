@@ -165,6 +165,19 @@ def main():
     assert stats["calls"] == 7 and stats["views"] == 1
     assert stats["payload_bytes"] == (3 * 50 + 2 + 8) * 4
 
+    # Distortion components share the existing loss collective. Unlike
+    # mean-of-rank-means, this raw SUM is correct for unequal pixel shards.
+    components = _fixture()
+    source = _accumulator(2)
+    source.update(rgb_loss_sum=_float(2.5), distortion_loss_sum=_float(.125))
+    result, loss, finite, _, _ = components.reduce_view(source, 3., True)
+    np.testing.assert_array_equal(loss, [7.])
+    np.testing.assert_array_equal(result["rgb_loss_sum"], [6.])
+    np.testing.assert_array_equal(result["distortion_loss_sum"], [1.25])
+    assert components._lib.calls[3] == (3, _NCCL_FLOAT32, _NCCL_SUM)
+    assert components.statistics()["calls"] == 5
+    assert components.dr.syncs == 1
+
     # Empty topology still participates in the loss/finite scalar collectives.
     empty = _fixture()
     result, _, _, out_raw, out_alpha = empty.reduce_view(_accumulator(0), 0., True)
@@ -173,15 +186,20 @@ def main():
     assert empty.statistics()["calls"] == 2
     assert empty.dr.syncs == 1
 
-    for malformed in ("groups", "counts", "scalar"):
+    for malformed in ("groups", "counts", "scalar", "missing_component", "component_shape"):
         broken, value = _fixture(), _accumulator(2)
         loss_value = 0.
         if malformed == "groups":
             del value["gradients"][GRADIENT_KEYS[0]]
         elif malformed == "counts":
             value[SUM_COUNTER_KEYS[0]] = np.zeros(3, dtype=np.uint32)
-        else:
+        elif malformed == "scalar":
             loss_value = [0., 1.]
+        elif malformed == "missing_component":
+            value["rgb_loss_sum"] = _float(1.)
+        else:
+            value["rgb_loss_sum"] = _float([1., 2.])
+            value["distortion_loss_sum"] = _float(0.)
         try:
             broken.reduce_view(value, loss_value, True)
         except ValueError:
@@ -192,7 +210,7 @@ def main():
     print({"status": "passed", "scope": "CPU mock only", "checks": [
         "sum_gradients_and_validity", "max_evidence", "finite_min", "loss_sum",
         "fresh_receive_buffers", "optional_images", "single_sync", "empty_topology",
-        "reject_invalid_shapes", "statistics"]})
+        "packed_distortion_component_sums", "reject_invalid_shapes", "statistics"]})
 
 
 if __name__ == "__main__":

@@ -504,13 +504,16 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         {"max_candidates", 16.f}, {"entry_offset_fraction", 0.f},
         {"profile_stages", 0.f}, {"rgb_only", 0.f},
         {"collect_rgb_deletion_evidence", 0.f},
-        {"collect_growth_evidence", 0.f}, {"max_growth_hits", 8.f}};
+        {"collect_growth_evidence", 0.f}, {"max_growth_hits", 8.f},
+        {"distortion_loss_weight", 0.f}};
     for (const auto &[key, value] : settings) {
         if (cfg.find(key) == cfg.end() || !std::isfinite(value) || value < 0.f)
             Throw("VoxelReconstruction.loss_and_grad(): unknown/invalid setting %s.", key.c_str());
         cfg[key] = value;
     }
     const bool rgb_only = cfg["rgb_only"] != 0.f;
+    const float distortion_weight = cfg["distortion_loss_weight"];
+    const bool distortion_enabled = distortion_weight > 0.f;
     const bool collect_rgb_deletion = cfg["collect_rgb_deletion_evidence"] != 0.f;
     if (collect_rgb_deletion && !rgb_only)
         Throw("VoxelReconstruction.loss_and_grad(): RGB deletion evidence requires RGB-only mode.");
@@ -533,15 +536,16 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     // differently sized compatibility alpha argument must not affect the batch.
     if (!rgb_only)
         width = std::max(width, dr::width(reference_alpha));
+    const uint32_t hit_fields = distortion_enabled ? 11u : 9u;
     if (width == 0 || width * std::max(max_hits, std::max(max_candidates,
-        collect_growth ? max_growth_hits : 1u)) * 9 > UINT32_MAX)
+        collect_growth ? max_growth_hits : 1u)) * hit_fields > UINT32_MAX)
         Throw("VoxelReconstruction.loss_and_grad(): ray batch is empty or too large.");
     ReconstructionStageProfiler<dr::is_jit_v<Float>> profiler(cfg["profile_stages"] != 0.f);
     // std::map is not traversed by dr::schedule(); schedule its buffers explicitly.
     auto evaluate_result = [](const TrainingResult &result) {
         if constexpr (dr::is_jit_v<Float>) {
             dr::schedule(result.rgb, result.raw_rgb, result.alpha, result.raw_alpha,
-                         result.loss, result.hit_count);
+                         result.loss, result.rgb_loss, result.distortion_loss, result.hit_count);
             for (const auto &[key, value] : result.gradients)
                 dr::schedule(value);
             for (const auto &[key, value] : result.counters)
@@ -566,7 +570,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         result.alpha = result.raw_alpha;
         Color3f target = rgb_only ? reference_rgb :
             reference_rgb*reference_alpha + Color3f(1.f)*(1.f-reference_alpha);
-        result.loss = dr::squared_norm(result.rgb-target);
+        result.rgb_loss = dr::squared_norm(result.rgb-target);
+        result.distortion_loss = dr::zeros<Float>(width);
+        result.loss = result.rgb_loss;
         if (!rgb_only)
             result.loss += cfg["alpha_loss_weight"]*dr::square(reference_alpha);
         result.hit_count = dr::zeros<UInt32>(width);
@@ -599,7 +605,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     // Nine hit floats: relative-world xStar[3], gmin, RGB[3], opacity, T_before.
     // Each field contains hit-major rows of rays: field * hit_stride +
     // hit_index * ray_count + lane. Reverse traversal therefore reads adjacent
-    // lanes contiguously. The batch-size check above bounds all nine fields.
+    // lanes contiguously. Distortion adds normalized closest-point depth and
+    // an unclamped-depth flag only when explicitly enabled.
     const uint32_t ray_count = uint32_t(width), hit_stride = ray_count * max_hits;
     // Candidate slots are lane-local loop variables. A read after a scatter to
     // global memory cannot be evaluated inside a symbolic Dr.Jit loop.
@@ -625,7 +632,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         FloatBuffer growth_values;
         UIntBuffer growth_ids, growth_unknown;
         DRJIT_STRUCT(Records, hit, hit_id, candidates, growth_values, growth_ids, growth_unknown)
-    } records{dr::zeros<FloatBuffer>(width*max_hits*9),
+    } records{dr::zeros<FloatBuffer>(width*max_hits*hit_fields),
               dr::zeros<UIntBuffer>(width*max_hits),
               std::vector<Candidate>(max_candidates,
                   Candidate{Vector3f(0.f), Float(0.f), Float(0.f), Float(0.f), UInt32(0), UInt32(0)}),
@@ -730,8 +737,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         Float entry, transmittance;
         Color3f color;
         UInt32 hits,candidates,iterations,growth_hits;
-        DRJIT_STRUCT(State,active,cell,next,entry,transmittance,color,hits,candidates,iterations,growth_hits)
-    } state{active,cell,next,entry,Float(1.f),Color3f(0.f),UInt32(0),UInt32(0),UInt32(0),UInt32(0)};
+        Float distortion_mass, distortion_moment, distortion;
+        DRJIT_STRUCT(State,active,cell,next,entry,transmittance,color,hits,candidates,
+                     iterations,growth_hits,distortion_mass,distortion_moment,distortion)
+    } state{active,cell,next,entry,Float(1.f),Color3f(0.f),UInt32(0),UInt32(0),
+            UInt32(0),UInt32(0),Float(0.f),Float(0.f),Float(0.f)};
     const float diagonal=std::sqrt(dr::square(m_max[0]-m_min[0])+dr::square(m_max[1]-m_min[1])+dr::square(m_max[2]-m_min[2]));
     dr::tie(state,records)=dr::while_loop(dr::make_tuple(state,records),
         [](const State &s,const Records &) {return s.active;},
@@ -795,7 +805,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             if (m_active_count) dr::tie(s,r.candidates)=dr::if_stmt(
                 dr::make_tuple(s,r.candidates,id,end,occupied,ray.o,d),occupied,
                 [this,rotate,quaternion,appearance,ray_count,hit_stride,lane,
-                 max_candidates,diagonal,hit_buffers](State s,Candidates candidates,const UInt32 &id,
+                 max_candidates,diagonal,hit_buffers,distortion_enabled,
+                 grid_entry=entry](State s,Candidates candidates,const UInt32 &id,
                     const Float &end,const Mask &occupied,const Point3f &origin,
                     const Vector3f &direction) {
                     Vector3f relative,scale,segment=direction*(end-s.entry);
@@ -816,11 +827,18 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     Float star=dr::select(a>1e-20f,dr::clip(-dr::dot(u,v)/dr::select(a>1e-20f,a,1.f),0.f,1.f),0.f);
                     Vector3f relative_star=relative+star*segment, unit_star=u+star*v;
                     Float gmin=dr::squared_norm(unit_star)-1.f;
+                    Float depth(0.f);
+                    Mask depth_free(false);
+                    if (distortion_enabled) {
+                        depth = (s.entry+star*(end-s.entry)-grid_entry)/diagonal;
+                        depth_free = (a>1e-20f)&(star>0.f)&(star<1.f);
+                    }
                     s=dr::if_stmt(
-                        dr::make_tuple(s,id,relative_star,gmin,hit,direction),hit,
-                        [appearance,ray_count,hit_stride,lane,hit_buffers](State s,
+                        dr::make_tuple(s,id,relative_star,gmin,hit,direction,depth,depth_free),hit,
+                        [appearance,ray_count,hit_stride,lane,hit_buffers,distortion_enabled](State s,
                             const UInt32 &id,const Vector3f &relative_star,
-                            const Float &gmin,const Mask &hit,const Vector3f &direction) {
+                            const Float &gmin,const Mask &hit,const Vector3f &direction,
+                            const Float &depth,const Mask &depth_free) {
                             Color3f emission;
                             Float opacity;
                             appearance(id,Vector3f(-direction),hit,emission,opacity);
@@ -834,13 +852,23 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                             dr::scatter(hit_buffers->hit,opacity,7*hit_stride+slot,hit);
                             dr::scatter(hit_buffers->hit,s.transmittance,8*hit_stride+slot,hit);
                             Float hit_alpha=dr::select(hit,opacity,0.f);
+                            if (distortion_enabled) {
+                                dr::scatter(hit_buffers->hit,depth,9*hit_stride+slot,hit);
+                                dr::scatter(hit_buffers->hit,Float(depth_free),10*hit_stride+slot,hit);
+                                Float contribution = s.transmittance*hit_alpha;
+                                s.distortion += 2.f*contribution*
+                                    (depth*s.distortion_mass-s.distortion_moment);
+                                s.distortion_mass += contribution;
+                                s.distortion_moment += contribution*depth;
+                            }
                             s.color += s.transmittance*hit_alpha*emission;
                             s.transmittance *= 1.f-hit_alpha;
                             s.hits += dr::select(hit,1u,0u);
                             return s;
                         },
                         [](State s,const UInt32 &,const Vector3f &,
-                           const Float &,const Mask &,const Vector3f &) {
+                           const Float &,const Mask &,const Vector3f &,
+                           const Float &,const Mask &) {
                             return s;
                         },"Voxel reconstruction training hit");
                     if(max_candidates) {
@@ -941,7 +969,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     Float dalpha(0.f),deletion_dalpha(0.f);
     Color3f deletion_dcolor(0.f);
     Mask is_background(false),is_foreground(false);
-    result.loss=dr::squared_norm(delta);
+    result.rgb_loss=dr::squared_norm(delta);
+    result.distortion_loss=distortion_enabled ?
+        dr::select(state.hits>1u,state.distortion*weight,0.f) :
+        dr::zeros<Float>(width);
+    result.loss=result.rgb_loss;
     if (!rgb_only) {
         dalpha=2.f*cfg["alpha_loss_weight"]*(result.alpha-reference_alpha);
         result.loss+=cfg["alpha_loss_weight"]*dr::square(result.alpha-reference_alpha);
@@ -950,6 +982,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         is_background=reference_alpha<=cfg["background_alpha_max"];
         is_foreground=!is_background & (reference_alpha>=cfg["foreground_alpha_min"]);
     }
+    if (distortion_enabled)
+        result.loss += distortion_weight*result.distortion_loss;
     if (growth_requested) {
         result.growth_sums["growth_gain"] = dr::zeros<FloatBuffer>(m_growth_count);
         result.growth_counts["growth_observed"] = dr::zeros<UIntBuffer>(m_growth_count);
@@ -1104,6 +1138,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         }
         dr::scatter_reduce(ReduceOp::Add,counters["geometry_valid"],UInt32(1),id,valid);
         if(!rgb_only && hard_hit) dr::scatter_reduce(ReduceOp::Add,counters["background_carve_valid"],UInt32(1),id,valid&is_background);
+        return valid;
     };
 
     // Hit records stay read-only inside the symbolic reverse loop. Separate
@@ -1133,18 +1168,23 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         CounterMap counters;
         GradientMap deletion_sums;
         CounterMap deletion_counts;
+        Float distortion_mass, distortion_moment, distortion_weight_derivative;
         DRJIT_STRUCT(ReverseState,hit,behind,after,suffix,gradients,counters,
-                     deletion_sums,deletion_counts)
+                     deletion_sums,deletion_counts,distortion_mass,
+                     distortion_moment,distortion_weight_derivative)
     } reverse{dr::full<Int32>(int(max_hits)-1,width),background,Float(1.f),
               dr::zeros<FloatBuffer>(size_t(hit_stride)*4),
               std::move(result.gradients),std::move(result.counters),
-              std::move(result.deletion_sums),std::move(result.deletion_counts)};
+              std::move(result.deletion_sums),std::move(result.deletion_counts),
+              Float(0.f),Float(0.f),Float(0.f)};
     dr::tie(reverse)=dr::while_loop(dr::make_tuple(std::move(reverse)),
         [](const ReverseState &s) { return s.hit>=0; },
         [this,hit_records=records.hit,hit_ids=records.hit_id,hit_count=state.hits,
          ray_count,hit_stride,lane,clean,dcolor,dalpha,d,weight,is_background,
          is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry,rgb_only,
-         collect_rgb_deletion,deletion_complete,deletion_residual](ReverseState &s) {
+         collect_rgb_deletion,deletion_complete,deletion_residual,distortion_enabled,
+         distortion_weight,diagonal,quaternion,rotate,
+         total_mass=state.distortion_mass,total_moment=state.distortion_moment](ReverseState &s) {
             Mask valid=UInt32(s.hit)<hit_count;
             UInt32 slot=UInt32(s.hit)*ray_count+lane,id=dr::gather<UInt32>(hit_ids,slot,valid);
             Vector3f offset;Color3f radiance;
@@ -1161,6 +1201,69 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             grad_rgb*=weight;
             Float grad_opacity=clean(dr::dot(dcolor,before*(radiance-s.behind))+dalpha*before*s.after);
             Float grad_logit=grad_opacity*weight*opacity*(1.f-opacity);
+            Mask distortion_geometry_valid(false);
+            if (distortion_enabled) {
+                Float depth=dr::gather<Float>(hit_records,9*hit_stride+slot,valid);
+                Mask depth_free=dr::gather<Float>(hit_records,10*hit_stride+slot,valid)>0.f;
+                Float contribution=dr::select(valid,before*opacity,0.f);
+                Float left_mass=total_mass-contribution-s.distortion_mass;
+                Float left_moment=total_moment-contribution*depth-s.distortion_moment;
+                Float derivative=2.f*(depth*left_mass-left_moment+
+                                      s.distortion_moment-depth*s.distortion_mass);
+                // A single point has identically zero distortion. Enforce
+                // this contract explicitly despite possible fused-operation
+                // rounding in total_moment - contribution*depth.
+                derivative=dr::select(hit_count>1u,derivative,0.f);
+                // q_i = dD/dw_i. Differentiating all later transmittances
+                // yields this division-free sigmoid-logit derivative, including
+                // alpha == 1 without a potentially singular 1/(1-alpha).
+                grad_logit += distortion_weight*weight*clean(
+                    derivative*contribution*(1.f-opacity)-
+                    opacity*s.distortion_weight_derivative);
+                Float depth_derivative=distortion_weight*weight*
+                    (2.f*contribution*(left_mass-s.distortion_mass))/diagonal;
+                depth_derivative=dr::select(hit_count>1u,depth_derivative,0.f);
+
+                // Interior closest point minimizes p^T diag(scale^-2) p.
+                // Its implicit derivative is exact while hard-hit membership,
+                // cell clipping, and DDA ordering stay fixed. Clipped endpoints
+                // are fixed by the grid, so their geometric depth derivative is zero.
+                Float qw;Vector3f qv,scale,log_scale;
+                quaternion(id,valid,qw,qv);
+                for(uint32_t j=0;j<3;++j) {
+                    log_scale[j]=dr::gather<Float>(m_log_scales,id*3+j,valid);
+                    scale[j]=dr::exp(dr::clip(log_scale[j],-30.f,30.f));
+                }
+                Vector3f principal=rotate(offset,qw,-qv), direction=rotate(d,qw,-qv);
+                Vector3f weighted_point=principal/(scale*scale);
+                Vector3f weighted_direction=direction/(scale*scale);
+                Float denominator=dr::dot(direction,weighted_direction);
+                distortion_geometry_valid=valid&depth_free&dr::isfinite(depth_derivative)&
+                    (depth_derivative!=0.f)&dr::isfinite(denominator)&(denominator>0.f);
+                Float factor=dr::select(distortion_geometry_valid,
+                    depth_derivative/dr::select(distortion_geometry_valid,denominator,1.f),0.f);
+                Vector3f center_gradient=rotate(weighted_direction,qw,qv);
+                Vector3f scale_gradient=2.f*direction*weighted_point;
+                Vector3f rotation_gradient=dr::cross(direction,weighted_point)+
+                                          dr::cross(principal,weighted_direction);
+                Float rotation_norm2=dr::square(dr::gather<Float>(m_rotations,id*4,valid));
+                for(uint32_t j=0;j<3;++j)
+                    rotation_norm2 += dr::square(dr::gather<Float>(m_rotations,id*4+j+1,valid));
+                Mask rotation_valid=dr::isfinite(rotation_norm2)&(rotation_norm2>1e-20f);
+                for(uint32_t j=0;j<3;++j) {
+                    dr::scatter_reduce(ReduceOp::Add,s.gradients["centers"],
+                        clean(factor*center_gradient[j]*m_size[j]),id*3+j,distortion_geometry_valid);
+                    dr::scatter_reduce(ReduceOp::Add,s.gradients["log_scales"],
+                        clean(factor*scale_gradient[j]),id*3+j,
+                        distortion_geometry_valid&(log_scale[j]>-30.f)&(log_scale[j]<30.f));
+                    dr::scatter_reduce(ReduceOp::Add,s.gradients["rotation_tangent"],
+                        clean(factor*rotation_gradient[j]),id*3+j,
+                        distortion_geometry_valid&rotation_valid);
+                }
+                s.distortion_mass += contribution;
+                s.distortion_moment += contribution*depth;
+                s.distortion_weight_derivative += contribution*derivative;
+            }
             for(uint32_t k=0;k<std::max(m_sh_count,m_opacity_sh_count);++k) {
                 Float sh=reconstruction_sh(k,Vector3f(-d));
                 if(k<m_sh_count)
@@ -1198,7 +1301,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 dr::scatter_reduce(ReduceOp::Add,s.deletion_counts["deletion_unknown"],
                     UInt32(1),id,valid&!known);
             }
-            add_geometry(s.gradients,s.counters,id,offset,gmin,before,opacity,radiance,s.behind,s.after,valid,true);
+            Mask proxy_geometry_valid=add_geometry(s.gradients,s.counters,id,offset,gmin,
+                before,opacity,radiance,s.behind,s.after,valid,true);
+            if (distortion_enabled)
+                dr::scatter_reduce(ReduceOp::Add,s.counters["geometry_valid"],UInt32(1),
+                    id,distortion_geometry_valid&!proxy_geometry_valid);
             s.behind=dr::select(valid,clean(opacity*radiance+(1.f-opacity)*s.behind),s.behind);
             s.after=dr::select(valid,dr::clip(clean(s.after*(1.f-opacity)),0.f,1.f),s.after);
             // Each ray writes each slot once; the four planes are disjoint.

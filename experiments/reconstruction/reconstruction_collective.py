@@ -21,6 +21,7 @@ import time
 GRADIENT_KEYS = ("radiance_sh", "opacity_sh", "centers", "log_scales", "rotation_tangent")
 SUM_COUNTER_KEYS = ("appearance_valid", "geometry_valid", "background_carve_valid")
 MAX_COUNTER_KEYS = ("foreground_evidence", "background_evidence")
+LOSS_COMPONENT_KEYS = ("rgb_loss_sum", "distortion_loss_sum")
 
 _NCCL_FLOAT32, _NCCL_UINT32 = 7, 3
 _NCCL_SUM, _NCCL_MAX, _NCCL_MIN = 0, 2, 3
@@ -213,6 +214,16 @@ class NcclCollective:
         loss_sum, finite = mi.Float(loss_sum), mi.UInt32(finite)
         if dr.width(loss_sum) != 1 or dr.width(finite) != 1:
             raise ValueError("Loss and finite-status reductions require scalar device arrays")
+        component_presence = [name in accumulator for name in LOSS_COMPONENT_KEYS]
+        if any(component_presence) and not all(component_presence):
+            raise ValueError("Distortion reductions require both RGB and distortion loss sums")
+        component_names = LOSS_COMPONENT_KEYS if all(component_presence) else ()
+        if any(dr.width(accumulator[name]) != 1 for name in component_names):
+            raise ValueError("Loss component reductions require scalar device arrays")
+        # Pack these scalars into the existing loss collective, so reporting
+        # components adds no NCCL call or host synchronization per view.
+        packed_losses = (dr.concat([loss_sum, *[mi.Float(accumulator[name]) for name in component_names]])
+                         if component_names else loss_sum)
         operations = []
 
         def prepare(value, dtype, operation):
@@ -226,7 +237,7 @@ class NcclCollective:
         global_gradients = prepare(gradients, _NCCL_FLOAT32, _NCCL_SUM)
         global_validity = prepare(validity, _NCCL_UINT32, _NCCL_SUM)
         global_evidence = prepare(evidence, _NCCL_UINT32, _NCCL_MAX)
-        global_loss = prepare(loss_sum, _NCCL_FLOAT32, _NCCL_SUM)
+        global_losses = prepare(packed_losses, _NCCL_FLOAT32, _NCCL_SUM)
         global_finite = prepare(finite, _NCCL_UINT32, _NCCL_MIN)
         global_raw = prepare(mi.Float(raw_alpha), _NCCL_FLOAT32, _NCCL_SUM) if raw_alpha is not None else None
         global_alpha = prepare(mi.Float(alpha), _NCCL_FLOAT32, _NCCL_SUM) if alpha is not None else None
@@ -278,6 +289,13 @@ class NcclCollective:
             result.update(self._unpack(global_validity, SUM_COUNTER_KEYS, validity_widths, mi.UInt32))
             result.update(self._unpack(global_evidence, MAX_COUNTER_KEYS, evidence_widths, mi.UInt32))
             result.update(global_rgb_evidence)
+            if component_names:
+                losses = self._unpack(global_losses, ("loss_sum", *component_names),
+                                      [1] * (1 + len(component_names)), mi.Float)
+                global_loss = losses.pop("loss_sum")
+                result.update(losses)
+            else:
+                global_loss = global_losses
             self._stats["views"] += 1
             self._stats["calls"] += len(descriptors)
             self._stats["payload_bytes"] += sum(width * 4 for _, _, width, _, _ in descriptors)

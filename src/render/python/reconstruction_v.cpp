@@ -111,6 +111,8 @@ MI_PY_EXPORT(VoxelReconstruction) {
             result["raw_alpha"] = values.raw_alpha;
             result["hit_count"] = values.hit_count;
             result["loss"] = values.loss;
+            result["rgb_loss"] = values.rgb_loss;
+            result["distortion_loss"] = values.distortion_loss;
             result["gradients"] = values.gradients;
             for (const auto &[key, value] : values.counters)
                 result[nb::str(key.c_str())] = value;
@@ -157,5 +159,6 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("rgb_only_version") = nb::int_(Model::rgb_only_version);
     cls.attr("rgb_growth_version") = nb::int_(Model::rgb_growth_version);
     cls.attr("rgb_deletion_version") = nb::int_(Model::rgb_deletion_version);
+    cls.attr("distortion_version") = nb::int_(Model::distortion_version);
     drjit::bind_traverse(cls);
 }

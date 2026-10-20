@@ -30,6 +30,8 @@ public:
     static constexpr uint32_t rgb_growth_version = 3;
     /// Per-hit single-removal RGB gains on complete baseline paths.
     static constexpr uint32_t rgb_deletion_version = 1;
+    /// Point-pair L1 depth distortion with exact fixed-hit continuous gradients.
+    static constexpr uint32_t distortion_version = 1;
 
     VoxelReconstruction(const std::string &filename, uint32_t resolution,
                         const std::array<float, 3> &grid_min,
@@ -57,7 +59,7 @@ public:
 
     struct TrainingResult {
         Color3f rgb, raw_rgb;
-        Float alpha, raw_alpha, loss;
+        Float alpha, raw_alpha, loss, rgb_loss, distortion_loss;
         UInt32 hit_count;
         std::map<std::string, FloatBuffer> gradients;
         std::map<std::string, UIntBuffer> counters;
@@ -82,6 +84,10 @@ public:
     /// are off. collect_rgb_deletion_evidence explicitly enables RGB-only
     /// single-removal evidence using the existing reverse traversal.
     /// Internal opacity, transmittance, and returned rendered alpha remain active.
+    /// distortion_loss_weight optionally adds pairwise L1 separation of the
+    /// recorded hard-hit contributions. Depth is the clipped ellipsoid-metric
+    /// closest point, normalized by the fixed grid diagonal. No background,
+    /// unrecorded suffix, near-miss surrogate, or extra tracing is included.
     TrainingResult loss_and_grad(const Ray3f &ray, const Color3f &reference_rgb,
                                  const Float &reference_alpha,
                                  const Color3f &background,
