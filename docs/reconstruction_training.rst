@@ -28,6 +28,9 @@ RGB-only 训练、在线生长与删除（当前默认）
    CONFIG.topology.use_low_opacity_deletion = True
    CONFIG.topology.use_growth_evidence = False
    CONFIG.topology.use_rgb_growth = True
+   CONFIG.topology.growth_inherit_opacity = True
+   CONFIG.topology.growth_opacity_scale = 0.8
+   CONFIG.topology.growth_initial_opacity = 0.3
    CONFIG.topology.growth_warmup_epochs = 20
    CONFIG.topology.growth_fine_warmup_epochs = 20
    CONFIG.topology.growth_freeze_last_epochs = 100
@@ -155,8 +158,30 @@ opacity／深度几何有限差分、分批及重放；完整场景的改善需�
 几何候选保留原规则：目标空格、26 邻域、有限面／棱／角接触、至少 0.05 个体素宽度的
 外伸、同一空格至少两个合法父体支持，以及成熟期与冷却条件。
 这些规则仅提出位置，不将“周围有体素”当作缺洞的证明。
-候选几何沿用原初始化，颜色继承父体 radiance DC、其余 SH 为零，初始 opacity 为 0.5；
-这些候选参数在一次证据事件中冻结，提交时使用同一组参数。
+候选几何沿用原初始化，颜色继承父体 radiance DC、其余 SH 为零。
+新实验的出生不透明度改为继承父体并衰减、限制上限：
+
+.. math::
+
+   a_{\mathrm{parent}} = \operatorname{sigmoid}(Y_0 b_{0,\mathrm{parent}}),
+   \qquad
+   a_{\mathrm{child}} =
+   \min(a_{\mathrm{birth,max}}, k a_{\mathrm{parent}}).
+
+当前 ``growth_inherit_opacity=True``、``growth_opacity_scale=0.8``，
+``growth_initial_opacity=0.3``；后者在继承模式中是出生上限。
+例如父体 opacity 为 0.9 时，子体为 0.3；父体为 0.2 时，子体为 0.16。
+继承只支持各向同性 DC opacity，衰减真实不透明度，而不是直接缩放 opacity SH 系数；
+实现使用稳定的对数概率转换，不给低 opacity 人为添加下限。
+候选准备时冻结这一出生值，与几何、颜色一起用于整轮 RGB 收益证据及最终出生；
+即使父体在该轮中继续优化，提交时也不重新读取它的 opacity 来改变候选。
+``growth_inherit_opacity=False`` 保留固定出生值，此时 ``growth_initial_opacity`` 就是该固定值；
+旧规则的独立对照应同时设为 ``False`` 和 ``0.5``。
+
+较低出生 opacity 用于减小新增体素的瞬时遮挡，是待验证的初始化设置，并不保证减少模糊或加快补洞。
+多层低 opacity 仍能累积遮挡，无色差或被遮挡的体素也未必自动变透明；
+连续几代继承衰减可能降低新生体素的优化信号，需要结合实际图像与生长统计比较。
+它不改变点云初始化及升层分裂时的 opacity 规则，不额外执行前向或增加每视角回读。
 同一目标空格来自不同合法父体的形状与颜色提案全部保留，分别累积可靠命中、
 收益及支持／反对视角，不再在投票前只选第一个父体。事件结束后先检查每份提案的
 RGB 资格，再按当时的几何检查父体与目标格是否合法；同格仍有多份合格提案时，
@@ -231,8 +256,9 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 候选记录容量溢出只使未能保存的记录未知，已保存记录在其他完整路径检查通过时继续
 有效；记录溢出本身不改变真实前向的颜色、透射率或此前保存的 prefix。
 即使原射线完整，插入候选后可能触发命中上限或透射率终止时，对应记录也保守弃权。
-例如当前候选初始 opacity 为 0.5，会将后方透射率再减半，可能使有用候选也因不满足
-完整路径条件而失去部分射线证据；这需要在真实实验中结合未知计数检查。
+候选会将后方透射率乘以 ``1-a_child``。当前继承模式的出生上限为 0.3，
+旧固定 0.5 规则会将其再减半；即使使用较低出生值，有用候选仍可能因不满足完整路径条件
+而失去部分射线证据，需要在真实实验中结合未知计数检查。
 当前仅支持均匀训练采样；原生证据遇到非单位采样权重同样弃权，不用于 contour 模式。
 
 上述均值是以“证据可靠”为条件的局部均值。路径能否完整、记录是否溢出与遮挡和深度
@@ -244,6 +270,9 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 
 .. code-block:: python
 
+   CONFIG.topology.growth_inherit_opacity = True
+   CONFIG.topology.growth_opacity_scale = 0.8
+   CONFIG.topology.growth_initial_opacity = 0.3
    CONFIG.topology.growth_warmup_epochs = 20
    CONFIG.topology.growth_fine_warmup_epochs = 20
    CONFIG.topology.growth_freeze_last_epochs = 100
@@ -394,13 +423,19 @@ RGB 分支不因没有观测、零收益或 opacity 较低而删除；持续低 
 源码版本、续训与启动
 ~~~~~~~~~~~~~~~~~~~~
 
-本次保留同格多个父体提案修改了原生候选索引、记录及收益计算，需要相应的 C++ 与绑定。
+出生 opacity 继承仅修改 Python 候选初始化，不增加新的 C++ 接口要求；
+已使用下述兼容原生构建时，更新脚本后新开实验即可，无须为这一改动再次编译。
+配置随 checkpoint 保存；缺少 ``growth_inherit_opacity`` 的可兼容旧 checkpoint 恢复为
+``False``，继续使用已保存的固定 ``growth_initial_opacity``（旧默认 0.5）。
+新实验默认继承与上限不会悄悄改变旧实验的续训规则；比较新规则应从初始化重新训练。
+
+此前保留同格多个父体提案修改了原生候选索引、记录及收益计算，需要相应的 C++ 与绑定。
 RGB-only 启动会检查 ``mi.VoxelReconstruction.rgb_only_version``，启用生长还要求
-``rgb_growth_version >= 3``；**同步代码后必须增量编译，再启动新进程**，
+``rgb_growth_version >= 3``；**尚未同步该原生修正时必须增量编译，再启动新进程**，
 旧二进制不能只更新 Python 后继续使用。该修正保持生长间隔、0.05 外伸门槛、
 两个合法父体、0.7 形状缩小比例、warmup、分裂与损失定义不变。
 已有 RGB 删除要求 ``mi.VoxelReconstruction.rgb_deletion_version >= 1``；
-之前的持续低 opacity 分支只修改 Python 调度，但本次多父体生长修正需要重新编译。
+持续低 opacity 分支及出生 opacity 继承只修改 Python 调度与初始化，但尚未同步的多父体生长修正需要重新编译。
 checkpoint 保存内部证据版本，使用版本 2 或更早 RGB 生长证据规则的训练不能直接升级
 续训，应新开实验，避免把单父体证据与多父体证据混用；
 旧模型仍可独立评价，证据版本不改变已保存的体素渲染参数。

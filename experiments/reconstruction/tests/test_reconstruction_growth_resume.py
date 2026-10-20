@@ -36,7 +36,112 @@ class GrowthResumeTests(unittest.TestCase):
         settings = train.CONFIG.topology
         self.assertEqual(settings.growth_rgb_normalization, "observed")
         self.assertEqual(settings.growth_freeze_last_epochs, 100)
+        self.assertTrue(settings.growth_inherit_opacity)
+        self.assertEqual(settings.growth_opacity_scale, .8)
+        self.assertEqual(settings.growth_initial_opacity, .3)
         train.validate(copy.deepcopy(train.CONFIG))
+
+    def test_missing_birth_mode_keeps_legacy_fixed_opacity(self):
+        previous = copy.deepcopy(asdict(train.CONFIG.topology))
+        previous.pop("growth_inherit_opacity")
+        previous.pop("growth_opacity_scale")
+        previous["growth_initial_opacity"] = .5
+        normalized = train.normalized_algorithm_group("topology", previous)
+        self.assertFalse(normalized["growth_inherit_opacity"])
+        self.assertEqual(normalized["growth_initial_opacity"], .5)
+        self.assertEqual(normalized["growth_opacity_scale"], .8)
+        self.assertNotIn("growth_inherit_opacity", previous)
+        self.assertEqual(normalized, train.normalized_algorithm_group("topology", {
+            **previous, "growth_inherit_opacity": False, "growth_opacity_scale": .8}))
+        self.assertNotEqual(normalized, train.normalized_algorithm_group("topology", {
+            **previous, "growth_inherit_opacity": True, "growth_initial_opacity": .3}))
+
+    def test_birth_mode_change_cannot_overwrite_existing_model_on_resume(self):
+        previous = legacy_checkpoint()
+        previous["config"]["topology"].pop("growth_inherit_opacity")
+        previous["config"]["topology"].pop("growth_opacity_scale")
+        previous["config"]["topology"]["growth_initial_opacity"] = .5
+        explicit = explicit_checkpoint(previous)
+        with tempfile.TemporaryDirectory(prefix="mitsuba-growth-opacity-resume-") as directory:
+            path = Path(directory) / "model.npz"
+            path.touch()
+            with patch.object(train, "load_checkpoint", return_value=explicit):
+                train.validate_existing_model(path, previous)
+            for name, value in (("growth_inherit_opacity", True),
+                                ("growth_initial_opacity", .3),
+                                ("growth_opacity_scale", .7)):
+                with self.subTest(name=name):
+                    changed = copy.deepcopy(explicit)
+                    changed["config"]["topology"][name] = value
+                    with patch.object(train, "load_checkpoint", return_value=changed):
+                        with self.assertRaisesRegex(ValueError, "different topology"):
+                            train.validate_existing_model(path, previous)
+
+    def test_invalid_birth_settings_rejected_before_runtime(self):
+        cases = {
+            "growth_inherit_opacity": (0, 1, "true", None),
+            "growth_opacity_scale": (0., -1., 1.01, float("inf"), float("nan"), True, ".8", None),
+            "growth_initial_opacity": (0., -1., 1., float("inf"), float("nan"), True, ".3", None),
+        }
+        for name, values in cases.items():
+            for value in values:
+                with self.subTest(name=name, value=value):
+                    config = copy.deepcopy(train.CONFIG)
+                    setattr(config.topology, name, value)
+                    with self.assertRaisesRegex(ValueError, name):
+                        train.validate(config)
+        config = copy.deepcopy(train.CONFIG)
+        config.topology.growth_opacity_scale = 1.
+        train.validate(config)
+
+    def test_inherited_birth_rejects_directional_opacity_before_runtime(self):
+        # Disable the independent RGB-only restriction, so this checks the
+        # inheritance requirement itself rather than an unrelated validator.
+        config = copy.deepcopy(train.CONFIG)
+        config.training.rgb_only = False
+        config.data.reference_compositing = "linear"
+        config.topology.use_rgb_growth = False
+        config.topology.use_rgb_deletion = False
+        config.topology.use_low_opacity_deletion = False
+        config.model.opacity_sh_count = 4
+        with self.assertRaisesRegex(ValueError, "opacity_sh_count"):
+            train.validate(config)
+
+    def test_explicit_legacy_training_restores_fixed_birth_defaults(self):
+        with patch.object(sys, "argv", ["train.py", "--no-rgb-only"]):
+            args = train.parse_arguments()
+        config = copy.deepcopy(train.CONFIG)
+        train.apply_arguments(config, args, {})
+        self.assertFalse(config.topology.growth_inherit_opacity)
+        self.assertEqual(config.topology.growth_initial_opacity, .5)
+        train.validate(config)
+
+    def test_explicit_birth_settings_survive_legacy_training_selection(self):
+        with patch.object(sys, "argv", ["train.py", "--no-rgb-only"]):
+            args = train.parse_arguments()
+        for settings, expected_inherit in (
+                ({"growth_initial_opacity": .25}, False),
+                ({"growth_inherit_opacity": True, "growth_initial_opacity": .25}, True)):
+            with self.subTest(settings=settings):
+                config = copy.deepcopy(train.CONFIG)
+                train.apply_arguments(config, args, {"topology": settings})
+                self.assertEqual(config.topology.growth_inherit_opacity, expected_inherit)
+                self.assertEqual(config.topology.growth_initial_opacity, .25)
+                train.validate(config)
+
+    def test_legacy_resume_preserves_saved_birth_mode_and_custom_opacity(self):
+        with patch.object(sys, "argv", ["train.py", "--resume", "saved.npz"]):
+            args = train.parse_arguments()
+        for inherit in (False, True):
+            with self.subTest(inherit=inherit):
+                config = copy.deepcopy(train.CONFIG)
+                config.training.rgb_only = False
+                config.topology = train.TopologySettings(
+                    growth_initial_opacity=.7, growth_inherit_opacity=inherit)
+                train.apply_arguments(config, args, {})
+                self.assertEqual(config.topology.growth_inherit_opacity, inherit)
+                self.assertEqual(config.topology.growth_initial_opacity, .7)
+                train.validate(config)
 
     def test_missing_tail_window_preserves_legacy_growth_schedule(self):
         previous = copy.deepcopy(asdict(train.CONFIG.topology))

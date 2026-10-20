@@ -59,7 +59,10 @@ class TopologySettings:
     growth_interval: int = 10
     growth_shrink: float = .7
     growth_contact_offset: float = .2
+    # Fixed birth opacity for legacy runs; a birth cap when inheritance is on.
     growth_initial_opacity: float = .5
+    growth_inherit_opacity: bool = False
+    growth_opacity_scale: float = .8
     growth_wait_epochs: int = 5
     growth_protection_epochs: int = 5
     deletion_cooldown_epochs: int = 5
@@ -87,6 +90,48 @@ class CoarseToFineConfig:
     growth_finer_level_multiplier: float = 2.5
     coarse_growth_interval: int = 10
     save_each_level: bool = True
+
+
+def validate_growth_opacity(settings, opacity_sh_count):
+    """Validate parent-opacity initialization in both CLI and topology paths."""
+    if not isinstance(settings.growth_inherit_opacity, bool):
+        raise ValueError("topology.growth_inherit_opacity must be a boolean")
+    scale = settings.growth_opacity_scale
+    if (isinstance(scale, bool) or not isinstance(scale, (int, float))
+            or not math.isfinite(scale) or not 0 < scale <= 1):
+        raise ValueError("topology.growth_opacity_scale must satisfy 0 < scale <= 1")
+    if settings.growth_inherit_opacity:
+        if opacity_sh_count != 1:
+            raise ValueError("Parent-opacity growth requires isotropic opacity_sh_count == 1")
+        cap = settings.growth_initial_opacity
+        if (isinstance(cap, bool) or not isinstance(cap, (int, float))
+                or not math.isfinite(cap) or not 0 < cap < 1):
+            raise ValueError("topology.growth_initial_opacity must satisfy 0 < birth cap < 1")
+
+
+def _growth_opacity_coefficients(state, metadata, parent_ids, settings, np):
+    """Freeze candidate opacity in probability space, then encode its DC logit."""
+    sh_count = metadata["opacity_sh_count"]
+    validate_growth_opacity(settings, sh_count)
+    opacity = np.zeros((len(parent_ids), sh_count), dtype=np.float32)
+    inverse_y0 = 2 * math.sqrt(math.pi)
+    if settings.growth_inherit_opacity:
+        parent_b0 = np.asarray(state["opacity_sh"]).reshape(-1, sh_count)[parent_ids, 0]
+        if not np.all(np.isfinite(parent_b0)):
+            raise ValueError("Growth parent opacity coefficients must be finite")
+        parent_logit = parent_b0.astype(np.float64) / inverse_y0
+        # log(sigmoid(z)) avoids underflow for very transparent parents. Scaling
+        # b0 itself would pull alpha toward 0.5 and brighten transparent parents.
+        log_alpha = np.minimum(
+            math.log(settings.growth_initial_opacity),
+            math.log(settings.growth_opacity_scale) - np.logaddexp(0., -parent_logit))
+        child_logit = log_alpha - np.log(-np.expm1(log_alpha))
+        opacity[:, 0] = child_logit * inverse_y0
+    else:
+        # Preserve historical fixed-opacity and clipping behavior exactly.
+        alpha = float(np.clip(settings.growth_initial_opacity, .01, .99))
+        opacity[:, 0] = math.log(alpha / (1 - alpha)) * inverse_y0
+    return opacity
 
 
 def level_budgets(start: int, target: int, total: int, weights=(6, 4)) -> dict[int, int]:
@@ -474,6 +519,7 @@ class TopologyManager:
             raise ValueError("topology.use_rgb_deletion must be a boolean")
         if not isinstance(cfg.use_low_opacity_deletion, bool):
             raise ValueError("topology.use_low_opacity_deletion must be a boolean")
+        validate_growth_opacity(cfg, self._model_opacity_sh_count)
         if (cfg.enable_deletion and cfg.use_low_opacity_deletion and
                 self._model_opacity_sh_count != 1):
             raise ValueError("Low-opacity deletion requires isotropic opacity_sh_count == 1")
@@ -781,9 +827,8 @@ class TopologyManager:
             state, metadata = checkpoint["model_state"], checkpoint["model_metadata"]
             radiance = np.zeros((count, metadata["sh_count"], 3), dtype=np.float32)
             radiance[:, 0] = state["radiance_sh"].reshape(self.count, metadata["sh_count"], 3)[pending["parent_ids"], 0]
-            opacity = np.zeros((count, metadata["opacity_sh_count"]), dtype=np.float32)
-            alpha = float(np.clip(cfg.growth_initial_opacity, .01, .99))
-            opacity[:, 0] = math.log(alpha / (1 - alpha)) * (2 * math.sqrt(math.pi))
+            opacity = _growth_opacity_coefficients(
+                state, metadata, pending["parent_ids"], cfg, np)
             pending.update(radiance_sh=radiance, opacity_sh=opacity,
                            geometric_support=counts[inverse].astype(np.uint32),
                            mode="rgb", normalization=cfg.growth_rgb_normalization,
@@ -1418,9 +1463,8 @@ class TopologyManager:
                 else:
                     radiance = np.zeros((added, metadata["sh_count"], 3), dtype=np.float32)
                     radiance[:, 0] = state["radiance_sh"].reshape(self.count, metadata["sh_count"], 3)[parents, 0]
-                    opacity = np.zeros((added, metadata["opacity_sh_count"]), dtype=np.float32)
-                    alpha = float(np.clip(cfg.growth_initial_opacity, .01, .99))
-                    opacity[:, 0] = math.log(alpha / (1 - alpha)) * (2 * math.sqrt(math.pi))
+                    opacity = _growth_opacity_coefficients(
+                        state, metadata, parents, cfg, np)
                 new = {"cell_indices": selected["cells"].astype(np.uint32), "centers": selected["centers"],
                        "log_scales": selected["log_scales"], "rotations": selected["rotations"],
                        "radiance_sh": radiance, "opacity_sh": opacity}

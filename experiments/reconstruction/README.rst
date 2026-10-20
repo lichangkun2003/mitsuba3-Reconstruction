@@ -34,6 +34,11 @@
 RGB 投票与提交时几何复核后，每格选择跨可靠视角平均收益最高的一份提案，
 同分按父体格编号确定顺序，每格最多新增一个体素，再应用总体素容量限制。
 父体外伸门槛 0.05、至少两个合法父体支持及形状缩小比例 0.7 保持不变。
+新实验的出生 opacity 为 ``min(0.3, 0.8 * parent_opacity)``，其中父体 opacity 按
+``sigmoid(Y0*b0)`` 计算，只支持各向同性 DC。它衰减真实不透明度，不直接缩放 SH 系数。
+候选准备时冻结出生值，RGB 投票和最终加入模型使用相同值，提交时不随父体的新参数重新计算。
+继承模式不人为添加 opacity 下限；该设置旨在降低出生时的遮挡扰动，但不保证改善模糊，
+多层低 opacity 仍可累积遮挡，连续继承也可能减弱优化信号，需要新实验验证。
 粗层、细层分别先冻结生长 20 轮，之后按 10 轮周期处理；各层第一次事件在第 30 轮。
 删除包含两条分支：复用已有命中反向的后缀颜色判断 RGB 删除收益，以及持续低 opacity 清理；
 两者均不另做前向。
@@ -43,6 +48,9 @@ RGB 投票与提交时几何复核后，每格选择跨可靠视角平均收益�
 .. code-block:: python
 
    CONFIG.topology.use_rgb_growth = True
+   CONFIG.topology.growth_inherit_opacity = True
+   CONFIG.topology.growth_opacity_scale = 0.8
+   CONFIG.topology.growth_initial_opacity = 0.3
    CONFIG.topology.growth_warmup_epochs = 20
    CONFIG.topology.growth_fine_warmup_epochs = 20
    CONFIG.topology.growth_freeze_last_epochs = 100
@@ -61,6 +69,12 @@ RGB 投票与提交时几何复核后，每格选择跨可靠视角平均收益�
    CONFIG.topology.deletion_rgb_min_mean_gain = 1e-7
    CONFIG.topology.deletion_opacity_threshold = 0.005
    CONFIG.topology.deletion_opacity_confirmation_windows = 2
+
+``growth_initial_opacity`` 在继承模式中是上限；关闭 ``growth_inherit_opacity`` 后则是固定出生值。
+旧固定 0.5 规则的对照需同时设置 ``growth_inherit_opacity=False``、``growth_initial_opacity=0.5``。
+新配置随 checkpoint 保存；旧 checkpoint 缺少继承开关时保持关闭，使用原已保存的固定值
+（旧默认 0.5），不会自动切换规则。本次仅修改 Python 初始化，已具备下述原生构建的机器
+不需要为此重新编译；不增加前向或每视角回读，点云初始化及升层分裂规则保持原样。
 
 末尾冻结按全局总轮数计算：700 轮实验冻结第 601–700 轮，1000 轮实验冻结第 901–1000 轮，
 期间不准备生长候选、不收集生长证据，也不提交新增体素。设为 ``0`` 关闭该窗口；
@@ -106,13 +120,13 @@ RGB 分支不因无观测、零收益或低 opacity 删除。
 轮毂改善。``0.005`` 是待验证的初始阈值，很多低 opacity 体素仍可能共同产生可见贡献。
 本阶段尚未添加 ``T*a`` 低贡献裁剪。更完整的公式、事件日志和局限见训练文档。
 
-本次多父体生长修正修改了 C++ 候选索引与证据计算，**同步后必须增量编译并重新启动**，
+此前多父体生长修正修改了 C++ 候选索引与证据计算，**尚未同步该修正时必须增量编译并重新启动**，
 源码构建需满足 ``mi.VoxelReconstruction.rgb_growth_version >= 3``。
 使用版本 2 或更早 RGB 生长证据的 checkpoint 不能直接升级续训，应新开实验；
 旧模型仍可独立评价。完整投票定义、截断弃权、每射线记录容量与
 局限见 ``docs/reconstruction_training.rst`` 开头。
 已有原生 RGB 删除要求 ``mi.VoxelReconstruction.rgb_deletion_version >= 1``，
-之前的持续低 opacity 分支仅修改 Python，本次生长修正仍需要上述 C++ 增量编译。
+持续低 opacity 分支及本次出生 opacity 继承仅修改 Python，多父体生长修正仍需要上述 C++ 构建。
 旧 checkpoint 缺少 ``use_rgb_deletion`` 时按 ``False`` 恢复，
 保留原有已保存配置，不自动给原来关闭删除的实验启用此机制；启用应新开实验。
 旧 checkpoint 缺少 ``use_low_opacity_deletion`` 时也按 ``False`` 恢复；

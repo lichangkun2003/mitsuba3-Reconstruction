@@ -7,6 +7,7 @@ and evidence decisions must only consume the native training statistics.
 from __future__ import annotations
 
 import copy
+import math
 from pathlib import Path
 import sys
 import unittest
@@ -36,6 +37,7 @@ class Model:
         self.checkpoint = checkpoint
         self.resolution = checkpoint["model_metadata"]["resolution"]
         self.active_voxel_count = len(checkpoint["model_state"]["cell_indices"])
+        self.opacity_sh_count = checkpoint["model_metadata"]["opacity_sh_count"]
         self.overlay = None
 
     def set_growth_candidates(self, state):
@@ -119,6 +121,121 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         self.assertEqual(self.manager.growth_wait_start[-1], 2)
         self.assertIsNone(self.model.overlay)
         self.assertIsNone(self.manager.pending_growth)
+
+    def set_parent_opacities(self, alphas):
+        # Independent DC SH encoding: opacity is sigmoid(b0 / sqrt(4*pi)).
+        values = np.asarray(alphas, dtype=np.float64)
+        self.checkpoint["model_state"]["opacity_sh"][:] = (
+            np.log(values / (1. - values)) * math.sqrt(4. * math.pi))
+
+    def inherit_parent_opacity(self):
+        self.settings.growth_inherit_opacity = True
+        self.settings.growth_opacity_scale = .8
+        self.settings.growth_initial_opacity = .3
+        self.manager = topology.TopologyManager(self.model, 3, self.settings, self.schedule)
+
+    def test_sibling_proposals_inherit_probability_and_apply_birth_cap(self):
+        self.set_parent_opacities([.2, .95])
+        self.inherit_parent_opacity()
+        pending = self.prepare()
+        ids = np.flatnonzero(pending["cells"] == 74)
+        self.assertEqual(set(pending["parent_cells"][ids]), {73, 75})
+        logits = pending["opacity_sh"][ids, 0] / math.sqrt(4. * math.pi)
+        alphas = 1. / (1. + np.exp(-logits.astype(np.float64)))
+        expected = np.asarray([.16 if parent == 73 else .3
+                               for parent in pending["parent_cells"][ids]])
+        np.testing.assert_allclose(alphas, expected, rtol=2e-7, atol=1e-8)
+        np.testing.assert_array_equal(
+            pending["candidate_state"]["opacity_sh"], pending["opacity_sh"].reshape(-1))
+        np.testing.assert_array_equal(
+            self.model.overlay["opacity_sh"], pending["candidate_state"]["opacity_sh"])
+
+    def test_fixed_birth_opacity_remains_independent_of_parent(self):
+        self.set_parent_opacities([.2, .95])
+        self.settings.growth_initial_opacity = .4
+        pending = self.prepare()
+        expected = np.float32(math.log(.4 / .6) * math.sqrt(4. * math.pi))
+        np.testing.assert_array_equal(
+            pending["opacity_sh"], np.full_like(pending["opacity_sh"], expected))
+
+    def test_inherited_birth_is_frozen_through_parent_changes_and_resume(self):
+        self.set_parent_opacities([.2, .95])
+        self.inherit_parent_opacity()
+        pending = self.prepare()
+        target = np.flatnonzero((pending["cells"] == 74) &
+                               (pending["parent_cells"] == 73))[0]
+        expected = pending["opacity_sh"][target].copy()
+        self.manager.observe_rgb_growth(self.model, self.evidence(pending), 0, 0, 100)
+        saved = self.manager.state_dict()
+        self.set_parent_opacities([.99, .01])
+        resumed = topology.TopologyManager(self.model, 3, self.settings, self.schedule)
+        resumed.load_state_dict(saved)
+        self.manager = resumed
+        self.assertTrue(resumed.prepare_rgb_growth(self.model, 0))
+        np.testing.assert_array_equal(resumed.pending_growth["opacity_sh"][target], expected)
+        np.testing.assert_array_equal(
+            self.model.overlay["opacity_sh"], pending["candidate_state"]["opacity_sh"])
+        self.observe_all(resumed.pending_growth)
+        replacement, event = resumed.finish_epoch(self.model, self.optimizer, 1)
+        self.assertEqual(event["grown"], 1)
+        np.testing.assert_array_equal(replacement["model_state"]["opacity_sh"][-1:], expected)
+        np.testing.assert_array_equal(
+            replacement["model_state"]["opacity_sh"][:2],
+            self.checkpoint["model_state"]["opacity_sh"])
+        self.assertTrue(resumed.settings.growth_inherit_opacity)
+
+    def test_extreme_finite_parent_logits_do_not_create_an_opacity_floor(self):
+        # Direct logits avoid underflow in the test's own sigmoid/logit encoder.
+        self.checkpoint["model_state"]["opacity_sh"][:] = (
+            np.asarray([-10000., 10000.]) * math.sqrt(4. * math.pi))
+        self.inherit_parent_opacity()
+        pending = self.prepare()
+        self.assertTrue(np.isfinite(pending["opacity_sh"]).all())
+        by_parent = {int(parent): float(value)
+                     for parent, value in zip(pending["parent_cells"],
+                                              pending["opacity_sh"][:, 0])}
+        parent_logit = (float(self.checkpoint["model_state"]["opacity_sh"][0])
+                        / math.sqrt(4. * math.pi))
+        self.assertAlmostEqual(by_parent[73] / math.sqrt(4. * math.pi),
+                               parent_logit + math.log(.8), delta=.002)
+        self.assertAlmostEqual(by_parent[75] / math.sqrt(4. * math.pi),
+                               math.log(.3 / .7), places=6)
+
+    def test_largest_finite_parent_coefficients_remain_finite(self):
+        limit = np.finfo(np.float32).max
+        self.checkpoint["model_state"]["opacity_sh"][:] = [-limit, limit]
+        self.inherit_parent_opacity()
+        with np.errstate(over="raise", invalid="raise"):
+            pending = self.prepare()
+        self.assertTrue(np.isfinite(pending["opacity_sh"]).all())
+        negative = pending["opacity_sh"][pending["parent_cells"] == 73, 0]
+        # At this magnitude the attenuation is below float32 precision, but
+        # must not become -inf or be replaced by an artificial opacity floor.
+        np.testing.assert_array_equal(negative, np.full_like(negative, -limit))
+
+    def test_legacy_pending_resume_preserves_fixed_birth_opacity(self):
+        self.prepare()
+        saved = self.manager.state_dict()
+        saved["settings"].pop("growth_inherit_opacity")
+        saved["settings"].pop("growth_opacity_scale")
+        current = copy.deepcopy(self.settings)
+        current.growth_inherit_opacity = True
+        current.growth_initial_opacity = .3
+        resumed = topology.TopologyManager(self.model, 3, current, self.schedule)
+        resumed.load_state_dict(saved)
+        self.assertFalse(resumed.settings.growth_inherit_opacity)
+        self.assertEqual(resumed.settings.growth_initial_opacity, .5)
+        self.manager = resumed
+        self.observe_all(resumed.pending_growth)
+        replacement, event = resumed.finish_epoch(self.model, self.optimizer, 1)
+        self.assertEqual(event["grown"], 1)
+        np.testing.assert_array_equal(replacement["model_state"]["opacity_sh"][-1:], [0.])
+
+    def test_inheritance_rejects_directional_opacity(self):
+        self.model.opacity_sh_count = 4
+        self.settings.growth_inherit_opacity = True
+        with self.assertRaisesRegex(ValueError, "opacity_sh_count"):
+            topology.TopologyManager(self.model, 3, self.settings, self.schedule)
 
     def test_unknown_only_conflicting_and_neutral_evidence_do_not_grow(self):
         for gain, known, unknown in ((0., 0, 1), (-1., 1, 0), (-1., 1, 1), (0., 1, 1)):

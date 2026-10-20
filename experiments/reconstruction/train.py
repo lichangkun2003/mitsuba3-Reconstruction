@@ -35,7 +35,8 @@ from reconstruction_progress import ProgressLine
 from reconstruction_reference import GPUReferenceCache
 from reconstruction_replay import NativeLossReplay
 from reconstruction_growth_rgb import RGB_GROWTH_EVIDENCE_VERSION
-from reconstruction_topology import TopologyManager, TopologySettings, CoarseToFineConfig, level_budgets
+from reconstruction_topology import (TopologyManager, TopologySettings, CoarseToFineConfig,
+                                     level_budgets, validate_growth_opacity)
 
 
 @dataclass
@@ -142,6 +143,9 @@ CONFIG.topology.deletion_rgb_gain_epsilon = 1e-7
 CONFIG.topology.deletion_rgb_min_mean_gain = 1e-7
 CONFIG.topology.use_growth_evidence = False
 CONFIG.topology.use_rgb_growth = True  # 复用训练前向的 RGB 收益票，不额外渲染。
+CONFIG.topology.growth_inherit_opacity = True
+CONFIG.topology.growth_opacity_scale = .8  # 出生 opacity 继承父体素概率值的 80%，不是缩放 logit。
+CONFIG.topology.growth_initial_opacity = .3  # 继承模式的出生上限：min(0.3, 0.8 * parent_opacity)。
 CONFIG.topology.growth_rgb_normalization = "observed"  # 有效命中射线均值，再对可靠观测视角求均值。
 CONFIG.topology.growth_warmup_epochs = 20  # 最粗层级先优化 20 轮，再按生长周期检查。
 CONFIG.topology.growth_fine_warmup_epochs = 20  # 每个后续层级重新 warmup。
@@ -255,6 +259,11 @@ def apply_arguments(config, args, values):
     if (not config.training.rgb_only and
             "use_low_opacity_deletion" not in values.get("topology", {})):
         config.topology.use_low_opacity_deletion = False
+    if (not config.training.rgb_only and not getattr(args, "resume", None) and
+            "growth_inherit_opacity" not in values.get("topology", {})):
+        config.topology.growth_inherit_opacity = False
+        if "growth_initial_opacity" not in values.get("topology", {}):
+            config.topology.growth_initial_opacity = TopologySettings().growth_initial_opacity
     if (not config.training.rgb_only and
             "reference_compositing" not in values.get("data", {})):
         config.data.reference_compositing = "linear"
@@ -303,6 +312,7 @@ def validate(config):
         raise ValueError("topology.deletion_opacity_threshold must be finite and strictly between 0 and 1")
     if config.topology.growth_rgb_normalization not in ("observed", "full_image"):
         raise ValueError("topology.growth_rgb_normalization must be 'observed' or 'full_image'")
+    validate_growth_opacity(config.topology, config.model.opacity_sh_count)
     if (type(config.topology.growth_freeze_last_epochs) is not int or
             config.topology.growth_freeze_last_epochs < 0):
         raise ValueError("topology.growth_freeze_last_epochs must be a nonnegative integer")
@@ -944,6 +954,12 @@ def run_training(distributed=None):
             growth_evidence=("same-DDA independent parent proposals; per-cell winner after signed 1-spp RGB votes; no confirmation render"
                              if rgb_growth_enabled else "disabled" if config.training.rgb_only else "legacy alpha evidence"),
             growth_normalization=config.topology.growth_rgb_normalization if rgb_growth_enabled else None,
+            growth_birth_opacity={
+                "mode": "parent_scaled" if config.topology.growth_inherit_opacity else "fixed",
+                "parent_scale": config.topology.growth_opacity_scale if config.topology.growth_inherit_opacity else None,
+                "birth_cap" if config.topology.growth_inherit_opacity else "fixed_value":
+                    config.topology.growth_initial_opacity,
+            },
             growth_evidence_version=(mi.VoxelReconstruction.rgb_growth_version if rgb_growth_enabled else None),
             growth_unknown_policy="exclude unknown rays; retain reliable rays from the same view"
                                   if rgb_growth_enabled else None,
