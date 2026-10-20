@@ -35,7 +35,29 @@ class GrowthResumeTests(unittest.TestCase):
     def test_new_experiment_uses_observations(self):
         settings = train.CONFIG.topology
         self.assertEqual(settings.growth_rgb_normalization, "observed")
+        self.assertEqual(settings.growth_freeze_last_epochs, 100)
         train.validate(copy.deepcopy(train.CONFIG))
+
+    def test_missing_tail_window_preserves_legacy_growth_schedule(self):
+        previous = copy.deepcopy(asdict(train.CONFIG.topology))
+        previous.pop("growth_freeze_last_epochs")
+        normalized = train.normalized_algorithm_group("topology", previous)
+        self.assertEqual(normalized["growth_freeze_last_epochs"], 0)
+        self.assertNotIn("growth_freeze_last_epochs", previous)
+        explicit = {**previous, "growth_freeze_last_epochs": 0}
+        self.assertEqual(
+            train.normalized_algorithm_group("topology", explicit), normalized)
+        current = {**previous, "growth_freeze_last_epochs": 100}
+        self.assertNotEqual(
+            train.normalized_algorithm_group("topology", current), normalized)
+
+    def test_invalid_tail_window_is_rejected_before_runtime(self):
+        for value in (-1, 1.5, "100", True, None):
+            with self.subTest(value=value):
+                config = copy.deepcopy(train.CONFIG)
+                config.topology.growth_freeze_last_epochs = value
+                with self.assertRaisesRegex(ValueError, "growth_freeze_last_epochs"):
+                    train.validate(config)
 
     def test_missing_mode_preserves_legacy_units(self):
         previous = legacy_checkpoint()["config"]["topology"]

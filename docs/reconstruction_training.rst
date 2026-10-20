@@ -27,6 +27,7 @@ RGB-only 训练与在线生长（当前默认）
    CONFIG.topology.use_rgb_growth = True
    CONFIG.topology.growth_warmup_epochs = 20
    CONFIG.topology.growth_fine_warmup_epochs = 20
+   CONFIG.topology.growth_freeze_last_epochs = 100
    CONFIG.topology.growth_rgb_normalization = "observed"
    CONFIG.schedule.enable_coarse_growth = True
    CONFIG.contour.enabled = False
@@ -66,6 +67,18 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 仅事件轮在正常训练前向中收集证据；其他轮不安装候选。升层时重置层内计数和候选证据，
 升层边界及整个训练的最后一轮不再生长。若层级预算不够 30 轮，该层不会生长。
 生长 warmup 与优化器的 opacity warmup 是两个独立配置。
+
+新实验另外设置 ``topology.growth_freeze_last_epochs=100``，在完整训练的最后 100 轮
+停止准备生长候选、收集生长证据及提交新增体素，继续以 1 spp 优化已有体素。
+这是全局末尾窗口，不是每个分辨率层级各冻结 100 轮：总计 700 轮时冻结第 601–700 轮，
+总计 1000 轮时冻结第 901–1000 轮。设为 ``0`` 关闭这一额外窗口；大于或等于总轮数时
+整个训练都不生长。原来的层内 20 轮 warmup、分裂时机和层级预算均不变，删除仍关闭。
+``--stop-after-epochs`` 只暂停运行，不会重新定义完整训练的末尾。
+
+100 轮是用于检查末尾新增体素是否来不及优化的初始对照设置，不保证消除轮毂模糊；
+当前默认总轮数仍为 700。该设置保存在配置与 checkpoint 中，续训沿用保存值，
+不允许中途悄悄修改拓扑配置。可兼容的旧 checkpoint 若没有此字段，按 ``0`` 恢复，
+不会自动套用新实验的 100 轮；比较此规则应新开实验。
 
 在需要证据的轮次，正常 DDA 经过候选空格时额外检查候选椭球相交，并记录该位置前的
 合成 RGB ``P`` 和透射率 ``T``。候选并不参与当前渲染、真实命中计数或训练梯度。
@@ -127,6 +140,7 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 
    CONFIG.topology.growth_warmup_epochs = 20
    CONFIG.topology.growth_fine_warmup_epochs = 20
+   CONFIG.topology.growth_freeze_last_epochs = 100
    CONFIG.topology.growth_rgb_normalization = "observed"
    CONFIG.topology.growth_rgb_min_support_views = 3
    CONFIG.topology.growth_rgb_max_conflict_views = 2
@@ -166,11 +180,12 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 一定淘汰它们。应通过生长数量、有效／未知证据、损失及图像对照评估此次实验。
 分裂保持不变，也不能用本次生长规则声称 RGB 已唯一确定几何。
 
-本次按射线处理未知证据，同时修改了原生候选记录溢出规则，需要增量编译 C++ 与绑定。
+此前按射线处理未知证据时修改了原生候选记录溢出规则，需要相应的 C++ 与绑定。
 RGB-only 启动会检查 ``mi.VoxelReconstruction.rgb_only_version``，启用生长还要求
 ``rgb_growth_version >= 2``；旧二进制不能只更新 Python 后继续使用。
 checkpoint 保存内部证据版本，旧 RGB 生长训练不能直接续训为本次证据规则，应新开实验；
 旧模型仍可独立评价，证据版本不改变已保存的体素渲染参数。
+末尾生长冻结只修改 Python 调度，已有上述版本的源码构建无需再次编译。
 从仓库目录启动新的单卡实验：
 
 .. code-block:: bash

@@ -127,6 +127,7 @@ CONFIG.topology.use_rgb_growth = True  # 复用训练前向的 RGB 收益票，�
 CONFIG.topology.growth_rgb_normalization = "observed"  # 有效命中射线均值，再对可靠观测视角求均值。
 CONFIG.topology.growth_warmup_epochs = 20  # 最粗层级先优化 20 轮，再按生长周期检查。
 CONFIG.topology.growth_fine_warmup_epochs = 20  # 每个后续层级重新 warmup。
+CONFIG.topology.growth_freeze_last_epochs = 100  # 整个训练的最后 100 轮停止生长，继续优化已有体素；0 关闭。
 CONFIG.topology.growth_rgb_min_support_views = 3
 CONFIG.topology.growth_rgb_max_conflict_views = 2  # 达到 2 个反对视角则拒绝。
 CONFIG.topology.growth_rgb_gain_epsilon = 1e-7  # 有效命中射线的平均 RGB 收益票阈值（保留数值，单位已变）。
@@ -144,7 +145,7 @@ CONFIG.training.freeze_native = True  # 重放原生计算；拓扑变化后重�
 CONFIG.schedule.enabled = True
 CONFIG.schedule.start_resolution = 256
 CONFIG.schedule.target_resolution = 512
-CONFIG.training.num_epochs = 700  # 整个实验总轮数，每轮遍历全部训练视角。
+CONFIG.training.num_epochs = 1000  # 整个实验总轮数，每轮遍历全部训练视角。
 CONFIG.training.save_count = 3  # 包含最终 model.npz，共保存三次。
 CONFIG.training.output = None  # 自动创建 outputs/场景-MM.DD-E编号/training。
 # 需要手动指定目录时，将 None 改为路径字符串，或传 --output-dir。
@@ -241,6 +242,9 @@ def validate(config):
         raise ValueError("RGB growth evidence requires training.rgb_only=true")
     if config.topology.growth_rgb_normalization not in ("observed", "full_image"):
         raise ValueError("topology.growth_rgb_normalization must be 'observed' or 'full_image'")
+    if (type(config.topology.growth_freeze_last_epochs) is not int or
+            config.topology.growth_freeze_last_epochs < 0):
+        raise ValueError("topology.growth_freeze_last_epochs must be a nonnegative integer")
     if config.training.rgb_only:
         if config.model.opacity_sh_count != 1:
             raise ValueError("RGB-only training requires model.opacity_sh_count=1 (DC logit only)")
@@ -724,6 +728,9 @@ def run_training(distributed=None):
             growth_evidence_version=(mi.VoxelReconstruction.rgb_growth_version if rgb_growth_enabled else None),
             growth_unknown_policy="exclude unknown rays; retain reliable rays from the same view"
                                   if rgb_growth_enabled else None,
+            growth_freeze_last_epochs=config.topology.growth_freeze_last_epochs,
+            growth_freeze_start_epoch=(max(1, config.training.num_epochs - config.topology.growth_freeze_last_epochs + 1)
+                                       if config.topology.growth_freeze_last_epochs else None),
             reported_loss="mean pixel RGB squared-error sum over channels, then mean over views"
                           if config.training.rgb_only else "mean RGB plus alpha loss over pixels and views")
         performance.metadata["config"] = asdict(config)
@@ -767,6 +774,10 @@ def run_training(distributed=None):
             emit("RGB growth warmup (epochs per level):", config.topology.growth_warmup_epochs,
                  "coarse,", config.topology.growth_fine_warmup_epochs,
                  "fine; no extra forward render", flush=True)
+            if config.topology.growth_freeze_last_epochs:
+                emit("RGB growth final freeze:", config.topology.growth_freeze_last_epochs,
+                     "epochs; no growth from epoch", report["training_protocol"]["growth_freeze_start_epoch"],
+                     "through", config.training.num_epochs, flush=True)
         rng = np.random.default_rng(config.training.seed)
         sampler = make_sampler(config, np)
         completed, global_step = 0, 0

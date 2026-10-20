@@ -23,6 +23,8 @@ class TopologySettings:
     use_rgb_growth: bool = False
     growth_warmup_epochs: int = 20
     growth_fine_warmup_epochs: int = 20
+    # Global training tail; zero preserves historical checkpoint behavior.
+    growth_freeze_last_epochs: int = 0
     # Missing fields in historical checkpoints retain their old loss units.
     # The current training CONFIG explicitly selects "observed".
     growth_rgb_normalization: str = "full_image"
@@ -437,6 +439,9 @@ class TopologyManager:
             raise ValueError("topology.use_rgb_growth must be a boolean")
         if cfg.growth_rgb_normalization not in ("observed", "full_image"):
             raise ValueError("topology.growth_rgb_normalization must be 'observed' or 'full_image'")
+        if (not isinstance(cfg.growth_freeze_last_epochs, int) or
+                isinstance(cfg.growth_freeze_last_epochs, bool) or cfg.growth_freeze_last_epochs < 0):
+            raise ValueError("topology.growth_freeze_last_epochs must be a nonnegative integer")
         for name, value in asdict(cfg).items():
             if isinstance(value, bool) or name == "growth_rgb_normalization":
                 continue
@@ -544,7 +549,18 @@ class TopologyManager:
         return (self.settings.enable_deletion and epoch >= self.evidence_start and
                 (not self.schedule.enabled or self.resolution == self.schedule.target_resolution))
 
+    def growth_frozen(self, boundary):
+        """Whether a one-based epoch lies in the global growth-free training tail.
+
+        This uses the complete training schedule, not the current level budget
+        or a temporary stop-after limit. Refinement and deletion remain separate.
+        """
+        count = self.settings.growth_freeze_last_epochs
+        return count > 0 and boundary > max(0, self.schedule.total_epochs - count)
+
     def _growth_due(self, boundary):
+        if self.growth_frozen(boundary):
+            return False
         schedule, cfg = self.schedule, self.settings
         if cfg.use_rgb_growth:
             local_epoch = boundary - self.level_start_epoch
@@ -987,7 +1003,9 @@ class TopologyManager:
         self._materialize_growth()
         self.before_refine_checkpoint = None
         event = {"completed_epochs": boundary, "resolution": self.resolution, "deleted": 0, "grown": 0,
-                 "refined": False, "finished": False, "level_budget": self.level_budget}
+                 "refined": False, "finished": False, "level_budget": self.level_budget,
+                 "growth_frozen": self.growth_frozen(boundary),
+                 "growth_freeze_last_epochs": cfg.growth_freeze_last_epochs}
         if cfg.use_rgb_growth:
             model.clear_growth_candidates()
             event.update(growth_mode="rgb_online", growth_level_epoch=boundary - self.level_start_epoch,

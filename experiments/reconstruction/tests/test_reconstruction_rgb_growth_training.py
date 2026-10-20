@@ -1,7 +1,8 @@
 """Tiny CUDA integration: online topology -> train_view -> Adam -> commit/resume.
 
-Two one-cell holes, three generated cameras, 4x4 at 1 spp. The test uses no
-dataset and writes runtime metadata only in an automatically removed temp dir.
+Two birth epochs followed by one frozen epoch, three generated cameras,
+4x4 at 1 spp. The test uses no dataset and writes runtime metadata only in an
+automatically removed temp dir.
 """
 
 from __future__ import annotations
@@ -33,6 +34,9 @@ def run(mi, dr, np):
     config.schedule.enabled = False
     config.schedule.total_epochs = 5
     config.topology.growth_warmup_epochs = 0
+    # Scale the production tail to this five-epoch fixture: two birth events
+    # are allowed, then continuous optimization must proceed without growth.
+    config.topology.growth_freeze_last_epochs = 3
     config.topology.growth_interval = 1
     assert config.topology.growth_rgb_normalization == "observed"
     config.topology.growth_rgb_min_support_views = 3
@@ -124,10 +128,42 @@ def run(mi, dr, np):
         model = restore_model(replacement, mi)
         assert int(model.active_voxel_count) == n + epoch + 1
         events.append(event)
+    # The saved policy must still freeze exactly the next global epoch after
+    # restoring; starting the final window does not stop RGB/Adam updates.
+    assert manager.statistics()["rgb_growth_device_views"] > 0
+    saved = manager.state_dict()
+    resumed = TopologyManager(model, 3, config.topology, config.schedule)
+    resumed.load_state_dict(saved)
+    manager = resumed
+    epoch = 2
+    assert manager.growth_frozen(epoch + 1)
+    assert not manager.prepare_rgb_growth(model, epoch)
+    assert manager.pending_growth is None and int(model.growth_candidate_count) == 0
+    evidence_views = manager.statistics()["rgb_growth_device_views"]
+    before = model_checkpoint(model)["model_state"]
+    optimizer.config.lr_radiance = .01
+    reference.fill(.75)
+    for view_id in range(3):
+        view["index"] = view_id
+        gradients, loss, alpha = train_view(
+            model, view, reference, config, sampler, rng, mi, dr, np,
+            native_replay=replay, collect_growth_evidence=False,
+            collect_deletion_evidence=False)
+        assert math.isfinite(loss) and alpha is None
+        manager.observe_rgb_growth(model, gradients, view_id, epoch, 16)
+        optimizer.step(model, gradients, epoch=epoch, coarse_to_fine=False)
+    replacement, event = manager.finish_epoch(model, optimizer, epoch + 1)
+    assert replacement is None and event["grown"] == 0
+    assert event["growth_frozen"] and not event["growth_evidence_requested"]
+    assert manager.statistics()["rgb_growth_device_views"] == evidence_views
+    after = model_checkpoint(model)["model_state"]
+    np.testing.assert_array_equal(after["cell_indices"], before["cell_indices"])
+    assert np.max(np.abs(after["radiance_sh"] - before["radiance_sh"])) > 0
+    events.append(event)
     stats = replay.statistics()
     assert stats["recordings"] > 0 and stats["replays"] > 0, stats
-    assert manager.statistics()["rgb_growth_device_views"] > 0
     return {"native_prepare_train_view_vote_commit_resume": "passed",
+            "frozen_tail_keeps_rgb_optimizer_active_after_resume": "passed",
             "epochs": len(events), "grown": sum(event["grown"] for event in events),
             "final_voxels": int(model.active_voxel_count), "replay": stats}
 

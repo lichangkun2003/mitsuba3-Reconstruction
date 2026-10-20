@@ -363,6 +363,7 @@ def main():
         config["contour"] = {"enabled": False}
         config["topology"] = {"enable_deletion": True, "enable_growth": True,
             "use_growth_evidence": True, "growth_interval": 1, "evidence_interval": 1,
+            "growth_freeze_last_epochs": 0,
             "deletion_interval": 1, "growth_min_foreground_views": 2,
             "min_deletion_conflict_views": 2}
         config_path.write_text(json.dumps(config), encoding="utf-8")
