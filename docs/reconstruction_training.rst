@@ -25,6 +25,7 @@ RGB-only 训练、在线生长与删除（当前默认）
    CONFIG.topology.enable_growth = True
    CONFIG.topology.enable_deletion = True
    CONFIG.topology.use_rgb_deletion = True
+   CONFIG.topology.use_low_opacity_deletion = True
    CONFIG.topology.use_growth_evidence = False
    CONFIG.topology.use_rgb_growth = True
    CONFIG.topology.growth_warmup_epochs = 20
@@ -55,7 +56,10 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 保持渲染结果。RGB-only 去掉了 alpha 约束，RGB loss 的下降本身不能证明几何或 opacity
 唯一可辨识。要复现之前的无生长基线，同时关闭 ``topology.enable_growth``、
 ``topology.use_rgb_growth`` 和 ``schedule.enable_coarse_growth``，并关闭
-``topology.enable_deletion`` 与 ``topology.use_rgb_deletion``。
+``topology.enable_deletion``。``use_rgb_deletion`` 和 ``use_low_opacity_deletion`` 分别控制
+RGB 收益与持续低 opacity 两条删除分支，总开关关闭时两者均不执行。
+当前 RGB-only 训练入口保留 RGB 删除分支；可单独将 ``use_low_opacity_deletion=False``
+以对照新增清理规则的影响。
 
 在线 RGB 生长：复用训练前向，不增加验证渲染
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -186,10 +190,12 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 一定淘汰它们。应通过生长数量、有效／未知证据、损失及图像对照评估此次实验。
 分裂保持不变，也不能用本次生长规则声称 RGB 已唯一确定几何。
 
-在线 RGB 删除：复用命中反向，不增加 DDA
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+删除：RGB 收益与持续低 opacity
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-删除判断不再使用参考 alpha、前景／背景射线分类或旧的 alpha 冲突票。
+当前新实验同时启用两条互补的删除规则：持续有正 RGB 删除收益，或者持续低 opacity，
+任一分支确认后即可删除。两条规则均不使用参考 alpha、前景／背景射线分类或旧的 alpha 冲突票。
+以下首先说明 RGB 收益分支。
 在现有命中反向循环中，令 ``T`` 为某体素命中前的透射率，``a`` 为其 opacity，
 ``c`` 为它的颜色，``B`` 为从该命中之后看向射线末端的合成颜色（包含背景），
 ``C`` 为当前完整预测，``y`` 为参考 RGB。单独移除这个体素的颜色变化及收益为：
@@ -227,6 +233,7 @@ GPU 上的算术、按体素归约和事件统计，并非零开销。
 
    CONFIG.topology.enable_deletion = True
    CONFIG.topology.use_rgb_deletion = True
+   CONFIG.topology.use_low_opacity_deletion = True
    CONFIG.topology.deletion_warmup_epochs = 20
    CONFIG.topology.deletion_interval = 10
    CONFIG.topology.deletion_protection_epochs = 20
@@ -236,9 +243,11 @@ GPU 上的算术、按体素归约和事件统计，并非零开销。
    CONFIG.topology.deletion_rgb_max_conflict_views = 1
    CONFIG.topology.deletion_rgb_gain_epsilon = 1e-7
    CONFIG.topology.deletion_rgb_min_mean_gain = 1e-7
+   CONFIG.topology.deletion_opacity_threshold = 0.005
+   CONFIG.topology.deletion_opacity_confirmation_windows = 2
 
-每个分辨率层级先 warmup 20 轮，然后第 30、40、50 等轮收集证据，每个窗口只包含
-该轮的全部训练视角。体素连续两个完整证据窗口通过才删除，中间不通过或缺少窗口会
+每个分辨率层级先 warmup 20 轮，然后第 30、40、50 等轮检查删除。RGB 分支的每个窗口只包含
+该轮的全部训练视角。体素连续两个完整 RGB 证据窗口通过才由该分支删除，中间不通过或缺少窗口会
 重置连续计数。因此初始体素最早可在层内第 40 轮删除；新生体素另外先保护 20 个完整
 训练轮次。删除后的格子沿用原冷却期，避免立即被重新生长；升层后重新 warmup，
 证据与连续确认状态重置。删除与生长都在 epoch 边界处理，幸存体素保留 Adam 状态。
@@ -246,10 +255,27 @@ GPU 上的算术、按体素归约和事件统计，并非零开销。
 全局最后 100 轮停止收集及提交删除，配合生长冻结让已有体素继续优化；1000 轮对应
 第 901–1000 轮。``deletion_freeze_last_epochs=0`` 关闭该窗口，大于或等于总轮数时全程
 不删除。``--stop-after-epochs`` 不改变这个全局窗口。分裂规则、训练的 1 spp 不变。
-本规则只删除持续有正 RGB 收益证据的体素，**不因没有观测、零收益或 opacity 较低而删除**。
+RGB 分支不因没有观测、零收益或 opacity 较低而删除；持续低 opacity 由独立分支处理。
+
+低 opacity 分支在上述事件的 epoch 结束时，读取当前模型的 DC opacity 参数，
+按真实前向公式 ``a = sigmoid(Y0 * b0)`` 计算不透明度，连续两个检查窗口都满足
+``a < deletion_opacity_threshold`` 才通过。它比较的是不透明度，不是未经 sigmoid 的 SH 系数，
+当前只支持各向同性 DC opacity。某次不再低于阈值会重置连续计数；
+非有限参数不能作为低 opacity 证据。
+这个分支不要求 RGB 删除收益为正，因此可以清理 RGB 删除收益已接近零的透明体素。
+它不把没有命中或没有观测当作零贡献，也不额外运行前向；只有事件末的 opacity 参数读取与检查。
+
+两条分支共用层级 warmup、新生体素 20 轮保护、删除周期、冷却期和末尾冻结。
+细分后重新开始保护与确认，避免直接清理经过 opacity 衰减、尚未重新优化的子体素；
+幸存体素的连续确认状态随 checkpoint 保存和恢复。
+``0.005`` 与两个窗口是初始实验设置，并非已验证的最佳阈值。低 opacity 裁剪是近似清理：
+很多低 opacity 体素仍可能共同产生可见贡献，持续低值不构成删除后图像不变的证明。
+本阶段尚未实现按 ``T * a`` 的低贡献统计裁剪，保留它作为后续独立对照。
 
 ``training.jsonl`` 的 ``topology.deletion_rgb`` 记录有效／未知命中、支持／反对、
-保护期、拒绝原因、等待确认与已确认数量；``topology.deleted`` 是本次实际删除数。
+保护期、拒绝原因、等待确认与已确认数量；``topology.deletion_opacity`` 另外记录低 opacity
+检查与确认统计。两条分支可能命中同一个体素，``topology.deleted`` 是合并后本次实际删除数，
+不能将两个分支的确认数直接相加。
 这些拒绝原因可能重叠，不能求和当作被拒绝的唯一体素数。可靠比例仍仅覆盖已遇到的
 命中，未访问区域不在分母中。条件观测均值不能保证未知区域无损。
 
@@ -264,14 +290,16 @@ GPU 上的算术、按体素归约和事件统计，并非零开销。
 此前按射线处理未知证据时修改了原生候选记录溢出规则，需要相应的 C++ 与绑定。
 RGB-only 启动会检查 ``mi.VoxelReconstruction.rgb_only_version``，启用生长还要求
 ``rgb_growth_version >= 2``；旧二进制不能只更新 Python 后继续使用。
-本次 RGB 删除另要求 ``mi.VoxelReconstruction.rgb_deletion_version >= 1``，
-**同步代码后必须增量编译，再启动新进程**。末尾冻结本身虽是 Python 调度，不能因此省略
-新增原生删除接口所需的编译。
+已有 RGB 删除要求 ``mi.VoxelReconstruction.rgb_deletion_version >= 1``；
+若尚未编译该原生接口，**同步代码后必须增量编译，再启动新进程**。
+本次持续低 opacity 分支只修改 Python 调度，已具备该接口的构建无需重新编译 C++。
 checkpoint 保存内部证据版本，使用旧版 RGB 生长证据规则的训练不能直接升级续训，应新开实验；
 旧模型仍可独立评价，证据版本不改变已保存的体素渲染参数。
 可兼容旧 checkpoint 缺少 ``use_rgb_deletion`` 时恢复为 ``False``，保留原来已保存的
 删除开关与调度，原先关闭删除的 RGB 实验不会自动启用新删除。要比较新规则，使用
 当前配置新开实验，不在旧 checkpoint 上切换算法。
+同样，旧 checkpoint 缺少 ``use_low_opacity_deletion`` 时按 ``False`` 恢复；
+只有当前 ``train.py`` 的新实验配置默认启用低 opacity 清理，不会改变既有实验的续训行为。
 从仓库目录启动新的单卡实验：
 
 .. code-block:: bash
@@ -294,7 +322,7 @@ checkpoint 保存内部证据版本，使用旧版 RGB 生长证据规则的训�
 双卡平台要求和资源分配方式见下文“同节点两张 GPU 训练与评价”。
 十轮只检查正常训练路径，不会触发默认 warmup 后的生长或删除。
 第一次生长／删除证据在第 30 轮；观察删除的第二次确认机会可短跑 41 轮，
-但是否实际删除仍取决于收益证据。从仓库根目录执行 Windows 短跑：
+但是否实际删除仍取决于 RGB 收益或持续低 opacity 的确认条件。从仓库根目录执行 Windows 短跑：
 
 .. code-block:: powershell
 
@@ -321,6 +349,7 @@ RGB-only checkpoint 同样不能切回旧监督模式。旧模型仍可通过
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_deletion.py
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_deletion_driver.py
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_deletion_lifecycle.py
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_low_opacity_deletion.py
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_deletion_training.py
 
 该测试不打开真实数据集或既有实验，覆盖参考 alpha 不变性、RGB L2 的颜色与 opacity

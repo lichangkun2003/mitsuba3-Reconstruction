@@ -24,10 +24,15 @@ class RGBDeletionDriverTests(unittest.TestCase):
         options = train.settings(config)
         self.assertTrue(options["collect_rgb_deletion_evidence"])
         self.assertFalse(options["collect_deletion_evidence"])
+        self.assertTrue(config.topology.use_low_opacity_deletion)
+        config.topology.use_low_opacity_deletion = False
+        # Parameter-only pruning adds no new ray evidence or native forward.
+        self.assertEqual(train.settings(config), options)
         legacy = train.TrainConfig()
         options = train.settings(legacy)
         self.assertFalse(options["collect_rgb_deletion_evidence"])
         self.assertTrue(options["collect_deletion_evidence"])
+        self.assertFalse(legacy.topology.use_low_opacity_deletion)
 
     def test_legacy_cli_does_not_inherit_rgb_deletion(self):
         config = copy.deepcopy(train.CONFIG)
@@ -35,6 +40,7 @@ class RGBDeletionDriverTests(unittest.TestCase):
             args = train.parse_arguments()
         train.apply_arguments(config, args, {})
         self.assertFalse(config.topology.use_rgb_deletion)
+        self.assertFalse(config.topology.use_low_opacity_deletion)
         self.assertFalse(train.settings(config)["collect_rgb_deletion_evidence"])
         with self.assertRaisesRegex(ValueError, "requires training.rgb_only"):
             train.apply_arguments(config, args, {"topology": {"use_rgb_deletion": True}})
@@ -43,12 +49,14 @@ class RGBDeletionDriverTests(unittest.TestCase):
     def test_legacy_checkpoint_has_disabled_rgb_deletion(self):
         saved = asdict(train.CONFIG.topology)
         for name in list(saved):
-            if name == "use_rgb_deletion" or name.startswith("deletion_rgb_") or name in (
+            if name in ("use_rgb_deletion", "use_low_opacity_deletion") or name.startswith(
+                    ("deletion_rgb_", "deletion_opacity_")) or name in (
                     "deletion_warmup_epochs", "deletion_protection_epochs", "deletion_freeze_last_epochs"):
                 saved.pop(name)
         saved["enable_deletion"] = False
         restored = train.normalized_algorithm_group("topology", saved)
         self.assertFalse(restored["use_rgb_deletion"])
+        self.assertFalse(restored["use_low_opacity_deletion"])
         self.assertFalse(restored["enable_deletion"])
         self.assertEqual(restored["deletion_freeze_last_epochs"], 0)
 
@@ -63,6 +71,8 @@ class RGBDeletionDriverTests(unittest.TestCase):
             "deletion_rgb_confirmation_windows": (0, True),
             "deletion_rgb_gain_epsilon": (-1, float("nan")),
             "deletion_rgb_min_mean_gain": (-1, float("inf")),
+            "deletion_opacity_threshold": (0., 1., -1., True, float("nan"), float("inf")),
+            "deletion_opacity_confirmation_windows": (0, -1, .5, True),
         }
         for name, values in invalid.items():
             for value in values:

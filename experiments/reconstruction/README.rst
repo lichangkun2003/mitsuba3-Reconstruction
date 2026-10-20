@@ -16,7 +16,8 @@
 当前为 RGB-only 训练加在线 RGB 生长与删除：保留原来两个合法父体支持、有限边界接触和
 外伸的候选规则，利用正常训练前向计算候选的虚拟插入 RGB 收益，不额外渲染确认。
 粗层、细层分别先冻结生长 20 轮，之后按 10 轮周期处理；各层第一次事件在第 30 轮。
-删除复用已有命中反向中的后缀颜色，判断单独移除体素是否降低 RGB 误差，不另做前向。
+删除包含两条分支：复用已有命中反向的后缀颜色判断 RGB 删除收益，以及持续低 opacity 清理；
+两者均不另做前向。
 完整训练的最后 100 轮同时停止生长和删除，继续优化已有体素。
 分裂机制不变，训练保持 1 spp。配置位置：
 
@@ -29,6 +30,7 @@
    CONFIG.topology.growth_rgb_normalization = "observed"
    CONFIG.topology.enable_deletion = True
    CONFIG.topology.use_rgb_deletion = True
+   CONFIG.topology.use_low_opacity_deletion = True
    CONFIG.topology.deletion_warmup_epochs = 20
    CONFIG.topology.deletion_interval = 10
    CONFIG.topology.deletion_protection_epochs = 20
@@ -38,6 +40,8 @@
    CONFIG.topology.deletion_rgb_max_conflict_views = 1
    CONFIG.topology.deletion_rgb_gain_epsilon = 1e-7
    CONFIG.topology.deletion_rgb_min_mean_gain = 1e-7
+   CONFIG.topology.deletion_opacity_threshold = 0.005
+   CONFIG.topology.deletion_opacity_confirmation_windows = 2
 
 末尾冻结按全局总轮数计算：700 轮实验冻结第 601–700 轮，1000 轮实验冻结第 901–1000 轮，
 期间不准备生长候选、不收集生长证据，也不提交新增体素。设为 ``0`` 关闭该窗口；
@@ -66,19 +70,30 @@ opacity／颜色。不需要除以 ``1-a``，也不重新追踪，但会增加 G
 每个层级前 20 轮不收集删除证据，第 30、40 等事件轮各遍历全部训练视角。
 默认至少 3 个支持视角、没有可靠均值为负的反对视角、跨视角收益超过 ``1e-7``，
 且连续两个事件窗口通过才删除；新生体素额外保护 20 个完整轮次。
-无观测、零收益或低 opacity 均不会单独触发删除。
+RGB 分支不因无观测、零收益或低 opacity 删除。
+低 opacity 分支在上述事件末检查模型的真实不透明度 ``sigmoid(Y0*b0)``，
+连续两次低于 ``0.005`` 才通过，某次不再低于阈值则重置计数。它仅支持 DC opacity，
+不使用参考 alpha、不要求 RGB 删除收益为正，也不将未观测视为零贡献。
+两条分支共用 warmup、新生保护、冷却和末尾冻结，升层后重新保护与确认，
+任一分支确认后即可删除；只有事件末的 opacity 参数读取，不增加前向。
+``training.jsonl`` 中 ``topology.deletion_opacity`` 记录新分支统计，
+``topology.deleted`` 为两个分支合并去重后的实际删除数。
 
 这些是在线参数快照上的单体素收益，不是固定模型的联合删除证明。多体素分别有益、
 一起删除仍可能有害；未知区域也不被可靠射线的均值覆盖。应对照实际图像，不能保证
-轮毂改善。更完整的公式、事件日志和局限见训练文档。
+轮毂改善。``0.005`` 是待验证的初始阈值，很多低 opacity 体素仍可能共同产生可见贡献。
+本阶段尚未添加 ``T*a`` 低贡献裁剪。更完整的公式、事件日志和局限见训练文档。
 
 此前按射线处理未知证据时修改了 C++ 的记录溢出处理，源码构建需满足
 ``mi.VoxelReconstruction.rgb_growth_version >= 2``。使用更早版本 RGB 生长证据的 checkpoint
 不能直接升级续训，但旧模型仍可独立评价。完整投票定义、截断弃权、每射线记录容量与
 局限见 ``docs/reconstruction_training.rst`` 开头。
-本次新增原生 RGB 删除，要求 ``mi.VoxelReconstruction.rgb_deletion_version >= 1``，
-同步后必须增量编译。旧 checkpoint 缺少 ``use_rgb_deletion`` 时按 ``False`` 恢复，
+已有原生 RGB 删除要求 ``mi.VoxelReconstruction.rgb_deletion_version >= 1``，
+尚未具备该接口的构建需要增量编译。本次持续低 opacity 分支仅修改 Python，
+已有该接口时无需重新编译 C++。旧 checkpoint 缺少 ``use_rgb_deletion`` 时按 ``False`` 恢复，
 保留原有已保存配置，不自动给原来关闭删除的实验启用此机制；启用应新开实验。
+旧 checkpoint 缺少 ``use_low_opacity_deletion`` 时也按 ``False`` 恢复；
+当前新实验默认开启，确认计数保存在 checkpoint 中，续训不悄悄改变删除规则。
 仅运行十轮不会覆盖生长／删除；保留 ``--epochs 1000``，另传
 ``--stop-after-epochs 41 --skip-evaluation`` 可覆盖前两次证据事件，
 是否生长或删除仍取决于数据。这是新实验，不会修改已有结果。
@@ -309,7 +324,7 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 当前默认是 RGB-only 加在线生长与删除：800 × 800、每视角 1 spp、opacity 仅优化 DC。
 参考 alpha 只在读取时参与白底合成，之后不参与训练监督或筛选；sRGB 图片先合成再解码，
 训练输入仍为线性 RGB。
-启用同次训练前向中的 RGB 生长证据，以及已有反向中的 RGB 删除证据，
+启用同次训练前向中的 RGB 生长证据，以及已有反向中的 RGB 删除证据和持续低 opacity 清理，
 每个层级各 warmup 20 轮；保留 256 → 512 分裂。
 新实验在全局最后 100 轮冻结生长和删除，继续以 1 spp 优化已有体素。
 最终出图为 64 spp，训练集与测试集各取前 10 个视角。

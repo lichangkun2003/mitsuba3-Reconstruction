@@ -1,8 +1,9 @@
 """Tiny CUDA train/view/vote/delete/resume integration, with no dataset.
 
 Three 4x4 views at 1 spp observe one dark voxel against white. Two complete
-evidence windows confirm its removal; two unseen voxels survive with their
-optimizer state. The frozen tail then continues continuous optimization.
+evidence windows confirm its removal, while persistent low opacity removes
+an unseen voxel independently. Two opaque unseen voxels retain optimizer state.
+The frozen tail then continues continuous optimization.
 """
 
 from __future__ import annotations
@@ -55,6 +56,9 @@ def run(mi, dr, np, temporary):
     config.schedule.enable_coarse_growth = False
     config.topology.enable_growth = config.topology.use_rgb_growth = False
     config.topology.enable_deletion = config.topology.use_rgb_deletion = True
+    config.topology.use_low_opacity_deletion = True
+    config.topology.deletion_opacity_threshold = .005
+    config.topology.deletion_opacity_confirmation_windows = 2
     config.topology.deletion_warmup_epochs = 0
     config.topology.deletion_protection_epochs = 0
     config.topology.deletion_interval = 1
@@ -66,18 +70,20 @@ def run(mi, dr, np, temporary):
     for name in ("lr_radiance", "lr_opacity", "lr_center", "lr_log_scale", "lr_rotation"):
         setattr(config.optimizer, name, 0.)
     validate(config)
-    count, sh = 3, config.model.sh_count
+    count, sh = 4, config.model.sh_count
     checkpoint = {
         "model_metadata": {"resolution": 8, "grid_min": [0.] * 3, "grid_max": [8.] * 3,
                            "sh_count": sh, "opacity_sh_count": 1},
         "model_state": {
-            "cell_indices": np.asarray([73, 75, 77], np.uint32),
+            "cell_indices": np.asarray([73, 75, 77, 79], np.uint32),
             "centers": np.tile([.5, .5, .5], count).astype(np.float32),
             "log_scales": np.tile(np.log([.8, .7, .6]), count).astype(np.float32),
             "rotations": np.tile([1., 0., 0., 0.], count).astype(np.float32),
             "radiance_sh": np.zeros(count * sh * 3, np.float32),
             "opacity_sh": np.zeros(count, np.float32),
         }}
+    checkpoint["model_state"]["opacity_sh"][1] = (
+        math.log(.001 / (1. - .001)) * (2. * math.sqrt(math.pi)))
     model = restore_model(checkpoint, mi)
     optimizer = FalcorOptimizer(model, config.optimizer)
     # Distinct nonzero moments detect accidental resets or wrong survivor indices.
@@ -85,7 +91,7 @@ def run(mi, dr, np, temporary):
     for group in seeded_optimizer["groups"].values():
         group["mean"][:] = np.linspace(-.002, .002, len(group["mean"]), dtype=np.float32)
         group["squared_mean"][:] = np.linspace(.01, .02, len(group["squared_mean"]), dtype=np.float32)
-        group["steps"][:] = [2, 3, 4]
+        group["steps"][:] = [2, 3, 4, 5]
     optimizer.load_state_dict(seeded_optimizer)
     manager = TopologyManager(model, 3, config.topology, config.schedule)
     replay, sampler = NativeLossReplay(dr), UniformSampler(np)
@@ -120,8 +126,8 @@ def run(mi, dr, np, temporary):
                 model, view_at(view_id), reference, config, sampler, rng, mi, dr, np,
                 native_replay=replay, collect_deletion_evidence=manager.collect_deletion(epoch))
             assert math.isfinite(loss) and alpha is None
-            np.testing.assert_array_equal(np.asarray(out["deletion_observed"]), [16, 0, 0])
-            np.testing.assert_array_equal(np.asarray(out["deletion_unknown"]), [0, 0, 0])
+            np.testing.assert_array_equal(np.asarray(out["deletion_observed"]), [16, 0, 0, 0])
+            np.testing.assert_array_equal(np.asarray(out["deletion_unknown"]), [0, 0, 0, 0])
             manager.observe_rgb_deletion(model, out, view_id, epoch, 16)
             optimizer.step(model, out, epoch=epoch, coarse_to_fine=False)
             if epoch == 1 and view_id == 0:
@@ -141,7 +147,9 @@ def run(mi, dr, np, temporary):
                 manager = TopologyManager(model, 3, config.topology, config.schedule)
                 manager.load_state_dict(loaded["training_state"]["topology"])
                 assert manager.pending_rgb_deletion["seen_views"] == {0}
-                np.testing.assert_array_equal(manager.rgb_deletion_streak, [1, 0, 0])
+                np.testing.assert_array_equal(manager.rgb_deletion_streak, [1, 0, 0, 0])
+                np.testing.assert_array_equal(manager.low_opacity_deletion_streak, [0, 1, 0, 0])
+                assert manager.low_opacity_deletion_last_boundary == 1
                 manager.observe_rgb_deletion(model, out, view_id, epoch, 16)
                 assert manager.pending_rgb_deletion["seen_views"] == {0}
         before_optimizer = optimizer.state_dict()
@@ -150,22 +158,25 @@ def run(mi, dr, np, temporary):
         events.append(event)
         assert event["deletion_rgb"]["support_votes"] == 3, event
         assert event["deletion_rgb"]["status"] == "complete", event
+        assert event["deletion_opacity"]["low_opacity_voxels"] == 1, event
         if epoch == 0:
             assert replacement is None and event["deleted"] == 0
-            np.testing.assert_array_equal(manager.rgb_deletion_streak, [1, 0, 0])
+            np.testing.assert_array_equal(manager.rgb_deletion_streak, [1, 0, 0, 0])
+            np.testing.assert_array_equal(manager.low_opacity_deletion_streak, [0, 1, 0, 0])
         else:
-            assert replacement is not None and event["deleted"] == 1, event
-            np.testing.assert_array_equal(replacement["model_state"]["cell_indices"], [75, 77])
+            assert replacement is not None and event["deleted"] == 2, event
+            assert event["deletion_rgb"]["deleted"] == event["deletion_opacity"]["deleted"] == 1
+            np.testing.assert_array_equal(replacement["model_state"]["cell_indices"], [77, 79])
             for name, values in before_model["model_state"].items():
-                width = len(values) // 3
+                width = len(values) // count
                 np.testing.assert_array_equal(replacement["model_state"][name],
-                                              values.reshape(3, width)[1:].ravel(), err_msg=name)
+                                              values.reshape(count, width)[2:].ravel(), err_msg=name)
             after_optimizer = optimizer.state_dict()
             for name, group in before_optimizer["groups"].items():
                 for field, values in group.items():
-                    width = len(values) // 3
+                    width = len(values) // count
                     np.testing.assert_array_equal(after_optimizer["groups"][name][field],
-                                                  values.reshape(3, width)[1:].ravel(),
+                                                  values.reshape(count, width)[2:].ravel(),
                                                   err_msg=f"{name}.{field}")
             replay.clear()
             model = restore_model(replacement, mi)
@@ -182,7 +193,7 @@ def run(mi, dr, np, temporary):
     optimizer.config.lr_radiance = .01
     for view_id in range(3):
         out, loss, alpha = train_view(
-            model, view_at(view_id, 3.2), reference, config, sampler, rng, mi, dr, np,
+            model, view_at(view_id, 5.2), reference, config, sampler, rng, mi, dr, np,
             native_replay=replay, collect_deletion_evidence=manager.collect_deletion(2))
         assert math.isfinite(loss) and alpha is None
         assert all(name not in out for name in EVIDENCE)
@@ -199,7 +210,7 @@ def run(mi, dr, np, temporary):
     stats = replay.statistics()
     assert stats["recordings"] > 0 and stats["replays"] > 0, stats
     return {"train_view_full_chunk_uneven_shard_evidence_parity": "passed",
-            "two_complete_windows_then_one_removal": "passed",
+            "rgb_and_persistent_low_opacity_remove_disjoint_voxels": "passed",
             "mid_window_npz_resume_and_duplicate_view_guard": "passed",
             "survivor_parameters_and_adam_moments_retained": "passed",
             "frozen_tail_keeps_continuous_optimization": "passed",

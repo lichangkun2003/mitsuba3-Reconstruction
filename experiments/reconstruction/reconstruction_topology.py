@@ -20,6 +20,11 @@ class TopologySettings:
     # Optional RGB-only removal evidence. Historical checkpoints retain the
     # foreground/background deletion rule unless this field is explicitly set.
     use_rgb_deletion: bool = False
+    # Independent cleanup of persistently transparent, isotropic voxels. The
+    # default preserves the behavior of checkpoints predating this lifecycle.
+    use_low_opacity_deletion: bool = False
+    deletion_opacity_threshold: float = .005
+    deletion_opacity_confirmation_windows: int = 2
     deletion_warmup_epochs: int = 20
     deletion_protection_epochs: int = 20
     deletion_freeze_last_epochs: int = 0
@@ -421,6 +426,7 @@ class TopologyManager:
         self.view_count = int(view_count)
         self.opacity_warmup, self.opacity_ramp = int(opacity_warmup), int(opacity_ramp)
         self.resolution = int(model.resolution)
+        self._model_opacity_sh_count = getattr(model, "opacity_sh_count", None)
         self.level_start_epoch = 0
         self.schedule_start_resolution = self.resolution
         self.budgets = (level_budgets(self.resolution, self.schedule.target_resolution, self.schedule.total_epochs,
@@ -440,6 +446,7 @@ class TopologyManager:
                                        rgb_growth_readback_bytes=0)
         self._device_statistics.update(rgb_deletion_device_views=0, rgb_deletion_cpu_views=0,
                                        rgb_deletion_readback_bytes=0)
+        self._device_statistics["deletion_opacity_readback_bytes"] = 0
         self.before_refine_checkpoint = None
         self.completed_windows = 0
         self._validate()
@@ -453,19 +460,30 @@ class TopologyManager:
             raise ValueError("topology.use_rgb_growth must be a boolean")
         if not isinstance(cfg.use_rgb_deletion, bool):
             raise ValueError("topology.use_rgb_deletion must be a boolean")
+        if not isinstance(cfg.use_low_opacity_deletion, bool):
+            raise ValueError("topology.use_low_opacity_deletion must be a boolean")
+        if (cfg.enable_deletion and cfg.use_low_opacity_deletion and
+                self._model_opacity_sh_count != 1):
+            raise ValueError("Low-opacity deletion requires isotropic opacity_sh_count == 1")
         for name in ("deletion_warmup_epochs", "deletion_protection_epochs",
                      "deletion_freeze_last_epochs", "deletion_rgb_min_support_views",
-                     "deletion_rgb_max_conflict_views", "deletion_rgb_confirmation_windows"):
+                     "deletion_rgb_max_conflict_views", "deletion_rgb_confirmation_windows",
+                     "deletion_opacity_confirmation_windows"):
             value = getattr(cfg, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"topology.{name} must be a nonnegative integer")
         if any(getattr(cfg, name) < 1 for name in (
                 "deletion_rgb_min_support_views", "deletion_rgb_max_conflict_views",
-                "deletion_rgb_confirmation_windows")):
-            raise ValueError("RGB deletion vote and confirmation thresholds must be positive")
-        if cfg.use_rgb_deletion and (not isinstance(cfg.deletion_interval, int) or
-                                    isinstance(cfg.deletion_interval, bool)):
-            raise ValueError("RGB deletion interval must be an integer")
+                "deletion_rgb_confirmation_windows", "deletion_opacity_confirmation_windows")):
+            raise ValueError("Deletion vote and confirmation thresholds must be positive")
+        if (isinstance(cfg.deletion_opacity_threshold, bool) or
+                not isinstance(cfg.deletion_opacity_threshold, (int, float)) or
+                not 0 < cfg.deletion_opacity_threshold < 1):
+            raise ValueError("topology.deletion_opacity_threshold must satisfy 0 < threshold < 1")
+        if ((cfg.use_rgb_deletion or cfg.use_low_opacity_deletion) and
+                (not isinstance(cfg.deletion_interval, int) or
+                 isinstance(cfg.deletion_interval, bool))):
+            raise ValueError("Deletion interval must be an integer")
         if cfg.growth_rgb_normalization not in ("observed", "full_image"):
             raise ValueError("topology.growth_rgb_normalization must be 'observed' or 'full_image'")
         if (not isinstance(cfg.growth_freeze_last_epochs, int) or
@@ -509,6 +527,8 @@ class TopologyManager:
         self._rgb_deletion_device = None
         self.rgb_deletion_streak = np.zeros(count, dtype=np.uint32)
         self.rgb_deletion_last_boundary = None
+        self.low_opacity_deletion_streak = np.zeros(count, dtype=np.uint32)
+        self.low_opacity_deletion_last_boundary = None
 
     def _materialize_rgb_deletion(self):
         if self._rgb_deletion_device is not None:
@@ -598,9 +618,15 @@ class TopologyManager:
         return count > 0 and boundary > max(0, self.schedule.total_epochs - count)
 
     def _rgb_deletion_due(self, boundary):
+        return self.settings.use_rgb_deletion and self._scheduled_deletion_due(boundary)
+
+    def _low_opacity_deletion_due(self, boundary):
+        return self.settings.use_low_opacity_deletion and self._scheduled_deletion_due(boundary)
+
+    def _scheduled_deletion_due(self, boundary):
+        """Common epoch-end schedule, independent of per-ray RGB evidence."""
         cfg = self.settings
-        if (not cfg.use_rgb_deletion or not cfg.enable_deletion or
-                self.deletion_frozen(boundary)):
+        if not cfg.enable_deletion or self.deletion_frozen(boundary):
             return False
         local_epoch = boundary - self.level_start_epoch
         # Refinement replaces all rows and resets evidence. Avoid collecting
@@ -935,6 +961,63 @@ class TopologyManager:
         self._rgb_deletion_device = None
         return selected
 
+    def _evaluate_low_opacity_deletion(self, model, boundary, event):
+        """Inspect only the optimized DC opacity at a scheduled epoch boundary.
+
+        This is a parameter-based cleanup rule, not a visibility or RGB vote:
+        unvisited voxels can qualify only when their own learned opacity stays
+        low. No ray tracing, per-view collection, or full host snapshot is needed.
+        """
+        if not self._low_opacity_deletion_due(boundary):
+            return None
+        np, cfg = self.np, self.settings
+        if int(model.opacity_sh_count) != 1:
+            raise ValueError("Low-opacity deletion requires isotropic opacity_sh_count == 1")
+        # snapshot() returns existing device buffers; copy just this field.
+        value = model.snapshot()["opacity_sh"]
+        dr = _cuda_array(value)
+        if dr is not None:
+            dr.eval(value)
+            dr.sync_thread()
+        coefficients = np.array(value, copy=True).reshape(-1)
+        self._device_statistics["deletion_opacity_readback_bytes"] += coefficients.nbytes
+        if coefficients.shape != (self.count,):
+            raise ValueError("Low-opacity deletion parameter dimensions differ")
+        if not np.all(np.isfinite(coefficients)):
+            raise ValueError("Low-opacity deletion encountered nonfinite opacity coefficients")
+        # sigmoid(Y00*b0) < threshold, compared in logit space to avoid
+        # overflow/underflow for nearly transparent or nearly opaque voxels.
+        threshold = float(cfg.deletion_opacity_threshold)
+        coefficient_threshold = math.log(threshold / (1. - threshold)) * (2. * math.sqrt(math.pi))
+        low = coefficients.astype(np.float64) < coefficient_threshold
+        mature = ((self.growth_birth == 0) |
+                  (boundary - self.growth_birth >= cfg.deletion_protection_epochs))
+        qualified = low & mature
+        previous = self.low_opacity_deletion_streak.copy()
+        consecutive = self.low_opacity_deletion_last_boundary == boundary - cfg.deletion_interval
+        if not consecutive:
+            self.low_opacity_deletion_streak.fill(0)
+        self.low_opacity_deletion_streak = np.where(
+            qualified, np.minimum(self.low_opacity_deletion_streak.astype(np.uint64) + 1,
+                                  cfg.deletion_opacity_confirmation_windows), 0).astype(np.uint32)
+        self.low_opacity_deletion_last_boundary = boundary
+        selected = self.low_opacity_deletion_streak >= cfg.deletion_opacity_confirmation_windows
+        event["deletion_opacity"] = {
+            "status": "complete", "threshold": threshold,
+            "tested_voxels": self.count, "low_opacity_voxels": int(np.count_nonzero(low)),
+            "eligible_voxels": int(np.count_nonzero(mature)),
+            "protected_voxels": int(np.count_nonzero(~mature)),
+            "qualified_voxels": int(np.count_nonzero(qualified)),
+            "confirmation_windows": cfg.deletion_opacity_confirmation_windows,
+            "previous_window_consecutive": consecutive,
+            "streak_reset": int(np.count_nonzero((previous > 0) &
+                                               (~qualified | (not consecutive)))),
+            "awaiting_confirmation": int(np.count_nonzero(qualified & ~selected)),
+            "confirmed": int(np.count_nonzero(selected)), "deleted": 0,
+            "max_streak": int(self.low_opacity_deletion_streak.max()) if self.count else 0,
+        }
+        return selected
+
     def _growth_world_points(self, pending, metadata):
         """Reuse the seven frozen proposal samples across views, never evidence.
 
@@ -1091,7 +1174,7 @@ class TopologyManager:
         kept = len(survivors)
         for name in ("foreground_masks", "background_masks", "qualified", "candidates",
                      "deletion_eligible", "growth_birth", "growth_wait_start",
-                     "rgb_deletion_streak"):
+                     "rgb_deletion_streak", "low_opacity_deletion_streak"):
             old = getattr(self, name)
             resized = np.zeros((new_count,) + old.shape[1:], dtype=old.dtype)
             resized[:kept] = old[survivors]
@@ -1195,14 +1278,18 @@ class TopologyManager:
                          growth_warmup_epochs=self.growth_warmup,
                          growth_warmup_active=boundary - self.level_start_epoch <= self.growth_warmup,
                          growth_evidence_requested=self._growth_due(boundary))
-        if cfg.use_rgb_deletion:
-            event.update(deletion_mode="rgb_online",
+        if cfg.use_rgb_deletion or cfg.use_low_opacity_deletion:
+            mode = ("rgb_online+low_opacity" if cfg.use_rgb_deletion else "legacy+low_opacity"
+                    ) if cfg.use_low_opacity_deletion else "rgb_online"
+            event.update(deletion_mode=mode,
                          deletion_level_epoch=boundary - self.level_start_epoch,
                          deletion_warmup_epochs=cfg.deletion_warmup_epochs,
                          deletion_warmup_active=boundary - self.level_start_epoch <= cfg.deletion_warmup_epochs,
                          deletion_frozen=self.deletion_frozen(boundary),
                          deletion_freeze_last_epochs=cfg.deletion_freeze_last_epochs,
                          deletion_evidence_requested=self._rgb_deletion_due(boundary))
+        if cfg.use_low_opacity_deletion:
+            event["deletion_opacity_requested"] = self._low_opacity_deletion_due(boundary)
         checkpoint = None
         level_done = boundary - self.level_start_epoch >= self.level_budget
         if schedule.enabled and self.resolution < schedule.target_resolution and level_done:
@@ -1225,14 +1312,16 @@ class TopologyManager:
             event.update(refined=True, resolution=self.resolution, active_voxel_count=self.count)
             return replacement, event
         rgb_delete = self._evaluate_rgb_deletion(boundary, event) if cfg.use_rgb_deletion else None
+        opacity_delete = self._evaluate_low_opacity_deletion(model, boundary, event)
         event["evidence_window_evaluated"] = (
             rgb_delete is not None if cfg.use_rgb_deletion else self._evaluate_deletion(boundary))
         final = level_done if schedule.enabled else boundary >= schedule.total_epochs
         first = self.evidence_start + 2 * cfg.evidence_interval
         periodic = boundary >= first and (boundary - first) % cfg.deletion_interval == 0
-        delete = (rgb_delete if cfg.use_rgb_deletion else
-                  self.candidates if (periodic or final) and self.collect_deletion(boundary)
-                  else None)
+        legacy_delete = (self.candidates if not cfg.use_rgb_deletion and
+                         (periodic or final) and self.collect_deletion(boundary) else None)
+        masks = [mask for mask in (rgb_delete, legacy_delete, opacity_delete) if mask is not None]
+        delete = np.logical_or.reduce(masks) if masks else None
         if delete is not None and np.any(delete):
             checkpoint = model_checkpoint(model)
             old_cells = checkpoint["model_state"]["cell_indices"]
@@ -1241,11 +1330,17 @@ class TopologyManager:
             survivors = np.flatnonzero(~delete).astype(np.uint32)
             event["deleted"] = self.count - len(survivors)
             checkpoint = self._take_rows(checkpoint, survivors)
-            if cfg.use_rgb_deletion:
-                optimizer.remap(survivors, len(survivors))
-                event["deletion_rgb"]["deleted"] = event["deleted"]
-            else:
+            if rgb_delete is not None:
+                event["deletion_rgb"]["deleted"] = int(np.count_nonzero(rgb_delete))
+            if opacity_delete is not None:
+                event["deletion_opacity"]["deleted"] = int(np.count_nonzero(opacity_delete))
+            # Preserve every surviving Adam group for RGB/opacity cleanup.
+            # Only actual legacy evidence removals retain Falcor's historical
+            # radiance reset; a mere enabled legacy mode must not trigger it.
+            if legacy_delete is not None and np.any(legacy_delete):
                 optimizer.remap(survivors, len(survivors), reset_radiance=True)
+            else:
+                optimizer.remap(survivors, len(survivors))
             self._remap_lifecycle(survivors, len(survivors), boundary)
             self.foreground_masks.fill(0)
             self.background_masks.fill(0)
@@ -1333,7 +1428,9 @@ class TopologyManager:
                  "count": self.count, "pending_growth": self.pending_growth,
                  "pending_rgb_deletion": self.pending_rgb_deletion,
                  "rgb_deletion_streak": self.rgb_deletion_streak,
-                 "rgb_deletion_last_boundary": self.rgb_deletion_last_boundary}
+                 "rgb_deletion_last_boundary": self.rgb_deletion_last_boundary,
+                 "low_opacity_deletion_streak": self.low_opacity_deletion_streak,
+                 "low_opacity_deletion_last_boundary": self.low_opacity_deletion_last_boundary}
         for name in ("foreground_masks", "background_masks", "qualified", "candidates",
                      "deletion_eligible", "growth_birth", "growth_wait_start"):
             state[name] = getattr(self, name)
@@ -1357,6 +1454,10 @@ class TopologyManager:
             if any(name not in state for name in (
                     "pending_rgb_deletion", "rgb_deletion_streak", "rgb_deletion_last_boundary")):
                 raise ValueError("RGB deletion lifecycle state is incomplete")
+        if state["settings"].get("use_low_opacity_deletion", False):
+            if any(name not in state for name in (
+                    "low_opacity_deletion_streak", "low_opacity_deletion_last_boundary")):
+                raise ValueError("Low-opacity deletion lifecycle state is incomplete")
         self._growth_world_cache = None
         self._growth_device = None
         self._rgb_growth_device = None
@@ -1365,6 +1466,8 @@ class TopologyManager:
         self.pending_rgb_deletion = None
         self.rgb_deletion_streak = self.np.zeros(self.count, dtype=self.np.uint32)
         self.rgb_deletion_last_boundary = None
+        self.low_opacity_deletion_streak = self.np.zeros(self.count, dtype=self.np.uint32)
+        self.low_opacity_deletion_last_boundary = None
         state = copy.deepcopy(state)
         state.pop("rgb_growth_evidence_version", None)
         state.pop("rgb_deletion_evidence_version", None)
@@ -1393,6 +1496,26 @@ class TopologyManager:
                  isinstance(self.rgb_deletion_last_boundary, bool) or
                  self.rgb_deletion_last_boundary < 1)):
             raise ValueError("RGB deletion previous boundary must be a positive integer")
+        opacity_streak = self.np.asarray(self.low_opacity_deletion_streak)
+        if (opacity_streak.shape != (self.count,) or
+                not self.np.issubdtype(opacity_streak.dtype, self.np.integer) or
+                self.np.any(opacity_streak < 0) or
+                self.np.any(opacity_streak > self.settings.deletion_opacity_confirmation_windows)):
+            raise ValueError("Low-opacity deletion confirmation dimensions or values differ")
+        self.low_opacity_deletion_streak = opacity_streak.astype(self.np.uint32, copy=True)
+        last = self.low_opacity_deletion_last_boundary
+        if last is not None:
+            local_epoch = last - self.level_start_epoch if isinstance(last, int) else -1
+            if (not isinstance(last, int) or isinstance(last, bool) or
+                    not 1 <= last <= self.schedule.total_epochs or
+                    local_epoch <= self.settings.deletion_warmup_epochs or
+                    (local_epoch - self.settings.deletion_warmup_epochs) % self.settings.deletion_interval or
+                    self.deletion_frozen(last) or
+                    (self.schedule.enabled and self.resolution < self.schedule.target_resolution and
+                     local_epoch >= self.level_budget)):
+                raise ValueError("Low-opacity deletion previous boundary is not a scheduled window")
+        elif self.np.any(self.low_opacity_deletion_streak):
+            raise ValueError("Low-opacity deletion confirmation requires a previous boundary")
         if self.pending_rgb_deletion is not None:
             from reconstruction_deletion_rgb import validate_pending
             validate_pending(self.pending_rgb_deletion, self.count, self.resolution,
