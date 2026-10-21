@@ -166,8 +166,8 @@ CONFIG.training.chunk_size = 0  # 0 = 整图提交；显存不足时可显式改
 CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译、缓存和 GPU 耗时。
 CONFIG.training.profile_interval_epochs = 50  # 每 50 轮及首次进入各分辨率时抽样记录内核耗时；0 关闭。
 CONFIG.training.profile_stages = True  # 仅在抽样视角细分前向、命中反向和候选梯度；会增加诊断开销。
-CONFIG.training.reference_cache_mib = 1024  # 内存缓存参考图，避免每轮重新解码；0 关闭。
-CONFIG.training.gpu_reference_cache_mib = 1024  # 显存缓存参考图；0 恢复逐视角上传。
+CONFIG.training.reference_cache_mib = 4096  # 内存缓存上限；bicycle 全部 RGB 参考约 1967 MiB，避免每轮重新解码。
+CONFIG.training.gpu_reference_cache_mib = 4096  # 显存缓存上限，按需分配；容纳全部参考图以避免反复上传，0 关闭。
 CONFIG.training.freeze_native = True  # 重放原生计算；拓扑变化后重新记录，分段诊断时旁路。
 
 CONFIG.schedule.enabled = True
@@ -227,8 +227,8 @@ def parse_arguments():
     parser.add_argument("--profile-interval-epochs", type=int, help="Sample one view every N epochs and on entering a resolution (default: 50); 0 disables automatic samples")
     parser.add_argument("--profile-stages", action=argparse.BooleanOptionalAction, default=None,
                         help="Synchronize and time native phases in sampled views; --no-profile-stages keeps only aggregate kernel profiling")
-    parser.add_argument("--reference-cache-mib", type=int, help="RAM budget for decoded reference images in MiB (default: 1024); 0 disables caching")
-    parser.add_argument("--gpu-reference-cache-mib", type=int, help="GPU reference-image cache budget in MiB (default: 1024); 0 disables caching")
+    parser.add_argument("--reference-cache-mib", type=int, help=f"RAM budget for decoded reference images in MiB (default: {CONFIG.training.reference_cache_mib}); 0 disables caching")
+    parser.add_argument("--gpu-reference-cache-mib", type=int, help=f"GPU reference-image cache budget in MiB (default: {CONFIG.training.gpu_reference_cache_mib}); 0 disables caching")
     parser.add_argument("--freeze-native", action=argparse.BooleanOptionalAction, default=None,
                         help="Replay native GPU work without repeated tracing (default: enabled); stage diagnostics run directly")
     parser.add_argument("--skip-evaluation", action="store_true", help="Save the final model without automatic train/test evaluation")
