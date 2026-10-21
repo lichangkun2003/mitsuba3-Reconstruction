@@ -46,7 +46,8 @@
 预览、训练与评价共用读图实现。参考 alpha 仅用于这一预处理步骤。
 ``"linear"`` 保留旧的“先解码、再合成”目标，半透明边缘与新协议不同。
 旧 checkpoint 缺少该字段时仍按 ``linear`` 续训与评价；比较新协议应新开实验。
-默认评价主指标改为 sRGB PSNR，同时保留线性 PSNR；不改变训练的损失空间。
+默认评价主指标为实际保存并读回的 8 位 PNG 的 ``psnr_srgb_png``，同时保留
+浮点 ``psnr_srgb_float`` 与线性 PSNR；不改变训练的损失空间。
 
 当前为 RGB-only 训练加在线 RGB 生长与删除：保留原来两个合法父体支持、有限边界接触和
 外伸的候选规则，利用正常训练前向计算候选的虚拟插入 RGB 收益，不额外渲染确认。
@@ -309,14 +310,14 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
    $python = (Resolve-Path '..\envs\mitsuba\Scripts\python.exe').Path
    & $python -I -c "import sys; print(sys.executable); print(sys.version); assert sys.version_info[:2] == (3, 12); assert sys.prefix != sys.base_prefix"
    if ($LASTEXITCODE -ne 0) { throw 'Check the project environment first' }
-   & $python -m pip install numpy
+   & $python -m pip install -r experiments/reconstruction/requirements.txt
    if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed' }
    git submodule update --init --recursive
    if ($LASTEXITCODE -ne 0) { throw 'Submodule initialization failed' }
 
 从源码构建 Mitsuba 和配套 Dr.Jit，无需另外安装 Mitsuba wheel。
 ``requirements-local-smoke.txt`` 只用于旧版 wheel 环境的基础测试，
-不是本定制源码的部署依赖；此处仅需安装 NumPy。
+不是本定制源码的部署依赖；重建脚本使用 NumPy，360 图像尺寸读取另使用 Pillow。
 首次配置采用已有 Windows 构建选项：
 
 .. code-block:: powershell
@@ -357,7 +358,7 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 
    & '..\envs\mitsuba\Scripts\python.exe' -I .\experiments\reconstruction\train.py `
      --dataset datasets/lego --gpu 0 --epochs 1000 --chunk-size 0 `
-     --no-profile-stages --eval-spp 64 --eval-max-views 10
+     --no-profile-stages --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
 
 ``--no-profile-stages`` 关闭分段诊断，使抽样视角也能使用原生重放，适合速度比较。
 若需要定位前向与反向耗时，可重新开启 ``--profile-stages``。
@@ -398,7 +399,7 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
      --dataset datasets/lego --epochs 1000 --chunk-size 0 \
-     --no-profile-stages --eval-spp 64 --eval-max-views 10
+     --no-profile-stages --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
 
 实验启动时自动分配为 ``outputs/场景-MM.DD-E编号/``，其中 ``E`` 表示实验编号。
 训练成功并保存最终模型后，目录自动加上耗时，例如 ``hotdog-10.20-E3-20min``。
@@ -418,7 +419,35 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 启用同次训练前向中的 RGB 生长证据，以及已有反向中的 RGB 删除证据和持续低 opacity 清理，
 每个层级各 warmup 20 轮；保留 256 → 512 分裂。
 新实验在全局最后 50 轮冻结生长，删除继续按周期执行，同时以 1 spp 优化已有体素。
-最终出图为 64 spp，训练集与测试集各取前 10 个视角。
+最终出图为 64 spp，训练集取前 10 个视角，测试集全部出图并计入指标。
+
+出图及 COLMAP 图片读取使用 Pillow，在本项目独立环境安装：
+
+.. code-block:: powershell
+
+   & '..\envs\mitsuba\Scripts\python.exe' -m pip install -r experiments/reconstruction/requirements.txt
+
+若独立环境由 Conda 创建，解释器位于 ``..\envs\mitsuba\python.exe``。
+HPC 使用 ``$HOME/envs/mitsuba/bin/python`` 执行同一 ``-m pip install -r`` 命令。
+
+无需重训即可重新评价现有模型。从源码仓库目录执行，替换为实际实验路径：
+
+.. code-block:: powershell
+
+   & '..\envs\mitsuba\Scripts\python.exe' -I .\experiments\reconstruction\evaluate.py `
+     --checkpoint outputs/hotdog-10.21-E0-47min/model.npz --split both --spp 64 `
+     --train-max-views 10 --test-max-views 0 `
+     --output-dir outputs/hotdog-10.21-E0-47min
+
+评价对多 spp 的预测先在线性空间求均值，再转换为 sRGB；预测和合成后的参考都实际保存为
+8 位 RGB PNG，再读回整数 RGB / 255 计算全图 MSE 与 PSNR。参考 PNG 位于
+``train/reference/``、``test/reference/``，与对应预测图同名，便于独立复算。
+``metrics.json`` 的 ``aggregate.psnr_srgb_png`` 是逐视角 PSNR 的算术平均；
+``aggregate.srgb_png.mean_psnr_db`` 提供同一结果及 MSE 汇总，
+``aggregate.psnr_srgb_float``／``aggregate.srgb.mean_psnr_db`` 保留量化前结果。
+不使用前景 mask；JPEG/RGB 参考没有 alpha 时保留整张原图，不用白色替换背景。
+与其他方法比较仍须统一数据划分、图像分辨率和背景合成协议。
+这里更新的是评价流程；训练参数、梯度和生长删除规则不变，未据此宣称真实场景已完成全量 GPU 评价。
 
 新实验还会在第一次参数更新前，将训练相机 JSON 中视角 0 的初始化体素图保存为
 ``outputs/场景-日期-E编号/train/0000-initial.png``，可与最终 ``train/0000.png`` 对照。
@@ -436,3 +465,68 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 单独评价。完整说明见 `训练与评价文档 <../../docs/reconstruction_training.rst>`_、
 `初始化预览文档 <../../docs/reconstruction_preview.rst>`_ 和
 `基础 CUDA 检查文档 <../../docs/local_gpu_smoke.rst>`_。
+
+合成场景与 COLMAP 360 初始化
+--------------------------
+
+入口仍为 ``train.py --dataset datasets/场景名``。合成场景继续读取
+``transforms_train.json`` 与 ``init_points.ply``，保留原坐标、边界、图像尺寸和初始化算法。
+没有相机 JSON 时，自动查找 ``sparse/0``（其次 ``sparse``）下的
+``cameras.bin``、``images.bin``；点云优先读取配置的 ``init_points.ply``，
+不存在时直接读取 ``points3D.bin``，不会重新运行 COLMAP 或改写输入数据。
+PLY 和相机来源独立判断，因此已有导出 PLY 的 360 场景仍可使用 COLMAP 相机。
+
+360 场景按注册图像文件名排序，索引 0、8、16……为测试集，其余为训练集。
+点云使用提供的完整 COLMAP 稀疏模型；这是使用官方初始点云的设置，
+并非仅用训练图像重新运行 SfM。``images_2``、``images_4`` 等目录是图像降采样版本，
+不是训练/测试划分。室外 bicycle/garden/stump/flowers/treehill 默认读取 ``images_4``，
+室内 bonsai/counter/kitchen/room 默认读取 ``images_2``；可用 ``data.images`` 指定目录。
+360 的渲染尺寸自动取所选图像的实际尺寸，不隐式重采样；
+``fx, fy, cx, cy`` 分别按实际宽高比例缩放，支持 PINHOLE / SIMPLE_PINHOLE 去畸变相机。
+输出图像编号保留排序后的全局索引，报告记录参考文件名。
+``0000-initial.png`` 和 ``0000-coarse.png`` 使用首个训练视角；
+360 中通常对应全局索引 1，可与最终 ``train/0001.png`` 对比，
+具体索引保存在报告的 ``view_index`` 中。
+
+360 初始化使用所有注册相机中心的均值 ``c``，以及
+``R = 1.1 * max(||camera - c||)``；点云和相机先统一变换为 ``(p-c)/R``，
+再统一转换坐标轴为 ``(x,y,z) -> (x,z,-y)``。相机只做这一相似变换。
+半径 ``r <= 1`` 的点保持不变；远景点沿径向一次性映射到
+``r' = 1 + W * (1 - 1/r)``，其中
+``W = 2 * render.max_hits / 最终核心分辨率``。
+这是压缩几何的初始化，后续直接在该几何上求交和优化，不对射线做逆压缩。
+
+默认核心分辨率 256 → 512、``max_hits=16`` 时，固定边界为
+``[-1.0625, 1.0625]^3``，实际存储网格为 272 → 544，
+外壳径向层数为 8 → 16；核心体素边长仍分别为 ``2/256``、``2/512``。
+合成场景的核心分辨率与存储分辨率相同。
+独立 ``preview.py`` 没有升层计划，最终核心分辨率等于其 ``grid_resolution``；
+因此预览 256 单层时外壳为 16 层、实际网格为 288。
+需要查看 256 → 512 训练计划的原始初始化图时，使用训练入口保存的 ``0000-initial.png``。
+中心、半径、外壳宽度和图像目录写入 ``data.initialization``，
+随 checkpoint 保存；续训、升层和评价复用它们，不重新压缩已训练体素。
+初始化后两类场景共用索引表、八叉树、Adam、生长与删除流程。
+``max_hits`` 仍是整条射线的命中上限，外壳层数相同不代表所有射线都不会截断。
+
+自动评价和独立评价统一默认 train 前 10 张、test 全量。合成场景按各自
+``transforms_train/test.json`` 的顺序取图；360 场景使用上述排序及每八张留一张的划分。
+评价复用 checkpoint 保存的归一化、图像目录与相机尺寸，不读取点云或重新估计场景变换。
+例如配置文件为::
+
+   {
+     "data": {"dataset": "datasets/garden"},
+     "evaluation": {"max_views": null, "train_max_views": 10, "test_max_views": null}
+   }
+
+``--eval-train-max-views`` / ``--eval-test-max-views`` 分别控制训练后出图范围；
+独立评价使用 ``--train-max-views`` / ``--test-max-views``，``0`` 表示该划分全部视角。
+旧 ``max_views`` / ``--eval-max-views`` / ``--max-views`` 若显式设置为非 ``None``，
+仍优先覆盖两个划分；旧配置中的 ``max_views=10`` 必须移除或改为 ``null``，才能采用新的完整测试集默认。
+
+源码编译及回归检查::
+
+   cmake --build build --config Release --parallel 8
+   & $python -m unittest discover -s experiments/reconstruction/tests -p test_reconstruction_dataset.py
+   & $python -m unittest discover -s experiments/reconstruction/tests -p test_reconstruction_core_resolution.py
+   & $python -u -I experiments/reconstruction/tests/test_reconstruction_points.py
+   & $python -u -I experiments/reconstruction/tests/test_reconstruction_colmap_training.py

@@ -25,6 +25,7 @@ The CPU initialization algorithm and input conventions are preserved.
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <vector>
@@ -79,5 +80,15 @@ Result load(
     const std::array<float, 3>& gridMin,
     const std::array<float, 3>& voxelSize,
     double opacityThreshold
+);
+
+// In-memory plain point cloud. Positions are already in the renderer frame;
+// colors are sRGB [0,1]. Invalid colors keep the geometric point, as for PLY.
+// Uses exactly the same per-cell PCA fitting as the plain PLY loader.
+Result load_points(
+    const float* positions, const float* colors, size_t pointCount,
+    const std::array<uint32_t, 3>& voxelCount,
+    const std::array<float, 3>& gridMin,
+    const std::array<float, 3>& voxelSize
 );
 } // namespace mitsuba::reconstruction

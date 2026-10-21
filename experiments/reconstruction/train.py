@@ -26,6 +26,7 @@ from preview import (DataConfig, ModelConfig, RenderConfig, RuntimeConfig, Previ
                      validate_config, validate_traversal, native_traversal_settings)
 from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, UniformSampler, ReferenceImageCache,
     generate_ray_batch, prepare_camera, initialize_runtime, load_views, model_metadata,
+    prepare_dataset, initialize_model,
     restore_model, workspace_path, file_sha256, render_view, write_png)
 from reconstruction_checkpoint import load_checkpoint, save_checkpoint
 from reconstruction_color import validate_reference_compositing
@@ -87,7 +88,9 @@ class ContourSettings:
 class EvaluationSettings:
     enabled: bool = True
     spp: int = 64
-    max_views: int | None = 10  # First N cameras of each split; None: all views.
+    train_max_views: int | None = 10  # First N training cameras; None or 0: all.
+    test_max_views: int | None = None  # Evaluate the complete held-out test split.
+    max_views: int | None = None  # Legacy explicit override of both split limits; 0: all.
     chunk_size: int = 65536
     seed: int = 42
     test_cameras: str = "transforms_test.json"
@@ -177,7 +180,8 @@ CONFIG.training.output = None  # 自动创建 outputs/场景-MM.DD-E编号/train
 # 需要手动指定目录时，将 None 改为路径字符串，或传 --output-dir。
 CONFIG.evaluation.enabled = True  # 最终 model.npz 保存后，自动评价训练集和测试集。
 CONFIG.evaluation.spp = 64  # 仅用于评价出图，不改变训练的 1 spp。
-CONFIG.evaluation.max_views = 10  # 各取相机文件中的前 10 个视角；None 表示全部。
+CONFIG.evaluation.train_max_views = 10  # 训练集前 10 个视角。
+CONFIG.evaluation.test_max_views = None  # 测试集全部视角，适用于合成场景和 COLMAP/Mip-NeRF 360。
 # 高级参数使用 CONFIG.optimizer / gradient / topology / contour / runtime。
 # ============================ 配置区结束 ============================
 
@@ -229,7 +233,12 @@ def parse_arguments():
                         help="Replay native GPU work without repeated tracing (default: enabled); stage diagnostics run directly")
     parser.add_argument("--skip-evaluation", action="store_true", help="Save the final model without automatic train/test evaluation")
     parser.add_argument("--eval-spp", type=int, help="Samples per pixel for final evaluation (default: 64)")
-    parser.add_argument("--eval-max-views", type=int, help="Evaluate the first N cameras of each split (default: 10)")
+    parser.add_argument("--eval-train-max-views", type=int,
+                        help="Evaluate the first N training cameras (default: 10); 0 evaluates all")
+    parser.add_argument("--eval-test-max-views", type=int,
+                        help="Evaluate the first N held-out test cameras (default: all); 0 evaluates all")
+    parser.add_argument("--eval-max-views", type=int,
+                        help="Deprecated: override BOTH train/test limits; 0 evaluates all. Prefer the split-specific options")
     return parser.parse_args()
 
 
@@ -249,11 +258,18 @@ def apply_arguments(config, args, values):
         (args.rgb_only, "training", "rgb_only"),
         (getattr(args, "distortion_weight", None), "gradient", "distortion_loss_weight"),
         (args.eval_spp, "evaluation", "spp"),
+        (getattr(args, "eval_train_max_views", None), "evaluation", "train_max_views"),
+        (getattr(args, "eval_test_max_views", None), "evaluation", "test_max_views"),
         (args.eval_max_views, "evaluation", "max_views")):
         if value is not None:
             setattr(getattr(config, group), key, value)
     if args.skip_evaluation:
         config.evaluation.enabled = False
+    if config.evaluation.enabled and config.evaluation.max_views is not None:
+        print("Deprecated evaluation.max_views / --eval-max-views explicitly overrides BOTH "
+              "train and test limits, including split-specific options. Remove it (or set "
+              "evaluation.max_views=null) to use train_max_views=10 and test_max_views=null "
+              "for full test-set evaluation.", file=sys.stderr)
     if (not config.training.rgb_only and
             "use_rgb_growth" not in values.get("topology", {})):
         # Explicit legacy supervision must not inherit the current RGB-only
@@ -380,6 +396,7 @@ def final_evaluation_config(config, model_path):
     return EvaluationConfig(checkpoint=str(model_path), dataset=config.data.dataset,
         splits=("train", "test"), cameras={"train": config.data.cameras, "test": config.evaluation.test_cameras},
         spp=config.evaluation.spp, max_views=config.evaluation.max_views,
+        train_max_views=config.evaluation.train_max_views, test_max_views=config.evaluation.test_max_views,
         seed=config.evaluation.seed, chunk_size=config.evaluation.chunk_size,
         traversal=config.render.traversal,
         output_directory=str(model_path.parent), runtime=config.runtime)
@@ -403,9 +420,10 @@ def save_initial_training_view(config, model, views, model_path, mi, dr, np, *, 
 
 def is_coarse_training_end(topology, completed_epochs):
     """Capture the original coarse level only, before its refinement."""
+    core = getattr(topology, "core_resolution", topology.resolution)
     return (topology.schedule.enabled
-            and topology.resolution == topology.schedule.start_resolution
-            and topology.resolution < topology.schedule.target_resolution
+            and core == topology.schedule.start_resolution
+            and core < topology.schedule.target_resolution
             and completed_epochs >= topology.level_start_epoch + topology.level_budget)
 
 
@@ -427,15 +445,17 @@ def save_coarse_training_view(config, model, views, model_path, mi, dr, np, *,
 def _save_training_view_zero(config, model, views, path, mi, dr, np, *,
                              completed_epochs, global_step):
     """Use evaluation camera/seed settings without consuming training RNG."""
-    view = next(view for view in views if view["index"] == 0)
-    # Match evaluate.render_evaluation_record's train camera 0 sample sequence.
-    seed = int(np.random.SeedSequence([config.evaluation.seed, 0, 0]).generate_state(1)[0])
+    # COLMAP holds out global filename index 0. Select the first training view,
+    # and keep its global index so the final evaluation uses the same samples.
+    view = views[0]
+    view_index = int(view["index"])
+    seed = int(np.random.SeedSequence([config.evaluation.seed, 0, view_index]).generate_state(1)[0])
     started = time.perf_counter()
     rgb, _ = render_view(model, config.render, view["camera"], config.evaluation.spp,
                          seed, config.evaluation.chunk_size, mi, dr, np)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_png(path, rgb, mi, np)
-    return dict(status="passed", image=str(path), view_index=0,
+    return dict(status="passed", image=str(path), view_index=view_index,
                 completed_epochs=completed_epochs, global_step=global_step,
                 spp=config.evaluation.spp, seed=seed,
                 width=config.render.width, height=config.render.height,
@@ -717,9 +737,17 @@ def kernel_profile(history):
             "jit_hashes": sorted({str(entry.hash) for entry in jit})}
 
 
-def dataset_signature(views, dataset, camera_file):
-    return {"cameras": file_sha256(dataset / camera_file),
-            "references": [file_sha256(Path(view["reference_path"])) for view in views]}
+def dataset_signature(views, dataset, camera_file, initialization=None):
+    if initialization is None:
+        cameras = file_sha256(dataset / camera_file)
+    else:
+        source = dataset / initialization["source_model"]
+        cameras = {name: file_sha256(source / name) for name in ("cameras.bin", "images.bin")}
+    signature = {"cameras": cameras,
+                 "references": [file_sha256(Path(view["reference_path"])) for view in views]}
+    if initialization is not None:
+        signature["initialization"] = initialization
+    return signature
 
 
 def checkpoint_epochs(num_epochs: int, save_count: int) -> tuple[int, ...]:
@@ -774,7 +802,10 @@ def normalized_algorithm_group(name, values):
         # not change leaf shading, gradients, candidate evidence, or sampling.
         return {key: value for key, value in values.items() if key != "traversal"}
     if name == "data" and values is not None:
-        return {"reference_compositing": "linear", **values}
+        # Omitted/None COLMAP options are identical for historical synthetic runs.
+        return {"reference_compositing": "linear", **{
+            key: value for key, value in values.items()
+            if key not in ("images", "initialization") or value is not None}}
     defaults = {"topology": TopologySettings, "gradient": GradientSettings}
     if values is not None and name in defaults:
         return {**asdict(defaults[name]()), **values}
@@ -1091,6 +1122,26 @@ def run_training(distributed=None):
             reported_loss=("mean pixel RGB squared-error sum over channels, then mean over views"
                            if config.training.rgb_only else "mean RGB plus alpha loss over pixels and views")
                           + (" + weight * mean hard-hit distortion" if distortion_enabled else ""))
+        dataset = workspace_path(config.data.dataset, WORKSPACE)
+        emit("Loading training views and checking reference files:", dataset, flush=True)
+        prepared = prepare_dataset(config, np, load_points=checkpoint is None)
+        views = (prepared["views"] if prepared is not None else
+                 load_views(dataset, config.data.cameras, config.render, np))
+        signature = dataset_signature(views, dataset, config.data.cameras, config.data.initialization)
+        if prepared is not None:
+            if config.data.cameras not in ("train", "transforms_train.json"):
+                raise ValueError("COLMAP training must use the train split; held-out views are reserved for evaluation")
+            report["initialization"] = config.data.initialization
+            report["resolved"]["point_cloud"] = prepared["point_source"]
+            report["effective_grid"] = {key: prepared[key] for key in
+                ("resolution", "core_resolution", "grid_min", "grid_max")}
+            emit("COLMAP initialization:", json.dumps(config.data.initialization), flush=True)
+            emit(f"Reference images: {config.render.width} x {config.render.height}; "
+                 f"{len(views)} training views; grid {prepared['resolution']} "
+                 f"(core {prepared['core_resolution']})", flush=True)
+            from evaluate import evaluation_view_limits
+            emit("Final evaluation view limits:",
+                 json.dumps(evaluation_view_limits(final_evaluation_config(config, model_path))), flush=True)
         performance.metadata["config"] = asdict(config)
         batch_size = effective_chunk_size(config)
         ray_count = config.render.width * config.render.height
@@ -1109,10 +1160,6 @@ def run_training(distributed=None):
         report["checkpoint_epochs"] = list(save_epochs)
         if primary:
             (output / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
-        dataset = workspace_path(config.data.dataset, WORKSPACE)
-        emit("Loading training views and checking reference files:", dataset, flush=True)
-        views = load_views(dataset, config.data.cameras, config.render, np)
-        signature = dataset_signature(views, dataset, config.data.cameras)
         reference_cache = ReferenceImageCache(config.render.width, config.render.height, mi, np,
                                              config.training.reference_cache_mib,
                                              rgb_only=config.training.rgb_only, background=config.render.background,
@@ -1172,14 +1219,10 @@ def run_training(distributed=None):
             rng.bit_generator.state = state["rng_state"]
             sampler.load_state_dict(state["contour_state"])
         else:
-            emit("Initializing voxel model from point cloud:", dataset / config.data.point_cloud, flush=True)
-            bounds_min = np.asarray(config.model.bounds_min)
-            bounds_max = np.asarray(config.model.bounds_max)
-            center, half = (bounds_min + bounds_max) / 2, (bounds_max - bounds_min) / 2 * config.model.bounds_padding
-            resolution = config.schedule.start_resolution if config.schedule.enabled else config.model.grid_resolution
-            model = mi.VoxelReconstruction(str(dataset / config.data.point_cloud), resolution,
-                (center-half).tolist(), (center+half).tolist(), config.model.opacity_threshold,
-                config.model.sh_count, config.model.opacity_sh_count)
+            emit("Initializing voxel model:", "COLMAP normalized points" if prepared is not None
+                 else str(dataset / config.data.point_cloud), flush=True)
+            model = initialize_model(config, dataset, mi, np, prepared=prepared)
+        del prepared
         if config.training.rgb_only and int(model.opacity_sh_count) != 1:
             raise ValueError("RGB-only model/checkpoint must contain exactly one opacity coefficient per voxel")
         optimizer = FalcorOptimizer(model, config.optimizer)
@@ -1192,7 +1235,7 @@ def run_training(distributed=None):
         elif (not config.schedule.enabled
               or config.schedule.start_resolution == config.schedule.target_resolution):
             report["coarse_render"] = dict(status="skipped", reason="no_coarse_level")
-        elif int(model.resolution) != config.schedule.start_resolution:
+        elif int(getattr(model, "core_resolution", model.resolution)) != config.schedule.start_resolution:
             report["coarse_render"] = dict(status="skipped", reason="coarse_stage_already_completed",
                                           image=str(coarse_path), existing_image=coarse_path.is_file())
         else:
@@ -1228,7 +1271,7 @@ def run_training(distributed=None):
                     sampler = make_sampler(config, np)
                 topology.before_refine_checkpoint = None
 
-        emit("Training epochs by resolution:", json.dumps(topology.budgets), flush=True)
+        emit("Training epochs by core resolution:", json.dumps(topology.budgets), flush=True)
 
         if distributed is not None:
             # Establish a canonical model/Adam/RNG before the first collective,
@@ -1581,15 +1624,19 @@ def main(distributed=None):
     if not config.evaluation.enabled:
         return 0
     evaluation = final_evaluation_config(config, model_path)
+    from evaluate import evaluation_view_limits
+    view_limits = evaluation_view_limits(evaluation)
     evaluation_report = model_path.parent / "evaluation-report.json"
     report["evaluation"] = {"status": "running", "spp": evaluation.spp,
         "max_views_per_split": evaluation.max_views, "splits": list(evaluation.splits),
+        "view_limits": view_limits, "score_metric": "psnr_srgb_png",
         "gpu_workers": distributed.world_size if distributed else 1,
         "output": evaluation.output_directory, "report": str(evaluation_report)}
     if primary:
         (output / "training-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
-    limit = "all views" if evaluation.max_views is None else f"first {evaluation.max_views} views per split"
-    emit(f"Starting final train/test evaluation: {evaluation.spp} spp, {limit}"
+    limit = ", ".join(f"{split}: all views" if count is None else f"{split}: first {count} views"
+                      for split, count in view_limits.items())
+    emit(f"Starting final train/test evaluation: {evaluation.spp} spp, {limit}, metric=psnr_srgb_png"
          + (f", {distributed.world_size} GPUs by view" if distributed else ""), flush=True)
     evaluation_started = time.perf_counter()
     try:

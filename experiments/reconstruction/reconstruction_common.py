@@ -71,7 +71,87 @@ def initialize_runtime(runtime: RuntimeConfig, output: Path, report: dict, *,
     return mi, dr, np, handles
 
 
-def load_views(dataset: Path, cameras_file: str, render: RenderConfig, np) -> list[dict]:
+def _colmap_split(cameras_file):
+    names = {"train": "train", "test": "test", "transforms_train.json": "train",
+             "transforms_test.json": "test"}
+    if cameras_file not in names:
+        raise ValueError(f"Unknown COLMAP split: {cameras_file}; use train or test")
+    return names[cameras_file]
+
+
+def _colmap_views(prepared, render):
+    """Keep rays and reference pixels in the same selected image resolution."""
+    if (render.width, render.height) != (prepared["width"], prepared["height"]):
+        raise ValueError("COLMAP reference image dimensions differ from the saved render size; "
+                         "use the original data.images directory")
+    for view in prepared["views"]:
+        view["camera"].update(
+            sampling="per_pixel_uniform",
+            rng="NumPy PCG64; distribution matches uniform Falcor samples, bit sequence differs",
+            near_clip=render.near_clip, far_clip=render.far_clip,
+            entry_offset_fraction=render.entry_offset_fraction,
+            ray_origin="near plane; camera_position + near_clip * unnormalized_direction")
+    return prepared["views"]
+
+
+def prepare_dataset(config, np, *, load_points=True):
+    """Resolve the 360 initializer; synthetic initialization stays unchanged.
+
+    This runs before batch sizes, caches or config files are created. Images are
+    used at their selected on-disk resolution, with matching full intrinsics.
+    """
+    from reconstruction_dataset import detect_dataset, prepare_colmap
+    dataset = workspace_path(config.data.dataset, WORKSPACE)
+    if detect_dataset(dataset, config.data.cameras) == "synthetic":
+        if config.data.initialization is not None:
+            raise ValueError("COLMAP initialization metadata cannot be used with synthetic cameras")
+        return None
+    schedule = getattr(config, "schedule", None)
+    start = schedule.start_resolution if schedule and schedule.enabled else config.model.grid_resolution
+    target = schedule.target_resolution if schedule and schedule.enabled else start
+    prepared = prepare_colmap(dataset, split=_colmap_split(config.data.cameras), images_dir=config.data.images,
+        point_cloud=config.data.point_cloud, initialization=config.data.initialization,
+        start_core_resolution=start, target_core_resolution=target,
+        shell_layers=config.render.max_hits, load_points=load_points)
+    config.data.initialization = prepared["initialization"]
+    config.render.width, config.render.height = prepared["width"], prepared["height"]
+    _colmap_views(prepared, config.render)
+    return prepared
+
+
+def initialize_model(config, dataset, mi, np, *, prepared=None):
+    if prepared is not None:
+        if not hasattr(mi.VoxelReconstruction, "from_points"):
+            raise RuntimeError("Rebuild this checkout: in-memory point-cloud initialization is missing")
+        return mi.VoxelReconstruction.from_points(
+            np.ascontiguousarray(prepared["positions"], dtype=np.float32).reshape(-1),
+            np.ascontiguousarray(prepared["colors"], dtype=np.float32).reshape(-1),
+            prepared["resolution"], prepared["grid_min"], prepared["grid_max"],
+            config.model.sh_count, config.model.opacity_sh_count, prepared["core_resolution"])
+    lo, hi = np.asarray(config.model.bounds_min), np.asarray(config.model.bounds_max)
+    center, half = (lo + hi) / 2, (hi - lo) / 2 * config.model.bounds_padding
+    schedule = getattr(config, "schedule", None)
+    resolution = schedule.start_resolution if schedule and schedule.enabled else config.model.grid_resolution
+    return mi.VoxelReconstruction(str(dataset / config.data.point_cloud), resolution,
+        (center-half).tolist(), (center+half).tolist(), config.model.opacity_threshold,
+        config.model.sh_count, config.model.opacity_sh_count)
+
+
+def load_views(dataset: Path, cameras_file: str, render: RenderConfig, np, *,
+               data=None, split=None) -> list[dict]:
+    from reconstruction_dataset import detect_dataset, prepare_colmap
+    if detect_dataset(dataset, cameras_file) == "colmap":
+        initialization = getattr(data, "initialization", None)
+        if initialization is None:
+            raise ValueError("COLMAP views require the model's saved initialization metadata")
+        if split is None:
+            split = _colmap_split(cameras_file)
+        prepared = prepare_colmap(dataset, split=split, images_dir=data.images,
+            initialization=initialization,
+            start_core_resolution=initialization["start_core_resolution"],
+            target_core_resolution=initialization["target_core_resolution"],
+            shell_layers=initialization["shell_layers"], load_points=False)
+        return _colmap_views(prepared, render)
     document = json.loads((dataset / cameras_file).read_text(encoding="utf-8"))
     frames = document.get("frames", [])
     if not frames:
@@ -154,16 +234,19 @@ def prepare_camera(render, camera, mi, dr):
     instead of embedding them in generated code. Keep these separately from the
     serializable camera dictionary and reuse them for every batch of a view.
     """
-    tan_x = math.tan(camera["camera_angle_x"] / 2)
-    tan_y = tan_x * render.height / render.width
-    return {
+    values = {
         "position": dr.opaque(mi.Point3f, camera["position"]),
         "forward": dr.opaque(mi.Vector3f, camera["forward"]),
         "right": dr.opaque(mi.Vector3f, camera["right"]),
         "up": dr.opaque(mi.Vector3f, camera["up"]),
-        "tan_x": dr.opaque(mi.Float, tan_x),
-        "tan_y": dr.opaque(mi.Float, tan_y),
     }
+    if "fx" in camera:
+        values.update({key: dr.opaque(mi.Float, camera[key]) for key in ("fx", "fy", "cx", "cy")})
+    else:
+        tan_x = math.tan(camera["camera_angle_x"] / 2)
+        tan_y = tan_x * render.height / render.width
+        values.update(tan_x=dr.opaque(mi.Float, tan_x), tan_y=dr.opaque(mi.Float, tan_y))
+    return values
 
 
 def generate_ray_batch(render, camera, indices, offsets, mi, dr, *, prepared_camera=None):
@@ -172,9 +255,13 @@ def generate_ray_batch(render, camera, indices, offsets, mi, dr, *, prepared_cam
     index = mi.UInt32(indices)
     u = (mi.Float(index % render.width) + mi.Float(offsets[:, 0])) / render.width
     v = (mi.Float(index // render.width) + mi.Float(offsets[:, 1])) / render.height
-    direction = (values["forward"]
-                 + ((2 * u - 1) * values["tan_x"]) * values["right"]
-                 + ((1 - 2 * v) * values["tan_y"]) * values["up"])
+    if "fx" in values:
+        horizontal = (u * render.width - values["cx"]) / values["fx"]
+        vertical = (values["cy"] - v * render.height) / values["fy"]
+    else:
+        horizontal = (2 * u - 1) * values["tan_x"]
+        vertical = (1 - 2 * v) * values["tan_y"]
+    direction = values["forward"] + horizontal * values["right"] + vertical * values["up"]
     ray = mi.Ray3f(values["position"] + render.near_clip * direction,
                   dr.normalize(direction))
     ray.maxt = (render.far_clip - render.near_clip) * dr.norm(direction)
@@ -233,17 +320,22 @@ def render_view(model, render, camera, spp, seed, chunk_size, mi, dr, np):
 
 
 def model_metadata(model) -> dict:
-    return {"resolution": int(model.resolution), "grid_min": list(model.grid_min),
+    metadata = {"resolution": int(model.resolution), "grid_min": list(model.grid_min),
             "grid_max": list(model.grid_max), "sh_count": int(model.sh_count),
             "opacity_sh_count": int(model.opacity_sh_count)}
+    core = int(getattr(model, "core_resolution", model.resolution))
+    if core != metadata["resolution"]:
+        metadata["core_resolution"] = core
+    return metadata
 
 
 def restore_model(checkpoint, mi):
     metadata = checkpoint["model_metadata"]
     state = {key: (mi.UInt32(value) if key == "cell_indices" else mi.Float(value))
              for key, value in checkpoint["model_state"].items()}
+    options = ({"core_resolution": metadata["core_resolution"]} if "core_resolution" in metadata else {})
     return mi.VoxelReconstruction.from_state(metadata["resolution"], metadata["grid_min"],
-        metadata["grid_max"], state, metadata["sh_count"], metadata["opacity_sh_count"])
+        metadata["grid_max"], state, metadata["sh_count"], metadata["opacity_sh_count"], **options)
 
 
 class UniformSampler:

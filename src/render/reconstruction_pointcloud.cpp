@@ -621,6 +621,93 @@ Seed fitPoints(const std::vector<CloudPoint>& points, size_t begin, size_t end, 
 
 } // namespace
 
+Result load_points(
+    const float* positions, const float* colors, size_t pointCount,
+    const std::array<uint32_t, 3>& voxelCount,
+    const std::array<float, 3>& gridMin,
+    const std::array<float, 3>& voxelSize
+)
+{
+    if (!pointCount || !positions || !colors)
+        fail("in-memory point cloud must contain position and color triples.");
+    uint64_t totalVoxelCount = 1;
+    for (size_t axis = 0; axis < 3; ++axis)
+    {
+        if (!voxelCount[axis] || !std::isfinite(gridMin[axis]) ||
+            !std::isfinite(voxelSize[axis]) || voxelSize[axis] <= 0)
+            fail("invalid voxel grid dimensions or bounds.");
+        totalVoxelCount *= voxelCount[axis];
+        if (totalVoxelCount > std::numeric_limits<uint32_t>::max())
+            fail("voxel grid exceeds the 32-bit index range.");
+    }
+    Result result;
+    result.statistics.inputPoints = pointCount;
+    std::vector<CloudPoint> cloudPoints;
+    cloudPoints.reserve(pointCount);
+    for (size_t i = 0; i < pointCount; ++i)
+    {
+        bool valid = true;
+        for (size_t axis = 0; axis < 3; ++axis)
+            valid = valid && std::isfinite(positions[i * 3 + axis]);
+        if (!valid)
+        {
+            ++result.statistics.invalidPoints;
+            continue;
+        }
+        std::array<uint32_t, 3> cell = {};
+        std::array<double, 3> coordinate = {};
+        for (size_t axis = 0; axis < 3; ++axis)
+        {
+            coordinate[axis] = (double(positions[i * 3 + axis]) - gridMin[axis]) / voxelSize[axis];
+            if (!(coordinate[axis] >= 0 && coordinate[axis] < double(voxelCount[axis])))
+            {
+                valid = false;
+                break;
+            }
+            cell[axis] = static_cast<uint32_t>(std::floor(coordinate[axis]));
+        }
+        if (!valid)
+        {
+            ++result.statistics.outsidePoints;
+            continue;
+        }
+        CloudPoint point = {};
+        point.cell = static_cast<uint32_t>(uint64_t(cell[0]) + uint64_t(cell[1]) * voxelCount[0] +
+            uint64_t(cell[2]) * voxelCount[0] * voxelCount[1]);
+        point.hasColor = true;
+        for (size_t axis = 0; axis < 3; ++axis)
+        {
+            point.local[axis] = float(coordinate[axis] - cell[axis]);
+            const double color = colors[i * 3 + axis];
+            point.hasColor = point.hasColor && std::isfinite(color) && color >= 0 && color <= 1;
+        }
+        if (point.hasColor)
+        {
+            ++result.statistics.coloredPoints;
+            for (size_t axis = 0; axis < 3; ++axis)
+            {
+                const double color = colors[i * 3 + axis];
+                point.color[axis] = float(color <= 0.04045 ? color / 12.92 :
+                    std::pow((color + 0.055) / 1.055, 2.4));
+            }
+        }
+        cloudPoints.push_back(point);
+    }
+    std::sort(cloudPoints.begin(), cloudPoints.end(), [](const CloudPoint& a, const CloudPoint& b) { return a.cell < b.cell; });
+    for (size_t begin = 0; begin < cloudPoints.size();)
+    {
+        size_t end = begin + 1;
+        while (end < cloudPoints.size() && cloudPoints[end].cell == cloudPoints[begin].cell) ++end;
+        result.seeds.push_back(fitPoints(cloudPoints, begin, end, voxelSize));
+        begin = end;
+    }
+    if (result.seeds.empty())
+        fail("no occupied voxels inside the voxel grid (input=" + std::to_string(result.statistics.inputPoints) +
+            ", invalid=" + std::to_string(result.statistics.invalidPoints) + ", outside=" +
+            std::to_string(result.statistics.outsidePoints) + "). Check the point-cloud coordinates and grid bounds.");
+    return result;
+}
+
 Result load(
     const std::filesystem::path& path,
     const std::array<uint32_t, 3>& voxelCount,

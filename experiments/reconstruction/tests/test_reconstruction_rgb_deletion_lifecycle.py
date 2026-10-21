@@ -108,7 +108,8 @@ class RGBDeletionLifecycleTests(unittest.TestCase):
         manager = self.manager(scheduled=True)
         self.assertTrue(manager.collect_deletion(29))  # Coarse evidence is enabled.
         self.assertFalse(manager.collect_deletion(419))  # Split boundary.
-        manager.resolution, manager.level_start_epoch = 16, 420
+        manager.resolution = manager.core_resolution = 16
+        manager.level_start_epoch = 420
         self.assertFalse(manager.collect_deletion(439))  # Fine local epoch 20.
         self.assertTrue(manager.collect_deletion(449))   # Fine local epoch 30.
         self.assertFalse(manager.collect_deletion(601))  # Global tail overrides.

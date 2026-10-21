@@ -43,6 +43,8 @@ def validate_model_state(state: dict, metadata: dict) -> None:
     if not required.issubset(metadata):
         raise ValueError(f"Missing model metadata: {sorted(required - metadata.keys())}")
     resolution = _integer(metadata["resolution"], "resolution", 1, 1024)
+    if "core_resolution" in metadata:
+        _integer(metadata["core_resolution"], "core_resolution", 1, resolution)
     sh = _integer(metadata["sh_count"], "sh_count", 1, 16)
     opacity_sh = _integer(metadata["opacity_sh_count"], "opacity_sh_count", 1, 16)
     lo, hi = np.asarray(metadata["grid_min"]), np.asarray(metadata["grid_max"])

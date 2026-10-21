@@ -39,6 +39,8 @@ class DataConfig:
     cameras: str = "transforms_train.json"  # Relative to dataset.
     camera_index: int = 0
     reference_compositing: str = "linear"  # Missing field in old checkpoints keeps the old convention.
+    images: str | None = None  # COLMAP image folder; None selects the scene's downsampled images.
+    initialization: dict | None = None  # Resolved COLMAP normalization/shell, persisted for resume/evaluation.
 
 
 @dataclass
@@ -126,6 +128,8 @@ def source_provenance(repository: Path) -> dict:
         "src/render/python/CMakeLists.txt",
         "experiments/reconstruction/preview.py",
         "experiments/reconstruction/reconstruction_color.py",
+        "experiments/reconstruction/reconstruction_common.py",
+        "experiments/reconstruction/reconstruction_dataset.py",
         "experiments/reconstruction/tests/test_reconstruction.py",
     ):
         try:
@@ -198,6 +202,10 @@ def parse_config(workspace: Path) -> PreviewConfig:
 
 def validate_config(config: PreviewConfig) -> None:
     validate_reference_compositing(config.data.reference_compositing)
+    if config.data.images is not None and not isinstance(config.data.images, str):
+        raise ValueError("data.images must be an image directory name or null")
+    if config.data.initialization is not None and not isinstance(config.data.initialization, dict):
+        raise ValueError("data.initialization must be resolved initialization metadata or null")
     if config.render.traversal not in ("octree", "dda"):
         raise ValueError("render.traversal must be octree or dda")
     for name in ("width", "height", "spp", "max_hits"):
@@ -411,11 +419,16 @@ def generate_rays(config: RenderConfig, camera: dict, offset, mi, dr):
     index = dr.arange(mi.UInt32, config.width * config.height)
     u = (mi.Float(index % config.width) + float(offset[0])) / config.width
     v = (mi.Float(index // config.width) + float(offset[1])) / config.height
-    tan_x = math.tan(camera["camera_angle_x"] / 2)
-    tan_y = tan_x * config.height / config.width
+    if "fx" in camera:
+        horizontal = (u * config.width - camera["cx"]) / camera["fx"]
+        vertical = (camera["cy"] - v * config.height) / camera["fy"]
+    else:
+        tan_x = math.tan(camera["camera_angle_x"] / 2)
+        tan_y = tan_x * config.height / config.width
+        horizontal, vertical = (2 * u - 1) * tan_x, (1 - 2 * v) * tan_y
     unnormalized = (mi.Vector3f(camera["forward"])
-                    + ((2 * u - 1) * tan_x) * mi.Vector3f(camera["right"])
-                    + ((1 - 2 * v) * tan_y) * mi.Vector3f(camera["up"]))
+                    + horizontal * mi.Vector3f(camera["right"])
+                    + vertical * mi.Vector3f(camera["up"]))
     origin = mi.Point3f(camera["position"]) + config.near_clip * unnormalized
     ray = mi.Ray3f(origin, dr.normalize(unnormalized))
     ray.maxt = (config.far_clip - config.near_clip) * dr.norm(unnormalized)
@@ -490,24 +503,33 @@ def main() -> int:
             raise RuntimeError("This source build lacks VoxelReconstruction; rebuild the current checkout")
         validate_traversal(config.render, mi, report)
 
+        from reconstruction_common import prepare_dataset, initialize_model
         dataset = workspace_path(config.data.dataset, workspace)
-        point_cloud = (dataset / config.data.point_cloud).resolve()
-        if not point_cloud.is_file():
-            raise FileNotFoundError(point_cloud)
-        report["resolved"].update(dataset=str(dataset), point_cloud=str(point_cloud))
-        camera, reference_path = load_camera(config, dataset, np)
+        prepared = prepare_dataset(config, np)
+        report["resolved"]["dataset"] = str(dataset)
+        if prepared is None:
+            point_cloud = (dataset / config.data.point_cloud).resolve()
+            if not point_cloud.is_file():
+                raise FileNotFoundError(point_cloud)
+            report["resolved"]["point_cloud"] = str(point_cloud)
+            camera, reference_path = load_camera(config, dataset, np)
+        else:
+            if not 0 <= config.data.camera_index < len(prepared["views"]):
+                raise ValueError(f"camera_index must be in [0, {len(prepared['views']) - 1}]")
+            view = prepared["views"][config.data.camera_index]
+            camera, reference_path = view["camera"], Path(view["reference_path"])
+            camera.update(sampling=config.render.pixel_sampling)
+            report["initialization"] = config.data.initialization
+            report["resolved"]["point_cloud"] = prepared["point_source"]
+        (output / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
         report["camera"] = camera
         report["resolved"]["reference"] = str(reference_path)
-        lo, hi = np.asarray(config.model.bounds_min), np.asarray(config.model.bounds_max)
-        middle, half_extent = (lo + hi) / 2, (hi - lo) / 2 * config.model.bounds_padding
-        grid_min, grid_max = (middle - half_extent).tolist(), (middle + half_extent).tolist()
-        report["effective_grid"] = {"min": grid_min, "max": grid_max, "resolution": config.model.grid_resolution}
-        print("Point cloud:", point_cloud, flush=True)
         started = time.perf_counter()
-        model = mi.VoxelReconstruction(
-            str(point_cloud), config.model.grid_resolution, grid_min, grid_max,
-            config.model.opacity_threshold, config.model.sh_count, config.model.opacity_sh_count,
-        )
+        model = initialize_model(config, dataset, mi, np, prepared=prepared)
+        del prepared
+        report["effective_grid"] = {"min": list(model.grid_min), "max": list(model.grid_max),
+                                    "resolution": int(model.resolution),
+                                    "core_resolution": int(model.core_resolution)}
         dr.sync_thread()
         report["initialization_seconds"] = time.perf_counter() - started
         report["model_statistics"] = model.statistics()

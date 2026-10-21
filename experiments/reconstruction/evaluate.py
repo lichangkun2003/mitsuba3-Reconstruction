@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import preview
 from reconstruction_checkpoint import load_checkpoint
 from reconstruction_progress import ProgressLine
+from reconstruction_png_metrics import save_srgb_png_pair, read_png_metrics
 
 
 @dataclass
@@ -34,7 +35,9 @@ class EvaluationConfig:
     cameras: dict[str, str | None] = field(default_factory=lambda: {
         "train": None, "test": "transforms_test.json"})
     spp: int = 64  # Independent evaluation sampling; training remains 1 spp.
-    max_views: int | None = None  # First N cameras per split; None evaluates all.
+    max_views: int | None = None  # Legacy global override; 0 means all, None uses split limits.
+    train_max_views: int | None = 10
+    test_max_views: int | None = None  # All held-out cameras, for synthetic and COLMAP datasets.
     seed: int = 42
     chunk_size: int = 65536
     traversal: str | None = None  # None: saved mode; legacy checkpoints default to octree.
@@ -72,7 +75,10 @@ def parse_config(workspace):
     parser.add_argument("--train-cameras")
     parser.add_argument("--test-cameras")
     parser.add_argument("--spp", type=int)
-    parser.add_argument("--max-views", type=int, help="Evaluate the first N cameras in each selected split")
+    parser.add_argument("--max-views", type=int,
+                        help="Legacy override for BOTH splits (0: all); prefer separate train/test limits")
+    parser.add_argument("--train-max-views", type=int, help="First N train views (default: 10; 0: all)")
+    parser.add_argument("--test-max-views", type=int, help="First N test views (default: all; 0: all)")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--chunk-size", type=int)
     parser.add_argument("--traversal", choices=("octree", "dda"),
@@ -90,7 +96,7 @@ def parse_config(workspace):
     _update_config(config, asdict(CONFIG))
     if args.config:
         _update_config(config, json.loads(preview.workspace_path(args.config, workspace).read_text(encoding="utf-8")))
-    for name in ("checkpoint", "dataset", "spp", "max_views", "seed", "chunk_size",
+    for name in ("checkpoint", "dataset", "spp", "max_views", "train_max_views", "test_max_views", "seed", "chunk_size",
                  "metric_color_space", "reference_compositing", "background", "save_linear", "traversal"):
         value = getattr(args, name)
         if value is not None:
@@ -116,10 +122,10 @@ def validate_config(config):
         value = getattr(config, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{name} must be a positive integer")
-    if config.max_views is not None and (
-            isinstance(config.max_views, bool) or not isinstance(config.max_views, int)
-            or config.max_views < 1):
-        raise ValueError("max_views must be None or a positive integer")
+    for name in ("max_views", "train_max_views", "test_max_views"):
+        value = getattr(config, name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ValueError(f"{name} must be None or a nonnegative integer (0: all)")
     if isinstance(config.seed, bool) or not isinstance(config.seed, int) or config.seed < 0:
         raise ValueError("seed must be a nonnegative integer")
     if (not isinstance(config.splits, (tuple, list)) or not config.splits
@@ -139,6 +145,51 @@ def validate_config(config):
             len(config.background) != 3 or any(not math.isfinite(x) or not 0 <= x <= 1
                                              for x in config.background)):
         raise ValueError("background must contain three finite linear RGB values in [0, 1]")
+
+
+def evaluation_view_limit(config, split):
+    """Resolve before sharding; an explicit legacy global limit takes precedence."""
+    if split not in ("train", "test"):
+        raise ValueError(f"Unsupported evaluation split: {split}")
+    value = config.max_views if config.max_views is not None else getattr(config, split + "_max_views")
+    return None if value in (None, 0) else value
+
+
+def evaluation_view_limits(config):
+    return {split: evaluation_view_limit(config, split) for split in config.splits}
+
+
+def warn_legacy_view_limit(config):
+    if config.max_views is not None:
+        print("Legacy max_views overrides BOTH train/test limits. "
+              "For train-first-10 and all test views, omit --max-views and set "
+              "--train-max-views 10 --test-max-views 0.", file=sys.stderr, flush=True)
+
+
+def primary_metric_name(config):
+    return "psnr_srgb_png" if config.metric_color_space == "srgb" else "psnr_linear"
+
+
+def primary_metric_space(config):
+    return "srgb_png" if config.metric_color_space == "srgb" else "linear"
+
+
+def metric_protocol(config):
+    """One documented image/aggregation protocol for serial and distributed evaluation."""
+    return {
+        "primary_color_space": config.metric_color_space,
+        "primary_metric": primary_metric_name(config),
+        "mse": "mean over all image pixels and RGB channels; no mask; peak value 1",
+        "linear": "unclamped floating linear RGB targets prepared under reference_compositing",
+        "srgb": "linear RGB clipped to [0,1], IEC sRGB transfer, floating values before PNG quantization",
+        "srgb_png": "save prediction and composited reference as RGB uint8 PNG, reopen both files; "
+                    "RGB bytes / 255 with no gamma decoding; float64 MSE; floor(255*sRGB+0.5) quantization",
+        "reference_png": "<split>/reference/<view-index>.png; source JPEG/RGB images are not alpha-masked",
+        "aggregation": "arithmetic mean of per-view PSNR; PSNR of mean MSE also reported separately; no rank averaging",
+        "view_selection": "per-split limits before sharding; legacy max_views overrides both; 0 or None limit selects all",
+        "view_limits": evaluation_view_limits(config),
+        "perfect_match": "PSNR is +infinity, encoded as null with an explicit boolean flag",
+    }
 
 
 def linear_to_display_srgb(values, np):
@@ -170,7 +221,13 @@ def aggregate_metrics(records):
     if not records:
         raise ValueError("Cannot aggregate an empty evaluation split")
     result = {"view_count": len(records)}
-    for space in ("linear", "srgb"):
+    spaces = ["linear", "srgb"]
+    has_png = ["srgb_png" in record["metrics"] for record in records]
+    if any(has_png):
+        if not all(has_png):
+            raise ValueError("Cannot aggregate mixed PNG and float-only evaluation records")
+        spaces.append("srgb_png")
+    for space in spaces:
         scores = [record["metrics"][space] for record in records]
         mean_mse = math.fsum(score["mse"] for score in scores) / len(scores)
         has_infinite_psnr = any(score["perfect_match"] for score in scores)
@@ -181,6 +238,10 @@ def aggregate_metrics(records):
             "psnr_from_mean_mse_db": None if mean_mse == 0 else -10 * math.log10(mean_mse),
             "all_views_perfect": mean_mse == 0,
         }
+    result["psnr_srgb_float"] = result["srgb"]["mean_psnr_db"]
+    if all(has_png):
+        result["psnr_srgb_png"] = result["srgb_png"]["mean_psnr_db"]
+        result["psnr_srgb_png_is_infinite"] = result["srgb_png"]["mean_psnr_is_infinite"]
     return result
 
 
@@ -195,6 +256,17 @@ def resolve_reference_compositing(config, checkpoint_config):
     if mode not in ("linear", "srgb"):
         raise ValueError(f"Unsupported checkpoint reference compositing: {mode!r}")
     return mode, source
+
+
+def checkpoint_data_config(saved):
+    """Reuse the exact initialization transform for every evaluation split."""
+    data = preview.DataConfig()
+    allowed = {item.name for item in fields(data)}
+    for key, value in saved.get("data", {}).items():
+        if key not in allowed:
+            raise ValueError(f"Unsupported checkpoint data setting: {key}")
+        setattr(data, key, value)
+    return data
 
 
 def reference_metric_protocol(mode, source):
@@ -228,12 +300,18 @@ def render_evaluation_record(config, common, model, render, view, split, output,
     with _wall_stage(view_timing, stage_seconds, "metrics_seconds"):
         metrics = image_metrics(rgb, target, np)
     prediction_path = output / split / f"{index:04d}.png"
+    reference_png_path = output / split / "reference" / f"{index:04d}.png"
     with _wall_stage(view_timing, stage_seconds, "write_seconds"):
-        preview.write_png(prediction_path, rgb, mi, np)
+        save_srgb_png_pair(prediction_path, reference_png_path, rgb, target, np)
         if config.save_linear:
             np.savez_compressed(output / split / f"{index:04d}.npz", rgb_linear=rgb, alpha=alpha)
+    with _wall_stage(view_timing, stage_seconds, "metrics_seconds"):
+        metrics["srgb_png"] = read_png_metrics(prediction_path, reference_png_path, np)
     return {"index": index, "reference": str(view["reference_path"]),
-            "prediction": str(prediction_path), "seed": seed,
+            "prediction": str(prediction_path), "reference_png": str(reference_png_path), "seed": seed,
+            "psnr_srgb_float": metrics["srgb"]["psnr_db"],
+            "psnr_srgb_png": metrics["srgb_png"]["psnr_db"],
+            "psnr_srgb_png_is_infinite": metrics["srgb_png"]["perfect_match"],
             "seconds": time.perf_counter() - started, "metrics": metrics, **view_timing}
 
 
@@ -342,15 +420,7 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
             "split_scope": "split_seconds is max worker-local split duration, not synchronized global split wall",
             "total_seconds": 0., "setup_seconds": None, "split_seconds": {},
         },
-        "metric_protocol": {
-            "primary_color_space": config.metric_color_space,
-            "mse": "mean over all image pixels and RGB channels; no mask; peak value 1",
-            "linear": "unclamped floating linear RGB targets prepared under reference_compositing",
-            "srgb": "linear RGB clipped to [0,1], IEC sRGB transfer, floating values before PNG quantization",
-            "aggregation": "arithmetic mean of all per-view PSNR; PSNR of mean MSE also reported separately; no rank averaging",
-            "view_selection": "first max_views cameras per split before sharding; None selects all",
-            "perfect_match": "PSNR is +infinity, encoded as null with an explicit boolean flag",
-        },
+        "metric_protocol": metric_protocol(config),
     }
     progress = ProgressLine() if primary else ProgressLine(stream=io.StringIO())
     callback = progress_callback or distributed.heartbeat
@@ -359,6 +429,8 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
     # not wait for camera records while its peer is still expecting a setup plan.
     try:
         validate_config(config)
+        if primary:
+            warn_legacy_view_limit(config)
         import reconstruction_common as common
         callback("evaluation setup")
         mi, dr, np, dll_handles = common.initialize_runtime(config.runtime, output, report,
@@ -398,9 +470,12 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
         report["model_statistics"] = model.statistics()
         for split in config.splits:
             cameras_file = config.cameras[split] or saved.get("data", {}).get("cameras", "transforms_train.json")
-            views = common.load_views(dataset, cameras_file, render, np)
+            views = common.load_views(dataset, cameras_file, render, np,
+                                      data=checkpoint_data_config(saved), split=split)
+            limit = evaluation_view_limit(config, split)
             plans[split] = {"cameras": cameras_file, "available_view_count": len(views),
-                            "views": views[:config.max_views] if config.max_views is not None else views}
+                            "max_views": limit,
+                            "views": views[:limit] if limit is not None else views}
             if not plans[split]["views"]:
                 raise ValueError(f"Empty camera split: {split}")
     except KeyboardInterrupt:
@@ -446,7 +521,7 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
                 stages = dict.fromkeys(("render_seconds", "reference_seconds", "metrics_seconds", "write_seconds"), 0.)
                 split_report = {"cameras": plan["cameras"], "views": records,
                     "metric_protocol": report["metric_protocol"],
-                    "max_views": config.max_views, "view_order": "camera file order",
+                    "max_views": plan["max_views"], "view_order": "dataset split order (JSON order or sorted COLMAP filenames)",
                     "available_view_count": plan["available_view_count"], "selected_view_count": len(all_views),
                     "assigned_view_count": len(assigned), "evaluated_view_count": 0, "status": "running",
                     "seconds": 0., "stage_seconds": stages}
@@ -498,10 +573,10 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
                         json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
                     report["timing"]["split_seconds"][split] = result["seconds"]
                     if result.get("aggregate"):
-                        score = result["aggregate"][config.metric_color_space]["mean_psnr_db"]
+                        score = result["aggregate"][primary_metric_space(config)]["mean_psnr_db"]
                         text = "+inf" if score is None else f"{score:.4f}"
                         print(f"Eval {split} {result['evaluated_view_count']}/{result['selected_view_count']} "
-                              f"| {config.spp} spp | mean PSNR({config.metric_color_space})={text} dB", flush=True)
+                              f"| {config.spp} spp | {primary_metric_name(config)}={text} dB", flush=True)
             else:
                 report.update(status=readiness["status"], error=readiness["error"])
             errors = [f"rank {worker['rank']}: {worker['error']}" for worker in workers if worker["error"]]
@@ -563,19 +638,12 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
             "render_scope": "render_view including tracing/JIT, transfers and its existing device waits/readbacks",
             "total_seconds": 0.0, "setup_seconds": None, "split_seconds": {},
         },
-        "metric_protocol": {
-            "primary_color_space": config.metric_color_space,
-            "mse": "mean over all image pixels and RGB channels; no mask; peak value 1",
-            "linear": "unclamped floating linear RGB targets prepared under reference_compositing",
-            "srgb": "linear RGB clipped to [0,1], IEC sRGB transfer, floating values before PNG quantization",
-            "aggregation": "arithmetic mean of per-view PSNR; PSNR of mean MSE also reported separately",
-            "view_selection": "first max_views cameras per split in camera file order; None selects all",
-            "perfect_match": "PSNR is +infinity, encoded as null with an explicit boolean flag",
-        },
+        "metric_protocol": metric_protocol(config),
     }
     progress = ProgressLine()
     try:
         validate_config(config)
+        warn_legacy_view_limit(config)
         import reconstruction_common as common
         mi, dr, np, dll_handles = common.initialize_runtime(config.runtime, output, report)
         checkpoint_path = preview.workspace_path(config.checkpoint, workspace)
@@ -626,21 +694,23 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
             records = []
             stage_seconds = dict.fromkeys(
                 ("render_seconds", "reference_seconds", "metrics_seconds", "write_seconds"), 0.0)
+            limit = evaluation_view_limit(config, split)
             split_report = {
                 "cameras": cameras_file, "views": records,
                 "metric_protocol": report["metric_protocol"],
-                "max_views": config.max_views, "view_order": "camera file order",
+                "max_views": limit, "view_order": "dataset split order (JSON order or sorted COLMAP filenames)",
                 "evaluated_view_count": 0, "status": "running",
                 "seconds": 0.0, "stage_seconds": stage_seconds,
             }
             report["splits"][split] = split_report
             try:
-                views = common.load_views(dataset, cameras_file, render, np)
+                views = common.load_views(dataset, cameras_file, render, np,
+                                          data=checkpoint_data_config(saved), split=split)
                 if not views:
                     raise ValueError(f"Empty camera split: {split}")
                 split_report["available_view_count"] = len(views)
-                if config.max_views is not None:
-                    views = views[:config.max_views]
+                if limit is not None:
+                    views = views[:limit]
                 split_report["selected_view_count"] = len(views)
                 split_output.mkdir(parents=True, exist_ok=True)
                 progress.update(f"Eval {split} 0/{len(views)} (0.0%) | {config.spp} spp", force=True)
@@ -656,12 +726,12 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
                     records.append(record)
                     del split_report["incomplete_view"]
                     split_report["evaluated_view_count"] = len(records)
-                    score = record["metrics"][config.metric_color_space]["psnr_db"]
+                    score = record["metrics"][primary_metric_space(config)]["psnr_db"]
                     text = "+inf" if score is None else f"{score:.4f}"
                     progress.update(
                         f"Eval {split} {len(records)}/{len(views)} "
                         f"({100 * len(records) / len(views):.1f}%) | {config.spp} spp | "
-                        f"PSNR({config.metric_color_space})={text} dB")
+                        f"{primary_metric_name(config)}={text} dB")
                 split_report["aggregate"] = aggregate_metrics(records)
                 split_report["status"] = "passed"
             except KeyboardInterrupt:
@@ -675,11 +745,11 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
                 report["timing"]["split_seconds"][split] = split_report["seconds"]
             (split_output / "metrics.json").write_text(
                 json.dumps(split_report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
-            mean_score = split_report["aggregate"][config.metric_color_space]["mean_psnr_db"]
+            mean_score = split_report["aggregate"][primary_metric_space(config)]["mean_psnr_db"]
             mean_text = "+inf" if mean_score is None else f"{mean_score:.4f}"
             progress.finish(
                 f"Eval {split} {len(records)}/{len(views)} (100%) | {config.spp} spp | "
-                f"mean PSNR({config.metric_color_space})={mean_text} dB | "
+                f"{primary_metric_name(config)}={mean_text} dB | "
                 f"{time.perf_counter() - split_started:.1f}s")
         report["status"] = "passed"
     except KeyboardInterrupt:

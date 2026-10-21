@@ -1,5 +1,6 @@
 #include <mitsuba/render/reconstruction.h>
 #include <mitsuba/python/python.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/string.h>
@@ -9,6 +10,7 @@
 MI_PY_EXPORT(VoxelReconstruction) {
     MI_PY_IMPORT_TYPES()
     using Model = mitsuba::VoxelReconstruction<Float, Spectrum>;
+    using PointArray = nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
     // Keep device selection and stream ownership inside the Dr.Jit runtime.
     // These narrow helpers let the optional NCCL transport operate on evaluated
     // buffers without changing CUDA_VISIBLE_DEVICES or importing another tensor
@@ -64,10 +66,24 @@ MI_PY_EXPORT(VoxelReconstruction) {
              "filename"_a, "resolution"_a, "grid_min"_a, "grid_max"_a,
              "opacity_threshold"_a = .05, "sh_count"_a = 9, "opacity_sh_count"_a = 9,
              nb::call_guard<nb::gil_scoped_release>())
+        .def_static("from_points", [](const PointArray &positions, const PointArray &colors,
+                 uint32_t resolution, const std::array<float, 3> &grid_min,
+                 const std::array<float, 3> &grid_max, uint32_t sh_count,
+                 uint32_t opacity_sh_count, uint32_t core_resolution) {
+            if (!positions.size() || positions.size() % 3 || colors.size() != positions.size())
+                throw nb::value_error("from_points(): expected nonempty flat XYZ and RGB arrays of equal length");
+            nb::gil_scoped_release release;
+            return new Model(positions.data(), colors.data(), positions.size() / 3,
+                             resolution, grid_min, grid_max, sh_count, opacity_sh_count,
+                             core_resolution);
+        }, "positions"_a.noconvert(), "colors"_a.noconvert(), "resolution"_a,
+           "grid_min"_a, "grid_max"_a, "sh_count"_a = 9, "opacity_sh_count"_a = 9,
+           "core_resolution"_a = 0, nb::rv_policy::take_ownership,
+           "Initialize from flat CPU float32 XYZ and sRGB arrays in the renderer frame.")
         .def_static("from_state", [](uint32_t resolution,
                  const std::array<float, 3> &grid_min,
                  const std::array<float, 3> &grid_max, const nb::dict &state,
-                 uint32_t sh_count, uint32_t opacity_sh_count) {
+                 uint32_t sh_count, uint32_t opacity_sh_count, uint32_t core_resolution) {
             if (!state.contains("cell_indices"))
                 throw nb::value_error("from_state(): missing cell_indices");
             auto cells = nb::cast<typename Model::UIntBuffer>(state["cell_indices"]);
@@ -78,9 +94,10 @@ MI_PY_EXPORT(VoxelReconstruction) {
                     parameters[key] = nb::cast<typename Model::FloatBuffer>(item.second);
             }
             return new Model(resolution, grid_min, grid_max, cells,
-                             parameters, sh_count, opacity_sh_count);
+                             parameters, sh_count, opacity_sh_count, core_resolution);
         }, "resolution"_a, "grid_min"_a, "grid_max"_a, "state"_a,
-           "sh_count"_a = 9, "opacity_sh_count"_a = 9, nb::rv_policy::take_ownership)
+           "sh_count"_a = 9, "opacity_sh_count"_a = 9, "core_resolution"_a = 0,
+           nb::rv_policy::take_ownership)
         .def("set_parameters", &Model::set_parameters, "parameters"_a,
              "Replace continuous parameter buffers atomically after shape/finite validation.")
         .def("set_growth_candidates", [](Model &model, const nb::dict &state) {
@@ -139,6 +156,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
              "transmittance_threshold"_a = .01f, "max_hits"_a = 16,
              "entry_offset_fraction"_a = 0.f, "use_octree"_a = true)
         .def_prop_ro("resolution", &Model::resolution)
+        .def_prop_ro("core_resolution", &Model::core_resolution)
         .def_prop_ro("active_voxel_count", &Model::active_voxel_count)
         .def_prop_ro("sh_count", &Model::sh_count)
         .def_prop_ro("opacity_sh_count", &Model::opacity_sh_count)

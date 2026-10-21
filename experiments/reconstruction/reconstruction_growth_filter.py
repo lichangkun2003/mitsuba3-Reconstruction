@@ -120,7 +120,7 @@ def generate_growth_for_targets(manager, checkpoint, boundary, target_cells):
         penetration = float(np.clip(cfg.growth_evidence_penetration, 0., 4.))
     elif manager.schedule.enabled:
         penetration = manager.schedule.coarsest_growth_face_penetration * (
-            1 if resolution == manager.schedule.start_resolution
+            1 if metadata.get("core_resolution", resolution) == manager.schedule.start_resolution
             else manager.schedule.growth_finer_level_multiplier)
         penetration = float(np.clip(penetration, 0., 4.))
     else:

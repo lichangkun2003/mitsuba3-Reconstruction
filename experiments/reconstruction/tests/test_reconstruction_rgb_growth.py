@@ -353,7 +353,7 @@ def check_warmup():
     assert manager._growth_due(30) and manager._growth_due(40)
     assert not manager.needs_rendered_alpha(29)
     assert not manager._growth_due(manager.level_budget), "No growth on the refinement boundary"
-    manager.resolution = 8
+    manager.resolution = manager.core_resolution = 8
     manager.level_start_epoch = manager.budgets[4]
     for local in range(1, 30):
         assert not manager._growth_due(manager.level_start_epoch + local)

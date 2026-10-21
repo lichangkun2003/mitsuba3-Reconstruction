@@ -9,6 +9,8 @@
 
 NAMESPACE_BEGIN(mitsuba)
 
+namespace reconstruction { struct Result; }
+
 /** Point-cloud initialized voxel ellipsoids, matching Falcor's
  * VoxelReconstructionNoLightTransport forward model. This is an independent
  * renderer: alpha is continuous transmittance coverage, not a validity mask.
@@ -41,12 +43,20 @@ public:
                         double opacity_threshold = .05,
                         uint32_t sh_count = 9, uint32_t opacity_sh_count = 9);
 
+    /// Plain XYZ and sRGB triples already expressed in the renderer frame.
+    VoxelReconstruction(const float *positions, const float *colors, size_t point_count,
+                        uint32_t resolution, const std::array<float, 3> &grid_min,
+                        const std::array<float, 3> &grid_max,
+                        uint32_t sh_count = 9, uint32_t opacity_sh_count = 9,
+                        uint32_t core_resolution = 0);
+
     VoxelReconstruction(uint32_t resolution,
                         const std::array<float, 3> &grid_min,
                         const std::array<float, 3> &grid_max,
                         const UIntBuffer &cell_indices,
                         const std::map<std::string, FloatBuffer> &parameters,
-                        uint32_t sh_count = 9, uint32_t opacity_sh_count = 9);
+                        uint32_t sh_count = 9, uint32_t opacity_sh_count = 9,
+                        uint32_t core_resolution = 0);
 
     /// Replace continuous parameters without changing occupancy or array sizes.
     void set_parameters(const std::map<std::string, FloatBuffer> &parameters);
@@ -107,6 +117,8 @@ public:
         float entry_offset_fraction = 0.f, bool use_octree = true) const;
 
     uint32_t resolution() const { return m_resolution; }
+    /// Resolution across the uncompressed core; storage may include a shell.
+    uint32_t core_resolution() const { return m_core_resolution; }
     uint32_t active_voxel_count() const { return m_active_count; }
     uint32_t sh_count() const { return m_sh_count; }
     uint32_t opacity_sh_count() const { return m_opacity_sh_count; }
@@ -125,6 +137,7 @@ public:
     MI_DECLARE_CLASS(VoxelReconstruction)
 
 private:
+    void initialize_seeds(const reconstruction::Result &loaded);
     void rebuild_octree();
     void mark_octree(const UIntBuffer &cells, uint32_t bit_offset);
     void refresh_octree_skips();
@@ -142,7 +155,7 @@ private:
                           Mask active, bool include_growth,
                           UInt32 &queries, bool profile) const;
 
-    uint32_t m_resolution, m_active_count, m_sh_count, m_opacity_sh_count;
+    uint32_t m_resolution, m_core_resolution, m_active_count, m_sh_count, m_opacity_sh_count;
     std::array<float, 3> m_min, m_max, m_size;
     std::map<std::string, uint64_t> m_statistics;
     IntBuffer m_index;

@@ -181,11 +181,15 @@ def model_checkpoint(model, fields=None) -> dict:
         snapshot = {name: snapshot[name] for name in fields}
     dr.eval(*snapshot.values())
     dr.sync_thread()
+    metadata = {"resolution": int(model.resolution), "grid_min": list(model.grid_min),
+                "grid_max": list(model.grid_max), "sh_count": int(model.sh_count),
+                "opacity_sh_count": int(model.opacity_sh_count)}
+    core_resolution = int(getattr(model, "core_resolution", model.resolution))
+    if core_resolution != metadata["resolution"]:
+        metadata["core_resolution"] = core_resolution
     return {
         "model_state": {name: np.array(value, copy=True) for name, value in snapshot.items()},
-        "model_metadata": {"resolution": int(model.resolution), "grid_min": list(model.grid_min),
-                           "grid_max": list(model.grid_max), "sh_count": int(model.sh_count),
-                           "opacity_sh_count": int(model.opacity_sh_count)},
+        "model_metadata": metadata,
     }
 
 
@@ -367,6 +371,8 @@ def refine_state(checkpoint: dict, config: CoarseToFineConfig, max_active_voxels
     n = len(state["cell_indices"])
     if n == 0:
         metadata["resolution"] *= 2
+        if "core_resolution" in metadata:
+            metadata["core_resolution"] *= 2
         return {"model_metadata": metadata,
                 "model_state": {key: np.array(value, copy=True) for key, value in state.items()}}
     center, axes, rotation, quaternion, size, metric, extent = _geometry(state, metadata, np)
@@ -451,6 +457,8 @@ def refine_state(checkpoint: dict, config: CoarseToFineConfig, max_active_voxels
         child_logit = np.where(tau > 15, tau, np.where(tau < 1e-4, np.log(small), np.log(np.expm1(np.minimum(tau, 15)))))
         new_opacity[:, 0] = np.minimum(child_logit, parent_logit) / y0
     metadata["resolution"] *= 2
+    if "core_resolution" in metadata:
+        metadata["core_resolution"] *= 2
     return {"model_metadata": metadata, "model_state": {
         "cell_indices": np.concatenate([block[1] for block in blocks]).astype(np.uint32),
         "centers": np.concatenate([block[2] for block in blocks]).astype(np.float32).ravel(),
@@ -528,11 +536,15 @@ class TopologyManager:
         self.view_count = int(view_count)
         self.opacity_warmup, self.opacity_ramp = int(opacity_warmup), int(opacity_ramp)
         self.resolution = int(model.resolution)
+        # The enclosing grid includes any contracted shell. Scheduling refers
+        # to the core diameter, while every address and geometric operation
+        # continues to use the actual enclosing grid resolution.
+        self.core_resolution = int(getattr(model, "core_resolution", model.resolution))
         self._model_opacity_sh_count = getattr(model, "opacity_sh_count", None)
         self.level_start_epoch = 0
-        self.schedule_start_resolution = self.resolution
-        self.budgets = (level_budgets(self.resolution, self.schedule.target_resolution, self.schedule.total_epochs,
-                                     self.schedule.level_weights) if self.schedule.enabled else {self.resolution: self.schedule.total_epochs})
+        self.schedule_start_resolution = self.core_resolution
+        self.budgets = (level_budgets(self.core_resolution, self.schedule.target_resolution, self.schedule.total_epochs,
+                                     self.schedule.level_weights) if self.schedule.enabled else {self.core_resolution: self.schedule.total_epochs})
         self.cooldown = {}
         self.pending_growth = None
         # Diagnostic wall times only: never serialized as algorithm state.
@@ -558,6 +570,13 @@ class TopologyManager:
 
     def _validate(self):
         cfg, schedule = self.settings, self.schedule
+        if not 1 <= self.core_resolution <= self.resolution <= 1024:
+            raise ValueError("Topology requires 1 <= core resolution <= grid resolution <= 1024")
+        if self.core_resolution not in self.budgets:
+            raise ValueError("Topology epoch budgets do not contain the current core resolution")
+        if (schedule.enabled and
+                self.resolution * schedule.target_resolution > 1024 * self.core_resolution):
+            raise ValueError("Coarse-to-fine enclosing grid resolution would exceed 1024")
         if not 1 <= self.view_count <= 32767:
             raise ValueError("Training requires 1..32767 distinct cameras")
         if not isinstance(cfg.use_rgb_growth, bool):
@@ -706,7 +725,7 @@ class TopologyManager:
 
     @property
     def level_budget(self):
-        return self.budgets[self.resolution]
+        return self.budgets[self.core_resolution]
 
     @property
     def evidence_start(self):
@@ -716,7 +735,7 @@ class TopologyManager:
         if self.settings.use_rgb_deletion:
             return self._rgb_deletion_due(int(epoch) + 1)
         return (self.settings.enable_deletion and epoch >= self.evidence_start and
-                (not self.schedule.enabled or self.resolution == self.schedule.target_resolution))
+                (not self.schedule.enabled or self.core_resolution == self.schedule.target_resolution))
 
     def deletion_frozen(self, boundary):
         count = self.settings.deletion_freeze_last_epochs
@@ -736,7 +755,7 @@ class TopologyManager:
         local_epoch = boundary - self.level_start_epoch
         # Refinement replaces all rows and resets evidence. Avoid collecting
         # statistics that would immediately be discarded at that boundary.
-        if (self.schedule.enabled and self.resolution < self.schedule.target_resolution and
+        if (self.schedule.enabled and self.core_resolution < self.schedule.target_resolution and
                 local_epoch >= self.level_budget):
             return False
         return (1 <= boundary <= self.schedule.total_epochs and
@@ -776,7 +795,7 @@ class TopologyManager:
     @property
     def growth_warmup(self):
         """Growth-only warmup; deletion and continuous optimization are unchanged."""
-        return (self.settings.growth_warmup_epochs if self.resolution == self.schedule_start_resolution
+        return (self.settings.growth_warmup_epochs if self.core_resolution == self.schedule_start_resolution
                 else self.settings.growth_fine_warmup_epochs)
 
     def _generate_growth(self, checkpoint, boundary):
@@ -793,7 +812,7 @@ class TopologyManager:
         if evidence:
             penetration = float(np.clip(cfg.growth_evidence_penetration, 0., 4.))
         elif self.schedule.enabled:
-            penetration = self.schedule.coarsest_growth_face_penetration * (1 if resolution == self.schedule.start_resolution
+            penetration = self.schedule.coarsest_growth_face_penetration * (1 if metadata.get("core_resolution", resolution) == self.schedule.start_resolution
                                                                            else self.schedule.growth_finer_level_multiplier)
             penetration = float(np.clip(penetration, 0., 4.))
         else:
@@ -1408,6 +1427,8 @@ class TopologyManager:
                  "refined": False, "finished": False, "level_budget": self.level_budget,
                  "growth_frozen": self.growth_frozen(boundary),
                  "growth_freeze_last_epochs": cfg.growth_freeze_last_epochs}
+        if self.core_resolution != self.resolution:
+            event["core_resolution"] = self.core_resolution
         if cfg.use_rgb_growth:
             model.clear_growth_candidates()
             event.update(growth_mode="rgb_online", growth_level_epoch=boundary - self.level_start_epoch,
@@ -1429,7 +1450,7 @@ class TopologyManager:
             event["deletion_opacity_requested"] = self._low_opacity_deletion_due(boundary)
         checkpoint = None
         level_done = boundary - self.level_start_epoch >= self.level_budget
-        if schedule.enabled and self.resolution < schedule.target_resolution and level_done:
+        if schedule.enabled and self.core_resolution < schedule.target_resolution and level_done:
             previous = model_checkpoint(model)
             replacement = refine_state(previous, schedule, cfg.max_active_voxels)
             if schedule.save_each_level:
@@ -1437,6 +1458,7 @@ class TopologyManager:
                     **previous, "optimizer_state": optimizer.state_dict(), "topology_state": self.state_dict()}
                 event["pre_refine_checkpoint_available"] = True
             self.resolution = replacement["model_metadata"]["resolution"]
+            self.core_resolution = replacement["model_metadata"].get("core_resolution", self.resolution)
             self.level_start_epoch = boundary
             self._initialize_lifecycle(len(replacement["model_state"]["cell_indices"]))
             self.completed_windows = 0
@@ -1447,6 +1469,8 @@ class TopologyManager:
             self._rgb_growth_device = None
             optimizer.remap(np.empty(0, dtype=np.uint32), self.count)
             event.update(refined=True, resolution=self.resolution, active_voxel_count=self.count)
+            if self.core_resolution != self.resolution:
+                event["core_resolution"] = self.core_resolution
             return replacement, event
         rgb_delete = self._evaluate_rgb_deletion(boundary, event) if cfg.use_rgb_deletion else None
         opacity_delete = self._evaluate_low_opacity_deletion(model, boundary, event)
@@ -1567,6 +1591,8 @@ class TopologyManager:
                  "rgb_deletion_last_boundary": self.rgb_deletion_last_boundary,
                  "low_opacity_deletion_streak": self.low_opacity_deletion_streak,
                  "low_opacity_deletion_last_boundary": self.low_opacity_deletion_last_boundary}
+        if self.core_resolution != self.resolution:
+            state["core_resolution"] = self.core_resolution
         for name in ("foreground_masks", "background_masks", "qualified", "candidates",
                      "deletion_eligible", "growth_birth", "growth_wait_start"):
             state[name] = getattr(self, name)
@@ -1579,6 +1605,9 @@ class TopologyManager:
 
     def load_state_dict(self, state):
         import copy
+        if (state["resolution"] != self.resolution or
+                state.get("core_resolution", state["resolution"]) != self.core_resolution):
+            raise ValueError("Topology checkpoint grid/core resolution does not match the model")
         if (state["settings"].get("use_rgb_growth", False) and
                 state.get("rgb_growth_evidence_version") != RGB_GROWTH_EVIDENCE_VERSION):
             raise ValueError("RGB growth evidence version differs; start a new run "
@@ -1607,6 +1636,7 @@ class TopologyManager:
         state = copy.deepcopy(state)
         state.pop("rgb_growth_evidence_version", None)
         state.pop("rgb_deletion_evidence_version", None)
+        state.setdefault("core_resolution", state["resolution"])
         if state["count"] != self.count or state["view_count"] != self.view_count:
             raise ValueError("Topology checkpoint dimensions do not match model or dataset")
         self.settings = TopologySettings(**state.pop("settings"))
@@ -1647,7 +1677,7 @@ class TopologyManager:
                     local_epoch <= self.settings.deletion_warmup_epochs or
                     (local_epoch - self.settings.deletion_warmup_epochs) % self.settings.deletion_interval or
                     self.deletion_frozen(last) or
-                    (self.schedule.enabled and self.resolution < self.schedule.target_resolution and
+                    (self.schedule.enabled and self.core_resolution < self.schedule.target_resolution and
                      local_epoch >= self.level_budget)):
                 raise ValueError("Low-opacity deletion previous boundary is not a scheduled window")
         elif self.np.any(self.low_opacity_deletion_streak):

@@ -67,7 +67,7 @@ class GrowthTailFreezeTests(unittest.TestCase):
                 self.assertTrue(manager._growth_due(419))
                 self.assertFalse(manager.growth_frozen(420))
                 self.assertFalse(manager._growth_due(420))  # Existing refine boundary.
-                manager.resolution = 16
+                manager.resolution = manager.core_resolution = 16
                 manager.level_start_epoch = 420
                 self.assertTrue(manager._growth_due(600))
                 self.assertFalse(manager._growth_due(601))
@@ -185,9 +185,12 @@ class GrowthTailFreezeTests(unittest.TestCase):
 
     def test_resume_retains_global_window_and_legacy_missing_field_means_zero(self):
         manager = self.manager(scheduled=True)
-        manager.resolution = 16
+        manager.resolution = manager.core_resolution = 16
         manager.level_start_epoch = 420
         state = manager.state_dict()
+        # The training driver restores the fine model before topology state.
+        self.checkpoint["model_metadata"]["resolution"] = 16
+        self.model = Model(self.checkpoint)
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
                 saved = copy.deepcopy(state)
