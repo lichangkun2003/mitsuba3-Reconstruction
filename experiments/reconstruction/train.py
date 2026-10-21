@@ -1316,6 +1316,7 @@ def run_training(distributed=None):
             active_voxels_before = int(model.active_voxel_count)
             entering_resolution = last_training_resolution != training_resolution
             growth_prepare_started = time.perf_counter()
+            growth_prepare_stage_seconds = {}
             previous_growth_count = int(getattr(model, "growth_candidate_count", 0))
             if primary:
                 rgb_growth_requested = False
@@ -1323,6 +1324,7 @@ def run_training(distributed=None):
                     if previous_growth_count or topology._growth_due(epoch + 1):
                         native_replay.clear()
                     rgb_growth_requested = topology.prepare_rgb_growth(model, epoch)
+                    growth_prepare_stage_seconds = dict(topology.growth_prepare_stage_seconds)
                 payload = topology.pending_growth["candidate_state"] if rgb_growth_requested else None
                 flags = (topology.needs_rendered_alpha(epoch), topology.collect_deletion(epoch),
                          rgb_growth_requested, payload)
@@ -1469,6 +1471,7 @@ def run_training(distributed=None):
                      "topology_execution": topology.statistics() if primary else None,
                      "view_stage_seconds": stage_totals,
                      "epoch_growth_prepare_seconds": growth_prepare_seconds,
+                     "epoch_growth_prepare_stage_seconds": growth_prepare_stage_seconds,
                      "epoch_topology_seconds": time.perf_counter()-topology_started}
             if coarse_render is not None:
                 entry["coarse_render"] = coarse_render

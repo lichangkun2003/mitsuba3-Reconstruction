@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import math
+import time
 
 from reconstruction_growth_rgb import RGB_GROWTH_EVIDENCE_VERSION
 from reconstruction_deletion_rgb import RGB_DELETION_EVIDENCE_VERSION
@@ -186,6 +187,50 @@ def model_checkpoint(model, fields=None) -> dict:
                            "grid_max": list(model.grid_max), "sh_count": int(model.sh_count),
                            "opacity_sh_count": int(model.opacity_sh_count)},
     }
+
+
+class _GrowthBlockedCells:
+    """Exact occupied/cooldown membership, shared by all neighbor directions.
+
+    This index lives for one candidate-generation call, so no topology or
+    cooldown changes can leave it stale. Up to 512 cubed the dense table
+    occupies at most 128 MiB; larger grids reuse a sorted index instead.
+    Neither representation changes the order or number of proposals.
+    """
+
+    def __init__(self, occupied, cooldown, resolution, np, *,
+                 max_dense_bytes=128 * 1024 * 1024):
+        self.np = np
+        self.cell_count = int(resolution) ** 3
+        self.dense = None
+        self.sorted_cells = None
+        blocked = np.concatenate((np.asarray(occupied, dtype=np.int64).reshape(-1),
+                                  np.asarray(cooldown, dtype=np.int64).reshape(-1)))
+        blocked = blocked[(blocked >= 0) & (blocked < self.cell_count)]
+        if self.cell_count * np.dtype(np.bool_).itemsize <= max_dense_bytes:
+            try:
+                self.dense = np.zeros(self.cell_count, dtype=np.bool_)
+            except MemoryError:
+                # A low-memory host can use the same exact sorted lookup.
+                pass
+        if self.dense is not None:
+            self.dense[blocked] = True
+        else:
+            self.sorted_cells = np.unique(blocked)
+
+    def contains(self, addresses):
+        np = self.np
+        addresses = np.asarray(addresses, dtype=np.int64)
+        valid = (addresses >= 0) & (addresses < self.cell_count)
+        result = np.zeros(addresses.shape, dtype=np.bool_)
+        query = addresses[valid]
+        if self.dense is not None:
+            result[valid] = self.dense[query]
+        elif len(self.sorted_cells):
+            positions = np.searchsorted(self.sorted_cells, query)
+            result[valid] = ((positions < len(self.sorted_cells)) &
+                             (self.sorted_cells[np.minimum(positions, len(self.sorted_cells) - 1)] == query))
+        return result
 
 
 def _coordinates(cells, resolution, np):
@@ -490,6 +535,8 @@ class TopologyManager:
                                      self.schedule.level_weights) if self.schedule.enabled else {self.resolution: self.schedule.total_epochs})
         self.cooldown = {}
         self.pending_growth = None
+        # Diagnostic wall times only: never serialized as algorithm state.
+        self.growth_prepare_stage_seconds = {}
         self._growth_world_cache = None
         self._growth_device = None
         self._rgb_growth_device = None
@@ -753,12 +800,15 @@ class TopologyManager:
             penetration = float(np.clip(cfg.growth_face_penetration, 0., 4.))
         pieces = []
         forbidden_cooldown = np.asarray([cell for cell, expiry in self.cooldown.items() if boundary < expiry], dtype=np.int64)
+        blocked = _GrowthBlockedCells(occupied, forbidden_cooldown, resolution, np)
         for offset in _neighbor_offsets(evidence and cfg.growth_use_26_neighbors, np):
             neighbors = cells + offset
             targets = _addresses(neighbors, resolution)
             possible = eligible & np.all(neighbors >= 0, axis=1) & np.all(neighbors < resolution, axis=1)
-            possible &= ~np.isin(targets, occupied) & ~np.isin(targets, forbidden_cooldown)
             ids = np.flatnonzero(possible)
+            # Filter in the original ascending parent order, querying only
+            # valid neighbor cells. Contact geometry below is unchanged.
+            ids = ids[~blocked.contains(targets[ids])]
             if not len(ids):
                 continue
             touched, contact = _contact(center[ids], metric[ids], offset, 0., np)
@@ -802,20 +852,28 @@ class TopologyManager:
         The payload in pending_growth['candidate_state'] can be broadcast to
         worker models; none of these arrays are committed model parameters.
         """
+        timings = self.growth_prepare_stage_seconds = {}
         cfg, np, boundary = self.settings, self.np, int(epoch) + 1
         if not cfg.use_rgb_growth:
             return False
         if not self._growth_due(boundary):
+            started = time.perf_counter()
             model.clear_growth_candidates()
             self.pending_growth = None
             self._rgb_growth_device = None
+            timings["candidate_clear"] = time.perf_counter() - started
             return False
         pending = self.pending_growth
         if (pending is None or pending.get("mode") != "rgb" or
                 pending["boundary"] != boundary or pending["resolution"] != self.resolution):
             from reconstruction_growth_rgb import initialize_statistics
+            started = time.perf_counter()
             checkpoint = model_checkpoint(model)
+            timings["snapshot"] = time.perf_counter() - started
+            started = time.perf_counter()
             proposals = self._generate_growth(checkpoint, boundary)
+            timings["candidate_generation"] = time.perf_counter() - started
+            started = time.perf_counter()
             # A cell can have different shape/color proposals from several
             # parents. Keep them independent until after evidence and geometry
             # revalidation: the first legal parent need not be beneficial.
@@ -846,12 +904,17 @@ class TopologyManager:
             self._growth_world_cache = None
             self._growth_device = None
             self._rgb_growth_device = None
+            timings["proposal_packing"] = time.perf_counter() - started
         self._rgb_normalization(pending)
         if not len(pending["cells"]):
+            started = time.perf_counter()
             model.clear_growth_candidates()
+            timings["candidate_clear"] = time.perf_counter() - started
             return False
         from reconstruction_growth_rgb import upload_rgb_growth_candidates
+        started = time.perf_counter()
         upload_rgb_growth_candidates(model, pending["candidate_state"])
+        timings["candidate_install"] = time.perf_counter() - started
         return True
 
     def observe_rgb_growth(self, model, out, view_id, epoch, pixel_count):

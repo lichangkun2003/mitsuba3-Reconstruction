@@ -15,6 +15,61 @@ from reconstruction_performance import PerformanceRecorder
 
 
 class PerformanceSummaryTests(unittest.TestCase):
+    def test_growth_preparation_in_epoch_total_and_separate_nested_breakdown(self):
+        with tempfile.TemporaryDirectory(prefix="mitsuba-performance-summary-") as directory:
+            recorder = PerformanceRecorder(Path(directory) / "summary.json", {})
+            for epoch, resolution, preparation, detail, growth in (
+                (1, 256, None, None, False),  # Legacy entry has no preparation timings.
+                (2, 256, 5., {"snapshot": 1., "candidate_generation": 3.}, True),
+                (3, 512, 2., {"snapshot": .5, "candidate_generation": 1.}, True),
+                (4, 512, .25, {"candidate_clear": .125}, False),
+            ):
+                entry = {"epoch": epoch, "training_resolution": resolution, "seconds": 10.,
+                         "view_stage_seconds": {"gradients": 2.}, "epoch_topology_seconds": 1.,
+                         "growth_evidence_requested": growth}
+                if preparation is not None:
+                    entry["epoch_growth_prepare_seconds"] = preparation
+                    entry["epoch_growth_prepare_stage_seconds"] = detail
+                recorder.record_epoch(entry)
+            report = recorder.write("passed")
+            overall = report["overall"]
+            self.assertEqual(overall["epoch_seconds"]["total"], 40.)
+            self.assertEqual(overall["stage_seconds"],
+                             {"gradients": 8., "epoch_topology": 4., "epoch_growth_prepare": 7.25})
+            self.assertEqual(sum(overall["stage_seconds"].values()), 19.25)
+            self.assertEqual(overall["stage_fraction_of_epoch_time"]["epoch_growth_prepare"], 7.25 / 40.)
+            detail = overall["growth_prepare_stages"]
+            self.assertEqual(detail["snapshot"]["count"], 2)
+            self.assertEqual(detail["snapshot"]["total"], 1.5)
+            self.assertEqual(detail["candidate_generation"]["mean"], 2.)
+            self.assertEqual(detail["candidate_clear"]["count"], 1)
+            grouped = report["by_resolution"]
+            self.assertEqual(grouped["256"]["stage_seconds"]["epoch_growth_prepare"], 5.)
+            self.assertEqual(grouped["256"]["growth_prepare_stages"]["snapshot"]["count"], 1)
+            self.assertEqual(grouped["256"]["normal_epochs"]["growth_prepare_stages"], {})
+            self.assertEqual(grouped["512"]["topology_event_epochs"]["growth_prepare_stages"]
+                             ["candidate_generation"]["total"], 1.)
+            self.assertEqual(grouped["512"]["normal_epochs"]["growth_prepare_stages"]
+                             ["candidate_clear"]["total"], .125)
+
+    def test_missing_and_invalid_growth_prepare_timings_are_not_zero_samples(self):
+        with tempfile.TemporaryDirectory(prefix="mitsuba-performance-summary-") as directory:
+            recorder = PerformanceRecorder(Path(directory) / "summary.json", {})
+            for detail in (None, {}, {"snapshot": math.nan, "candidate_generation": math.inf,
+                                     "proposal_packing": -1., "candidate_install": True},
+                           {"snapshot": .25, "candidate_generation": "3"}):
+                recorder.record_epoch({"seconds": 1., "epoch_growth_prepare_seconds": math.nan,
+                                       "epoch_growth_prepare_stage_seconds": detail})
+            report = recorder.write("passed")
+            summary = report["overall"]
+            self.assertEqual(summary["stage_seconds"], {})
+            self.assertEqual(summary["growth_prepare_stages"]["snapshot"]["count"], 1)
+            self.assertEqual(summary["growth_prepare_stages"]["snapshot"]["total"], .25)
+            for name in ("candidate_generation", "proposal_packing", "candidate_install"):
+                self.assertEqual(summary["growth_prepare_stages"][name]["count"], 0)
+                self.assertIsNone(summary["growth_prepare_stages"][name]["mean"])
+            self.assertNotIn("NaN", json.dumps(report, allow_nan=False))
+
     def test_legacy_profiles_have_no_native_stage_samples(self):
         with tempfile.TemporaryDirectory(prefix="mitsuba-performance-summary-") as directory:
             recorder = PerformanceRecorder(Path(directory) / "summary.json", {})

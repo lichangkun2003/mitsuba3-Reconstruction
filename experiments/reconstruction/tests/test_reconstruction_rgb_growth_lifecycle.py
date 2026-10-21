@@ -102,6 +102,39 @@ class RGBGrowthLifecycleTests(unittest.TestCase):
         for view_id in range(3):
             self.manager.observe_rgb_growth(self.model, out, view_id, 0, 100)
 
+    def test_preparation_timings_describe_only_current_call_and_are_not_checkpointed(self):
+        def check(expected):
+            timings = self.manager.growth_prepare_stage_seconds
+            self.assertEqual(set(timings), set(expected))
+            self.assertTrue(all(math.isfinite(value) and value >= 0
+                                for value in timings.values()))
+            self.assertNotIn("growth_prepare_stage_seconds", self.manager.state_dict())
+
+        self.assertEqual(self.manager.growth_prepare_stage_seconds, {})
+        pending = self.prepare()
+        check(("snapshot", "candidate_generation", "proposal_packing", "candidate_install"))
+        with patch.object(topology, "model_checkpoint", side_effect=AssertionError("repeated snapshot")):
+            self.assertTrue(self.manager.prepare_rgb_growth(self.model, 0))
+        self.assertIs(self.manager.pending_growth, pending)
+        check(("candidate_install",))
+
+        # The final epoch is not a growth window. No timings from the previous
+        # preparation may leak into its accounting or its saved algorithm state.
+        self.assertFalse(self.manager.prepare_rgb_growth(self.model, 4))
+        self.assertIsNone(self.manager.pending_growth)
+        check(("candidate_clear",))
+
+        # All parents immature: preparation is legitimate but has no proposals.
+        self.manager.candidates[:] = True
+        self.assertFalse(self.manager.prepare_rgb_growth(self.model, 0))
+        check(("snapshot", "candidate_generation", "proposal_packing", "candidate_clear"))
+        self.assertFalse(self.manager.prepare_rgb_growth(self.model, 0))
+        check(("candidate_clear",))
+
+        self.settings.use_rgb_growth = False
+        self.assertFalse(self.manager.prepare_rgb_growth(self.model, 0))
+        check(())
+
     def test_commit_exact_frozen_geometry_and_appearance(self):
         pending = self.prepare()
         target = int(np.flatnonzero(pending["cells"] == 74)[0])

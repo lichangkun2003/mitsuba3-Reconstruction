@@ -56,12 +56,20 @@ def _epoch_summary(entries):
         for name, value in entry["stages"].items():
             if value is not None:
                 stages[name] = stages.get(name, 0.0) + value
+    # These measurements are nested within epoch_growth_prepare. Keep them
+    # separate so consumers summing stage_seconds do not count the work twice.
+    growth_prepare_names = sorted({name for entry in entries
+                                   for name in entry.get("growth_prepare_stages", {})})
     return {
         "completed_epochs": len(entries), "epoch_seconds": seconds,
         "stage_seconds": stages,
         "stage_fraction_of_epoch_time": {
             name: value / seconds["total"] if seconds["total"] else None
             for name, value in stages.items()},
+        "growth_prepare_stages": {
+            name: _distribution(entry.get("growth_prepare_stages", {}).get(name)
+                                for entry in entries)
+            for name in growth_prepare_names},
         "active_voxels_before": _distribution(entry["active_voxels_before"] for entry in entries),
         "active_voxels_at_epoch_end": _distribution(entry["active_voxels"] for entry in entries),
         "communication_seconds": _distribution(entry.get("communication_seconds") for entry in entries),
@@ -114,7 +122,11 @@ class PerformanceRecorder:
     def record_epoch(self, entry: dict):
         topology = entry.get("topology", {})
         stages = {key: _number(value) for key, value in entry.get("view_stage_seconds", {}).items()}
+        stages["epoch_growth_prepare"] = _number(entry.get("epoch_growth_prepare_seconds"))
         stages["epoch_topology"] = _number(entry.get("epoch_topology_seconds"))
+        growth_prepare = entry.get("epoch_growth_prepare_stage_seconds")
+        growth_prepare_stages = ({name: _number(value) for name, value in growth_prepare.items()}
+                                 if isinstance(growth_prepare, dict) else {})
         if "epoch_coarse_render_seconds" in entry:
             stages["coarse_render"] = _number(entry["epoch_coarse_render_seconds"])
         topology_event = bool(topology.get("refined") or topology.get("grown")
@@ -124,6 +136,7 @@ class PerformanceRecorder:
             "epoch": entry.get("epoch"),
             "resolution": str(entry.get("training_resolution", entry.get("resolution", "unknown"))),
             "seconds": _number(entry.get("seconds")), "stages": stages,
+            "growth_prepare_stages": growth_prepare_stages,
             "active_voxels": _number(entry.get("active_voxels")),
             "active_voxels_before": _number(entry.get("active_voxels_before")), "topology_event": topology_event,
             "communication_seconds": _number(entry.get("epoch_communication_seconds")),
@@ -165,6 +178,12 @@ class PerformanceRecorder:
                               "but remains in elapsed_seconds and phase_seconds.training_loop.",
                 "phase_time": "Phase totals may contain the detailed epoch/checkpoint measurements; "
                               "do not add nested measurements together.",
+                "growth_prepare_stages": "Optional host wall-time breakdown of candidate preparation, "
+                                         "nested within stage_seconds.epoch_growth_prepare. "
+                                         "No additional GPU synchronization is introduced. "
+                                         "Only the primary rank prepares candidates; replay invalidation, "
+                                         "distributed broadcast and uninstrumented work remain in the parent total. "
+                                         "Missing/legacy substage timings are excluded from sample counts.",
                 "resolution": "Training resolution before the epoch's topology update.",
                 "profile": "Sampled views only; device_ms sums sampled device operation times. "
                            "Do not extrapolate these samples to all epochs or equate them with wall time. "
