@@ -114,7 +114,7 @@ class TrainConfig:
 # ==================== 训练实验配置：常用参数在这里修改 ====================
 # 路径相对于 mitsuba 仓库的父目录；切换场景只需修改下面的 dataset。
 CONFIG = TrainConfig()
-CONFIG.data.dataset = "datasets/lego"
+CONFIG.data.dataset = "datasets/bicycle"
 CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
 CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再解码；渲染与损失仍在线性空间。
@@ -173,8 +173,8 @@ CONFIG.training.freeze_native = True  # 重放原生计算；拓扑变化后重�
 CONFIG.schedule.enabled = True
 CONFIG.schedule.start_resolution = 256
 CONFIG.schedule.target_resolution = 512
-CONFIG.schedule.level_weights = (6, 4)  # 粗、细层级轮数比例；1000 轮分成 600 / 400。
-CONFIG.training.num_epochs = 1000  # 整个实验总轮数，每轮遍历全部训练视角。
+CONFIG.schedule.level_weights = (6, 4)  # 粗、细层级轮数比例；1500 轮分成 900 / 600。
+CONFIG.training.num_epochs = 1500  # 整个实验总轮数，每轮遍历全部训练视角。
 CONFIG.training.save_count = 3  # 包含最终 model.npz，共保存三次。
 CONFIG.training.output = None  # 自动创建 outputs/场景-MM.DD-E编号/training。
 # 需要手动指定目录时，将 None 改为路径字符串，或传 --output-dir。
