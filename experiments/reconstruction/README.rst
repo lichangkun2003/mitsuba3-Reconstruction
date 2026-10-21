@@ -5,6 +5,18 @@
 切换场景修改 ``CONFIG.data.dataset``，或传入 ``--dataset datasets/lego``；
 命令行参数覆盖配置文件与默认配置。RTX 5090 Windows 主机使用这个单卡入口。
 
+默认 ``CONFIG.render.traversal = "octree"`` 使用 GPU 八叉占用索引跳过空区域，
+预览、训练和评价均启用。正常叶子仍执行原有椭球求交、合成及 near-miss 几何梯度；
+生长候选标记单独维护，仅在收集生长证据时参与遍历，不改变真实命中数、颜色或透射率。
+初始化、模型加载和拓扑变化后构建索引，普通参数更新复用；候选集合变化会更新候选索引。
+父节点中同时缓存正常占用及正常加候选占用的空祖先步长，避免每条射线重复查询全部祖先。
+缓存与两种占用标记共用一个 ``uint32``，仅在拓扑或候选变化时更新。
+需要增量编译 C++，缺少 ``octree_version >= 1`` 的构建会明确报错。
+原逐格 DDA 默认关闭，保留 ``--traversal dda`` 作为正确性与性能对照；
+``--traversal octree`` 可显式选择当前默认。此开关可在恢复训练时调整。
+旧模型无需转换或重新保存；缺少遍历字段的 checkpoint 默认使用八叉树。
+单独评价通常继承模型保存的遍历选项，也可使用同名命令行参数覆盖。
+
 两层迭代比例也在 ``train.py`` 顶部配置：
 
 .. code-block:: python
@@ -18,7 +30,7 @@
 420／280 轮。不能整除时，粗层四舍五入，细层取剩余轮数，每层至少一轮。
 新实验用两项权重；四项旧配置和 checkpoint 仍按旧分配算法恢复，不自动改成 6:4。
 启动日志会打印各分辨率的轮数。512 层级继续允许生长，两层各 warmup 20 轮；
-整个训练末尾 100 轮冻结生长和删除，继续优化参数。
+整个训练末尾 50 轮冻结生长，删除继续按周期执行，连续参数保持优化。
 
 参考图协议由 ``CONFIG.data.reference_compositing = "srgb"`` 控制。新实验对 sRGB PNG
 先在编码空间用 alpha 合成白背景，再解码为线性 RGB；渲染、训练损失、梯度和拓扑收益
@@ -42,7 +54,7 @@ RGB 投票与提交时几何复核后，每格选择跨可靠视角平均收益�
 粗层、细层分别先冻结生长 20 轮，之后按 10 轮周期处理；各层第一次事件在第 30 轮。
 删除包含两条分支：复用已有命中反向的后缀颜色判断 RGB 删除收益，以及持续低 opacity 清理；
 两者均不另做前向。
-完整训练的最后 100 轮同时停止生长和删除，继续优化已有体素。
+完整训练的最后 50 轮停止生长；删除不设末尾冻结窗口，继续清理满足确认条件的体素。
 分裂机制不变，训练保持 1 spp。配置位置：
 
 .. code-block:: python
@@ -53,7 +65,7 @@ RGB 投票与提交时几何复核后，每格选择跨可靠视角平均收益�
    CONFIG.topology.growth_initial_opacity = 0.3
    CONFIG.topology.growth_warmup_epochs = 20
    CONFIG.topology.growth_fine_warmup_epochs = 20
-   CONFIG.topology.growth_freeze_last_epochs = 100
+   CONFIG.topology.growth_freeze_last_epochs = 50
    CONFIG.topology.growth_rgb_normalization = "observed"
    CONFIG.topology.enable_deletion = True
    CONFIG.topology.use_rgb_deletion = True
@@ -61,13 +73,13 @@ RGB 投票与提交时几何复核后，每格选择跨可靠视角平均收益�
    CONFIG.topology.deletion_warmup_epochs = 20
    CONFIG.topology.deletion_interval = 10
    CONFIG.topology.deletion_protection_epochs = 20
-   CONFIG.topology.deletion_freeze_last_epochs = 100
+   CONFIG.topology.deletion_freeze_last_epochs = 0
    CONFIG.topology.deletion_rgb_confirmation_windows = 2
    CONFIG.topology.deletion_rgb_min_support_views = 3
    CONFIG.topology.deletion_rgb_max_conflict_views = 1
    CONFIG.topology.deletion_rgb_gain_epsilon = 1e-7
    CONFIG.topology.deletion_rgb_min_mean_gain = 1e-7
-   CONFIG.topology.deletion_opacity_threshold = 0.005
+   CONFIG.topology.deletion_opacity_threshold = 0.1
    CONFIG.topology.deletion_opacity_confirmation_windows = 2
 
 ``growth_initial_opacity`` 在继承模式中是上限；关闭 ``growth_inherit_opacity`` 后则是固定出生值。
@@ -76,11 +88,13 @@ RGB 投票与提交时几何复核后，每格选择跨可靠视角平均收益�
 （旧默认 0.5），不会自动切换规则。本次仅修改 Python 初始化，已具备下述原生构建的机器
 不需要为此重新编译；不增加前向或每视角回读，点云初始化及升层分裂规则保持原样。
 
-末尾冻结按全局总轮数计算：700 轮实验冻结第 601–700 轮，1000 轮实验冻结第 901–1000 轮，
+生长末尾冻结按全局总轮数计算：700 轮实验冻结第 651–700 轮，1000 轮实验冻结第 951–1000 轮，
 期间不准备生长候选、不收集生长证据，也不提交新增体素。设为 ``0`` 关闭该窗口；
 设为大于或等于总轮数时，全程不生长。层级预算、分裂及层内 warmup 不变，
 ``--stop-after-epochs`` 不会将暂停位置当作完整训练的结尾。
-100 轮是初始对照设置，不保证消除细节模糊；当前默认总轮数为 1000。
+当前默认总轮数为 1000，最后一次生长机会在第 950 轮；其后继续优化，并在第 960、970、
+980、990、1000 轮按条件检查删除。新生体素仍须先完成保护期，再通过连续确认，
+并非每个删除窗口都会删除刚出生的体素。50 轮是待验证的设置，不保证消除细节模糊。
 续训保留 checkpoint 保存的拓扑配置，缺少此字段的可兼容旧 checkpoint 按 ``0`` 恢复；
 启用新规则应新开实验，不在旧实验中途修改。
 
@@ -108,7 +122,8 @@ opacity／颜色。不需要除以 ``1-a``，也不重新追踪，但会增加 G
 且连续两个事件窗口通过才删除；新生体素额外保护 20 个完整轮次。
 RGB 分支不因无观测、零收益或低 opacity 删除。
 低 opacity 分支在上述事件末检查模型的真实不透明度 ``sigmoid(Y0*b0)``，
-连续两次低于 ``0.005`` 才通过，某次不再低于阈值则重置计数。它仅支持 DC opacity，
+新实验连续两次低于 ``0.1`` 才通过，某次不再低于阈值则重置计数。它比较的是实际
+opacity，不是 ``T*a`` 贡献、参考 alpha 或未经 sigmoid 的系数；仅支持 DC opacity，
 不使用参考 alpha、不要求 RGB 删除收益为正，也不将未观测视为零贡献。
 两条分支共用 warmup、新生保护、冷却和末尾冻结，升层后重新保护与确认，
 任一分支确认后即可删除；只有事件末的 opacity 参数读取，不增加前向。
@@ -117,7 +132,11 @@ RGB 分支不因无观测、零收益或低 opacity 删除。
 
 这些是在线参数快照上的单体素收益，不是固定模型的联合删除证明。多体素分别有益、
 一起删除仍可能有害；未知区域也不被可靠射线的均值覆盖。应对照实际图像，不能保证
-轮毂改善。``0.005`` 是待验证的初始阈值，很多低 opacity 体素仍可能共同产生可见贡献。
+轮毂改善。``0.1`` 是新实验的待验证阈值，很多低 opacity 体素仍可能共同产生可见贡献。
+它仍受 20 轮新生保护、10 轮检查周期和连续两次确认约束，不会立即删除全部低于阈值的体素。
+通用设置类的兼容默认值仍为 ``0.005``；旧 checkpoint 沿用保存值，新阈值只由训练入口的新实验配置启用。
+传入旧 ``--config`` 文件时，其中显式填写的阈值和冻结轮数仍会覆盖这些新默认值；
+测试本次设置应检查配置内容，并新开实验。
 本阶段尚未添加 ``T*a`` 低贡献裁剪。更完整的公式、事件日志和局限见训练文档。
 
 此前多父体生长修正修改了 C++ 候选索引与证据计算，**尚未同步该修正时必须增量编译并重新启动**，
@@ -385,7 +404,7 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 训练输入仍为线性 RGB。
 启用同次训练前向中的 RGB 生长证据，以及已有反向中的 RGB 删除证据和持续低 opacity 清理，
 每个层级各 warmup 20 轮；保留 256 → 512 分裂。
-新实验在全局最后 100 轮冻结生长和删除，继续以 1 spp 优化已有体素。
+新实验在全局最后 50 轮冻结生长，删除继续按周期执行，同时以 1 spp 优化已有体素。
 最终出图为 64 spp，训练集与测试集各取前 10 个视角。
 
 新实验还会在第一次参数更新前，将训练相机 JSON 中视角 0 的初始化体素图保存为

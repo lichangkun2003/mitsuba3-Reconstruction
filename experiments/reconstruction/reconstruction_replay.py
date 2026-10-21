@@ -8,6 +8,7 @@ Synchronized phase diagnostics deliberately use the original implementation.
 from __future__ import annotations
 
 from collections import OrderedDict
+from preview import native_traversal_settings
 
 
 class NativeLossReplay:
@@ -30,10 +31,12 @@ class NativeLossReplay:
         self.dr, self.enabled, self.max_entries = dr, enabled, max_entries
         self._entries = OrderedDict()
         self._model = None
+        self._topology_revision = None
         self._calls = self._recordings = self._replays = self._bypasses = 0
         self._clears = self._model_changes = self._evictions = 0
         self._empty_model_bypasses = 0
         self._empty_growth_bypasses = 0
+        self._topology_changes = 0
 
         # The only closure capture is the Dr.Jit module. Never capture a model,
         # options dictionary, camera, reference, or previous result here.
@@ -50,14 +53,22 @@ class NativeLossReplay:
         """Release recordings and their retained buffers, preserving counters."""
         self._entries.clear()
         self._model = None
+        self._topology_revision = None
         self._clears += 1
 
     def __call__(self, model, ray, rgb, alpha, background, inverse_pdf, options):
+        options = native_traversal_settings(model, options)
         self._calls += 1
         # Keep no obsolete topology alive, including during diagnostic calls.
         if self._model is not None and self._model is not model:
             self.clear()
             self._model_changes += 1
+        revision = int(getattr(model, "topology_revision", 0))
+        if self._model is model and self._topology_revision != revision:
+            # Same object/count can still have different candidate cells and
+            # occupancy buffers. Never replay a capture of the obsolete tree.
+            self.clear()
+            self._topology_changes += 1
         if not self.enabled or bool(options.get("profile_stages", False)):
             self._bypasses += 1
             return model.loss_and_grad(ray, rgb, alpha, background, inverse_pdf, options)
@@ -79,9 +90,11 @@ class NativeLossReplay:
             self._empty_growth_bypasses += 1
             return model.loss_and_grad(ray, rgb, alpha, background, inverse_pdf, options)
         self._model = model
+        self._topology_revision = revision
         # Every native scalar and literal buffer stride is included. Exact input
         # widths matter: native code embeds ray_count in hit/candidate offsets.
         key = (
+            revision,
             int(model.resolution), int(model.active_voxel_count),
             int(getattr(model, "growth_candidate_count", 0)),
             int(model.sh_count), int(model.opacity_sh_count),
@@ -122,4 +135,5 @@ class NativeLossReplay:
                 "empty_growth_bypasses": self._empty_growth_bypasses,
                 "cached_recordings": sum(f.n_cached_recordings for f in self._entries.values()),
                 "max_entries": self.max_entries, "clears": self._clears,
-                "model_changes": self._model_changes, "evictions": self._evictions}
+                "model_changes": self._model_changes, "topology_changes": self._topology_changes,
+                "evictions": self._evictions}

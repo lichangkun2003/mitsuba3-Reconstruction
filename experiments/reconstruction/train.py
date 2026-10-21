@@ -22,7 +22,8 @@ import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from preview import DataConfig, ModelConfig, RenderConfig, RuntimeConfig, PreviewConfig, validate_config
+from preview import (DataConfig, ModelConfig, RenderConfig, RuntimeConfig, PreviewConfig,
+                     validate_config, validate_traversal, native_traversal_settings)
 from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, UniformSampler, ReferenceImageCache,
     generate_ray_batch, prepare_camera, initialize_runtime, load_views, model_metadata,
     restore_model, workspace_path, file_sha256, render_view, write_png)
@@ -118,6 +119,7 @@ CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再�
 CONFIG.render.width = 800
 CONFIG.render.height = 800
 CONFIG.render.spp = 1  # 训练固定每视角 1 spp；多 spp 出图使用评价脚本。
+CONFIG.render.traversal = "octree"  # 默认八叉占用树跳过空区域；"dda" 仅用于对照。
 CONFIG.training.rgb_only = True  # 参考 alpha 仅用于读图时合成 RGB，不进入训练或生长投票。
 CONFIG.model.opacity_sh_count = 1  # 仅优化 DC logit；opacity = sigmoid(Y0 * b0)。
 CONFIG.gradient.alpha_loss_weight = 0.
@@ -130,13 +132,13 @@ CONFIG.contour.enabled = False  # 所有像素均匀采样，不读取 alpha 轮
 CONFIG.topology.enable_growth = True
 CONFIG.topology.enable_deletion = True
 CONFIG.topology.use_rgb_deletion = True  # 复用正常反向合成，按移除单体素的 RGB 收益投票。
-CONFIG.topology.use_low_opacity_deletion = True  # 补充清理持续近透明体素，不要求正 RGB 删除收益。
-CONFIG.topology.deletion_opacity_threshold = .005  # 实际 sigmoid(Y0*b0) 阈值；作为首轮对照起点。
+CONFIG.topology.use_low_opacity_deletion = True  # 补充清理持续低不透明度体素，不要求正 RGB 删除收益。
+CONFIG.topology.deletion_opacity_threshold = .1  # 实际 sigmoid(Y0*b0) < 0.1；仍需成熟保护和连续窗口确认。
 CONFIG.topology.deletion_opacity_confirmation_windows = 2  # 连续两个删除检查窗口低于阈值才清理。
 CONFIG.topology.deletion_warmup_epochs = 20  # 每个层级先优化 20 轮，再按周期收集一轮全部视角。
 CONFIG.topology.deletion_interval = 10
 CONFIG.topology.deletion_protection_epochs = 20  # 新生体素先优化 20 轮。
-CONFIG.topology.deletion_freeze_last_epochs = 100  # 末尾停止删除，配合生长冻结稳定优化。
+CONFIG.topology.deletion_freeze_last_epochs = 0  # 不在末尾冻结删除，继续按周期清理至训练结束。
 CONFIG.topology.deletion_rgb_confirmation_windows = 2  # 连续两个证据窗口达标才删除。
 CONFIG.topology.deletion_rgb_min_support_views = 3
 CONFIG.topology.deletion_rgb_max_conflict_views = 1  # 一个可靠反对视角即可阻止本窗口删除。
@@ -150,7 +152,7 @@ CONFIG.topology.growth_initial_opacity = .3  # 继承模式的出生上限：min
 CONFIG.topology.growth_rgb_normalization = "observed"  # 有效命中射线均值，再对可靠观测视角求均值。
 CONFIG.topology.growth_warmup_epochs = 20  # 最粗层级先优化 20 轮，再按生长周期检查。
 CONFIG.topology.growth_fine_warmup_epochs = 20  # 每个后续层级重新 warmup。
-CONFIG.topology.growth_freeze_last_epochs = 100  # 整个训练的最后 100 轮停止生长，继续优化已有体素；0 关闭。
+CONFIG.topology.growth_freeze_last_epochs = 50  # 最后 50 轮停止生长，继续优化和删除；0 关闭生长冻结。
 CONFIG.topology.growth_rgb_min_support_views = 3
 CONFIG.topology.growth_rgb_max_conflict_views = 2  # 达到 2 个反对视角则拒绝。
 CONFIG.topology.growth_rgb_gain_epsilon = 1e-7  # 有效命中射线的平均 RGB 收益票阈值（保留数值，单位已变）。
@@ -215,6 +217,8 @@ def parse_arguments():
     parser.add_argument("--build-dir")
     parser.add_argument("--gpu", type=int, help="Local physical index; ignored under Slurm")
     parser.add_argument("--chunk-size", type=int, help="0 (default): full image; positive: maximum rays per batch")
+    parser.add_argument("--traversal", choices=("octree", "dda"),
+                        help="Spatial traversal (default: octree); dda is the comparison path")
     parser.add_argument("--profile-views", type=int, help="Record kernel/cache timings for the first N processed views")
     parser.add_argument("--profile-interval-epochs", type=int, help="Sample one view every N epochs and on entering a resolution (default: 50); 0 disables automatic samples")
     parser.add_argument("--profile-stages", action=argparse.BooleanOptionalAction, default=None,
@@ -235,6 +239,7 @@ def apply_arguments(config, args, values):
         (args.dataset, "data", "dataset"), (args.output_dir, "training", "output"),
         (args.build_dir, "runtime", "build_dir"), (args.gpu, "runtime", "gpu"),
         (args.chunk_size, "training", "chunk_size"),
+        (getattr(args, "traversal", None), "render", "traversal"),
         (args.profile_views, "training", "profile_views"),
         (args.profile_interval_epochs, "training", "profile_interval_epochs"),
         (args.profile_stages, "training", "profile_stages"),
@@ -376,6 +381,7 @@ def final_evaluation_config(config, model_path):
         splits=("train", "test"), cameras={"train": config.data.cameras, "test": config.evaluation.test_cameras},
         spp=config.evaluation.spp, max_views=config.evaluation.max_views,
         seed=config.evaluation.seed, chunk_size=config.evaluation.chunk_size,
+        traversal=config.render.traversal,
         output_directory=str(model_path.parent), runtime=config.runtime)
 
 
@@ -474,7 +480,8 @@ def settings(config):
         collect_deletion_evidence=config.topology.enable_deletion and not config.topology.use_rgb_deletion,
         collect_rgb_deletion_evidence=config.topology.enable_deletion and config.topology.use_rgb_deletion,
         transmittance_threshold=config.render.transmittance_threshold,
-        max_hits=config.render.max_hits, entry_offset_fraction=config.render.entry_offset_fraction)
+        max_hits=config.render.max_hits, entry_offset_fraction=config.render.entry_offset_fraction,
+        use_octree=config.render.traversal == "octree")
     return result
 
 
@@ -528,7 +535,7 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
         accumulator.update(rgb_loss_sum=mi.Float(0), distortion_loss_sum=mi.Float(0))
     total_loss, finite = mi.Float(0), mi.Bool(True)
     camera = prepare_camera(config.render, view["camera"], mi, dr)
-    native_settings = settings(config)
+    native_settings = native_traversal_settings(model, settings(config))
     native_settings["collect_growth_evidence"] = bool(collect_growth_evidence)
     if stage_profile is not None:
         native_settings["profile_stages"] = True
@@ -762,6 +769,10 @@ def prepare_training_output(config, resume_path=None, checkpoint_config=None):
 
 def normalized_algorithm_group(name, values):
     """Compare legacy saves with explicit defaults, without changing algorithms."""
+    if name == "render" and values is not None:
+        # Traversal is an acceleration choice and can change on resume; it does
+        # not change leaf shading, gradients, candidate evidence, or sampling.
+        return {key: value for key, value in values.items() if key != "traversal"}
     if name == "data" and values is not None:
         return {"reference_compositing": "linear", **values}
     defaults = {"topology": TopologySettings, "gradient": GradientSettings}
@@ -916,6 +927,7 @@ def run_training(distributed=None):
     native_replay = None
     collective = None
     topology = None
+    model = None
     history_name = ("training-resume-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".jsonl"
                     if checkpoint else "training.jsonl")
     performance_name = ("performance-summary-" + Path(history_name).stem.removeprefix("training-") + ".json"
@@ -956,6 +968,7 @@ def run_training(distributed=None):
             # Fields introduced after a checkpoint must use their legacy
             # dataclass defaults, not the latest experiment's CONFIG switches.
             config.data = DataConfig()
+            config.render = RenderConfig()
             config.topology = TopologySettings()
             config.gradient = GradientSettings()
             update(config, checkpoint["config"])
@@ -974,7 +987,7 @@ def run_training(distributed=None):
             current = asdict(config)
             for group in ("model", "render", "gradient", "optimizer", "topology", "contour"):
                 previous_group = normalized_algorithm_group(group, previous[group])
-                if current[group] != previous_group:
+                if normalized_algorithm_group(group, current[group]) != previous_group:
                     raise ValueError(f"Cannot change {group} while resuming; start a new run for a different algorithm")
             for key in ("seed", "shuffle", "save_count"):
                 previous_value = previous["training"].get(key, 3) if key == "save_count" else previous["training"][key]
@@ -994,6 +1007,8 @@ def run_training(distributed=None):
                     if (normalized_algorithm_group(group, existing.get(group))
                             != normalized_algorithm_group(group, previous_json[group])):
                         raise ValueError("Resume output belongs to a different configuration; choose a new --output-dir")
+        validate_traversal(config.render, mi, report)
+        performance.metadata["traversal"] = report["traversal"]
         rgb_growth_enabled = config.topology.use_rgb_growth and config.topology.enable_growth and (
             not config.schedule.enabled or config.schedule.enable_coarse_growth)
         distortion_enabled = config.gradient.distortion_loss_weight > 0
@@ -1018,6 +1033,7 @@ def run_training(distributed=None):
         report["training_protocol"].update(
             rgb_only=config.training.rgb_only,
             render_color_space="linear",
+            traversal=config.render.traversal,
             loss_color_space="linear",
             distortion={
                 "enabled": distortion_enabled,
@@ -1038,7 +1054,7 @@ def run_training(distributed=None):
                 "RGBA decoded to linear, then composited onto white; only RGB retained"
                                      if config.training.rgb_only else "linear RGBA; composed inside native training"),
             actual_sampling="per-pixel uniform" if config.training.rgb_only else "per-pixel uniform or contour-guided",
-            growth_evidence=("same-DDA independent parent proposals; per-cell winner after signed 1-spp RGB votes; no confirmation render"
+            growth_evidence=("same-traversal independent parent proposals; per-cell winner after signed 1-spp RGB votes; no confirmation render"
                              if rgb_growth_enabled else "disabled" if config.training.rgb_only else "legacy alpha evidence"),
             growth_normalization=config.topology.growth_rgb_normalization if rgb_growth_enabled else None,
             growth_birth_opacity={
@@ -1237,6 +1253,11 @@ def run_training(distributed=None):
             del initial
             distributed.barrier()
             distributed.heartbeat("replicas_initialized", force=True)
+
+        if callable(getattr(model, "statistics", None)):
+            # Native statistics contain host metadata (including tree allocation)
+            # only; this does not transfer voxel buffers or synchronize the GPU.
+            report["initial_model_statistics"] = dict(model.statistics())
 
         if primary:
             if checkpoint is None and config.evaluation.enabled:
@@ -1513,6 +1534,8 @@ def run_training(distributed=None):
             raise
     finally:
         progress_line.finish()
+        if callable(getattr(model, "statistics", None)):
+            report["final_model_statistics"] = dict(model.statistics())
         if reference_cache is not None:
             report["reference_cache"] = reference_cache.statistics()
         if gpu_reference_cache is not None:

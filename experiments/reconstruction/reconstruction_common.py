@@ -13,7 +13,7 @@ from reconstruction_color import reference_from_bitmap, validate_reference_compo
 from preview import (
     REPOSITORY, WORKSPACE, PreviewConfig, RenderConfig, RuntimeConfig, configure_drjit_threads,
     file_sha256, load_camera, prepare_runtime, source_provenance,
-    verify_cuda_device, workspace_path, write_png,
+    verify_cuda_device, workspace_path, write_png, trace_model,
 )
 
 def initialize_runtime(runtime: RuntimeConfig, output: Path, report: dict, *,
@@ -205,8 +205,7 @@ def render_view(model, render, camera, spp, seed, chunk_size, mi, dr, np):
         for begin, end, sums in chunks:
             ray = generate_ray_batch(render, camera, np.arange(begin, end, dtype=np.uint32),
                                      offsets[begin:end], mi, dr, prepared_camera=prepared_camera)
-            rgb, alpha, hits = model.trace(ray, mi.Color3f(render.background),
-                render.transmittance_threshold, render.max_hits, render.entry_offset_fraction)
+            rgb, alpha, hits = trace_model(model, ray, mi.Color3f(render.background), render)
             for channel, value in enumerate((rgb.x, rgb.y, rgb.z, alpha)):
                 sums[channel] = sums[channel] + Float64(dr.detach(value))
             # Evaluate every batch to bound graph lifetime, but let consecutive

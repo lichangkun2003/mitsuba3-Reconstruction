@@ -37,6 +37,7 @@ class EvaluationConfig:
     max_views: int | None = None  # First N cameras per split; None evaluates all.
     seed: int = 42
     chunk_size: int = 65536
+    traversal: str | None = None  # None: saved mode; legacy checkpoints default to octree.
     metric_color_space: str = "srgb"
     reference_compositing: str | None = None  # None: checkpoint protocol; legacy missing field means linear.
     background: tuple[float, float, float] | None = None  # None: checkpoint setting.
@@ -74,6 +75,8 @@ def parse_config(workspace):
     parser.add_argument("--max-views", type=int, help="Evaluate the first N cameras in each selected split")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--chunk-size", type=int)
+    parser.add_argument("--traversal", choices=("octree", "dda"),
+                        help="Override checkpoint traversal; legacy missing setting defaults to octree")
     parser.add_argument("--metric-color-space", choices=("linear", "srgb"))
     parser.add_argument("--reference-compositing", choices=("linear", "srgb"),
                         help="Override checkpoint reference preprocessing; training always optimizes linear RGB")
@@ -88,7 +91,7 @@ def parse_config(workspace):
     if args.config:
         _update_config(config, json.loads(preview.workspace_path(args.config, workspace).read_text(encoding="utf-8")))
     for name in ("checkpoint", "dataset", "spp", "max_views", "seed", "chunk_size",
-                 "metric_color_space", "reference_compositing", "background", "save_linear"):
+                 "metric_color_space", "reference_compositing", "background", "save_linear", "traversal"):
         value = getattr(args, name)
         if value is not None:
             setattr(config, name, value)
@@ -107,6 +110,8 @@ def parse_config(workspace):
 
 
 def validate_config(config):
+    if config.traversal not in (None, "octree", "dda"):
+        raise ValueError("traversal must be None, octree or dda")
     for name in ("spp", "chunk_size"):
         value = getattr(config, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -373,9 +378,12 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
                 raise ValueError(f"Unsupported checkpoint render setting: {key}")
             setattr(render, key, value)
         render.spp = config.spp
+        if config.traversal is not None:
+            render.traversal = config.traversal
         if config.background is not None:
             render.background = config.background
         preview.validate_config(preview.PreviewConfig(render=render, runtime=config.runtime))
+        preview.validate_traversal(render, mi, report)
         dataset_value = config.dataset or saved.get("data", {}).get("dataset")
         if not dataset_value:
             raise ValueError("No dataset in the checkpoint; supply --dataset")
@@ -586,12 +594,15 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
                 raise ValueError(f"Unsupported checkpoint render setting: {key}")
             setattr(render, key, value)
         render.spp = config.spp
+        if config.traversal is not None:
+            render.traversal = config.traversal
         if config.background is not None:
             render.background = config.background
         # pixel_sampling is a legacy preview field. Evaluation always uses the
         # independent uniform sampler in render_view, recorded separately below.
         validation_config = preview.PreviewConfig(render=render, runtime=config.runtime)
         preview.validate_config(validation_config)
+        preview.validate_traversal(render, mi, report)
         dataset_value = config.dataset or saved.get("data", {}).get("dataset")
         if not dataset_value:
             raise ValueError("No dataset in the checkpoint; supply --dataset")

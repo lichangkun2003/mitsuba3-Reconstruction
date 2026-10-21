@@ -32,6 +32,8 @@ public:
     static constexpr uint32_t rgb_deletion_version = 1;
     /// Point-pair L1 depth distortion with exact fixed-hit continuous gradients.
     static constexpr uint32_t distortion_version = 1;
+    /// GPU occupancy octree, including separately tagged hypothetical leaves.
+    static constexpr uint32_t octree_version = 1;
 
     VoxelReconstruction(const std::string &filename, uint32_t resolution,
                         const std::array<float, 3> &grid_min,
@@ -56,6 +58,7 @@ public:
                                const std::map<std::string, FloatBuffer> &parameters);
     void clear_growth_candidates();
     uint32_t growth_candidate_count() const { return m_growth_count; }
+    uint64_t topology_revision() const { return m_topology_revision; }
 
     struct TrainingResult {
         Color3f rgb, raw_rgb;
@@ -101,7 +104,7 @@ public:
     std::tuple<Color3f, Float, UInt32> trace(
         const Ray3f &ray, const Color3f &background,
         float transmittance_threshold = .01f, uint32_t max_hits = 16,
-        float entry_offset_fraction = 0.f) const;
+        float entry_offset_fraction = 0.f, bool use_octree = true) const;
 
     uint32_t resolution() const { return m_resolution; }
     uint32_t active_voxel_count() const { return m_active_count; }
@@ -122,11 +125,28 @@ public:
     MI_DECLARE_CLASS(VoxelReconstruction)
 
 private:
+    void rebuild_octree();
+    void mark_octree(const UIntBuffer &cells, uint32_t bit_offset);
+    void refresh_octree_skips();
+    void skip_empty_block(Vector3i &cell, Vector3f &next, Float &entry,
+                          UInt32 &iterations, const Vector3i &step,
+                          const Vector3f &step_t, const Float &exit,
+                          Mask active, bool include_growth,
+                          UInt32 &queries, bool profile) const;
+
     uint32_t m_resolution, m_active_count, m_sh_count, m_opacity_sh_count;
     std::array<float, 3> m_min, m_max, m_size;
     std::map<std::string, uint64_t> m_statistics;
     IntBuffer m_index;
     UIntBuffer m_cells;
+    // Flat parent levels, fine to coarse. Low eight bits describe normal
+    // children, bits 8..15 describe candidates. Bits 16..19 and 20..23 cache
+    // the largest empty ancestor's log2 size for normal and union occupancy.
+    // Leaf IDs remain in m_index; non-power-of-two resolutions are padded.
+    UIntBuffer m_octree = dr::zeros<UIntBuffer>(1);
+    std::array<uint32_t, 10> m_octree_offsets{};
+    uint32_t m_octree_resolution = 1, m_octree_levels = 0, m_octree_nodes = 0;
+    uint64_t m_topology_revision = 0;
     FloatBuffer m_centers, m_log_scales, m_rotations, m_radiance, m_opacity;
     uint32_t m_growth_count = 0;
     // Frozen-function traversal in this Dr.Jit version requires nonempty
@@ -140,7 +160,7 @@ private:
                 m_growth_rotations = dr::zeros<FloatBuffer>(1),
                 m_growth_radiance = dr::zeros<FloatBuffer>(1),
                 m_growth_opacity = dr::zeros<FloatBuffer>(1);
-    MI_TRAVERSE_CB(Object, m_index, m_cells, m_centers, m_log_scales,
+    MI_TRAVERSE_CB(Object, m_index, m_cells, m_octree, m_centers, m_log_scales,
                    m_rotations, m_radiance, m_opacity, m_growth_cells, m_growth_next,
                    m_growth_centers, m_growth_log_scales, m_growth_rotations,
                    m_growth_radiance, m_growth_opacity)

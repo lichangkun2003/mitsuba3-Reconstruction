@@ -65,6 +65,7 @@ class RenderConfig:
     background: tuple[float, float, float] = (0.0, 0.0, 0.0)
     transmittance_threshold: float = 0.01
     max_hits: int = 16
+    traversal: str = "octree"  # "dda" retains the original per-cell reference traversal.
 
 
 @dataclass
@@ -167,6 +168,8 @@ def parse_config(workspace: Path) -> PreviewConfig:
     parser.add_argument("--seed", type=int)
     parser.add_argument("--grid-resolution", type=int)
     parser.add_argument("--pixel-sampling", choices=("shared_jitter", "center"))
+    parser.add_argument("--traversal", choices=("octree", "dda"),
+                        help="Spatial traversal (default: octree); dda is the comparison path")
     parser.add_argument("--output-dir")
     parser.add_argument("--build-dir")
     parser.add_argument("--gpu", type=int, help="Local nvidia-smi index; ignored inside Slurm jobs")
@@ -184,7 +187,7 @@ def parse_config(workspace: Path) -> PreviewConfig:
         "output_dir": ("output", "directory"), "save_model": ("output", "save_model"),
         "build_dir": ("runtime", "build_dir"), "gpu": ("runtime", "gpu"),
     }
-    for name in ("width", "height", "spp", "seed", "pixel_sampling"):
+    for name in ("width", "height", "spp", "seed", "pixel_sampling", "traversal"):
         mapping[name] = ("render", name)
     for argument, (group, name) in mapping.items():
         value = getattr(args, argument)
@@ -195,6 +198,8 @@ def parse_config(workspace: Path) -> PreviewConfig:
 
 def validate_config(config: PreviewConfig) -> None:
     validate_reference_compositing(config.data.reference_compositing)
+    if config.render.traversal not in ("octree", "dda"):
+        raise ValueError("render.traversal must be octree or dda")
     for name in ("width", "height", "spp", "max_hits"):
         value = getattr(config.render, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -226,6 +231,41 @@ def validate_config(config: PreviewConfig) -> None:
         raise ValueError("opacity_threshold must be in (0, 1)")
     if any(not isinstance(n, int) or not 1 <= n <= 16 for n in (model.sh_count, model.opacity_sh_count)):
         raise ValueError("SH coefficient counts must be integers in [1, 16]")
+
+
+def validate_traversal(render, mi, report=None):
+    """Reject a stale build instead of silently using DDA for an octree request."""
+    if render.traversal not in ("octree", "dda"):
+        raise ValueError("render.traversal must be octree or dda")
+    version = int(getattr(mi.VoxelReconstruction, "octree_version", 0))
+    if render.traversal == "octree" and version < 1:
+        raise RuntimeError("Octree traversal requires native octree_version >= 1; "
+                           "incrementally rebuild this Mitsuba source checkout")
+    if report is not None:
+        report["traversal"] = {"mode": render.traversal, "native_octree_version": version}
+        print("Spatial traversal:", render.traversal, flush=True)
+
+
+def trace_model(model, ray, background, render):
+    """Pass the selected traversal explicitly; keep old DDA builds comparable."""
+    arguments = (ray, background, render.transmittance_threshold,
+                 render.max_hits, render.entry_offset_fraction)
+    if getattr(model, "octree_version", 0) >= 1:
+        return model.trace(*arguments, render.traversal == "octree")
+    if render.traversal != "dda":
+        raise RuntimeError("Octree traversal is unavailable; rebuild this source VoxelReconstruction module")
+    return model.trace(*arguments)
+
+
+def native_traversal_settings(model, options):
+    """Adapt an explicit DDA request to older native settings dictionaries."""
+    if getattr(model, "octree_version", 0) >= 1 or "use_octree" not in options:
+        return options
+    if options["use_octree"]:
+        raise RuntimeError("Octree traversal is unavailable; rebuild this source VoxelReconstruction module")
+    # Older builds reject unknown options, including a false acceleration flag.
+    # Only remove that flag, and never mutate caller-owned replay/config input.
+    return {name: value for name, value in options.items() if name != "use_octree"}
 
 
 def prepare_device_environment(gpu: int, report: dict) -> None:
@@ -448,6 +488,7 @@ def main() -> int:
             raise RuntimeError("CUDA variant/backend verification failed")
         if not hasattr(mi, "VoxelReconstruction"):
             raise RuntimeError("This source build lacks VoxelReconstruction; rebuild the current checkout")
+        validate_traversal(config.render, mi, report)
 
         dataset = workspace_path(config.data.dataset, workspace)
         point_cloud = (dataset / config.data.point_cloud).resolve()
@@ -483,10 +524,7 @@ def main() -> int:
             offset = random.random(2) if config.render.pixel_sampling == "shared_jitter" else (.5, .5)
             offsets.append([float(value) for value in offset])
             ray = generate_rays(config.render, camera, offset, mi, dr)
-            rgb, alpha, hits = model.trace(
-                ray, mi.Color3f(config.render.background), config.render.transmittance_threshold,
-                config.render.max_hits, config.render.entry_offset_fraction,
-            )
+            rgb, alpha, hits = trace_model(model, ray, mi.Color3f(config.render.background), config.render)
             rgb_sum += rgb
             alpha_sum += alpha
             hits_sum += hits

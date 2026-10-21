@@ -35,7 +35,7 @@ class GrowthResumeTests(unittest.TestCase):
     def test_new_experiment_uses_observations(self):
         settings = train.CONFIG.topology
         self.assertEqual(settings.growth_rgb_normalization, "observed")
-        self.assertEqual(settings.growth_freeze_last_epochs, 100)
+        self.assertEqual(settings.growth_freeze_last_epochs, 50)
         self.assertTrue(settings.growth_inherit_opacity)
         self.assertEqual(settings.growth_opacity_scale, .8)
         self.assertEqual(settings.growth_initial_opacity, .3)

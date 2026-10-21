@@ -16,6 +16,7 @@ RGB-only 训练、在线生长与删除（当前默认）
    CONFIG.model.opacity_sh_count = 1
    CONFIG.render.width = CONFIG.render.height = 800
    CONFIG.render.spp = 1
+   CONFIG.render.traversal = "octree"
    CONFIG.training.num_epochs = 1000
    CONFIG.gradient.alpha_loss_weight = 0
    CONFIG.gradient.alpha_geometry_weight = 0
@@ -26,6 +27,8 @@ RGB-only 训练、在线生长与删除（当前默认）
    CONFIG.topology.enable_deletion = True
    CONFIG.topology.use_rgb_deletion = True
    CONFIG.topology.use_low_opacity_deletion = True
+   CONFIG.topology.deletion_opacity_threshold = 0.1
+   CONFIG.topology.deletion_freeze_last_epochs = 0
    CONFIG.topology.use_growth_evidence = False
    CONFIG.topology.use_rgb_growth = True
    CONFIG.topology.growth_inherit_opacity = True
@@ -33,7 +36,7 @@ RGB-only 训练、在线生长与删除（当前默认）
    CONFIG.topology.growth_initial_opacity = 0.3
    CONFIG.topology.growth_warmup_epochs = 20
    CONFIG.topology.growth_fine_warmup_epochs = 20
-   CONFIG.topology.growth_freeze_last_epochs = 100
+   CONFIG.topology.growth_freeze_last_epochs = 50
    CONFIG.topology.growth_rgb_normalization = "observed"
    CONFIG.schedule.enable_coarse_growth = True
    CONFIG.contour.enabled = False
@@ -196,18 +199,18 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 升层边界及整个训练的最后一轮不再生长。若层级预算不够 30 轮，该层不会生长。
 生长 warmup 与优化器的 opacity warmup 是两个独立配置。
 
-新实验另外设置 ``topology.growth_freeze_last_epochs=100``，在完整训练的最后 100 轮
+新实验另外设置 ``topology.growth_freeze_last_epochs=50``，在完整训练的最后 50 轮
 停止准备生长候选、收集生长证据及提交新增体素，继续以 1 spp 优化已有体素。
-这是全局末尾窗口，不是每个分辨率层级各冻结 100 轮：总计 700 轮时冻结第 601–700 轮，
-总计 1000 轮时冻结第 901–1000 轮。设为 ``0`` 关闭这一额外窗口；大于或等于总轮数时
+这是全局末尾窗口，不是每个分辨率层级各冻结 50 轮：总计 700 轮时冻结第 651–700 轮，
+总计 1000 轮时冻结第 951–1000 轮。设为 ``0`` 关闭这一额外窗口；大于或等于总轮数时
 整个训练都不生长。原来的层内 20 轮 warmup、分裂时机和层级预算均不变。
-删除有独立的末尾冻结配置，当前也为 100 轮，见下文。
+删除有独立的末尾冻结配置，当前为 ``0``，继续按周期处理直至训练结束，见下文。
 ``--stop-after-epochs`` 只暂停运行，不会重新定义完整训练的末尾。
 
-100 轮是用于检查末尾新增体素是否来不及优化的初始对照设置，不保证消除轮毂模糊；
+50 轮用于给末尾新增体素留出优化和删除确认时间，不保证消除轮毂模糊；
 当前默认总轮数为 1000。该设置保存在配置与 checkpoint 中，续训沿用保存值，
 不允许中途悄悄修改拓扑配置。可兼容的旧 checkpoint 若没有此字段，按 ``0`` 恢复，
-不会自动套用新实验的 100 轮；比较此规则应新开实验。
+不会自动套用新实验的 50 轮；比较此规则应新开实验。
 
 在需要证据的轮次，正常 DDA 经过候选空格时额外检查候选椭球相交，并记录该位置前的
 合成 RGB ``P`` 和透射率 ``T``。候选并不参与当前渲染、真实命中计数或训练梯度。
@@ -275,7 +278,7 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
    CONFIG.topology.growth_initial_opacity = 0.3
    CONFIG.topology.growth_warmup_epochs = 20
    CONFIG.topology.growth_fine_warmup_epochs = 20
-   CONFIG.topology.growth_freeze_last_epochs = 100
+   CONFIG.topology.growth_freeze_last_epochs = 50
    CONFIG.topology.growth_rgb_normalization = "observed"
    CONFIG.topology.growth_rgb_min_support_views = 3
    CONFIG.topology.growth_rgb_max_conflict_views = 2
@@ -373,13 +376,13 @@ GPU 上的算术、按体素归约和事件统计，并非零开销。
    CONFIG.topology.deletion_warmup_epochs = 20
    CONFIG.topology.deletion_interval = 10
    CONFIG.topology.deletion_protection_epochs = 20
-   CONFIG.topology.deletion_freeze_last_epochs = 100
+   CONFIG.topology.deletion_freeze_last_epochs = 0
    CONFIG.topology.deletion_rgb_confirmation_windows = 2
    CONFIG.topology.deletion_rgb_min_support_views = 3
    CONFIG.topology.deletion_rgb_max_conflict_views = 1
    CONFIG.topology.deletion_rgb_gain_epsilon = 1e-7
    CONFIG.topology.deletion_rgb_min_mean_gain = 1e-7
-   CONFIG.topology.deletion_opacity_threshold = 0.005
+   CONFIG.topology.deletion_opacity_threshold = 0.1
    CONFIG.topology.deletion_opacity_confirmation_windows = 2
 
 每个分辨率层级先 warmup 20 轮，然后第 30、40、50 等轮检查删除。RGB 分支的每个窗口只包含
@@ -388,14 +391,18 @@ GPU 上的算术、按体素归约和事件统计，并非零开销。
 训练轮次。删除后的格子沿用原冷却期，避免立即被重新生长；升层后重新 warmup，
 证据与连续确认状态重置。删除与生长都在 epoch 边界处理，幸存体素保留 Adam 状态。
 
-全局最后 100 轮停止收集及提交删除，配合生长冻结让已有体素继续优化；1000 轮对应
-第 901–1000 轮。``deletion_freeze_last_epochs=0`` 关闭该窗口，大于或等于总轮数时全程
-不删除。``--stop-after-epochs`` 不改变这个全局窗口。分裂规则、训练的 1 spp 不变。
+新实验设置 ``deletion_freeze_last_epochs=0``，不设置删除的末尾冻结窗口；
+生长停止后，删除仍按原周期继续执行，直到训练结束。默认 1000 轮实验中，
+最后一次生长机会为第 950 轮，删除在第 960、970、980、990、1000 轮仍有检查机会。
+第 950 轮出生的体素需先完成 20 轮保护，最早可在第 980、990 轮连续通过确认后删除，
+并非第 960 轮就会被裁剪。设置正数可恢复删除末尾冻结，大于或等于总轮数时全程不删除。
+``--stop-after-epochs`` 不改变这个全局窗口。分裂规则、训练的 1 spp 不变。
 RGB 分支不因没有观测、零收益或 opacity 较低而删除；持续低 opacity 由独立分支处理。
 
 低 opacity 分支在上述事件的 epoch 结束时，读取当前模型的 DC opacity 参数，
 按真实前向公式 ``a = sigmoid(Y0 * b0)`` 计算不透明度，连续两个检查窗口都满足
-``a < deletion_opacity_threshold`` 才通过。它比较的是不透明度，不是未经 sigmoid 的 SH 系数，
+``a < deletion_opacity_threshold`` 才通过。新实验阈值为 ``0.1``：它比较的是实际不透明度，
+不是 ``T*a`` 贡献、参考 alpha 或未经 sigmoid 的 SH 系数，
 当前只支持各向同性 DC opacity。某次不再低于阈值会重置连续计数；
 非有限参数不能作为低 opacity 证据。
 这个分支不要求 RGB 删除收益为正，因此可以清理 RGB 删除收益已接近零的透明体素。
@@ -404,7 +411,13 @@ RGB 分支不因没有观测、零收益或 opacity 较低而删除；持续低 
 两条分支共用层级 warmup、新生体素 20 轮保护、删除周期、冷却期和末尾冻结。
 细分后重新开始保护与确认，避免直接清理经过 opacity 衰减、尚未重新优化的子体素；
 幸存体素的连续确认状态随 checkpoint 保存和恢复。
-``0.005`` 与两个窗口是初始实验设置，并非已验证的最佳阈值。低 opacity 裁剪是近似清理：
+``0.1`` 与两个窗口是待验证的实验设置，并非已验证的最佳阈值；20 轮新生保护和
+10 轮检查周期仍然生效，不会立即删除所有低于阈值的体素。
+通用 ``TopologySettings`` 的兼容默认值仍为 ``0.005``；训练入口的新实验显式使用 ``0.1``，
+旧 checkpoint 继续采用保存的阈值，缺失字段时采用兼容默认值。
+旧 ``--config`` 文件中显式填写的阈值、末尾冻结轮数会覆盖训练入口的新默认值，
+使用新规则时应检查这些字段并新开实验。
+低 opacity 裁剪是近似清理：
 很多低 opacity 体素仍可能共同产生可见贡献，持续低值不构成删除后图像不变的证明。
 本阶段尚未实现按 ``T * a`` 的低贡献统计裁剪，保留它作为后续独立对照。
 
@@ -625,8 +638,8 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 启动时 ``Training epochs by resolution`` 打印最终各层预算。
 
 以默认 1000 轮为例，第 1–600 轮在 256 层级训练，第 601–1000 轮在 512 层级训练。
-512 层级仍保留生长，升层后重新 warmup 20 轮；最后第 901–1000 轮冻结生长和删除。
-这 100 轮包含在细层的 400 轮内，不是额外增加的训练轮数。
+512 层级仍保留生长，升层后重新 warmup 20 轮；最后第 951–1000 轮冻结生长，
+删除继续按周期执行。这 50 轮包含在细层的 400 轮内，不是额外增加的训练轮数。
 
 训练完成后默认以 64 spp 评价 train/test 各前十个视角；某划分不足十个时使用全部视角。
 这里的顺序是对应相机 JSON 的原始顺序，不是训练打乱后的访问顺序。
@@ -890,13 +903,77 @@ RGB 删除对应 ``rgb_deletion_device_views``、``rgb_deletion_cpu_views`` 和
 这增加 ``4 * max_hits * ray_count * 4`` 字节的后缀缓冲；800 × 800 整图、
 ``max_hits=16`` 时为 163840000 字节，即 156.25 MiB，不代表整个训练的显存峰值。
 
-训练原生前向使用 GPU 条件分支区分空格、命中和有效未命中：空格只推进 DDA，
+训练原生前向使用 GPU 条件分支区分空格、命中和有效未命中：空格不执行椭球计算，
 占用体素才计算椭球几何，命中才计算外观并写命中记录，有效未命中才维护候选。
 候选容量已满时，先用新分数与当前最差分数比较，仅在严格小于时执行插入；
 容量未满时仍正常插入。评分、候选容量、稳定的同分顺序、命中顺序和终止条件保持不变。
 这些修改跳过不会影响结果的工作，保留 ``VoxelReconstruction`` 接口、梯度公式及
-每视角一次参数更新；没有改变算法或引入空区层次加速结构。实际收益取决于设备、
+每视角一次参数更新。当前默认进一步使用下面的八叉占用树跳过空区域。实际收益取决于设备、
 射线分布和场景稀疏程度，不能保证 A100 的端到端吞吐提升。
+
+默认八叉树遍历
+~~~~~~~~~~~~~~
+
+``render.traversal="octree"`` 是预览、训练和评价的默认空间加速方式。
+内部节点只表示对应区域是否包含正常体素或生长候选，真实参数仍在原有 GPU 体素数组中。
+正常叶子继续执行原来的椭球求交、近失射线几何记录、颜色合成、反向梯度和 Distortion；
+树不根据 opacity 阈值跳过尚未正式删除的体素。候选叶子只记录虚拟插入证据，
+不会变成真实命中、消耗正常 ``max_hits`` 或改变颜色、透射率。
+同一格的多个父体提案仍独立评估；普通出图只遍历正常占用。
+
+第一版保留已有的稠密叶子索引；各级父节点平铺在一个 GPU ``uint32`` 数组中，
+位 0–7 标记正常体素子区，位 8–15 标记候选子区；位 16–19 和 20–23 分别缓存
+“仅正常占用”与“正常加候选占用”下可跳过的最大空祖先边长的 log2。
+缓存按树层级自顶向下生成，普通遍历读取所在细父节点一次即可取得空块步长，
+不必对每条射线重复查询全部祖先。它只在拓扑或候选集合变化后更新，与占用掩码共用
+同一个字，不增加下面的父节点存储成本。非 2 的幂分辨率的索引边长向上补齐。
+非空模型在 256 分辨率增加约 9.14 MiB、512 分辨率增加约 73.14 MiB 的父节点存储；
+这不是总显存占用，原有体素参数、叶子索引、候选与反向记录仍另计。
+跨空块时使用仅推进寄存器状态的紧凑循环，保留原来的 ``next += step_t`` 浮点运算顺序；
+不是一次解析跳到出口的 O(1) 步骤。它跳过空格的叶子索引读取、几何分支和完整外层循环，
+避免解析跳跃改变切线、边角相等事件和候选路径的数值行为。实际加速仍需基准测量。
+
+初始化和从 ``model.npz`` / checkpoint 恢复时自动构建正常占用索引。
+生长、删除、分裂改变拓扑后重新构建；普通 Adam 参数更新不重建。
+准备或清除候选集合时更新独立的候选占用标记，即使候选数不变、仅位置改变也会更新。
+树缓存不写入模型文件，旧模型可直接加载；缺少 ``render.traversal`` 的旧 checkpoint
+使用八叉树。叶子边界顺序、原有容量限制和光线终止规则保持不变。
+
+本次涉及 C++：先拉取并增量编译，再运行原来的训练命令即可。
+脚本验证 ``VoxelReconstruction.octree_version >= 1``，不满足时明确要求重新编译，
+不会把旧 DDA 执行当作八叉树成功。启动日志和运行报告显示 ``traversal``，
+保存的 ``config.json`` 和模型配置包含所选模式。
+``training-report.json`` 的 ``initial_model_statistics`` 和 ``final_model_statistics``
+记录原生模型的树层数、父节点数与分配字节等主机元数据，不额外回读体素或逐射线诊断。
+
+原逐格 DDA 默认关闭，保留显式对照：
+
+.. code-block:: bash
+
+   python -I experiments/reconstruction/train.py --dataset datasets/hotdog --traversal octree
+   python -I experiments/reconstruction/train.py --dataset datasets/hotdog --traversal dda
+
+``preview.py``、``evaluate.py`` 和多卡训练转发的参数同样支持 ``--traversal``。
+单独评价继承保存的模式，命令行可覆盖。遍历模式是加速选项，可以在 ``--resume`` 时更改，
+不会放宽其他算法参数的恢复限制。Dr.Jit 重放键包含遍历开关和模型拓扑版本；
+同一模型的候选集合变化也会清除旧记录，避免复用旧占用结构。
+
+使用生成场景检查 DDA / 八叉树输出、梯度、拓扑证据和重放一致性：
+
+.. code-block:: bash
+
+   python -I experiments/reconstruction/tests/test_reconstruction_octree.py
+   python -I experiments/reconstruction/tests/test_reconstruction_octree.py --benchmark
+
+后一个命令另做生成稀疏场景的预热后性能比较；它不训练真实数据集，不改写已有实验。
+诊断计数仅由测试显式请求，普通训练不会增加逐视角计数回读。
+
+2026-10-21 本地 Windows Release、RTX 4060 Laptop、``cuda_ad_rgb`` 验证通过：
+八叉树与 DDA 的边界射线、near-miss、多父体候选、截断、删除、Distortion 和重放回归均通过。
+生成的 128³ 薄壳场景（24264 个体素、256 × 256、1 spp）中，预热后包含前向与梯度的
+同步重放耗时中位数为 DDA 3.181 ms、八叉树 3.241 ms，最大绝对数值差为 1.1921e-7；
+这组测试尚未证明加速。稀疏轴向射线样例的完整外层步数由 64 降至 7，
+但空块内部仍执行上述寄存器细步进。尚未验证真实场景或 A100／5090 的完整训练吞吐。
 
 legacy 的 256 → 512 调度在 256 阶段不消费删除证据。训练将其实际证据需求传给原生
 ``collect_deletion_evidence``，跳过这些未使用的计算；进入需要收集删除证据的目标

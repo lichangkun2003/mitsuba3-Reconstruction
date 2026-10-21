@@ -418,6 +418,10 @@ def check_nonfinite(config, view, rgba, mi, dr, np):
     rejected = []
 
     class NonfiniteModel:
+        # This fake result tests the driver's finite checks. Match the loaded
+        # native traversal capability so the independent build guard is honest.
+        octree_version = getattr(mi.VoxelReconstruction, "octree_version", 0)
+
         def __init__(self, field):
             self.field = field
 

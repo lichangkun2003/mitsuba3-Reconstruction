@@ -98,6 +98,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
            "Install frozen empty-cell candidates for online RGB evidence; does not grow the model.")
         .def("clear_growth_candidates", &Model::clear_growth_candidates)
         .def_prop_ro("growth_candidate_count", &Model::growth_candidate_count)
+        .def_prop_ro("topology_revision", &Model::topology_revision)
         .def("loss_and_grad", [](const Model &model, const Ray3f &ray,
                  const Color3f &reference_rgb, const Float &reference_alpha,
                  const Color3f &background, const Float &inverse_pdf,
@@ -136,7 +137,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
            "collect_rgb_deletion_evidence enables RGB-only removal evidence without another trace.")
         .def("trace", &Model::trace, "ray"_a, "background"_a = Color3f(0.f),
              "transmittance_threshold"_a = .01f, "max_hits"_a = 16,
-             "entry_offset_fraction"_a = 0.f)
+             "entry_offset_fraction"_a = 0.f, "use_octree"_a = true)
         .def_prop_ro("resolution", &Model::resolution)
         .def_prop_ro("active_voxel_count", &Model::active_voxel_count)
         .def_prop_ro("sh_count", &Model::sh_count)
@@ -160,5 +161,6 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("rgb_growth_version") = nb::int_(Model::rgb_growth_version);
     cls.attr("rgb_deletion_version") = nb::int_(Model::rgb_deletion_version);
     cls.attr("distortion_version") = nb::int_(Model::distortion_version);
+    cls.attr("octree_version") = nb::int_(Model::octree_version);
     drjit::bind_traverse(cls);
 }
