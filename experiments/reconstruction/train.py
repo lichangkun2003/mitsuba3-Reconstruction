@@ -33,6 +33,7 @@ from reconstruction_color import validate_reference_compositing
 from reconstruction_experiment import (allocate_training_output, resumed_training_output,
                                        finalize_training_output, relocate_experiment_paths)
 from reconstruction_optimizer import FalcorOptimizer, OptimizerConfig
+from reconstruction_checks import DeferredViewChecks
 from reconstruction_performance import PerformanceRecorder
 from reconstruction_progress import ProgressLine
 from reconstruction_reference import GPUReferenceCache
@@ -53,6 +54,7 @@ class TrainingSettings:
     reference_cache_mib: int = 1024  # Decoded float32 RGBA in host RAM; 0 disables caching.
     gpu_reference_cache_mib: int = 1024  # Float32 reference planes on the GPU; 0 disables.
     freeze_native: bool = True  # Replay native GPU work between topology changes.
+    sync_view_checks: bool = False  # Diagnostic: read loss/validity after every view.
     seed: int = 42
     shuffle: bool = True
     save_count: int = 3  # Total snapshots, including the final model.npz.
@@ -231,6 +233,10 @@ def parse_arguments():
     parser.add_argument("--gpu-reference-cache-mib", type=int, help=f"GPU reference-image cache budget in MiB (default: {CONFIG.training.gpu_reference_cache_mib}); 0 disables caching")
     parser.add_argument("--freeze-native", action=argparse.BooleanOptionalAction, default=None,
                         help="Replay native GPU work without repeated tracing (default: enabled); stage diagnostics run directly")
+    parser.add_argument("--sync-view-checks", action=argparse.BooleanOptionalAction, default=None,
+                        help="Diagnostic per-view loss/validity readback; default keeps guards on GPU and reports at epoch/profile boundaries")
+    parser.add_argument("--gpu-topology", action=argparse.BooleanOptionalAction, default=None,
+                        help="Build RGB growth candidates and update topology on GPU (default); --no-gpu-topology selects the NumPy reference")
     parser.add_argument("--skip-evaluation", action="store_true", help="Save the final model without automatic train/test evaluation")
     parser.add_argument("--eval-spp", type=int, help="Samples per pixel for final evaluation (default: 64)")
     parser.add_argument("--eval-train-max-views", type=int,
@@ -255,6 +261,8 @@ def apply_arguments(config, args, values):
         (args.reference_cache_mib, "training", "reference_cache_mib"),
         (args.gpu_reference_cache_mib, "training", "gpu_reference_cache_mib"),
         (args.freeze_native, "training", "freeze_native"),
+        (getattr(args, "sync_view_checks", None), "training", "sync_view_checks"),
+        (getattr(args, "gpu_topology", None), "topology", "gpu_topology"),
         (args.rgb_only, "training", "rgb_only"),
         (getattr(args, "distortion_weight", None), "gradient", "distortion_loss_weight"),
         (args.eval_spp, "evaluation", "spp"),
@@ -310,6 +318,8 @@ def validate(config):
         raise ValueError("RGB growth evidence requires training.rgb_only=true")
     if not isinstance(config.topology.use_rgb_deletion, bool):
         raise ValueError("topology.use_rgb_deletion must be a boolean")
+    if not isinstance(config.topology.gpu_topology, bool):
+        raise ValueError("topology.gpu_topology must be a boolean")
     if not isinstance(config.topology.use_low_opacity_deletion, bool):
         raise ValueError("topology.use_low_opacity_deletion must be a boolean")
     if config.topology.use_rgb_deletion and not config.training.rgb_only:
@@ -377,6 +387,8 @@ def validate(config):
         raise ValueError("training.profile_stages must be a boolean")
     if not isinstance(config.training.freeze_native, bool):
         raise ValueError("training.freeze_native must be a boolean")
+    if not isinstance(config.training.sync_view_checks, bool):
+        raise ValueError("training.sync_view_checks must be a boolean")
     if isinstance(config.gradient.distortion_loss_weight, bool):
         raise ValueError("gradient.distortion_loss_weight must be finite and nonnegative")
     for name, value in asdict(config.gradient).items():
@@ -520,6 +532,24 @@ def shard_pixel_range(count, rank, world_size):
     return count * rank // world_size, count * (rank + 1) // world_size
 
 
+def host_topology_payload(value, dr, np):
+    """Materialize only at the existing cross-process topology boundary.
+
+    Single-GPU lifecycle arrays remain on device. WorkerContext's control pipe
+    cannot serialize CUDA allocations, so two-GPU topology transfers stay CPU
+    messages; ordinary gradient reductions remain NCCL device collectives.
+    """
+    if dr.is_array_v(type(value)):
+        return np.array(value, copy=True)
+    if isinstance(value, dict):
+        return {key: host_topology_payload(item, dr, np) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(host_topology_payload(item, dr, np) for item in value)
+    if isinstance(value, list):
+        return [host_topology_payload(item, dr, np) for item in value]
+    return value
+
+
 def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, mi, dr, *,
                        pixel_begin=0, pixel_end=None, need_rendered_alpha=False,
                        collect_deletion_evidence=None, stage_profile=None,
@@ -642,13 +672,34 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
 
 
 def finalize_view(partial, view, config, sampler, token, mi, dr, np, *, alpha_on_device=False,
-                  loss_components=None):
+                  loss_components=None, deferred_checks=None):
     """Validate a globally reduced view and observe its contour history once."""
     accumulator, total_loss, finite, raw_alpha, estimated_alpha = partial
     count = config.render.width * config.render.height
     # Read loss and the combined validity flag together, rather than performing
     # a separate host synchronization for every parameter group and ray batch.
     distortion_enabled = config.gradient.distortion_loss_weight > 0
+    if deferred_checks is not None:
+        # Four scalar statistics per view; no image/parameter readback. A device
+        # guard blocks invalid updates immediately, even before host reporting.
+        mean_loss = total_loss / count
+        rgb = accumulator.pop("rgb_loss_sum") / count if distortion_enabled else mean_loss
+        distortion = accumulator.pop("distortion_loss_sum") / count if distortion_enabled else mi.Float(0.)
+        finite &= dr.isfinite(mean_loss) & dr.isfinite(rgb) & dr.isfinite(distortion)
+        summary = dr.concat([mean_loss, mi.Float(finite), rgb, distortion])
+        deferred_checks.add(view["index"], summary)
+        accumulator["_update_allowed"] = finite & (mean_loss >= 0)
+        if token is not None:
+            # Legacy contour history consumes a host image; preserve its original
+            # validation and observation ordering when explicitly requested.
+            deferred_checks.read(rgb_only=config.training.rgb_only,
+                                 distortion_weight=config.gradient.distortion_loss_weight)
+        if raw_alpha is not None:
+            sampler.observe(token, np.asarray(raw_alpha))
+        alpha = estimated_alpha
+        if alpha is not None and not alpha_on_device:
+            alpha = np.asarray(alpha).reshape(config.render.height, config.render.width)
+        return accumulator, mean_loss, alpha
     summary = dr.zeros(mi.Float, 4 if distortion_enabled else 2)
     dr.scatter(summary, total_loss / count, 0)
     dr.scatter(summary, mi.Float(finite), 1)
@@ -686,13 +737,14 @@ def finalize_view(partial, view, config, sampler, token, mi, dr, np, *, alpha_on
 def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rendered_alpha=False,
                collect_deletion_evidence=None, stage_profile=None, gpu_reference=None,
                native_replay=None, collective=None, alpha_on_device=False,
-               collect_growth_evidence=False, loss_components=None):
+               collect_growth_evidence=False, loss_components=None, deferred_checks=None):
     """Compute one full-view gradient, optionally over synchronized pixel shards.
 
     All ranks consume the same full-view sampling stream and contour history.
     A collective combines gradient/validity SUMs, evidence MAXs and disjoint
     alpha buffers before the single logical Adam update performed by the caller.
-    The ordinary path retains one small loss/finite readback per view. Contour
+    Direct callers retain one small loss/finite readback per view. The training
+    loop supplies deferred_checks to report at epoch/profile boundaries. Contour
     history still reads its image; production topology keeps alpha on device.
     """
     count = config.render.width * config.render.height
@@ -721,7 +773,8 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
             finite &= dr.isfinite(accumulator["rgb_loss_sum"]) & dr.isfinite(accumulator["distortion_loss_sum"])
         partial = accumulator, total_loss, finite, raw_alpha, estimated_alpha
     return finalize_view(partial, view, config, sampler, token, mi, dr, np,
-                         alpha_on_device=alpha_on_device, loss_components=loss_components)
+                         alpha_on_device=alpha_on_device, loss_components=loss_components,
+                         deferred_checks=deferred_checks)
 
 
 def kernel_profile(history):
@@ -808,7 +861,12 @@ def normalized_algorithm_group(name, values):
             if key not in ("images", "initialization") or value is not None}}
     defaults = {"topology": TopologySettings, "gradient": GradientSettings}
     if values is not None and name in defaults:
-        return {**asdict(defaults[name]()), **values}
+        normalized = {**asdict(defaults[name]()), **values}
+        if name == "topology":
+            # CPU and GPU execute the same topology policy; the implementation
+            # backend may be switched for a resumed diagnostic comparison.
+            normalized.pop("gpu_topology", None)
+        return normalized
     return values
 
 
@@ -1150,7 +1208,9 @@ def run_training(distributed=None):
             alpha_readback=("none during RGB-only training" if config.training.rgb_only else
                             "only contour history; scheduled growth evidence consumes device alpha"),
             camera_parameters="opaque runtime inputs",
-            gradients_stage_scope="forward paths, loss, hit/candidate gradients, reductions and readbacks",
+            gradients_stage_scope="forward paths, loss, hit/candidate gradients and reductions; deferred mode records host submission time",
+            validation_readback="each view" if config.training.sync_view_checks else "epoch and sampled-profile boundaries; GPU-latched update guard",
+            sync_view_checks=config.training.sync_view_checks,
             native_stage_profiling="synchronized sampled views only; bypasses frozen replay" if config.training.profile_stages else "disabled",
             freeze_native=config.training.freeze_native,
             gpu_reference_cache_mib=config.training.gpu_reference_cache_mib)
@@ -1172,6 +1232,8 @@ def run_training(distributed=None):
               f"{config.training.gpu_reference_cache_mib} MiB GPU, "
               "loaded on first use; dataset must remain unchanged during training", flush=True)
         emit("Native GPU replay:", "enabled" if config.training.freeze_native else "disabled", flush=True)
+        emit("Training validity checks:", "synchronous per view" if config.training.sync_view_checks
+             else "GPU guarded; loss/validity read at epoch and sampled-profile boundaries", flush=True)
         emit("Reference compositing:", config.data.reference_compositing,
              "| rendering and RGB loss: linear", flush=True)
         emit("Distortion loss:", f"weight={config.gradient.distortion_loss_weight:g}; "
@@ -1226,6 +1288,9 @@ def run_training(distributed=None):
         if config.training.rgb_only and int(model.opacity_sh_count) != 1:
             raise ValueError("RGB-only model/checkpoint must contain exactly one opacity coefficient per voxel")
         optimizer = FalcorOptimizer(model, config.optimizer)
+        if not config.training.sync_view_checks and not callable(getattr(model, "set_parameters_guarded", None)):
+            raise RuntimeError("Deferred GPU update checks require a rebuilt native set_parameters_guarded binding; "
+                               "incrementally rebuild this checkout, or use --sync-view-checks for diagnostics")
         topology = TopologyManager(model, len(views), settings=config.topology,
             schedule=replace(config.schedule, save_each_level=False),
             opacity_warmup=config.optimizer.opacity_warmup_epochs, opacity_ramp=config.optimizer.opacity_ramp_epochs)
@@ -1374,6 +1439,8 @@ def run_training(distributed=None):
             else:
                 flags = None
             if distributed is not None:
+                if primary:
+                    flags = host_topology_payload(flags, dr, np)
                 flags = distributed.broadcast(flags)
             alpha_growth_requested, deletion_evidence_collected, rgb_growth_requested, growth_payload = flags
             if not primary and (previous_growth_count or rgb_growth_requested):
@@ -1390,6 +1457,7 @@ def run_training(distributed=None):
             epoch_loss = 0.
             epoch_rgb_loss = 0. if config.training.rgb_only or distortion_enabled else None
             epoch_distortion_loss = 0.
+            deferred_checks = (None if config.training.sync_view_checks else DeferredViewChecks(mi, dr, np))
             stage_totals = dict(reference=0., gradients=0., topology_observation=0., optimizer=0.)
             communication_before = collective.statistics() if collective is not None else None
             progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} | view 0/{len(views)} (0%) "
@@ -1420,7 +1488,7 @@ def run_training(distributed=None):
                         collect_growth_evidence=rgb_growth_requested,
                         stage_profile=native_stages, gpu_reference=gpu_reference,
                         native_replay=native_replay, collective=collective, alpha_on_device=True,
-                        loss_components=loss_components)
+                        loss_components=loss_components, deferred_checks=deferred_checks)
                     gradients_done = time.perf_counter()
                     if primary and rgb_growth_requested:
                         topology.observe_rgb_growth(model, gradients, view_id=int(index), epoch=epoch,
@@ -1435,7 +1503,18 @@ def run_training(distributed=None):
                             rendered_alpha=rendered_alpha,
                             image_shape=(config.render.height, config.render.width))
                     topology_done = time.perf_counter()
-                    optimizer.step(model, gradients, sample_count=1, epoch=epoch, coarse_to_fine=config.schedule.enabled)
+                    update_result = optimizer.step(model, gradients, sample_count=1, epoch=epoch,
+                        coarse_to_fine=config.schedule.enabled,
+                        update_allowed=gradients.get("_update_allowed"))
+                    if deferred_checks is not None:
+                        deferred_checks.updated(update_result["accepted"])
+                        if profiling:
+                            # Sparse diagnostics are explicit synchronization
+                            # boundaries; normal views never fetch loss scalars.
+                            measurements = deferred_checks.read(rgb_only=config.training.rgb_only,
+                                distortion_weight=config.gradient.distortion_loss_weight)[-1]
+                            loss = measurements.pop("loss")
+                            loss_components.update(measurements)
                     optimizer_done = time.perf_counter()
                 stage = dict(reference=reference_done-view_started, gradients=gradients_done-reference_done,
                              topology_observation=topology_done-gradients_done, optimizer=optimizer_done-topology_done)
@@ -1445,13 +1524,15 @@ def run_training(distributed=None):
                 global_step += 1
                 if distributed is not None:
                     distributed.heartbeat(f"epoch {epoch+1} view {progress}")
-                epoch_loss += loss
-                if epoch_rgb_loss is not None:
-                    epoch_rgb_loss += loss_components["rgb_loss"]
-                epoch_distortion_loss += loss_components["distortion_loss"]
+                if deferred_checks is None:
+                    epoch_loss += loss
+                    if epoch_rgb_loss is not None:
+                        epoch_rgb_loss += loss_components["rgb_loss"]
+                    epoch_distortion_loss += loss_components["distortion_loss"]
+                loss_text = f"loss={loss:.6f}" if deferred_checks is None or profiling else "loss at epoch end"
                 progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} "
                     f"| view {progress}/{len(views)} ({100*progress/len(views):.0f}%) "
-                    f"| cam {int(index)+1} | loss={loss:.6f} | {optimizer_done-view_started:.2f}s/view")
+                    f"| cam {int(index)+1} | {loss_text} | {optimizer_done-view_started:.2f}s/submit")
                 if profiling and primary:
                     profile = dict(epoch=epoch+1, progress=progress, camera=int(index)+1,
                                    training_resolution=training_resolution, active_voxels=int(model.active_voxel_count),
@@ -1470,6 +1551,17 @@ def run_training(distributed=None):
                     with profile_path.open("a", encoding="utf-8") as stream:
                         stream.write(json.dumps(profile) + "\n")
                     performance.record_profile(profile)
+            validation_started = time.perf_counter()
+            if deferred_checks is not None:
+                measurements = deferred_checks.read(rgb_only=config.training.rgb_only,
+                    distortion_weight=config.gradient.distortion_loss_weight)
+                # Sum host doubles in view order, exactly as the original per-view
+                # path. Topology/save cannot consume an unvalidated epoch.
+                epoch_loss = sum(value["loss"] for value in measurements)
+                if epoch_rgb_loss is not None:
+                    epoch_rgb_loss = sum(value["rgb_loss"] for value in measurements)
+                epoch_distortion_loss = sum(value["distortion_loss"] for value in measurements)
+            validation_seconds = time.perf_counter() - validation_started
             progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} "
                                  f"| view {len(views)}/{len(views)} (100%) | updating topology...", force=True)
             coarse_render = capture_coarse_image(epoch+1)
@@ -1477,7 +1569,7 @@ def run_training(distributed=None):
             new_state, event = topology.finish_epoch(model, optimizer, epoch+1) if primary else (None, None)
             topology.before_refine_checkpoint = None
             if distributed is not None:
-                transition = distributed.broadcast((new_state, event,
+                transition = distributed.broadcast((host_topology_payload(new_state, dr, np), event,
                     optimizer.state_dict() if new_state is not None else None,
                     coarse_render) if primary else None)
                 new_state, event, new_optimizer, coarse_render = transition
@@ -1513,6 +1605,8 @@ def run_training(distributed=None):
                      "native_replay": native_replay.statistics(),
                      "topology_execution": topology.statistics() if primary else None,
                      "view_stage_seconds": stage_totals,
+                     "view_stage_timing": "host submission (asynchronous except sampled diagnostics)" if deferred_checks is not None else "synchronized per-view checks",
+                     "epoch_validation_seconds": validation_seconds,
                      "epoch_growth_prepare_seconds": growth_prepare_seconds,
                      "epoch_growth_prepare_stage_seconds": growth_prepare_stage_seconds,
                      "epoch_topology_seconds": time.perf_counter()-topology_started}

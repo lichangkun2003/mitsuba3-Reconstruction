@@ -332,7 +332,9 @@ class RGBDeletionLifecycleTests(unittest.TestCase):
         replacement, event = self.finish(manager, 40)
         self.assertEqual(event["deleted"], 1)
         self.assertEqual(event["grown"], 0)
-        self.assertEqual(event["growth_rgb"]["rgb_qualified"], 1)
+        # Both parent proposals vote independently before current geometry is
+        # revalidated. Deleting either supporting parent invalidates the cell.
+        self.assertEqual(event["growth_rgb"]["rgb_qualified"], 2)
         self.assertEqual(event["growth_rgb"]["geometry_revalidated"], 0)
         np.testing.assert_array_equal(replacement["model_state"]["cell_indices"], [75])
 

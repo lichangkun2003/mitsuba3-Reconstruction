@@ -61,6 +61,13 @@ public:
     /// Replace continuous parameters without changing occupancy or array sizes.
     void set_parameters(const std::map<std::string, FloatBuffer> &parameters);
 
+    /// Training-only device transaction: retain every old parameter unless the
+    /// scalar guard and every proposed value are finite/valid. Return the shared
+    /// acceptance mask so the caller can commit Adam state with the same gate.
+    /// Shape/key errors remain synchronous, but no device value is read on CPU.
+    Mask set_parameters_guarded(const std::map<std::string, FloatBuffer> &parameters,
+                                const Mask &allowed);
+
     /// Install immutable hypothetical proposals, allowing repeated target cells.
     /// Each input row retains its own evidence index. They never change trace(),
     /// actual parameter buffers, occupancy snapshots, or the training image/gradient.

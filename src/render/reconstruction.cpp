@@ -2,17 +2,49 @@
 #include <drjit/if_stmt.h>
 #include <drjit/while_loop.h>
 #include "reconstruction_pointcloud.h"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <sstream>
-#include <unordered_map>
 
 NAMESPACE_BEGIN(mitsuba)
 
 namespace {
+
+/// Stable row permutation, using the same small-bucket radix kernels as
+/// Dr.Jit's argsort(). No permutation or cell array crosses the device boundary.
+template <typename UInt> UInt reconstruction_cell_order(const UInt &cells) {
+    const size_t count = cells.size();
+    if (count <= 1)
+        return dr::arange<UInt>(count);
+    if constexpr (dr::is_jit_v<UInt>) {
+        using Index = dr::detached_t<UInt>;
+        Index ordinal = dr::detach<false>(cells), order = dr::arange<Index>(count);
+        constexpr uint32_t radix_bits = Index::Backend == JitBackend::LLVM ? 11u : 8u;
+        for (uint32_t shift = 0; shift < 32; shift += radix_bits) {
+            uint32_t bits = std::min(radix_bits, 32u - shift), buckets = 1u << bits;
+            Index digit = (ordinal >> shift) & (buckets - 1);
+            dr::eval(digit, ordinal, order);
+            auto *permutation = (uint32_t *) jit_malloc(Index::Backend, count * sizeof(uint32_t));
+            jit_block_mkperm(Index::Backend, digit.data(), uint32_t(count), uint32_t(count),
+                             buckets, permutation, nullptr);
+            Index perm = Index::map_(permutation, count, true);
+            ordinal = dr::gather<Index>(ordinal, perm);
+            order = dr::gather<Index>(order, perm);
+        }
+        return UInt(order);
+    } else {
+        std::vector<uint32_t> order(count);
+        std::iota(order.begin(), order.end(), 0u);
+        std::stable_sort(order.begin(), order.end(),
+            [&](uint32_t a, uint32_t b) { return cells.entry(a) < cells.entry(b); });
+        return dr::load<UInt>(order.data(), count);
+    }
+}
 
 /// Diagnostic-only barriers and nested history regions. The disabled path must
 /// neither change evaluation nor read a clock or alter the caller's JIT flags.
@@ -221,19 +253,18 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
         rebuild_octree();
         return;
     }
-    std::vector<uint32_t> host_cells(m_active_count);
-    dr::eval(cells);
-    dr::store(host_cells.data(), cells);
     const size_t total = size_t(resolution) * resolution * resolution;
-    std::vector<int32_t> index(total, -1);
-    for (uint32_t i = 0; i < m_active_count; ++i) {
-        uint32_t cell = host_cells[i];
-        if (cell >= total || index[cell] >= 0)
-            Throw("VoxelReconstruction.from_state(): cell indices must be unique and in bounds.");
-        index[cell] = int32_t(i);
-    }
+    // Build occupancy in place on its backend. Atomic max resolves duplicate
+    // writers deterministically; gathering back each assigned row identifies
+    // every duplicate without allocating or reading a CPU dense grid.
+    UIntBuffer rows = dr::arange<UIntBuffer>(m_active_count);
+    auto in_bounds = cells < uint32_t(total);
+    m_index = dr::full<IntBuffer>(-1, total);
+    dr::scatter_reduce(ReduceOp::Max, m_index, IntBuffer(rows), cells, in_bounds);
+    auto valid = in_bounds & (dr::gather<IntBuffer>(m_index, cells, in_bounds) == IntBuffer(rows));
+    if (!dr::slice(dr::all(valid)))
+        Throw("VoxelReconstruction.from_state(): cell indices must be unique and in bounds.");
     m_cells = dr::detach(cells);
-    m_index = dr::load<IntBuffer>(index.data(), index.size());
     set_parameters(parameters);
     m_statistics = {{"restored_voxels", m_active_count}};
     rebuild_octree();
@@ -438,6 +469,39 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_parameters(
     }
 }
 
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
+VoxelReconstruction<Float, Spectrum>::set_parameters_guarded(
+    const std::map<std::string, FloatBuffer> &parameters, const Mask &allowed) {
+    if (dr::width(allowed) != 1)
+        Throw("VoxelReconstruction.set_parameters_guarded(): allowed must be a scalar mask.");
+    const std::map<std::string, std::pair<size_t, FloatBuffer *>> destinations = {
+        {"centers", {size_t(m_active_count)*3, &m_centers}},
+        {"log_scales", {size_t(m_active_count)*3, &m_log_scales}},
+        {"rotations", {size_t(m_active_count)*4, &m_rotations}},
+        {"radiance_sh", {size_t(m_active_count)*m_sh_count*3, &m_radiance}},
+        {"opacity_sh", {size_t(m_active_count)*m_opacity_sh_count, &m_opacity}}};
+    Mask accepted = allowed;
+    for (const auto &[key, values] : parameters) {
+        auto target = destinations.find(key);
+        if (target == destinations.end() || values.size() != target->second.first)
+            Throw("VoxelReconstruction.set_parameters_guarded(): unknown key or wrong size: %s.",
+                  key.c_str());
+        if (values.size())
+            accepted &= dr::all(dr::isfinite(values));
+    }
+    // Both the parameters and the caller's Adam buffers use this SAME scalar
+    // predicate. Selection happens on device and rejects the entire update,
+    // including finite groups beside an invalid group. The caller latches a
+    // rejected update and reports it at its next explicit reporting boundary.
+    for (const auto &[key, values] : parameters) {
+        if (values.size()) {
+            FloatBuffer &target = *destinations.at(key).second;
+            target = dr::select(accepted, dr::detach(values), target);
+        }
+    }
+    return accepted;
+}
+
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::clear_growth_candidates() {
     if (m_growth_count) {
         dr::scatter(m_index, dr::full<IntBuffer>(-1, m_growth_cells.size()), m_growth_cells);
@@ -474,30 +538,12 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_growth_candidates(
         Throw("VoxelReconstruction.set_growth_candidates(): parameters must be finite.");
     // Check the complete transaction before restoring/replacing the old overlay.
     // Negative entries are hypothetical cells and remain genuinely unoccupied.
-    std::vector<uint32_t> host_cells(count);
-    dr::eval(cells);
-    if (count) dr::store(host_cells.data(), cells);
     const size_t total = size_t(m_resolution)*m_resolution*m_resolution;
     // A target cell may have several parent-specific shapes and appearances.
     // Keep all original row IDs, chaining siblings in input order. Only the
     // unique cell heads are scattered into the overlay, avoiding scatter races.
-    std::unordered_map<uint32_t, size_t> group_for_cell;
-    std::vector<uint32_t> unique_cells, heads, tails, next(count, UINT32_MAX);
-    for (uint32_t i = 0; i < count; ++i) {
-        uint32_t cell = host_cells[i];
-        if (cell >= total)
-            Throw("VoxelReconstruction.set_growth_candidates(): cells must be in bounds.");
-        auto [it, inserted] = group_for_cell.emplace(cell, unique_cells.size());
-        if (inserted) {
-            unique_cells.push_back(cell);
-            heads.push_back(i);
-            tails.push_back(i);
-        } else {
-            size_t group = it->second;
-            next[tails[group]] = i;
-            tails[group] = i;
-        }
-    }
+    if (count && !dr::slice(dr::all(cells < uint32_t(total))))
+        Throw("VoxelReconstruction.set_growth_candidates(): cells must be in bounds.");
     if (count && m_active_count) {
         auto occupied = dr::gather<IntBuffer>(m_index, cells) >= 0;
         if (dr::slice(dr::any(occupied)))
@@ -505,12 +551,29 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_growth_candidates(
     }
     // Keep independent buffer references alive even when the caller reuses its
     // dictionary. All accesses are detached, and no gradients target proposals.
-    UIntBuffer new_cells = count ? dr::load<UIntBuffer>(unique_cells.data(), unique_cells.size())
-                                 : dr::zeros<UIntBuffer>(1);
-    UIntBuffer new_next = count ? dr::load<UIntBuffer>(next.data(), next.size())
-                                : dr::zeros<UIntBuffer>(1);
-    UIntBuffer new_heads = count ? dr::load<UIntBuffer>(heads.data(), heads.size())
-                                 : dr::zeros<UIntBuffer>(1);
+    UIntBuffer new_cells = dr::zeros<UIntBuffer>(1), new_heads = dr::zeros<UIntBuffer>(1),
+               new_next = dr::zeros<UIntBuffer>(1);
+    if (count) {
+        UIntBuffer rows = dr::arange<UIntBuffer>(count),
+                   order = reconstruction_cell_order(cells),
+                   ordered_cells = dr::gather<UIntBuffer>(cells, order),
+                   previous_cell = dr::gather<UIntBuffer>(ordered_cells, rows - 1, rows > 0);
+        auto group_start = (rows == 0) | (ordered_cells != previous_cell);
+        // Scatter heads into ORIGINAL row order before compacting: even the
+        // order of unique cells stays identical to the previous CPU builder.
+        UIntBuffer head_flags = dr::zeros<UIntBuffer>(count);
+        dr::scatter(head_flags, UIntBuffer(group_start), order);
+        new_heads = dr::compress(head_flags != 0);
+        new_cells = dr::gather<UIntBuffer>(cells, new_heads);
+        auto has_following = rows + 1 < uint32_t(count);
+        UIntBuffer following_cell = dr::gather<UIntBuffer>(ordered_cells, rows + 1, has_following),
+                   following_row = dr::gather<UIntBuffer>(order, rows + 1, has_following);
+        new_next = dr::empty<UIntBuffer>(count);
+        dr::scatter(new_next,
+                    dr::select(has_following & (following_cell == ordered_cells),
+                               following_row, UINT32_MAX), order);
+        dr::eval(new_cells, new_heads, new_next);
+    }
     clear_growth_candidates();
     if (!count)
         return;

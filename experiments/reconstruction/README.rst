@@ -5,6 +5,34 @@
 切换场景修改 ``CONFIG.data.dataset``，或传入 ``--dataset datasets/lego``；
 命令行参数覆盖配置文件与默认配置。RTX 5090 Windows 主机使用这个单卡入口。
 
+当前 CUDA RGB-only 默认启用 ``topology.gpu_topology=True``：候选几何、同格父体素
+支持统计、RGB 生长／删除资格、冷却与保护期、新模型拼接和优化器状态重映射在 GPU
+完成。接触条件使用双精度；生长间隔、每视角更新顺序和同分择优规则保持原定义。
+``--no-gpu-topology``（或 ``topology.gpu_topology=False``）保留 NumPy 对照。
+``--gpu-topology`` 显式启用设备路径。升层拟合、存档、出图，以及当前多卡
+控制通道传输仍有明确的主机边界；动态压紧的数量与轮末日志标量也允许少量同步。
+
+默认 ``training.sync_view_checks=False`` 将逐视角损失及有效性摘要留在 GPU，epoch
+结束或诊断抽样边界统一读取。无效梯度、参数或 Adam 状态会锁存错误并阻止本次与
+后续更新；错误在下次检查边界报告。每视角仍更新一次，未扩大完整步骤重放范围。
+``--sync-view-checks`` 可恢复逐视角同步诊断。默认视角进度不显示即时 loss，epoch
+汇总仍给出完整 loss。新日志 ``epoch_validation_seconds`` 包含队列等待，比较加速
+应使用整个 epoch 的 ``seconds``，不能只比较异步提交阶段的 ``gradients`` 数字。
+这项修改包含 C++，运行前需要 ``cmake --build build --config Release --parallel 8``。
+
+单独比较候选生成可使用以下只读工具（不训练、不写输出）：
+
+.. code-block:: powershell
+
+   & ..\envs\mitsuba\Scripts\python.exe -I `
+     experiments/reconstruction/tests/benchmark_growth_candidates_gpu.py `
+     ..\outputs\某次实验\model.npz
+
+该工具将全部父体素设为成熟、清空冷却，比较相同输入的 CPU/GPU 候选编号、顺序及
+双精度几何，并报告首次与预热后时间；它不代表整个实验或真实轮末状态的耗时。
+普通轮对照工具为 ``tests/benchmark_training_checks.py``，使用生成场景、相同随机
+流与原生重放，计时含轮末 GPU 等待。减少主机同步不保证 GPU 已饱和时仍有明显提速。
+
 默认 ``CONFIG.render.traversal = "octree"`` 使用 GPU 八叉占用索引跳过空区域，
 预览、训练和评价均启用。正常叶子仍执行原有椭球求交、合成及 near-miss 几何梯度；
 生长候选标记单独维护，仅在收集生长证据时参与遍历，不改变真实命中数、颜色或透射率。

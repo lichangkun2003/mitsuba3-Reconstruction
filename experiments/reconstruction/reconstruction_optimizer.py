@@ -65,6 +65,7 @@ class FalcorOptimizer:
         self.reset(model)
 
     def reset(self, model):
+        self.update_healthy = self.mi.Bool(True)
         self.count = int(model.active_voxel_count)
         self.dimensions = {
             "radiance_sh": 3 * int(model.sh_count), "opacity_sh": int(model.opacity_sh_count),
@@ -148,15 +149,25 @@ class FalcorOptimizer:
         return result
 
     def step(self, model, out: dict, *, sample_count: int = 1, epoch: int = 0,
-             coarse_to_fine: bool = True) -> dict:
+             coarse_to_fine: bool = True, update_allowed=None) -> dict:
         dr, mi, cfg = self.dr, self.mi, self.config
+        guarded = update_allowed is not None
+        if guarded and not callable(getattr(model, "set_parameters_guarded", None)):
+            raise RuntimeError("Deferred checks require set_parameters_guarded; rebuild this source checkout")
+        allowed = self.update_healthy & update_allowed if guarded else mi.Bool(True)
+        # _adam constructs the next state. Keep the old arrays until the whole
+        # transaction, including candidate parameters, has passed device checks.
+        previous_state = {name: dict(state) for name, state in self.state.items()} if guarded else None
         if int(model.active_voxel_count) != self.count:
             raise ValueError("Topology changed: call optimizer.remap() or reset() before step")
         if sample_count < 1:
             raise ValueError("sample_count must be positive")
         if self.count == 0:
+            if guarded:
+                self.update_healthy = allowed
+                dr.eval(self.update_healthy)
             return {"effective_opacity_lr": self.effective_opacity_lr(epoch, coarse_to_fine),
-                    "backward_samples": sample_count}
+                    "backward_samples": sample_count, "accepted": self.update_healthy}
         gradients = out["gradients"]
         appearance = mi.UInt32(out["appearance_valid"])
         geometry = mi.UInt32(out["geometry_valid"])
@@ -178,7 +189,7 @@ class FalcorOptimizer:
             if lr <= 0:
                 continue
             is_geometry = name in ("centers", "log_scales", "rotation_tangent")
-            valid = (geometry if is_geometry else appearance) > 0
+            valid = ((geometry if is_geometry else appearance) > 0) & allowed
             gradient = mi.Float(gradients[name]) * (cfg.grad_scale / sample_count)
             step, mask = self._adam(name, gradient, valid, lr, geometry_lr_scale if is_geometry else 1.)
             if name == "rotation_tangent":
@@ -199,9 +210,24 @@ class FalcorOptimizer:
                 updated = dr.clip(self._finite(updated), dr.log(lower), dr.log(upper))
             parameters[name] = dr.select(mask, updated, old)
         if parameters:
-            dr.eval(*parameters.values(), *[value for state in self.state.values() for value in state.values()])
-            model.set_parameters(parameters)
-        return {"effective_opacity_lr": rates["opacity_sh"], "backward_samples": sample_count}
+            if guarded:
+                for state in self.state.values():
+                    allowed &= dr.all(dr.isfinite(state["mean"])) & dr.all(dr.isfinite(state["squared_mean"]))
+                accepted = model.set_parameters_guarded(parameters, allowed)
+                for name, state in self.state.items():
+                    for key, value in state.items():
+                        state[key] = dr.select(accepted, value, previous_state[name][key])
+                self.update_healthy = accepted
+                dr.eval(self.update_healthy, *parameters.values(),
+                        *[value for state in self.state.values() for value in state.values()])
+            else:
+                dr.eval(*parameters.values(), *[value for state in self.state.values() for value in state.values()])
+                model.set_parameters(parameters)
+        elif guarded:
+            self.update_healthy = allowed
+            dr.eval(self.update_healthy)
+        return {"effective_opacity_lr": rates["opacity_sh"], "backward_samples": sample_count,
+                "accepted": self.update_healthy}
 
     def remap(self, survivors, new_count: int, *, reset_radiance: bool = False):
         """Preserve surviving moments, append zero newborn state; all indices are old IDs."""

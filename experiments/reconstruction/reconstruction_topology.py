@@ -74,6 +74,8 @@ class TopologySettings:
     evidence_interval: int = 5
     deletion_interval: int = 10
     max_active_voxels: int = 67108864
+    # CUDA RGB lifecycle; False retains the NumPy reference implementation.
+    gpu_topology: bool = True
 
 
 @dataclass
@@ -871,6 +873,10 @@ class TopologyManager:
         The payload in pending_growth['candidate_state'] can be broadcast to
         worker models; none of these arrays are committed model parameters.
         """
+        from reconstruction_topology_gpu import get_gpu_lifecycle
+        device = get_gpu_lifecycle(self, model)
+        if device is not None:
+            return device.prepare(model, epoch)
         timings = self.growth_prepare_stage_seconds = {}
         cfg, np, boundary = self.settings, self.np, int(epoch) + 1
         if not cfg.use_rgb_growth:
@@ -944,6 +950,10 @@ class TopologyManager:
         This is evidence conditional on reliable observations, not a claim
         about missing rays. Unknown-only and invisible views cannot vote.
         """
+        from reconstruction_topology_gpu import get_gpu_lifecycle
+        device = get_gpu_lifecycle(self, model)
+        if device is not None:
+            return device.observe(model, out, view_id, epoch, pixel_count)
         cfg, pending, np = self.settings, self.pending_growth, self.np
         if not cfg.use_rgb_growth or not self._growth_due(int(epoch) + 1):
             return
@@ -993,6 +1003,10 @@ class TopologyManager:
         Unknown rays do not veto other reliable rays; no missing observation
         provides a positive removal vote.
         """
+        from reconstruction_topology_gpu import get_gpu_lifecycle
+        device = get_gpu_lifecycle(self, model)
+        if device is not None:
+            return device.observe(model, out, view_id, epoch, pixel_count, deletion=True)
         if not self.collect_deletion(epoch) or not self.settings.use_rgb_deletion:
             return
         np, cfg, boundary = self.np, self.settings, int(epoch) + 1
@@ -1419,6 +1433,17 @@ class TopologyManager:
 
     def finish_epoch(self, model, optimizer, completed_epochs: int):
         """Called after every view update. Returns (replacement checkpoint or None, event)."""
+        from reconstruction_topology_gpu import get_gpu_lifecycle
+        device = get_gpu_lifecycle(self, model)
+        if device is not None:
+            refine = (self.schedule.enabled and self.core_resolution < self.schedule.target_resolution and
+                      int(completed_epochs) - self.level_start_epoch >= self.level_budget)
+            if not refine:
+                return device.finish(model, optimizer, int(completed_epochs))
+            # The unchanged geometric child fitter is a once-per-level host
+            # boundary, separate from repeated GPU growth/deletion events.
+            device.materialize()
+            self._gpu_lifecycle = None
         np, cfg, schedule = self.np, self.settings, self.schedule
         boundary = int(completed_epochs)
         self._materialize_growth()
@@ -1575,6 +1600,10 @@ class TopologyManager:
 
     def state_dict(self):
         import copy
+        device = getattr(self, "_gpu_lifecycle", None)
+        if device is not None:
+            device.materialize()
+            self._gpu_lifecycle = None
         self._materialize_deletion_masks()
         self._materialize_growth()
         self._materialize_rgb_deletion()
@@ -1605,6 +1634,8 @@ class TopologyManager:
 
     def load_state_dict(self, state):
         import copy
+        self._gpu_lifecycle = None
+        gpu_topology = self.settings.gpu_topology
         if (state["resolution"] != self.resolution or
                 state.get("core_resolution", state["resolution"]) != self.core_resolution):
             raise ValueError("Topology checkpoint grid/core resolution does not match the model")
@@ -1640,6 +1671,9 @@ class TopologyManager:
         if state["count"] != self.count or state["view_count"] != self.view_count:
             raise ValueError("Topology checkpoint dimensions do not match model or dataset")
         self.settings = TopologySettings(**state.pop("settings"))
+        # Backend selection changes storage/implementation, not lifecycle
+        # decisions, so a checkpoint can move between CPU reference and CUDA.
+        self.settings.gpu_topology = gpu_topology
         self.schedule = CoarseToFineConfig(**state.pop("schedule"))
         for name, value in state.items():
             setattr(self, name, value)

@@ -124,6 +124,8 @@ class PerformanceRecorder:
         stages = {key: _number(value) for key, value in entry.get("view_stage_seconds", {}).items()}
         stages["epoch_growth_prepare"] = _number(entry.get("epoch_growth_prepare_seconds"))
         stages["epoch_topology"] = _number(entry.get("epoch_topology_seconds"))
+        if "epoch_validation_seconds" in entry:
+            stages["epoch_validation"] = _number(entry.get("epoch_validation_seconds"))
         growth_prepare = entry.get("epoch_growth_prepare_stage_seconds")
         growth_prepare_stages = ({name: _number(value) for name, value in growth_prepare.items()}
                                  if isinstance(growth_prepare, dict) else {})
@@ -172,6 +174,10 @@ class PerformanceRecorder:
                 "scope": "Current process only; resume excludes previous process timing.",
                 "wall_time": "Host wall time includes tracing, transfers and asynchronous GPU waits; "
                              "stages are not pure CPU/GPU durations.",
+                "deferred_checks": "With sync_view_checks=false, per-view stages measure host submission "
+                                   "and implicit waits; epoch_validation measures the final queued-work drain "
+                                   "and compact summary readback. Compare complete epoch seconds, not just "
+                                   "gradients or optimizer submission times, across synchronous/deferred runs.",
                 "epoch_time": "Completed epochs only, including their topology update. "
                               "Checkpoint saving and evaluation are measured separately. "
                               "An interrupted partial epoch is excluded from completed-epoch aggregates, "
