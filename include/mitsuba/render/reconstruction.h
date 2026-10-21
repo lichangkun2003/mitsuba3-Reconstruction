@@ -128,9 +128,17 @@ private:
     void rebuild_octree();
     void mark_octree(const UIntBuffer &cells, uint32_t bit_offset);
     void refresh_octree_skips();
+    Vector3f octree_boundary_times(const Vector3i &cell, const Vector3i &step,
+                                  const Point3f &origin, const Vector3f &inv_d) const;
+    void advance_empty_block(Vector3i &cell, Vector3f &next, Float &entry,
+                             UInt32 &iterations, const UInt32 &log_size,
+                             const Vector3i &step, const Vector3f &step_t,
+                             const Point3f &origin, const Vector3f &inv_d,
+                             const Float &exit) const;
     void skip_empty_block(Vector3i &cell, Vector3f &next, Float &entry,
                           UInt32 &iterations, const Vector3i &step,
-                          const Vector3f &step_t, const Float &exit,
+                          const Vector3f &step_t, const Point3f &origin,
+                          const Vector3f &inv_d, const Float &exit,
                           Mask active, bool include_growth,
                           UInt32 &queries, bool profile) const;
 

@@ -1,9 +1,10 @@
 """Generated CUDA regression for octree traversal against the original DDA.
 
-The reference is the explicitly selected original leaf-by-leaf traversal, on
-identical model buffers and rays. Checks include per-ray outputs, all parameter
-gradients, growth/deletion evidence, and frozen replay across topology changes.
-No dataset, existing experiment, or long training run is used.
+The primary reference is the original leaf-by-leaf traversal on identical model
+buffers and rays. Exact face-order and shifted-origin references independently
+check long rays where accumulated legacy boundary rounding changes a result.
+Checks include per-ray outputs, all parameter gradients, growth/deletion evidence,
+and frozen replay across topology changes. No dataset or long training run is used.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 from dataclasses import asdict
+from fractions import Fraction
 import json
 import math
 from pathlib import Path
@@ -260,6 +262,93 @@ def check_sparse_random_and_non_power_two(mi, dr, np):
             "max_absolute_error": maximum, "status": "passed"}
 
 
+def check_long_empty_block_exits(mi, dr, np):
+    """A large empty node ends directly at real/candidate face and corner hits.
+
+    The intermediate corner cells have zero ray length but contain the corner
+    inside their ellipsoid. Skipping them would change both physical hits and
+    growth evidence, even though a point sampled beyond the corner misses them.
+    """
+    maximum = 0.
+    legacy_center_difference = 0.
+    for positive in (True, False):
+        if positive:
+            coordinates = [(32, 31, 31), (32, 32, 31), (32, 32, 32)]
+            centers = [[.1, .9, .9], [.1, .1, .9], [.5, .5, .5]]
+            origin, direction, terminal = [-1.] * 3, [1.] * 3, (63, 63, 63)
+        else:
+            coordinates = [(31, 32, 32), (31, 31, 32), (31, 31, 31)]
+            centers = [[.9, .1, .1], [.9, .9, .1], [.5, .5, .5]]
+            origin, direction, terminal = [65.] * 3, [-1.] * 3, (0, 0, 0)
+        checkpoint = payload(np, 64, coordinates)
+        checkpoint["model_state"]["centers"][:] = np.asarray(centers).ravel()
+        model = restore_model(checkpoint, mi)
+        ray = rays(mi, np, [origin], [direction], 100.)
+        name = "positive" if positive else "negative"
+        reference = host(model.loss_and_grad(*inputs(mi, ray), settings(use_octree=0.)), dr, np)
+        result = host(model.loss_and_grad(*inputs(mi, ray), settings(use_octree=1.)), dr, np)
+        # Repeated additions in the legacy DDA drift at a distant exact corner.
+        # A closer origin on the identical ray, still before every voxel,
+        # provides an independent reference without those 32 accumulated steps.
+        # Keep strict tolerances; qualify only the known legacy center gradient
+        # against that reference instead of widening a global float tolerance.
+        close_origin = [31. if positive else 33.] * 3
+        close_ray = rays(mi, np, [close_origin], [direction], 100.)
+        close_reference = host(model.loss_and_grad(*inputs(mi, close_ray),
+                                                  settings(use_octree=0.)), dr, np)
+        close_octree = host(model.loss_and_grad(*inputs(mi, close_ray),
+                                               settings(use_octree=1.)), dr, np)
+        maximum = max(maximum, compare(close_reference, result, np, name + "_close_origin_reference"))
+        maximum = max(maximum, compare(close_octree, result, np, name + "_origin_invariant_octree"))
+        maximum = max(maximum, compare(
+            {k: v for k, v in reference.items() if k != "gradients.centers"},
+            {k: v for k, v in result.items() if k != "gradients.centers"}, np,
+            name + "_long_empty_corner"))
+        legacy_center_difference = max(legacy_center_difference,
+            float(np.max(np.abs(reference["gradients.centers"] - result["gradients.centers"]))))
+        np.testing.assert_array_equal(result["hit_count"], [3])
+        np.testing.assert_array_equal(result["appearance_valid"], 1)
+        maximum = max(maximum, compare(
+            host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., False), dr, np),
+            host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., True), dr, np),
+            np, name + "_long_empty_corner_trace"))
+        # Only proposals occupy the corner. Their leaf traversal must not
+        # insert real alpha or change the distant terminal voxel's gradient.
+        candidate_model = restore_model(payload(np, 64, [terminal]), mi)
+        before = host(candidate_model.trace(ray, mi.Color3f(1.), 1e-5, 16), dr, np)
+        proposals = state(np, 64, coordinates[:2], opacity=.25)
+        proposals["centers"][:] = np.asarray(centers[:2]).ravel()
+        candidate_model.set_growth_candidates(device_state(proposals, mi))
+        result, error = compare_loss(candidate_model, ray, mi, dr, np,
+                                    name + "_long_empty_candidate_corner",
+                                    collect_growth_evidence=1.)
+        maximum = max(maximum, error)
+        np.testing.assert_array_equal(result["growth_observed"], [1, 1])
+        np.testing.assert_array_equal(result["growth_unknown"], [0, 0])
+        np.testing.assert_array_equal(result["hit_count"], [1])
+        maximum = max(maximum, compare(before,
+            host(candidate_model.trace(ray, mi.Color3f(1.), 1e-5, 16), dr, np),
+            np, name + "_candidate_corner_is_invisible"))
+
+    # Padded octree nodes must respect the real extent, and a ray ending in
+    # the empty prefix or precisely on the next leaf face must stay empty.
+    model = restore_model(payload(np, 47, [(0, 0, 46), (46, 46, 0)]), mi)
+    ray = rays(mi, np, [[.5, .5, -1.]] * 4 + [[46.5, 46.5, 48.]] * 4,
+               [[0., 0., 1.]] * 4 + [[0., 0., -1.]] * 4,
+               [46.75, 47., 47.5, 100.] * 2)
+    result, error = compare_loss(model, ray, mi, dr, np, "padded_long_skip_maxt")
+    maximum = max(maximum, error)
+    np.testing.assert_array_equal(result["hit_count"], [0, 0, 1, 1] * 2)
+    maximum = max(maximum, compare(
+        host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., False), dr, np),
+        host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., True), dr, np),
+        np, "padded_long_skip_maxt_trace"))
+    return {"check": "long_empty_node_exit_corners_candidates_and_padded_maxt",
+            "max_absolute_error": maximum,
+            "legacy_accumulated_center_gradient_difference": legacy_center_difference,
+            "status": "passed"}
+
+
 def check_near_miss(mi, dr, np):
     checkpoint = payload(np, coordinates=[(0, 0, 6)])
     checkpoint["model_state"]["log_scales"][:] = math.log(.25)
@@ -396,6 +485,51 @@ def check_replay_mutations(mi, dr, np):
             "max_absolute_error": maximum, "statistics": replay.statistics(), "status": "passed"}
 
 
+def check_candidate_partition_invariance(mi, dr, np):
+    """Changing empty-node subdivision must not change the real ray solution."""
+    resolution = 64
+    rng = np.random.default_rng(9024)
+    indices = rng.choice(resolution**3, 128, replace=False)
+    coordinates = [(int(i % resolution), int(i // resolution % resolution),
+                    int(i // resolution**2)) for i in indices]
+    coordinates += [(0, 0, 31), (0, 0, 60), (31, 31, 31), (32, 32, 32)]
+    coordinates = sorted(set(coordinates))
+    checkpoint = payload(np, resolution, coordinates)
+    model = restore_model(checkpoint, mi)
+    # Guaranteed normal hits, arbitrary oblique rays, and a candidate-rich
+    # axis ray that overflows the evidence capacity without ending real tracing.
+    origins = np.asarray(coordinates, np.float32)+[.5, .5, -70.]
+    directions = np.tile([0., 0., 1.], (len(coordinates), 1))
+    arbitrary_origins = rng.uniform(-15., 79., (64, 3))
+    arbitrary_directions = rng.uniform(5., 59., (64, 3))-arbitrary_origins
+    origins = np.concatenate((origins, arbitrary_origins, [[.5, .5, -1.]]))
+    directions = np.concatenate((directions, arbitrary_directions, [[0., 0., 1.]]))
+    ray = rays(mi, np, origins, directions, 200.)
+    options = settings(use_octree=1.)
+    before = host(model.loss_and_grad(*inputs(mi, ray), options), dr, np)
+    occupied = set(coordinates)
+    proposal_coordinates = [(x, y, z) for z in range(0, resolution, 4)
+                            for y in range(0, resolution, 4)
+                            for x in range(0, resolution, 4)
+                            if (x, y, z) not in occupied]
+    proposals = state(np, resolution, proposal_coordinates, opacity=.25)
+    model.set_growth_candidates(device_state(proposals, mi))
+    after = host(model.loss_and_grad(*inputs(mi, ray),
+                                    options | {"collect_growth_evidence": 1.}), dr, np)
+    maximum = compare(before, {key: value for key, value in after.items()
+                               if not key.startswith("growth_")}, np,
+                      "candidate_overlay_changes_empty_node_partition_only")
+    assert np.sum(after["growth_observed"]) > 0
+    assert np.sum(after["growth_unknown"]) > 0, "Fixture must include candidate record overflow"
+    np.testing.assert_array_equal(after["hit_count"][-1], 2)
+    model.clear_growth_candidates()
+    cleared = host(model.loss_and_grad(*inputs(mi, ray), options), dr, np)
+    maximum = max(maximum, compare(before, cleared, np, "empty_node_partition_restored"))
+    return {"check": "normal_solution_invariant_to_dense_candidate_tree_partition",
+            "rays": len(origins), "candidate_cells": len(proposal_coordinates),
+            "max_absolute_error": maximum, "status": "passed"}
+
+
 def check_traversal_diagnostics(mi, dr, np):
     model = restore_model(payload(np, 64, [(0, 0, 63)]), mi)
     ray = rays(mi, np, [[.5, .5, -1.]], [[0., 0., 1.]], 100.)
@@ -418,6 +552,106 @@ def check_traversal_diagnostics(mi, dr, np):
             "dda_steps": int(baseline["traversal_steps"][0]),
             "octree_steps": int(octree["traversal_steps"][0]),
             "skipped_cells": int(octree["traversal_skipped_cells"][0]), "status": "passed"}
+
+
+def rational_leaf_reference(checkpoint, origin, direction, np):
+    """Independent exact face ordering and float64 segment/ellipsoid test.
+
+    This small oracle supports this module's identity-rotation, isotropic,
+    constant-opacity fixtures. Fraction times prevent the legacy repeated-add
+    drift from deciding whether a near-tangent shell voxel is hit.
+    """
+    resolution = checkpoint["model_metadata"]["resolution"]
+    values = checkpoint["model_state"]
+    ids = {int(cell): i for i, cell in enumerate(values["cell_indices"])}
+    centers = values["centers"].reshape(-1, 3).astype(np.float64)
+    scales = np.exp(values["log_scales"].reshape(-1, 3).astype(np.float64))
+    np.testing.assert_array_equal(values["rotations"].reshape(-1, 4),
+                                  np.tile([1., 0., 0., 0.], (len(ids), 1)))
+    colors = values["radiance_sh"].reshape(-1, 3).astype(np.float64) * Y00
+    opacities = 1. / (1. + np.exp(-values["opacity_sh"].astype(np.float64) * Y00))
+    o = [Fraction(float(v)) for v in origin]
+    d = [Fraction(float(v)) for v in direction]
+    near, far = [Fraction(0)], [Fraction(400)]
+    for a in range(3):
+        if d[a]:
+            pair = [-o[a]/d[a], (resolution-o[a])/d[a]]
+            near.append(min(pair))
+            far.append(max(pair))
+        else:
+            assert 0 <= o[a] <= resolution
+    entry, exit_time = max(near), min(far)
+    assert entry <= exit_time
+    grid_entry = entry
+    cell = [min(resolution-1, max(0, math.floor(o[a]+entry*d[a]))) for a in range(3)]
+    steps = [1 if v >= 0 else -1 for v in d]
+    color, transmittance = np.zeros(3), 1.
+    hit_ids, min_gains = [], []
+    mass, moment, distortion = 0., 0., 0.
+    direction_length = float(np.linalg.norm(direction))
+    for _ in range(3*resolution+3):
+        next_times = [(cell[a]+int(steps[a] > 0)-o[a])/d[a]
+                      if d[a] else exit_time for a in range(3)]
+        end = min(*next_times, exit_time)
+        index = ids.get(cell[0]+resolution*(cell[1]+resolution*cell[2]))
+        if index is not None:
+            relative = np.array([float(o[a]+entry*d[a])-cell[a]-centers[index, a]
+                                 for a in range(3)])
+            segment = np.array([float((end-entry)*d[a]) for a in range(3)])
+            u, v = relative/scales[index], segment/scales[index]
+            square = float(v@v)
+            star = float(np.clip(-(u@v)/square, 0., 1.)) if square > 1e-20 else 0.
+            gmin = float((u+star*v)@(u+star*v)-1.)
+            if gmin <= 0.:
+                hit_ids.append(index)
+                min_gains.append(gmin)
+                weight = transmittance*opacities[index]
+                depth = (float(entry-grid_entry)+star*float(end-entry))*direction_length/(math.sqrt(3.)*resolution)
+                distortion += 2.*weight*(depth*mass-moment)
+                mass += weight
+                moment += weight*depth
+                color += weight*colors[index]
+                transmittance *= 1.-opacities[index]
+        axis = min(range(3), key=lambda a: next_times[a])
+        entry = next_times[axis]
+        cell[axis] += steps[axis]
+        if entry >= exit_time or min(cell) < 0 or max(cell) >= resolution:
+            break
+    else:
+        raise AssertionError("Exact traversal exceeded its face crossing bound")
+    raw = color+transmittance
+    rgb = np.clip(raw, 0., 1.)
+    rgb_loss = float(np.sum((rgb-[.1, .25, .35])**2))
+    return {"hit_count": len(hit_ids), "rgb": rgb, "raw_rgb": raw,
+            "alpha": 1.-transmittance, "raw_alpha": 1.-transmittance,
+            "rgb_loss": rgb_loss, "distortion_loss": distortion,
+            "loss": rgb_loss+.1*distortion}, hit_ids, min_gains
+
+
+def assert_oracle_pixel(actual, index, expected, np):
+    for key, value in expected.items():
+        observed = actual[key][..., index]
+        if key == "hit_count":
+            np.testing.assert_array_equal(observed, value)
+        else:
+            np.testing.assert_allclose(observed, value, rtol=3e-5, atol=3e-6,
+                                       err_msg=f"rational_oracle_pixel_{index}:{key}")
+
+
+def check_far_tangent_reference(mi, dr, np):
+    checkpoint = payload(np, 128, [(54, 34, 38), (54, 34, 39),
+                                   (52, 28, 77), (52, 28, 78), (52, 28, 79)])
+    checkpoint["model_state"]["log_scales"][:] = math.log(.65)
+    origin, direction = [64., 64., -140.], [-10.546875, -33.515625, 204.]
+    expected, ids, distances = rational_leaf_reference(checkpoint, origin, direction, np)
+    assert len(ids) == 5 and -1e-4 < distances[-1] < -1e-5
+    model = restore_model(checkpoint, mi)
+    ray = rays(mi, np, [origin], [direction], 400.)
+    result = host(model.loss_and_grad(*inputs(mi, ray), settings(use_octree=1.)), dr, np)
+    assert_oracle_pixel(result, 0, expected, np)
+    return {"check": "far_near_tangent_hit_against_exact_face_order_oracle",
+            "hit_count": expected["hit_count"], "last_hit_squared_ellipsoid_distance": distances[-1],
+            "status": "passed"}
 
 
 def benchmark_sparse_shell(mi, dr, np, image_size=64):
@@ -444,7 +678,32 @@ def benchmark_sparse_shell(mi, dr, np, image_size=64):
     # Validate this larger fixture as well before timing any mode.
     dda = host(replay(model, *args, options | {"use_octree": 0.}), dr, np)
     octree = host(replay(model, *args, options | {"use_octree": 1.}), dr, np)
-    error = compare(dda, octree, np, "benchmark_shell_equivalence")
+    differing_hits = np.flatnonzero(dda["hit_count"] != octree["hit_count"])
+    # At long near-tangent segments, the old accumulating DDA can miss a real
+    # hit. Such pixels must satisfy an independent exact face-order oracle,
+    # not be accepted by a wider image tolerance.
+    stable = np.ones(image_size**2, dtype=bool)
+    stable[differing_hits] = False
+    pixel_keys = ("rgb", "alpha", "raw_rgb", "raw_alpha", "hit_count",
+                  "loss", "rgb_loss", "distortion_loss")
+    error = compare({key: dda[key][..., stable] for key in pixel_keys},
+                    {key: octree[key][..., stable] for key in pixel_keys},
+                    np, "benchmark_unchanged_hit_pixels")
+    for index in differing_hits:
+        expected, _, _ = rational_leaf_reference(checkpoint, origin, targets[index]-origin, np)
+        assert_oracle_pixel(octree, index, expected, np)
+    # This symmetric shell also puts rays exactly on cell edges. Legacy drift
+    # can choose the other zero-length side cell, changing near-miss gradients
+    # even when RGB and physical hit counts agree. Report those discrete changes
+    # explicitly; strict gradient regressions use the dedicated fixtures above.
+    assert all(np.isfinite(value).all() for value in octree.values())
+    gradient_differences = {
+        key.removeprefix("gradients."): float(np.max(np.abs(dda[key]-value)))
+        for key, value in octree.items() if key.startswith("gradients.") and value.size}
+    counter_differences = {
+        key: int(np.count_nonzero(dda[key] != value)) for key, value in octree.items()
+        if key not in pixel_keys and np.issubdtype(value.dtype, np.integer)
+        and np.any(dda[key] != value)}
     assert np.count_nonzero(dda["hit_count"]) > image_size**2//5
     timings = {"dda": [], "octree": []}
     # Alternate order across rounds to reduce thermal/order bias. Warm each
@@ -466,7 +725,11 @@ def benchmark_sparse_shell(mi, dr, np, image_size=64):
             "max_candidates": 16, "distortion_weight": .1,
             "wall_ms_samples": timings, "wall_ms_median": medians,
             "dda_over_octree_wall_ratio": medians["dda"]/medians["octree"],
+            "legacy_hit_disagreements_checked_by_rational_oracle": differing_hits.tolist(),
+            "legacy_gradient_max_absolute_differences": gradient_differences,
+            "legacy_counter_differing_entries": counter_differences,
             "max_absolute_error": error, "replay_statistics": replay.statistics(),
+            "comparison_scope": "Per-ray RGB, alpha, hit counts and losses; gradient and counter differences are reported separately.",
             "note": "Synthetic scene only; includes forward, gradients and synchronized dispatch, not full training."}
 
 
@@ -492,7 +755,10 @@ def main():
         assert int(getattr(mi.VoxelReconstruction, "octree_version", 0)) >= 1, \
             "Rebuild this checkout before running octree regression"
         for check in (check_boundaries_and_default, check_sparse_random_and_non_power_two,
+                      check_long_empty_block_exits,
+                      check_far_tangent_reference,
                       check_near_miss, check_growth_and_truncation, check_replay_mutations,
+                      check_candidate_partition_invariance,
                       check_traversal_diagnostics):
             checks.append(check(mi, dr, np))
             print(json.dumps(checks[-1]), flush=True)

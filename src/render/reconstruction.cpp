@@ -285,9 +285,24 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::rebuild_octree() {
     m_statistics["octree_allocated_bytes"] = uint64_t(m_octree.size()) * sizeof(uint32_t);
 }
 
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Vector3f
+VoxelReconstruction<Float, Spectrum>::octree_boundary_times(
+    const Vector3i &cell, const Vector3i &step,
+    const Point3f &origin, const Vector3f &inv_d) const {
+    Vector3f result;
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+        Float face = Float(cell[axis]) + dr::select(step[axis] > 0, 1.f, 0.f);
+        Float plane = dr::fmadd(face, m_size[axis], m_min[axis]);
+        result[axis] = dr::select(step[axis] != 0,
+            (plane - origin[axis]) * inv_d[axis], dr::Infinity<Float>);
+    }
+    return result;
+}
+
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::skip_empty_block(
     Vector3i &cell, Vector3f &next, Float &entry, UInt32 &iterations,
-    const Vector3i &step, const Vector3f &step_t, const Float &exit,
+    const Vector3i &step, const Vector3f &step_t, const Point3f &origin,
+    const Vector3f &inv_d, const Float &exit,
     Mask active, bool include_growth, UInt32 &queries, bool profile) const {
     if (!m_octree_levels)
         return;
@@ -298,58 +313,64 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::skip_empty_block(
     UInt32 log_size = (node >> (include_growth ? 20 : 16)) & 0xfu;
     if (profile)
         queries += dr::select(active, 1u, 0u);
+    Mask skippable = active & (log_size > 0u);
+    dr::tie(cell, next, entry, iterations) = dr::if_stmt(
+        dr::make_tuple(cell, next, entry, iterations), skippable,
+        [this, log_size, step, step_t, origin, inv_d, exit](
+            Vector3i cell, Vector3f next, Float entry, UInt32 iterations) {
+            advance_empty_block(cell, next, entry, iterations, log_size,
+                                step, step_t, origin, inv_d, exit);
+            return dr::make_tuple(cell, next, entry, iterations);
+        }, [](Vector3i cell, Vector3f next, Float entry, UInt32 iterations) {
+            return dr::make_tuple(cell, next, entry, iterations);
+        }, "Voxel reconstruction octree block exit");
+}
+
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::advance_empty_block(
+    Vector3i &cell, Vector3f &next, Float &entry, UInt32 &iterations,
+    const UInt32 &log_size, const Vector3i &step, const Vector3f &step_t,
+    const Point3f &origin, const Vector3f &inv_d, const Float &exit) const {
     Int32 size = Int32(UInt32(1u) << log_size);
     Vector3i lo, hi, remaining;
-    Float target = exit, magnitude(1.f);
     for (uint32_t axis = 0; axis < 3; ++axis) {
         lo[axis] = Int32((UInt32(cell[axis]) >> log_size) << log_size);
         hi[axis] = dr::minimum(lo[axis] + size - 1, int(m_resolution) - 1);
         remaining[axis] = dr::select(step[axis] > 0, hi[axis] - cell[axis],
                            dr::select(step[axis] < 0, cell[axis] - lo[axis], 0));
-        remaining[axis] = dr::select(active & (log_size > 0u), remaining[axis], 0);
-        Float delta = dr::select(step[axis] != 0, step_t[axis], 0.f);
-        Float first = dr::select(step[axis] != 0, next[axis], 0.f);
-        Float distance = Float(remaining[axis]) * delta;
-        Float boundary = first + distance;
-        target = dr::minimum(target, dr::select(step[axis] != 0, boundary,
-                                               dr::Infinity<Float>));
-        magnitude = dr::maximum(magnitude, dr::abs(first) + dr::abs(distance));
     }
-    // This bound keeps the speculative endpoint strictly inside the block even
-    // if its multiply-add differs from repeated float additions. Leave the
-    // actual block-exit face (and x/y/z ties) to the original fine DDA below.
-    Float guard = (4.f * float(m_resolution + 1) * std::numeric_limits<float>::epsilon()) * magnitude;
-    Float limit = dr::select(active & (log_size > 0u), target - guard,
-                             -dr::Infinity<Float>);
-    struct Advance {
-        Vector3i remaining;
-        Vector3f next;
-        Float entry;
-        DRJIT_STRUCT(Advance, remaining, next, entry)
-    } state{remaining, next, entry};
-    // Keep the original next += step_t arithmetic EXACTLY. Multiplying the
-    // step count changes last-bit rounding and can reorder tangent/edge hits or
-    // alter near-miss gradients when a candidate overlay changes block sizes.
-    // This compact register-only loop advances all three axes independently:
-    // no leaf-index/parameter reads, no geometry and no path records. Every
-    // consumed face is strictly before limit, hence all bypassed cells lie in
-    // the proven-empty block. The last consumed event is the new entry time.
-    dr::tie(state) = dr::while_loop(dr::make_tuple(state),
-        [limit](const Advance &s) {
-            return dr::any((s.remaining > 0) & (s.next < limit));
-        },
-        [step_t, limit](Advance &s) {
-            for (uint32_t axis = 0; axis < 3; ++axis) {
-                Mask cross = (s.remaining[axis] > 0) & (s.next[axis] < limit);
-                s.entry = dr::maximum(s.entry, dr::select(cross, s.next[axis], s.entry));
-                s.next[axis] = dr::select(cross, s.next[axis] + step_t[axis], s.next[axis]);
-                s.remaining[axis] -= dr::select(cross, 1, 0);
-            }
-        }, "Voxel reconstruction octree empty-block advance");
-    Vector3i consumed = remaining - state.remaining;
+    Vector3f block_exit = octree_boundary_times(cell + step * remaining, step, origin, inv_d);
+    Float target = dr::minimum(exit, dr::min(block_exit));
+    Mask jump = target > entry;
+    // Count internal face events strictly BEFORE the block exit. All events
+    // at the exit time stay pending for the ordinary x/y/z boundary ordering,
+    // including zero-length neighboring leaves. This is a bulk calculation,
+    // not a loop through empty fine cells.
+    Vector3i consumed;
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+        Mask moving = jump & (step[axis] != 0);
+        Float distance = dr::select(moving, target - next[axis], 0.f);
+        Float delta = dr::select(moving, step_t[axis], 1.f);
+        Float estimate = distance / delta;
+        estimate = dr::select(dr::isfinite(estimate), estimate, 0.f);
+        consumed[axis] = Int32(dr::clip(dr::ceil(estimate),
+                                       0.f, Float(remaining[axis])));
+    }
+    Vector3f last = octree_boundary_times(cell + step * (consumed - 1), step, origin, inv_d);
+    consumed -= dr::select((consumed > 0) & (last >= target), 1, 0);
+    Vector3f following = octree_boundary_times(cell + step * consumed, step, origin, inv_d);
+    consumed += dr::select(jump & (consumed < remaining) & (following < target), 1, 0);
+    last = octree_boundary_times(cell + step * (consumed - 1), step, origin, inv_d);
+    following = octree_boundary_times(cell + step * consumed, step, origin, inv_d);
+    Mask valid = dr::all(((consumed == 0) | (last < target)) &
+                        ((consumed == remaining) | (following >= target)));
+    // With far origins, several grid planes can round to the same ray time.
+    // A failed estimate conservatively leaves the ENTIRE ray state untouched;
+    // the normal one-face rule then handles it without skipping a live leaf.
+    consumed = dr::select(jump & valid, consumed, Vector3i(0));
+    for (uint32_t axis = 0; axis < 3; ++axis)
+        entry = dr::maximum(entry, dr::select(consumed[axis] > 0, last[axis], entry));
     cell += step * consumed;
-    next = state.next;
-    entry = state.entry;
+    next = dr::select(jump & valid, dr::maximum(entry, following), next);
     iterations += UInt32(dr::sum(consumed));
 }
 
@@ -524,6 +545,7 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
     Mask active = dr::all(dr::isfinite(ray.o)) & dr::all(dr::isfinite(ray.d)) &
                   (length > 0.f) & (ray.maxt > 0.f);
     Vector3f d = ray.d / dr::select(active, length, 1.f);
+    Vector3f inv_d = dr::rcp(dr::select(d != 0.f, d, Vector3f(1.f)));
     Float entry = 0.f, exit = ray.maxt * length;
     Vector3f step_t;
     Vector3i step;
@@ -557,6 +579,8 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
                             (boundary - ray.o[a]) / dr::select(step[a] == 0, 1.f, d[a]));
         next[a] = dr::maximum(next[a], entry);
     }
+    if (use_octree)
+        next = dr::maximum(entry, octree_boundary_times(cell, step, ray.o, inv_d));
     struct LoopState {
         Mask active;
         Vector3i cell;
@@ -577,10 +601,10 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
             if (use_octree) {
                 Mask empty = s.active & !occupied;
                 s = dr::if_stmt(dr::make_tuple(s, empty), empty,
-                    [this, step, step_t, exit](LoopState s, const Mask &empty) {
+                    [this, step, step_t, origin = ray.o, inv_d, exit](LoopState s, const Mask &empty) {
                         UInt32 queries(0);
                         skip_empty_block(s.cell, s.next, s.entry, s.iterations,
-                                         step, step_t, exit, empty, false, queries, false);
+                                         step, step_t, origin, inv_d, exit, empty, false, queries, false);
                         return s;
                     }, [](LoopState s, const Mask &) { return s; },
                     "Voxel reconstruction octree trace skip");
@@ -639,9 +663,13 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
             s.cell.x() += dr::select(cross_x, step.x(), 0);
             s.cell.y() += dr::select(cross_y, step.y(), 0);
             s.cell.z() += dr::select(cross_z, step.z(), 0);
-            s.next.x() = dr::select(cross_x, s.next.x() + step_t.x(), s.next.x());
-            s.next.y() = dr::select(cross_y, s.next.y() + step_t.y(), s.next.y());
-            s.next.z() = dr::select(cross_z, s.next.z() + step_t.z(), s.next.z());
+            if (use_octree)
+                s.next = dr::maximum(end, octree_boundary_times(s.cell, step, ray.o, inv_d));
+            else {
+                s.next.x() = dr::select(cross_x, s.next.x() + step_t.x(), s.next.x());
+                s.next.y() = dr::select(cross_y, s.next.y() + step_t.y(), s.next.y());
+                s.next.z() = dr::select(cross_z, s.next.z() + step_t.z(), s.next.z());
+            }
             s.entry = end;
             s.iterations += 1;
             s.active &= dr::all(s.cell >= 0) & dr::all(s.cell < int(m_resolution)) &
@@ -875,6 +903,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     Mask active = dr::all(dr::isfinite(ray.o)) & dr::all(dr::isfinite(ray.d)) &
                   (direction_length > 0.f) & (ray.maxt > 0.f);
     Vector3f d = ray.d / dr::select(active,direction_length,1.f);
+    Vector3f inv_d = dr::rcp(dr::select(d != 0.f, d, Vector3f(1.f)));
     Float entry(0.f), exit = ray.maxt*direction_length;
     Vector3f step_t;
     Vector3i step;
@@ -904,6 +933,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         next[a]=dr::maximum(entry,dr::select(step[a]==0,dr::Infinity<Float>,
                           (boundary-ray.o[a])/dr::select(step[a]==0,1.f,d[a])));
     }
+    if (use_octree)
+        next = dr::maximum(entry, octree_boundary_times(cell, step, ray.o, inv_d));
     struct State {
         Mask active;
         Vector3i cell;
@@ -936,11 +967,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             if (use_octree) {
                 Mask empty = s.active & !visit;
                 s = dr::if_stmt(dr::make_tuple(s, empty), empty,
-                    [this, step, step_t, exit, collect_growth, profile_traversal](
+                    [this, step, step_t, origin = ray.o, inv_d, exit, collect_growth, profile_traversal](
                         State s, const Mask &empty) {
                         UInt32 before = s.iterations;
                         skip_empty_block(s.cell, s.next, s.entry, s.iterations,
-                            step, step_t, exit, empty, collect_growth,
+                            step, step_t, origin, inv_d, exit, empty, collect_growth,
                             s.traversal_queries, profile_traversal);
                         if (profile_traversal)
                             s.traversal_skipped += s.iterations - before;
@@ -1130,9 +1161,13 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             Mask cross_x=(s.next.x()<=s.next.y())&(s.next.x()<=s.next.z());
             Mask cross_y=!cross_x&(s.next.y()<=s.next.z()),cross_z=!cross_x&!cross_y;
             s.cell.x()+=dr::select(cross_x,step.x(),0);s.cell.y()+=dr::select(cross_y,step.y(),0);s.cell.z()+=dr::select(cross_z,step.z(),0);
-            s.next.x()=dr::select(cross_x,s.next.x()+step_t.x(),s.next.x());
-            s.next.y()=dr::select(cross_y,s.next.y()+step_t.y(),s.next.y());
-            s.next.z()=dr::select(cross_z,s.next.z()+step_t.z(),s.next.z());
+            if (use_octree)
+                s.next=dr::maximum(end,octree_boundary_times(s.cell,step,ray.o,inv_d));
+            else {
+                s.next.x()=dr::select(cross_x,s.next.x()+step_t.x(),s.next.x());
+                s.next.y()=dr::select(cross_y,s.next.y()+step_t.y(),s.next.y());
+                s.next.z()=dr::select(cross_z,s.next.z()+step_t.z(),s.next.z());
+            }
             s.entry=end;s.iterations+=1;
             s.active &= dr::all(s.cell>=0)&dr::all(s.cell<int(m_resolution))&(s.entry<exit)&
                         (s.transmittance>cfg["transmittance_threshold"])&(s.hits<max_hits)&(s.iterations<=3*m_resolution+3);
