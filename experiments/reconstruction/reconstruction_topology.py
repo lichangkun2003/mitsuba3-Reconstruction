@@ -189,6 +189,8 @@ def model_checkpoint(model, fields=None) -> dict:
     core_resolution = int(getattr(model, "core_resolution", model.resolution))
     if core_resolution != metadata["resolution"]:
         metadata["core_resolution"] = core_resolution
+    if getattr(model, "scene_mapping", "") == "radial_seed_shell":
+        metadata["scene_mapping"] = "radial_seed_shell"
     return {
         "model_state": {name: np.array(value, copy=True) for name, value in snapshot.items()},
         "model_metadata": metadata,
@@ -246,6 +248,33 @@ def _coordinates(cells, resolution, np):
 
 def _addresses(cells, resolution):
     return cells[:, 0] + resolution * (cells[:, 1] + resolution * cells[:, 2])
+
+
+def _growth_core_radius_squared(metadata):
+    """Twice-cell-unit core radius squared, or None for unrestricted growth.
+
+    A radial far shell starts filled and may be pruned. Only cells whose entire
+    AABB lies inside the unit core sphere may supply parents or receive growth.
+    Integer coordinates make CPU/GPU classification exact, including boundary
+    cells. The explicit tag leaves historical point-only shells unchanged.
+    """
+    if metadata.get("scene_mapping") != "radial_seed_shell":
+        return None
+    resolution = int(metadata["resolution"])
+    core = int(metadata.get("core_resolution", resolution))
+    if not 0 < core < resolution or (resolution - core) % 2:
+        raise ValueError("Radial shell growth requires a centered integer core")
+    return core * core
+
+
+def _growth_coordinates_allowed(coordinates, metadata, np):
+    resolution = int(metadata["resolution"])
+    allowed = np.all((coordinates >= 0) & (coordinates < resolution), axis=1)
+    radius_squared = _growth_core_radius_squared(metadata)
+    if radius_squared is not None:
+        farthest = np.abs(2 * coordinates + 1 - resolution) + 1
+        allowed &= np.sum(farthest * farthest, axis=1) <= radius_squared
+    return allowed
 
 
 def _matching_growth_pairs(current, pending, np):
@@ -807,6 +836,7 @@ class TopologyManager:
         center, axes, rotation, quaternion, size, metric, extent = _geometry(state, metadata, np)
         cells = _coordinates(state["cell_indices"], resolution, np)
         eligible = ~self.candidates
+        eligible &= _growth_coordinates_allowed(cells, metadata, np)
         eligible &= (self.growth_wait_start == 0) | ((boundary >= self.growth_wait_start - 1) &
                                                     (boundary - (self.growth_wait_start - 1) >= cfg.growth_wait_epochs))
         occupied = np.asarray(state["cell_indices"], dtype=np.int64)
@@ -825,7 +855,7 @@ class TopologyManager:
         for offset in _neighbor_offsets(evidence and cfg.growth_use_26_neighbors, np):
             neighbors = cells + offset
             targets = _addresses(neighbors, resolution)
-            possible = eligible & np.all(neighbors >= 0, axis=1) & np.all(neighbors < resolution, axis=1)
+            possible = eligible & _growth_coordinates_allowed(neighbors, metadata, np)
             ids = np.flatnonzero(possible)
             # Filter in the original ascending parent order, querying only
             # valid neighbor cells. Contact geometry below is unchanged.

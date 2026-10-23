@@ -66,6 +66,18 @@ class Proposals(unittest.TestCase):
         manager=manager_for(state,use_rgb_growth=True,growth_min_supporting_parents=26)
         self.assertEqual(len(self.compare(manager,state)['cells']),0)
 
+    def test_radial_shell_is_not_a_growth_region(self):
+        state=checkpoint([217,219,221])
+        state['model_metadata'].update(core_resolution=6,scene_mapping='radial_seed_shell')
+        manager=manager_for(state,use_rgb_growth=True,growth_min_supporting_parents=2)
+        result=self.compare(manager,state)
+        self.assertNotIn(218,np.array(result['cells']))
+        self.assertIn(220,np.array(result['cells']))
+        # No core proposal may re-enter a deleted shell cell, including the
+        # restricted post-vote regeneration path.
+        subset=generate_growth_gpu(manager,state,10,target_cells=dr.cuda.UInt32([218,220,222]))
+        self.assertEqual(list(np.array(subset['cells'])),[220,220])
+
 
 if __name__=='__main__':
     from reconstruction_common import initialize_runtime

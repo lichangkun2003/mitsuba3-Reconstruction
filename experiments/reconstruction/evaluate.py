@@ -466,6 +466,7 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
             "layout": "independent uniform subpixel samples per pixel/sample",
             "seeding": "deterministic per split and view", "legacy_preview_pixel_sampling_ignored": render.pixel_sampling}
         report["metric_protocol"]["background_linear_rgb"] = list(render.background)
+        report["scene_background"] = preview.scene_background_protocol(checkpoint_data_config(saved), render)
         model = common.restore_model(checkpoint, mi)
         report["model_statistics"] = model.statistics()
         for split in config.splits:
@@ -683,6 +684,7 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
             "legacy_preview_pixel_sampling_ignored": render.pixel_sampling,
         }
         report["metric_protocol"]["background_linear_rgb"] = list(render.background)
+        report["scene_background"] = preview.scene_background_protocol(checkpoint_data_config(saved), render)
         model = common.restore_model(checkpoint, mi)
         report["model_statistics"] = model.statistics()
         (output / "evaluation-config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")

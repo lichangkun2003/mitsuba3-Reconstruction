@@ -41,6 +41,9 @@ class DataConfig:
     reference_compositing: str = "linear"  # Missing field in old checkpoints keeps the old convention.
     images: str | None = None  # COLMAP image folder; None selects the scene's downsampled images.
     initialization: dict | None = None  # Resolved COLMAP normalization/shell, persisted for resume/evaluation.
+    scene_mode: str = "auto"  # auto: synthetic bounded, COLMAP unbounded; explicit override supported.
+    background_layers: int = 8  # Initial radial shell width in voxels; independent of ray hit capacity.
+    background_opacity: float = 0.5  # Initial per-voxel opacity in the complete far-field shell.
 
 
 @dataclass
@@ -158,10 +161,55 @@ def update_config(config: PreviewConfig, values: dict) -> None:
             setattr(group, name, value)
 
 
+def resolve_scene_background(config, dataset_type: str) -> str:
+    """Select the residual ray color, preserving saved v1 scene semantics.
+
+    This is a compositing tail, not illumination: the reconstruction has no
+    light transport. Evaluation uses its checkpoint's saved background directly.
+    """
+    mode = config.data.scene_mode
+    if mode not in ("auto", "bounded", "unbounded"):
+        raise ValueError("data.scene_mode must be auto, bounded or unbounded")
+    if dataset_type not in ("synthetic", "colmap"):
+        raise ValueError(f"Unsupported dataset type: {dataset_type}")
+    saved = config.data.initialization
+    if saved is not None and saved.get("version") == 1:
+        if mode != "auto":
+            raise ValueError("Legacy version-1 initialization cannot be reinterpreted with a scene_mode override; "
+                             "resume/evaluate with its saved background or start a new reconstruction")
+        return "legacy"
+    resolved = ("bounded" if dataset_type == "synthetic" else "unbounded") if mode == "auto" else mode
+    if saved is not None:
+        saved_mode = saved.get("scene_mode")
+        if saved_mode not in ("bounded", "unbounded"):
+            raise ValueError("Saved initialization has no valid scene_mode")
+        if mode != "auto" and resolved != saved_mode:
+            raise ValueError("data.scene_mode disagrees with saved initialization")
+        resolved = saved_mode
+    config.render.background = (1., 1., 1.) if resolved == "bounded" else (0., 0., 0.)
+    return resolved
+
+
+def scene_background_protocol(data, render) -> dict:
+    """Describe the actual compositing setting without resolving or changing it."""
+    saved = data.initialization or {}
+    mode = saved.get("scene_mode", "bounded" if data.scene_mode == "auto" else data.scene_mode)
+    if saved.get("version") == 1:
+        mode = "legacy"
+    return {"requested_scene_mode": data.scene_mode, "scene_mode": mode,
+            "background_linear_rgb": list(render.background),
+            "background_role": "residual ray transmittance color; no environment illumination",
+            "initial_background_layers": data.background_layers if mode == "unbounded" else None,
+            "initial_background_opacity": data.background_opacity if mode == "unbounded" else None}
+
+
 def parse_config(workspace: Path) -> PreviewConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", help="JSON config, relative to the workspace parent")
     parser.add_argument("--dataset")
+    parser.add_argument("--scene-mode", choices=("auto", "bounded", "unbounded"))
+    parser.add_argument("--background-layers", type=int, help="Initial radial shell width in voxels (default: 8)")
+    parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
     parser.add_argument("--point-cloud")
     parser.add_argument("--cameras")
     parser.add_argument("--camera-index", type=int)
@@ -185,6 +233,8 @@ def parse_config(workspace: Path) -> PreviewConfig:
         update_config(config, json.loads(workspace_path(args.config, workspace).read_text(encoding="utf-8")))
     mapping = {
         "dataset": ("data", "dataset"), "point_cloud": ("data", "point_cloud"),
+        "scene_mode": ("data", "scene_mode"), "background_layers": ("data", "background_layers"),
+        "background_opacity": ("data", "background_opacity"),
         "cameras": ("data", "cameras"), "camera_index": ("data", "camera_index"),
         "reference_compositing": ("data", "reference_compositing"),
         "grid_resolution": ("model", "grid_resolution"),
@@ -206,6 +256,15 @@ def validate_config(config: PreviewConfig) -> None:
         raise ValueError("data.images must be an image directory name or null")
     if config.data.initialization is not None and not isinstance(config.data.initialization, dict):
         raise ValueError("data.initialization must be resolved initialization metadata or null")
+    if config.data.scene_mode not in ("auto", "bounded", "unbounded"):
+        raise ValueError("data.scene_mode must be auto, bounded or unbounded")
+    if type(config.data.background_layers) is not int or config.data.background_layers < 1:
+        raise ValueError("data.background_layers must be a positive integer")
+    if (isinstance(config.data.background_opacity, bool)
+            or not isinstance(config.data.background_opacity, (int, float))
+            or not math.isfinite(config.data.background_opacity)
+            or not 0 < config.data.background_opacity < 1):
+        raise ValueError("data.background_opacity must be finite and in (0, 1)")
     if config.render.traversal not in ("octree", "dda"):
         raise ValueError("render.traversal must be octree or dda")
     for name in ("width", "height", "spp", "max_hits"):
@@ -506,6 +565,7 @@ def main() -> int:
         from reconstruction_common import prepare_dataset, initialize_model
         dataset = workspace_path(config.data.dataset, workspace)
         prepared = prepare_dataset(config, np)
+        report["scene_background"] = scene_background_protocol(config.data, config.render)
         report["resolved"]["dataset"] = str(dataset)
         if prepared is None:
             point_cloud = (dataset / config.data.point_cloud).resolve()
@@ -588,6 +648,10 @@ def main() -> int:
         reference_white = reference_from_bitmap(
             reference_bitmap, mi, np, rgb_only=True, background=(1, 1, 1),
             reference_compositing=config.data.reference_compositing, path=reference_path)
+        reference_target = reference_from_bitmap(
+            reference_bitmap, mi, np, rgb_only=True, background=config.render.background,
+            reference_compositing=config.data.reference_compositing, path=reference_path)
+        write_png(output / "reference.png", reference_target, mi, np)
         write_png(output / "reference-white.png", reference_white, mi, np)
         report["reference_shape"] = list(reference.shape)
         report["reference_resampled"] = False
@@ -597,14 +661,14 @@ def main() -> int:
             "effective_compositing": (
                 "srgb" if config.data.reference_compositing == "srgb"
                 and reference_bitmap.srgb_gamma() else "linear"),
-            "target_space": "linear", "background_linear": [1, 1, 1],
+            "target_space": "linear", "background_linear": list(config.render.background),
             "alpha_usage": "reference compositing only",
             "linear_source_policy": "linear compositing; preserve EXR/HDR values",
         }
         np.savez_compressed(output / "render.npz", rgb_linear=rgb_np, alpha=alpha_np,
                             hit_count_sum=hits_np, rgb_white_linear=white,
                             pixel_offsets=np.asarray(offsets), reference_rgba_linear=reference,
-                            reference_white_linear=reference_white)
+                            reference_white_linear=reference_white, reference_target_linear=reference_target)
         if config.output.save_model:
             snapshot = model.snapshot()
             dr.eval(*snapshot.values())
@@ -612,7 +676,7 @@ def main() -> int:
             np.savez_compressed(output / "initial-model.npz", **{name: np.asarray(value) for name, value in snapshot.items()})
             report["model_snapshot_layout"] = "AoS flat arrays; rotations wxyz; SH coefficient counts in config"
         report["pixel_offsets"] = offsets
-        output_names = ["preview.png", "preview-white.png", "alpha.png", "reference-white.png", "render.npz", "config.json"]
+        output_names = ["preview.png", "preview-white.png", "alpha.png", "reference.png", "reference-white.png", "render.npz", "config.json"]
         if config.output.save_model:
             output_names.append("initial-model.npz")
         report["files"] = {

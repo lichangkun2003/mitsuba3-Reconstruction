@@ -27,6 +27,8 @@ def device_checkpoint(model):
     core = int(getattr(model, "core_resolution", model.resolution))
     if core != metadata["resolution"]:
         metadata["core_resolution"] = core
+    if getattr(model, "scene_mapping", "") == "radial_seed_shell":
+        metadata["scene_mapping"] = "radial_seed_shell"
     return {"model_state": {key: (dr.cuda.UInt32 if key == "cell_indices" else dr.cuda.Float32)(value)
                             for key, value in model.snapshot().items()},
             "model_metadata": metadata}

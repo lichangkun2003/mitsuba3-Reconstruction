@@ -60,7 +60,7 @@ def run_check(args, output):
     write_scene(dataset, np)
     full, resumed = output / "full", output / "resumed"
     config = {
-        "data": {"dataset": str(dataset)},
+        "data": {"dataset": str(dataset), "background_layers": 1},
         "model": {"grid_resolution": 4, "opacity_sh_count": 1},
         "render": {"width": 93, "height": 97, "spp": 1, "max_hits": 2},
         "runtime": {"build_dir": args.build_dir, "gpu": args.gpu},
@@ -93,6 +93,8 @@ def run_check(args, output):
     assert (report["initial_render"]["width"], report["initial_render"]["height"]) == (16, 12)
     assert final["model_metadata"]["resolution"] == 12
     assert final["model_metadata"]["core_resolution"] == 8
+    assert final["model_metadata"]["scene_mapping"] == "radial_seed_shell"
+    assert tuple(final["config"]["render"]["background"]) == (0., 0., 0.)
     assert first["training_state"]["global_step"] == 7
     assert final["training_state"]["global_step"] == 14
     assert final["training_state"]["completed_epochs"] == 2
@@ -104,6 +106,9 @@ def run_check(args, output):
     np.testing.assert_allclose(initialization["radius"], .66, atol=1e-15)
     assert initialization["shell_width"] == .5
     assert initialization["shell_layers"] == 2
+    assert initialization["version"] == 2
+    assert initialization["background_layers"] == 1
+    assert initialization["background_opacity"] == .5
     assert not (dataset / "init_points.ply").exists()
     history = [json.loads(line) for line in (full / "training.jsonl").read_text().splitlines()]
     assert [row["training_resolution"] for row in history] == [6, 12]

@@ -5,6 +5,40 @@
 切换场景修改 ``CONFIG.data.dataset``，或传入 ``--dataset datasets/lego``；
 命令行参数覆盖配置文件与默认配置。RTX 5090 Windows 主机使用这个单卡入口。
 
+新实验默认 ``data.scene_mode="auto"``：合成场景有界白底，COLMAP 场景无界黑底。
+可用 ``--scene-mode bounded`` / ``--scene-mode unbounded`` 显式指定；当前无界初始化
+要求 COLMAP 数据，合成相机 JSON 不能直接强制启用无界模式。背景只是剩余透射率的
+合成尾项，不是光照计算；普通 RGB/JPEG 参考图的实拍背景不会被替换。
+
+无界模式默认 ``data.background_layers=8``、``data.background_opacity=0.5``，
+也可用 ``--background-layers`` / ``--background-opacity`` 设置。所有静态格子 AABB
+与远景径向球壳相交的格子统一铺满：有点的格使用点云种子颜色，其余为黑色，
+几何为覆盖整个格子的球形椭球。内层种子保持原初始化。
+**只有初始化点继续使用原来的径向压缩；射线、前向直线遍历和梯度流程不变。**
+这不是新的无界射线映射，不会在运行时压缩光线路径。
+
+远景允许几何／颜色／opacity 优化与现有删除，禁止作为生长父体或生长目标；
+被删除的远景格不会重新长回。区域按静态格子确定，不受优化后中心移动影响。
+初始 8 层与 ``max_hits`` 解耦，256→512 沿用分裂后变为 16 层，保持物理壳层宽度。
+完整壳层会增加体素数与显存；删除、有限路径容量和后续优化可能留下透射率，
+黑色尾项不意味着保证射线最终不透明。
+
+新 COLMAP 初始化保存 version 2 的场景、背景和归一化元数据。旧 version 1 实验
+继续保留原初始化及背景，恢复／评价时不自动迁移。新规则应从新实验开始。
+本次仅为模型元数据扩展 Python 绑定，需要先在仓库根目录增量编译；
+没有修改 C++ 前向求交或深度计算：
+
+.. code-block:: powershell
+
+   cmake --build build --config Release --parallel 8
+   if ($LASTEXITCODE -ne 0) { throw "编译失败" }
+   & ..\envs\mitsuba\python.exe -u -I experiments/reconstruction/train.py `
+     --dataset datasets/bicycle --scene-mode unbounded `
+     --background-layers 8 --background-opacity 0.5 --gpu 0 --epochs 1000
+
+venv 解释器使用 ``..\envs\mitsuba\Scripts\python.exe``。完整 Bicycle 训练质量与
+资源开销需通过新实验确认；初始化与恢复的回归不替代完整训练。
+
 当前 CUDA RGB-only 默认启用 ``topology.gpu_topology=True``：候选几何、同格父体素
 支持统计、RGB 生长／删除资格、冷却与保护期、新模型拼接和优化器状态重映射在 GPU
 完成。接触条件使用双精度；生长间隔、每视角更新顺序和同分择优规则保持原定义。
@@ -69,7 +103,7 @@
 整个训练末尾 50 轮冻结生长，删除继续按周期执行，连续参数保持优化。
 
 参考图协议由 ``CONFIG.data.reference_compositing = "srgb"`` 控制。新实验对 sRGB PNG
-先在编码空间用 alpha 合成白背景，再解码为线性 RGB；渲染、训练损失、梯度和拓扑收益
+先在编码空间用 alpha 合成当前场景背景（有界白色、无界黑色），再解码为线性 RGB；渲染、训练损失、梯度和拓扑收益
 始终在线性空间计算。普通 RGB 图直接解码；线性 EXR 继续在线性空间合成。
 预览、训练与评价共用读图实现。参考 alpha 仅用于这一预处理步骤。
 ``"linear"`` 保留旧的“先解码、再合成”目标，半透明边缘与新协议不同。

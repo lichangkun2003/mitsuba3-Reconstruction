@@ -41,7 +41,8 @@ def generate_growth_for_targets(manager, checkpoint, boundary, target_cells):
     preserves the full generator's deterministic proposal order and winner.
     """
     from reconstruction_topology import (
-        _addresses, _contact, _coordinates, _geometry, _neighbor_offsets)
+        _addresses, _contact, _coordinates, _geometry, _growth_coordinates_allowed,
+        _neighbor_offsets)
 
     np, cfg = manager.np, manager.settings
     state, metadata = checkpoint["model_state"], checkpoint["model_metadata"]
@@ -61,6 +62,8 @@ def generate_growth_for_targets(manager, checkpoint, boundary, target_cells):
 
     targets = np.unique(np.asarray(target_cells, dtype=np.int64).reshape(-1))
     targets = targets[(targets >= 0) & (targets < resolution ** 3)]
+    coordinates = _coordinates(targets, resolution, np)
+    targets = targets[_growth_coordinates_allowed(coordinates, metadata, np)]
     if not len(targets) or not len(occupied):
         return empty_result()
 
@@ -95,8 +98,7 @@ def generate_growth_for_targets(manager, checkpoint, boundary, target_cells):
     neighborhoods = []
     for offset in offsets:
         parent_coordinates = target_coordinates - offset
-        inside = (np.all(parent_coordinates >= 0, axis=1) &
-                  np.all(parent_coordinates < resolution, axis=1))
+        inside = _growth_coordinates_allowed(parent_coordinates, metadata, np)
         target_ids = np.flatnonzero(inside)
         locations, found = lookup(_addresses(parent_coordinates[inside], resolution))
         parent_ids = order[locations[found]]

@@ -145,6 +145,101 @@ class ColmapDatasetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "center or radius"):
             self.prepare(initialization=broken)
 
+    def test_explicit_unbounded_uses_initial_shell_layers_not_hit_capacity(self):
+        prepared = self.prepare(scene_mode="unbounded", start_core_resolution=64,
+                                target_core_resolution=512, shell_layers=2)
+        metadata = prepared["initialization"]
+        self.assertEqual(metadata["version"], 2)
+        self.assertEqual(metadata["scene_mode"], "unbounded")
+        self.assertEqual(metadata["scene_mapping"], "radial_seed_shell")
+        self.assertEqual(metadata["background_layers"], 8)
+        self.assertEqual(metadata["background_opacity"], .5)
+        self.assertEqual(metadata["shell_layers"], 64)
+        self.assertEqual(metadata["shell_width"], .25)
+        self.assertEqual(prepared["resolution"], 80)
+        self.assertEqual(prepared["grid_max"], [1.25] * 3)
+        self.assertEqual(2 * prepared["grid_max"][0] / prepared["resolution"], 2 / 64)
+        points, _ = dataset.read_colmap_points(self.model / "points3D.bin")
+        expected = dataset.contract_points(points, metadata["center"], metadata["radius"], .25)
+        np.testing.assert_array_equal(prepared["positions"], expected)
+        # Ray capacity is not involved in either the explicit shell or point map.
+        other = self.prepare(scene_mode="unbounded", start_core_resolution=64,
+                             target_core_resolution=512, shell_layers=128)
+        self.assertEqual(other["initialization"], metadata)
+        np.testing.assert_array_equal(other["positions"], prepared["positions"])
+
+    def test_v2_saved_initialization_restores_exactly_and_rejects_overrides(self):
+        prepared = self.prepare(scene_mode="unbounded", background_layers=3,
+                                background_opacity=.4)
+        metadata = prepared["initialization"]
+        restored = self.prepare(initialization=metadata)
+        self.assertEqual(restored["initialization"], metadata)
+        self.assertEqual(restored["views"], prepared["views"])
+        np.testing.assert_array_equal(restored["positions"], prepared["positions"])
+        for option in ({"scene_mode": "bounded"}, {"scene_mode": "legacy"},
+                       {"background_layers": 4}, {"background_opacity": .5}):
+            with self.subTest(option=option), self.assertRaises(ValueError):
+                self.prepare(initialization=metadata, **option)
+        for key, value in (("scene_mapping", "projective_shell"), ("version", 99),
+                           ("shell_width", .3), ("shell_layers", 99)):
+            broken = dict(metadata, **{key: value})
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.prepare(initialization=broken)
+        (self.model / "points3D.bin").unlink()
+        cameras_only = self.prepare(initialization=metadata, load_points=False)
+        self.assertEqual(cameras_only["views"], prepared["views"])
+        self.assertIsNone(cameras_only["positions"])
+
+    def test_bounded_colmap_fits_points_without_radial_contraction(self):
+        prepared = self.prepare(scene_mode="bounded")
+        metadata = prepared["initialization"]
+        self.assertEqual(metadata["scene_mapping"], "bounded")
+        self.assertEqual(metadata["scene_mode"], "bounded")
+        self.assertEqual(metadata["shell_width"], 0.)
+        self.assertEqual(metadata["shell_layers"], 0)
+        self.assertEqual(prepared["resolution"], 256)
+        self.assertEqual(prepared["grid_min"], [-1.] * 3)
+        self.assertEqual(prepared["grid_max"], [1.] * 3)
+        self.assertAlmostEqual(metadata["radius"], 44 * 1.1)
+        points, _ = dataset.read_colmap_points(self.model / "points3D.bin")
+        expected = ((points - metadata["center"]) / metadata["radius"]) @ dataset._AXES.T
+        np.testing.assert_array_equal(prepared["positions"], expected.astype(np.float32))
+        self.assertLess(np.max(np.abs(prepared["positions"])), 1.)
+        for view in prepared["views"]:
+            self.assertLess(np.max(np.abs(view["camera"]["position"])), 1.)
+        cameras_only = self.prepare(scene_mode="bounded", load_points=False)
+        self.assertEqual(cameras_only["views"], prepared["views"])
+        self.assertEqual(cameras_only["initialization"], metadata)
+        (self.model / "points3D.bin").unlink()
+        restored = self.prepare(initialization=metadata, load_points=False)
+        self.assertEqual(restored["views"], prepared["views"])
+
+    def test_v1_saved_data_is_not_silently_migrated(self):
+        legacy = self.prepare()
+        self.assertEqual(legacy["initialization"]["version"], 1)
+        self.assertNotIn("scene_mode", legacy["initialization"])
+        restored = self.prepare(initialization=legacy["initialization"])
+        self.assertEqual(restored["views"], legacy["views"])
+        self.assertEqual(restored["initialization"], legacy["initialization"])
+        np.testing.assert_array_equal(restored["positions"], legacy["positions"])
+        for option in ({"scene_mode": "unbounded"}, {"background_layers": 8},
+                       {"background_opacity": .5}):
+            with self.subTest(option=option), self.assertRaises(ValueError):
+                self.prepare(initialization=legacy["initialization"], **option)
+
+    def test_explicit_scene_settings_reject_invalid_layers_opacity_and_extent(self):
+        for value in (0, -1, .5, True, float("nan")):
+            with self.subTest(layers=value), self.assertRaises(ValueError):
+                self.prepare(scene_mode="unbounded", background_layers=value)
+        for value in (0, 1, -.1, float("nan"), float("inf"), True):
+            with self.subTest(opacity=value), self.assertRaises(ValueError):
+                self.prepare(scene_mode="unbounded", background_opacity=value)
+        with self.assertRaisesRegex(ValueError, "maximum of 1024"):
+            self.prepare(scene_mode="unbounded", target_core_resolution=1024)
+        with self.assertRaisesRegex(ValueError, "powers of two"):
+            self.prepare(scene_mode="bounded", start_core_resolution=300)
+        self.assertEqual(self.prepare(scene_mode="bounded", target_core_resolution=1024)["resolution"], 256)
+
     def test_far_contraction_is_monotonic_and_bounded_at_float32_limit(self):
         radii = np.array([.5, 1., 1.01, 2., 10., 1e20])
         points = np.column_stack((radii, np.zeros((len(radii), 2))))

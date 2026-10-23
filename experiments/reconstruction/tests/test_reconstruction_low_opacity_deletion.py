@@ -84,6 +84,21 @@ class LowOpacityDeletionTests(unittest.TestCase):
             self.assertEqual(event["deletion_opacity"]["low_opacity_voxels"], 0)
             np.testing.assert_array_equal(manager.low_opacity_deletion_streak, [0, 0])
 
+    def test_radial_far_shell_still_allows_low_opacity_deletion(self):
+        # In an 8^3 grid with a radius-two core, both fixture cells (73,75)
+        # are outside the core. The no-growth rule must not protect them from
+        # ordinary persistent-opacity deletion.
+        self.checkpoint["model_metadata"].update(
+            core_resolution=4, scene_mapping="radial_seed_shell")
+        self.model.core_resolution = 4
+        self.model.scene_mapping = "radial_seed_shell"
+        manager = self.manager(use_rgb_deletion=False)
+        self.finish(manager, 30)
+        replacement, event = self.finish(manager, 40)
+        self.assertEqual(event["deleted"], 1)
+        self.assertEqual(replacement["model_metadata"]["scene_mapping"], "radial_seed_shell")
+        np.testing.assert_array_equal(replacement["model_state"]["cell_indices"], [75])
+
     def test_recovery_resets_streak_and_requires_two_new_low_windows(self):
         manager = self.manager()
         self.finish(manager, 30)

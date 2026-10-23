@@ -172,6 +172,19 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
     center, axes, q, size, metric, extent = geometry_gpu(state, metadata, dr)
     cells = [I(occupied % resolution), I(occupied // resolution % resolution),
              I(occupied // (resolution*resolution))]
+    from reconstruction_topology import _growth_core_radius_squared
+    radius_squared = _growth_core_radius_squared(metadata)
+    def region_allowed(coordinates):
+        allowed = dr.full(B, True, len(coordinates[0]))
+        for c in coordinates:
+            allowed &= (c >= 0) & (c < resolution)
+        if radius_squared is not None:
+            farthest_squared = sum((dr.abs(2*c + 1 - resolution) + 1)**2
+                                   for c in coordinates)
+            allowed &= farthest_squared <= radius_squared
+        return allowed
+    eligible = B(eligible)
+    eligible &= region_allowed(cells)
     offsets = ([(x,y,z) for z in (-1,0,1) for y in (-1,0,1) for x in (-1,0,1)
                 if (x,y,z)!=(0,0,0)] if evidence and cfg.growth_use_26_neighbors else
                [tuple(sign if j==axis else 0 for j in range(3))
@@ -181,9 +194,7 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
         return dr.gather(type(value), value, ids)
     for offset in offsets:
         neighbors = [cells[i]+offset[i] for i in range(3)]
-        possible = B(eligible)
-        for c in neighbors:
-            possible &= (c >= 0) & (c < resolution)
+        possible = B(eligible) & region_allowed(neighbors)
         targets = U(neighbors[0]+resolution*(neighbors[1]+resolution*neighbors[2]))
         possible &= ~dr.gather(B, blocked, targets, possible)
         if selected_targets is not None:

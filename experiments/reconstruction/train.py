@@ -23,7 +23,8 @@ import traceback
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from preview import (DataConfig, ModelConfig, RenderConfig, RuntimeConfig, PreviewConfig,
-                     validate_config, validate_traversal, native_traversal_settings)
+                     validate_config, validate_traversal, native_traversal_settings,
+                     scene_background_protocol)
 from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, UniformSampler, ReferenceImageCache,
     generate_ray_batch, prepare_camera, initialize_runtime, load_views, model_metadata,
     prepare_dataset, initialize_model,
@@ -120,6 +121,9 @@ CONFIG.data.dataset = "datasets/bicycle"
 CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
 CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再解码；渲染与损失仍在线性空间。
+CONFIG.data.scene_mode = "auto"  # 合成场景：有界白色背景；COLMAP：无界远景层、无白色背景尾项。
+CONFIG.data.background_layers = 8  # 初始化远景层数；独立于 render.max_hits，升层时随体素细分。
+CONFIG.data.background_opacity = 0.5  # 远景新生体素 opacity；允许后续优化和删除。
 
 CONFIG.render.width = 800
 CONFIG.render.height = 800
@@ -219,6 +223,10 @@ def parse_arguments():
     parser.add_argument("--stop-after-epochs", type=int,
                         help="Stop after N additional complete epochs, saving a resumable checkpoint without changing the full schedule or publishing model.npz")
     parser.add_argument("--dataset")
+    parser.add_argument("--scene-mode", choices=("auto", "bounded", "unbounded"),
+                        help="auto: bounded synthetic / unbounded COLMAP; override for a new scene")
+    parser.add_argument("--background-layers", type=int, help="Initial radial shell width in voxels (default: 8)")
+    parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
     parser.add_argument("--output-dir", help="Override automatic outputs/SCENE-MM.DD-Eindex/training; on resume the default reuses the checkpoint's experiment")
     parser.add_argument("--build-dir")
     parser.add_argument("--gpu", type=int, help="Local physical index; ignored under Slurm")
@@ -252,6 +260,9 @@ def apply_arguments(config, args, values):
     update(config, values)
     for value, group, key in ((args.epochs, "training", "num_epochs"),
         (args.dataset, "data", "dataset"), (args.output_dir, "training", "output"),
+        (getattr(args, "scene_mode", None), "data", "scene_mode"),
+        (getattr(args, "background_layers", None), "data", "background_layers"),
+        (getattr(args, "background_opacity", None), "data", "background_opacity"),
         (args.build_dir, "runtime", "build_dir"), (args.gpu, "runtime", "gpu"),
         (args.chunk_size, "training", "chunk_size"),
         (getattr(args, "traversal", None), "render", "traversal"),
@@ -307,8 +318,8 @@ def validate(config):
                       config.schedule.total_epochs, config.schedule.level_weights)
     if config.render.spp != 1:
         raise ValueError("Training requires exactly 1 spp per view; use evaluate.py for multi-spp images")
-    if list(config.render.background) != [1., 1., 1.]:
-        raise ValueError("Falcor's training reference is composited onto white; training requires background [1,1,1]. Evaluation background is configurable.")
+    # prepare_dataset resolves the ray tail and reference composite together:
+    # white for bounded scenes, black for the explicit unbounded background.
     if not isinstance(config.training.rgb_only, bool):
         raise ValueError("training.rgb_only must be a boolean")
     if not config.training.rgb_only and config.data.reference_compositing != "linear":
@@ -856,7 +867,8 @@ def normalized_algorithm_group(name, values):
         return {key: value for key, value in values.items() if key != "traversal"}
     if name == "data" and values is not None:
         # Omitted/None COLMAP options are identical for historical synthetic runs.
-        return {"reference_compositing": "linear", **{
+        return {"reference_compositing": "linear", "scene_mode": "auto",
+            "background_layers": 8, "background_opacity": .5, **{
             key: value for key, value in values.items()
             if key not in ("images", "initialization") or value is not None}}
     defaults = {"topology": TopologySettings, "gradient": GradientSettings}
@@ -1006,7 +1018,7 @@ def run_training(distributed=None):
               "started_utc": datetime.now(timezone.utc).isoformat(),
               "scope": "Falcor NoLightTransport 1-spp full-view training; explicit geometry surrogate gradients",
               "falcor_reference_commit": "398f634ec788bbb2e86a6f4d0ab78d41158d9905",
-              "training_protocol": {"spp": 1, "reference_background": [1, 1, 1],
+              "training_protocol": {"spp": 1, "reference_background": list(config.render.background),
                   "gradient_reduction": "sum over pixels, no hit-count normalization",
                   "reported_loss": "mean over pixels, then mean over training views",
                   "actual_sampling": "per-pixel uniform, optionally contour-guided; frozen for a view"}}
@@ -1183,6 +1195,8 @@ def run_training(distributed=None):
         dataset = workspace_path(config.data.dataset, WORKSPACE)
         emit("Loading training views and checking reference files:", dataset, flush=True)
         prepared = prepare_dataset(config, np, load_points=checkpoint is None)
+        report["scene_background"] = scene_background_protocol(config.data, config.render)
+        report["training_protocol"]["reference_background"] = list(config.render.background)
         views = (prepared["views"] if prepared is not None else
                  load_views(dataset, config.data.cameras, config.render, np))
         signature = dataset_signature(views, dataset, config.data.cameras, config.data.initialization)
@@ -1366,6 +1380,8 @@ def run_training(distributed=None):
             # Native statistics contain host metadata (including tree allocation)
             # only; this does not transfer voxel buffers or synchronize the GPU.
             report["initial_model_statistics"] = dict(model.statistics())
+        if hasattr(model, "background_initialization"):
+            report["background_initialization"] = dict(model.background_initialization)
 
         if primary:
             if checkpoint is None and config.evaluation.enabled:

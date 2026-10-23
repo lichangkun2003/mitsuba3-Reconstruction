@@ -45,6 +45,13 @@ def validate_model_state(state: dict, metadata: dict) -> None:
     resolution = _integer(metadata["resolution"], "resolution", 1, 1024)
     if "core_resolution" in metadata:
         _integer(metadata["core_resolution"], "core_resolution", 1, resolution)
+    mapping = metadata.get("scene_mapping", "bounded")
+    if mapping not in ("bounded", "radial_seed_shell"):
+        raise ValueError("Unknown initialization scene_mapping")
+    if mapping == "radial_seed_shell":
+        core = metadata.get("core_resolution", resolution)
+        if core >= resolution or (resolution-core) % 2:
+            raise ValueError("Radial shell metadata requires positive symmetric padding")
     sh = _integer(metadata["sh_count"], "sh_count", 1, 16)
     opacity_sh = _integer(metadata["opacity_sh_count"], "opacity_sh_count", 1, 16)
     lo, hi = np.asarray(metadata["grid_min"]), np.asarray(metadata["grid_max"])
@@ -52,6 +59,11 @@ def validate_model_state(state: dict, metadata: dict) -> None:
             or hi.dtype.kind not in "iuf" or not np.isfinite(lo).all()
             or not np.isfinite(hi).all() or not (lo < hi).all()):
         raise ValueError("grid_min/grid_max must contain three finite, increasing bounds")
+    if mapping == "radial_seed_shell":
+        extent = resolution / metadata["core_resolution"]
+        if (not np.allclose(lo, [-extent]*3, rtol=0, atol=1e-7)
+                or not np.allclose(hi, [extent]*3, rtol=0, atol=1e-7)):
+            raise ValueError("Radial shell grid bounds must preserve the unit-radius core")
     if not isinstance(state, dict) or set(state) != set(MODEL_FIELDS):
         raise ValueError(f"model_state must contain exactly {MODEL_FIELDS}")
     arrays = {key: np.asarray(value) for key, value in state.items()}

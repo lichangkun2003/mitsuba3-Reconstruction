@@ -43,10 +43,10 @@ RGB-only 训练、在线生长与删除（当前默认）
 
 默认损失为线性 RGB 的平方误差；可显式开启下面的 Distortion 正则。
 新实验默认 ``data.reference_compositing="srgb"``：
-读取 sRGB RGBA 图片时，先将编码空间的 RGB 与白底按 alpha 合成，再解码为线性 RGB，
+读取 sRGB RGBA 图片时，先将编码空间的 RGB 与所选背景按 alpha 合成，再解码为线性 RGB，
 随后只保留三个 RGB 通道；普通 RGB 图片直接解码为线性 RGB。
 源图片的 alpha 仅参与这一步图像合成，不再作为训练
-监督、几何门控、采样依据或删除证据。预测背景固定为白色。底层
+监督、几何门控、采样依据或删除证据。有界场景使用白色背景尾项，无界场景使用黑色尾项。底层
 ``loss_and_grad(..., reference_rgb, reference_alpha, ..., {"rgb_only": 1})``
 要求 ``reference_rgb`` 已完成合成，并完全忽略兼容签名中的 ``reference_alpha``。
 
@@ -584,9 +584,70 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 不会被新的脚本默认值悄悄改变。续训不允许切换参考协议；比较新旧协议应新开实验。
 训练的预览、CPU／GPU 参考缓存及自动评价均使用对应配置中的同一协议。
 
-训练脚本明确要求 ``render.background=[1,1,1]``，非白背景会报错，防止意外优化不一致的目标。
-评价是独立流程：评价时的背景设置会同时用于预测与参考合成。此前预览默认黑底，
-比较实验必须明确对齐实际背景，不能仅凭 pass 名称认为设置相同。
+训练按下面的场景模式统一解析背景：有界为白色，无界为黑色；普通 RGB/JPEG 参考图
+没有 alpha，不会被背景色覆盖。评价默认继承训练背景，独立评价的背景覆盖同时用于预测
+与参考合成。比较实验必须对齐实际背景，不能仅凭 pass 名称认为设置相同。
+
+有界背景与无界远景初始化
+--------------------------
+
+新实验默认 ``data.scene_mode="auto"``：合成相机 JSON 场景使用有界模式与白色背景，
+COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理场景一定有界或无界，
+可用 ``--scene-mode bounded`` / ``--scene-mode unbounded`` 显式选择；当前无界初始化
+需要 COLMAP 的相机归一化信息，合成相机 JSON 不支持强制切为无界模式。
+有界 COLMAP 使用同时容纳相机及点云的统一缩放，不压缩远处点，不增加远景壳层。
+合成有界场景保留原有点云初始化与边界。
+
+这里的“白色环境”只表示射线末端合成颜色，即 ``C += T * background``。
+当前 NoLightTransport 重建没有环境照明或间接光传输；无界模式关闭白色尾项，
+采用零颜色尾项，不会为射线额外添加光源。
+
+.. code-block:: python
+
+   CONFIG.data.scene_mode = "auto"
+   CONFIG.data.background_layers = 8
+   CONFIG.data.background_opacity = 0.5
+
+``background_layers`` 表示初始层级的远景径向厚度（以当前体素宽度计），不再与
+``render.max_hits`` 关联。无界初始化保持原有径向点压缩：单位球内仅作坐标归一化，
+单位球外的初始点压缩到半径 ``1 + shell_width`` 以内，其中
+``shell_width = 2 * background_layers / start_resolution``。
+**压缩仅用于初始化点；相机光线仍按当前直线前向、DDA／八叉树和椭球求交执行。**
+没有引入曲线射线、运行时坐标收缩或新的深度定义，不能将该初始化描述为完整的无界射线映射。
+
+所有静态格子 AABB 与径向球壳相交的远景格统一初始化：有点云种子的格保留种子颜色，
+其余为黑色；opacity 均设为 ``0.5``。使用能覆盖格子立方体的球形椭球，防止仅填满
+格子编号却在初始椭球之间留下缝隙。内层点云体素保留原有几何与初始化规则。
+这些远景体素可以继续优化几何、颜色和 opacity，也参与现有 RGB／低 opacity 删除。
+生长的父体与目标都限制在核心区域；远景格删除后不通过生长重新填回。
+区域按静态格子与单位球的关系确定，不随优化后的椭球中心移动。
+
+沿用现有升层分裂时壳层物理宽度不变，因此从 256 升到 512，初始 8 层对应细层 16 层；
+不会在升层时重新铺设一套 8 层，也不改变既有分裂拟合规则。完整壳层会增加初始体素数、
+参数、Adam 状态与细分后的显存占用，不能沿用稀疏远景初始化时的显存估计。
+初始每层 opacity 为 0.5 不等于强制不透明边界：删除、连续优化、有限 ``max_hits``、
+有限远裁剪面及后续几何变化都可能留下透射率，剩余部分以黑色尾项结束。
+
+新 COLMAP 初始化保存 ``data.initialization.version=2``，同时记录场景模式、
+``scene_mapping="radial_seed_shell"``（或 ``"bounded"``）、初始壳层数、opacity 和归一化参数。
+checkpoint 恢复及评价复用这些值；显式不一致的初始化设置会报错。
+旧 version 1 checkpoint 保留原来的相机、点云压缩、网格和已保存背景，不会自动铺满远景、
+改为黑底或应用新的远景生长限制。比较新初始化应从新实验开始。
+
+本次需要增量编译 Python 绑定，使模型可携带持久化的场景元数据；
+``reconstruction.cpp`` 中的前向追踪与梯度没有因此更改。在 Windows 仓库根目录执行：
+
+.. code-block:: powershell
+
+   cmake --build build --config Release --parallel 8
+   if ($LASTEXITCODE -ne 0) { throw "编译失败" }
+   & ..\envs\mitsuba\python.exe -u -I experiments/reconstruction/train.py `
+     --dataset datasets/bicycle --scene-mode unbounded `
+     --background-layers 8 --background-opacity 0.5 --gpu 0 --epochs 1000
+
+若使用 venv，将解释器路径换为 ``..\envs\mitsuba\Scripts\python.exe``。
+该功能的初始化／恢复回归不能替代完整 Bicycle 重建；新远景方案的最终质量、删除行为和
+完整实验资源开销仍需要实际训练验证。
 
 统一配置
 --------
@@ -599,6 +660,9 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
    CONFIG = TrainConfig()
    CONFIG.data.dataset = "datasets/lego"  # 切换场景就在这里改，例如 datasets/ficus
    CONFIG.data.point_cloud = "init_points.ply"
+   CONFIG.data.scene_mode = "auto"  # 合成场景有界白底；COLMAP 无界黑底
+   CONFIG.data.background_layers = 8  # 无界初始径向厚度，按体素宽度计
+   CONFIG.data.background_opacity = 0.5
    CONFIG.data.cameras = "transforms_train.json"
    CONFIG.render.width = 800
    CONFIG.render.height = 800

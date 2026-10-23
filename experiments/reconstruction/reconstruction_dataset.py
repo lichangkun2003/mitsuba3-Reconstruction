@@ -1,7 +1,8 @@
-"""Read COLMAP scenes and initialize a bounded proxy of an unbounded scene.
+"""Read COLMAP cameras and prepare explicit bounded/unbounded initializations.
 
-The original files remain untouched. Cameras receive a similarity transform;
-only point positions outside the unit sphere receive radial contraction.
+Files and straight rendering rays remain untouched. In the unbounded proxy,
+only initial point positions outside the unit sphere receive radial contraction.
+Version-1 metadata retains the original point-only contraction and grid layout.
 """
 
 from __future__ import annotations
@@ -342,20 +343,69 @@ def _grid_layout(start_core_resolution, target_core_resolution, shell_layers):
 
 def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_points.ply",
                    initialization=None, start_core_resolution=256, target_core_resolution=512,
-                   shell_layers=16, load_points=True):
-    """Prepare views and an optional point seed without writing any dataset files.
+                   shell_layers=16, load_points=True, *, scene_mode=None,
+                   background_layers=None, background_opacity=None):
+    """Prepare views and point seeds without writing dataset files.
 
-    ``initialization`` is JSON-safe metadata saved with the checkpoint. Passing it
-    restores exactly the same center, scale, shell and selected image directory.
-    ``resolution`` describes physical storage; ``core_resolution`` describes the
-    unchanged unit-sphere voxel spacing and coarse-to-fine schedule.
+    New explicit ``unbounded`` mode uses ``background_layers`` at the starting
+    resolution (eight by default), independent of the ray hit capacity. Refining
+    the core preserves the physical shell width. ``bounded`` mode fits cameras
+    and points into one cube by a similarity transform, without contraction.
+    This function does not initialize shell ellipsoids or transform any rays.
+
+    Omitted ``scene_mode`` retains the low-level version-1 initialization for
+    existing callers. A supplied checkpoint selects its own saved mode; explicit
+    contradictory arguments are rejected. Saved normalization is never refitted.
     """
     from PIL import Image
 
     dataset = Path(dataset).resolve()
     if split not in ("train", "test", "all"):
         raise ValueError("COLMAP split must be 'train', 'test', or 'all'")
-    resolution, shell_width = _grid_layout(start_core_resolution, target_core_resolution, shell_layers)
+    if scene_mode not in (None, "legacy", "bounded", "unbounded"):
+        raise ValueError("COLMAP scene_mode must be bounded, unbounded, or legacy")
+    saved = None if initialization is None else dict(initialization)
+    version = 1 if saved is None else saved.get("version")
+    if saved is not None and version not in (1, 2):
+        raise ValueError("Unsupported saved COLMAP initialization version")
+    if saved is not None:
+        mode = "legacy" if version == 1 else saved.get("scene_mode")
+        if mode not in ("legacy", "bounded", "unbounded") or (version == 2 and mode == "legacy"):
+            raise ValueError("Saved COLMAP initialization has an invalid scene_mode")
+        if scene_mode is not None and scene_mode != mode:
+            raise ValueError("Saved COLMAP initialization scene_mode disagrees with the configuration")
+    else:
+        mode = scene_mode or "legacy"
+        version = 1 if mode == "legacy" else 2
+
+    if mode == "legacy":
+        if background_layers is not None or background_opacity is not None:
+            raise ValueError("Version-1 COLMAP initialization has no background initialization settings")
+        resolution, shell_width = _grid_layout(start_core_resolution, target_core_resolution, shell_layers)
+        final_layers = int(shell_layers)
+    else:
+        if background_layers is None:
+            background_layers = saved.get("background_layers", 8) if saved else 8
+        if background_opacity is None:
+            background_opacity = saved.get("background_opacity", .5) if saved else .5
+        for name, value in (("start_core_resolution", start_core_resolution),
+                            ("target_core_resolution", target_core_resolution),
+                            ("background_layers", background_layers)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or int(value) != value or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        start, target, initial_layers = map(int, (start_core_resolution, target_core_resolution, background_layers))
+        if start & (start - 1) or target & (target - 1) or target < start:
+            raise ValueError("Core resolutions must be powers of two and target must be >= start")
+        if isinstance(background_opacity, bool) or not isinstance(background_opacity, (int, float)) or not math.isfinite(background_opacity) or not 0 < background_opacity < 1:
+            raise ValueError("background_opacity must lie strictly between zero and one")
+        if mode == "unbounded":
+            final_layers = initial_layers * (target // start)
+            resolution, shell_width = _grid_layout(start, target, final_layers)
+        else:
+            if target > 1024:
+                raise ValueError("Core resolution exceeds the supported maximum of 1024")
+            resolution, shell_width, final_layers = start, 0., 0
+
     model = find_colmap_model(dataset)
     cameras = read_colmap_cameras(model / "cameras.bin")
     images = read_colmap_images(model / "images.bin")
@@ -367,27 +417,49 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
         center = -rotation.T @ np.asarray(image["translation"])
         poses.append((center, rotation.T))
     centers = np.stack([pose[0] for pose in poses])
-    if initialization is None:
+
+    preferred_point_path = _inside(dataset, point_cloud, "Point cloud filename") if point_cloud else None
+    point_path = preferred_point_path if preferred_point_path and preferred_point_path.is_file() else model / "points3D.bin"
+    source_positions, source_colors = None, None
+    # A fresh bounded fit needs the same point-inclusive scale even for a
+    # cameras-only caller. Restoring saved cameras needs no point-cloud access.
+    if load_points or (saved is None and mode == "bounded"):
+        if point_path.suffix.lower() == ".ply":
+            source_positions, source_colors = read_ply_points(point_path)
+        else:
+            source_positions, source_colors = read_colmap_points(point_path)
+
+    if saved is None:
         center = centers.mean(axis=0)
         radius = float(np.max(np.linalg.norm(centers - center, axis=1)) * 1.1)
+        if mode == "bounded":
+            radius = max(radius, float(np.max(np.abs(source_positions - center))) * 1.1)
         if not math.isfinite(radius) or radius <= 1e-12:
             raise ValueError("Cannot estimate scene radius: registered camera centers are coincident")
         image_root = _image_directory(dataset, images_dir)
         initialization = {
-            "kind": "colmap", "version": 1, "center": center.tolist(), "radius": radius,
-            "shell_width": shell_width, "shell_layers": int(shell_layers),
+            "kind": "colmap", "version": version, "center": center.tolist(), "radius": radius,
+            "shell_width": shell_width, "shell_layers": final_layers,
             "start_core_resolution": int(start_core_resolution),
             "target_core_resolution": int(target_core_resolution),
             "image_directory": image_root.relative_to(dataset).as_posix(),
             "source_model": model.relative_to(dataset).as_posix(), "camera_count": len(images),
             "coordinate_system": "(x,y,z)->(x,z,-y)", "split": "sorted_filename_every_8th_test",
         }
+        if version == 2:
+            initialization.update(scene_mode=mode,
+                scene_mapping="radial_seed_shell" if mode == "unbounded" else "bounded",
+                background_layers=int(background_layers), background_opacity=float(background_opacity))
     else:
-        initialization = dict(initialization)
-        expected = {"kind": "colmap", "version": 1, "shell_layers": int(shell_layers),
+        initialization = saved
+        expected = {"kind": "colmap", "version": version, "shell_layers": final_layers,
                     "start_core_resolution": int(start_core_resolution),
                     "target_core_resolution": int(target_core_resolution),
                     "source_model": model.relative_to(dataset).as_posix(), "camera_count": len(images)}
+        if version == 2:
+            expected.update(scene_mode=mode,
+                scene_mapping="radial_seed_shell" if mode == "unbounded" else "bounded",
+                background_layers=int(background_layers), background_opacity=float(background_opacity))
         for name, value in expected.items():
             if initialization.get(name) != value:
                 raise ValueError(f"Saved COLMAP initialization {name} disagrees with the dataset/configuration")
@@ -442,16 +514,15 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
     if not views:
         raise ValueError(f"COLMAP {split} split contains no images")
 
-    preferred_point_path = _inside(dataset, point_cloud, "Point cloud filename") if point_cloud else None
-    point_path = preferred_point_path if preferred_point_path and preferred_point_path.is_file() else model / "points3D.bin"
     positions, colors = None, None
     if load_points:
-        if point_path.suffix.lower() == ".ply":
-            positions, colors = read_ply_points(point_path)
+        if mode == "bounded":
+            positions = np.ascontiguousarray(((source_positions - center) / radius) @ _AXES.T, dtype=np.float32)
+            if not np.isfinite(positions).all():
+                raise ValueError("Point normalization produced nonfinite coordinates")
         else:
-            positions, colors = read_colmap_points(point_path)
-        positions = contract_points(positions, center, radius, shell_width)
-        colors = np.ascontiguousarray(colors, dtype=np.float32)
+            positions = contract_points(source_positions, center, radius, shell_width)
+        colors = np.ascontiguousarray(source_colors, dtype=np.float32)
     extent = 1. + shell_width
     return {"views": views, "positions": positions, "colors": colors,
             "initialization": initialization, "width": first_size[0], "height": first_size[1],

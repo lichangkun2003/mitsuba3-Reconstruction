@@ -59,7 +59,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
         result["dtype"] = "uint32";
         return result;
     }, "value"_a.noconvert());
-    auto cls = nb::class_<Model, Object>(m, "VoxelReconstruction",
+    auto cls = nb::class_<Model, Object>(m, "VoxelReconstruction", nb::dynamic_attr(),
         "Point-cloud voxel ellipsoids with the Falcor NoLightTransport forward model.")
         .def(nb::init<const std::string &, uint32_t, const std::array<float, 3> &,
                      const std::array<float, 3> &, double, uint32_t, uint32_t>(),

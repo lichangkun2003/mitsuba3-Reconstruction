@@ -101,18 +101,26 @@ def prepare_dataset(config, np, *, load_points=True):
     used at their selected on-disk resolution, with matching full intrinsics.
     """
     from reconstruction_dataset import detect_dataset, prepare_colmap
+    from preview import resolve_scene_background
     dataset = workspace_path(config.data.dataset, WORKSPACE)
-    if detect_dataset(dataset, config.data.cameras) == "synthetic":
+    kind = detect_dataset(dataset, config.data.cameras)
+    mode = resolve_scene_background(config, kind)
+    if kind == "synthetic":
+        if mode == "unbounded":
+            raise ValueError("Unbounded shell initialization currently requires COLMAP camera normalization")
         if config.data.initialization is not None:
             raise ValueError("COLMAP initialization metadata cannot be used with synthetic cameras")
         return None
     schedule = getattr(config, "schedule", None)
     start = schedule.start_resolution if schedule and schedule.enabled else config.model.grid_resolution
     target = schedule.target_resolution if schedule and schedule.enabled else start
+    options = {} if mode == "legacy" else dict(scene_mode=mode,
+        background_layers=config.data.background_layers, background_opacity=config.data.background_opacity)
     prepared = prepare_colmap(dataset, split=_colmap_split(config.data.cameras), images_dir=config.data.images,
         point_cloud=config.data.point_cloud, initialization=config.data.initialization,
         start_core_resolution=start, target_core_resolution=target,
-        shell_layers=config.render.max_hits, load_points=load_points)
+        shell_layers=(config.data.initialization["shell_layers"] if mode == "legacy" else config.render.max_hits),
+        load_points=load_points, **options)
     config.data.initialization = prepared["initialization"]
     config.render.width, config.render.height = prepared["width"], prepared["height"]
     _colmap_views(prepared, config.render)
@@ -123,11 +131,17 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
     if prepared is not None:
         if not hasattr(mi.VoxelReconstruction, "from_points"):
             raise RuntimeError("Rebuild this checkout: in-memory point-cloud initialization is missing")
-        return mi.VoxelReconstruction.from_points(
+        model = mi.VoxelReconstruction.from_points(
             np.ascontiguousarray(prepared["positions"], dtype=np.float32).reshape(-1),
             np.ascontiguousarray(prepared["colors"], dtype=np.float32).reshape(-1),
             prepared["resolution"], prepared["grid_min"], prepared["grid_max"],
             config.model.sh_count, config.model.opacity_sh_count, prepared["core_resolution"])
+        if prepared["initialization"].get("scene_mapping") == "radial_seed_shell":
+            import drjit as dr
+            from reconstruction_background import initialize_background_model
+            return initialize_background_model(model, mi, dr, np,
+                opacity=prepared["initialization"]["background_opacity"])
+        return model
     lo, hi = np.asarray(config.model.bounds_min), np.asarray(config.model.bounds_max)
     center, half = (lo + hi) / 2, (hi - lo) / 2 * config.model.bounds_padding
     schedule = getattr(config, "schedule", None)
@@ -326,6 +340,8 @@ def model_metadata(model) -> dict:
     core = int(getattr(model, "core_resolution", model.resolution))
     if core != metadata["resolution"]:
         metadata["core_resolution"] = core
+    if getattr(model, "scene_mapping", "bounded") == "radial_seed_shell":
+        metadata["scene_mapping"] = "radial_seed_shell"
     return metadata
 
 
@@ -334,8 +350,11 @@ def restore_model(checkpoint, mi):
     state = {key: (mi.UInt32(value) if key == "cell_indices" else mi.Float(value))
              for key, value in checkpoint["model_state"].items()}
     options = ({"core_resolution": metadata["core_resolution"]} if "core_resolution" in metadata else {})
-    return mi.VoxelReconstruction.from_state(metadata["resolution"], metadata["grid_min"],
+    model = mi.VoxelReconstruction.from_state(metadata["resolution"], metadata["grid_min"],
         metadata["grid_max"], state, metadata["sh_count"], metadata["opacity_sh_count"], **options)
+    if metadata.get("scene_mapping") == "radial_seed_shell":
+        model.scene_mapping = "radial_seed_shell"
+    return model
 
 
 class UniformSampler:
