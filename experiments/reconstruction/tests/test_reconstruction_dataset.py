@@ -152,15 +152,15 @@ class ColmapDatasetTests(unittest.TestCase):
         self.assertEqual(metadata["version"], 2)
         self.assertEqual(metadata["scene_mode"], "unbounded")
         self.assertEqual(metadata["scene_mapping"], "radial_seed_shell")
-        self.assertEqual(metadata["background_layers"], 8)
+        self.assertEqual(metadata["background_layers"], 4)
         self.assertEqual(metadata["background_opacity"], .5)
-        self.assertEqual(metadata["shell_layers"], 64)
-        self.assertEqual(metadata["shell_width"], .25)
-        self.assertEqual(prepared["resolution"], 80)
-        self.assertEqual(prepared["grid_max"], [1.25] * 3)
+        self.assertEqual(metadata["shell_layers"], 32)
+        self.assertEqual(metadata["shell_width"], .125)
+        self.assertEqual(prepared["resolution"], 72)
+        self.assertEqual(prepared["grid_max"], [1.125] * 3)
         self.assertEqual(2 * prepared["grid_max"][0] / prepared["resolution"], 2 / 64)
         points, _ = dataset.read_colmap_points(self.model / "points3D.bin")
-        expected = dataset.contract_points(points, metadata["center"], metadata["radius"], .25)
+        expected = dataset.contract_points(points, metadata["center"], metadata["radius"], .125)
         np.testing.assert_array_equal(prepared["positions"], expected)
         # Ray capacity is not involved in either the explicit shell or point map.
         other = self.prepare(scene_mode="unbounded", start_core_resolution=64,
@@ -169,7 +169,7 @@ class ColmapDatasetTests(unittest.TestCase):
         np.testing.assert_array_equal(other["positions"], prepared["positions"])
 
     def test_v2_saved_initialization_restores_exactly_and_rejects_overrides(self):
-        prepared = self.prepare(scene_mode="unbounded", background_layers=3,
+        prepared = self.prepare(scene_mode="unbounded", background_layers=8,
                                 background_opacity=.4)
         metadata = prepared["initialization"]
         restored = self.prepare(initialization=metadata)

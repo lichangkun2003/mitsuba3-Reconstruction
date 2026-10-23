@@ -617,7 +617,7 @@ COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理�
 .. code-block:: python
 
    CONFIG.data.scene_mode = "auto"
-   CONFIG.data.background_layers = 8
+   CONFIG.data.background_layers = 4
    CONFIG.data.background_opacity = 0.5
 
 ``background_layers`` 表示初始层级的远景径向厚度（以当前体素宽度计），不再与
@@ -634,8 +634,9 @@ COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理�
 生长的父体与目标都限制在核心区域；远景格删除后不通过生长重新填回。
 区域按静态格子与单位球的关系确定，不随优化后的椭球中心移动。
 
-沿用现有升层分裂时壳层物理宽度不变，因此从 256 升到 512，初始 8 层对应细层 16 层；
-不会在升层时重新铺设一套 8 层，也不改变既有分裂拟合规则。完整壳层会增加初始体素数、
+沿用现有全场统一升层分裂时壳层物理宽度不变，因此从 256 升到 512，初始 4 层对应细层 8 层；
+近景与远景的体素边长始终相同，不保留粗分辨率远景。不会在升层时重新铺设一套 4 层，
+也不改变既有分裂拟合规则。完整壳层会增加初始体素数、
 参数、Adam 状态与细分后的显存占用，不能沿用稀疏远景初始化时的显存估计。
 初始每层 opacity 为 0.5 不等于强制不透明边界：删除、连续优化、有限 ``max_hits``、
 有限远裁剪面及后续几何变化都可能留下透射率，剩余部分以黑色尾项结束。
@@ -643,6 +644,8 @@ COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理�
 新 COLMAP 初始化保存 ``data.initialization.version=2``，同时记录场景模式、
 ``scene_mapping="radial_seed_shell"``（或 ``"bounded"``）、初始壳层数、opacity 和归一化参数。
 checkpoint 恢复及评价复用这些值；显式不一致的初始化设置会报错。
+已有初始 8 层的 version 2 checkpoint 继续使用保存的壳层参数，不会因默认值改为 4 层而迁移；
+要使用新的 4 层初始化，应开始新实验。
 旧 version 1 checkpoint 保留原来的相机、点云压缩、网格和已保存背景，不会自动铺满远景、
 改为黑底或应用新的远景生长限制。比较新初始化应从新实验开始。
 
@@ -655,7 +658,7 @@ checkpoint 恢复及评价复用这些值；显式不一致的初始化设置会
    if ($LASTEXITCODE -ne 0) { throw "编译失败" }
    & ..\envs\mitsuba\python.exe -u -I experiments/reconstruction/train.py `
      --dataset datasets/bicycle --scene-mode unbounded `
-     --background-layers 8 --background-opacity 0.5 --gpu 0 --epochs 1000
+     --background-layers 4 --background-opacity 0.5 --gpu 0 --epochs 1000
 
 若使用 venv，将解释器路径换为 ``..\envs\mitsuba\Scripts\python.exe``。
 该功能的初始化／恢复回归不能替代完整 Bicycle 重建；新远景方案的最终质量、删除行为和
@@ -673,7 +676,7 @@ checkpoint 恢复及评价复用这些值；显式不一致的初始化设置会
    CONFIG.data.dataset = "datasets/lego"  # 切换场景就在这里改，例如 datasets/ficus
    CONFIG.data.point_cloud = "init_points.ply"
    CONFIG.data.scene_mode = "auto"  # 合成场景有界白底；COLMAP 无界黑底
-   CONFIG.data.background_layers = 8  # 无界初始径向厚度，按体素宽度计
+   CONFIG.data.background_layers = 4  # 无界初始径向厚度，按体素宽度计
    CONFIG.data.background_opacity = 0.5
    CONFIG.data.cameras = "transforms_train.json"
    CONFIG.render.width = 800

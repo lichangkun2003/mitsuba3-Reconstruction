@@ -348,7 +348,7 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
     """Prepare views and point seeds without writing dataset files.
 
     New explicit ``unbounded`` mode uses ``background_layers`` at the starting
-    resolution (eight by default), independent of the ray hit capacity. Refining
+    resolution (four by default), independent of the ray hit capacity. Refining
     the core preserves the physical shell width. ``bounded`` mode fits cameras
     and points into one cube by a similarity transform, without contraction.
     This function does not initialize shell ellipsoids or transform any rays.
@@ -385,7 +385,7 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
         final_layers = int(shell_layers)
     else:
         if background_layers is None:
-            background_layers = saved.get("background_layers", 8) if saved else 8
+            background_layers = saved.get("background_layers", 8) if saved else 4
         if background_opacity is None:
             background_opacity = saved.get("background_opacity", .5) if saved else .5
         for name, value in (("start_core_resolution", start_core_resolution),

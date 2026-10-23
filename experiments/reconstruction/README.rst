@@ -10,7 +10,7 @@
 要求 COLMAP 数据，合成相机 JSON 不能直接强制启用无界模式。背景只是剩余透射率的
 合成尾项，不是光照计算；普通 RGB/JPEG 参考图的实拍背景不会被替换。
 
-无界模式默认 ``data.background_layers=8``、``data.background_opacity=0.5``，
+无界模式默认 ``data.background_layers=4``、``data.background_opacity=0.5``，
 也可用 ``--background-layers`` / ``--background-opacity`` 设置。所有静态格子 AABB
 与远景径向球壳相交的格子统一铺满：有点的格使用点云种子颜色，其余为黑色，
 几何为覆盖整个格子的球形椭球。内层种子保持原初始化。
@@ -19,12 +19,14 @@
 
 远景允许几何／颜色／opacity 优化与现有删除，禁止作为生长父体或生长目标；
 被删除的远景格不会重新长回。区域按静态格子确定，不受优化后中心移动影响。
-初始 8 层与 ``max_hits`` 解耦，256→512 沿用分裂后变为 16 层，保持物理壳层宽度。
+初始 4 层与 ``max_hits`` 解耦，256→512 时全场统一分裂，远景厚度变为 8 个体素层，
+保持物理壳层宽度；近景与远景的体素边长始终相同，不保留粗分辨率远景。
 完整壳层会增加体素数与显存；删除、有限路径容量和后续优化可能留下透射率，
 黑色尾项不意味着保证射线最终不透明。
 
 新 COLMAP 初始化保存 version 2 的场景、背景和归一化元数据。旧 version 1 实验
-继续保留原初始化及背景，恢复／评价时不自动迁移。新规则应从新实验开始。
+继续保留原初始化及背景，恢复／评价时不自动迁移。已有初始 8 层的 version 2 checkpoint
+同样保留其已保存的壳层参数，不会因新默认值变为 4 层；4 层设置应从新实验开始。
 远景初始化为模型元数据扩展了 Python 绑定，稀疏 Adam 更新另外使用新的原生参数提交接口。
 需要先在仓库根目录增量编译；前向求交与深度计算不变：
 
@@ -34,7 +36,7 @@
    if ($LASTEXITCODE -ne 0) { throw "编译失败" }
    & ..\envs\mitsuba\python.exe -u -I experiments/reconstruction/train.py `
      --dataset datasets/bicycle --scene-mode unbounded `
-     --background-layers 8 --background-opacity 0.5 --gpu 0 --epochs 1000
+     --background-layers 4 --background-opacity 0.5 --gpu 0 --epochs 1000
 
 venv 解释器使用 ``..\envs\mitsuba\Scripts\python.exe``。完整 Bicycle 训练质量与
 资源开销需通过新实验确认；初始化与恢复的回归不替代完整训练。
@@ -572,16 +574,17 @@ PLY 和相机来源独立判断，因此已有导出 PLY 的 360 场景仍可使
 ``R = 1.1 * max(||camera - c||)``；点云和相机先统一变换为 ``(p-c)/R``，
 再统一转换坐标轴为 ``(x,y,z) -> (x,z,-y)``。相机只做这一相似变换。
 半径 ``r <= 1`` 的点保持不变；远景点沿径向一次性映射到
-``r' = 1 + W * (1 - 1/r)``，其中
-``W = 2 * render.max_hits / 最终核心分辨率``。
+``r' = 1 + W * (1 - 1/r)``。新 version 2 初始化使用
+``W = 2 * data.background_layers / 起始核心分辨率``，默认初始 4 层。
 这是压缩几何的初始化，后续直接在该几何上求交和优化，不对射线做逆压缩。
 
-默认核心分辨率 256 → 512、``max_hits=16`` 时，固定边界为
+旧 version 1 初始化仍按 ``W = 2 * render.max_hits / 最终核心分辨率`` 恢复。
+该旧规则在核心分辨率 256 → 512、``max_hits=16`` 时，固定边界为
 ``[-1.0625, 1.0625]^3``，实际存储网格为 272 → 544，
 外壳径向层数为 8 → 16；核心体素边长仍分别为 ``2/256``、``2/512``。
 合成场景的核心分辨率与存储分辨率相同。
-独立 ``preview.py`` 没有升层计划，最终核心分辨率等于其 ``grid_resolution``；
-因此预览 256 单层时外壳为 16 层、实际网格为 288。
+在该旧规则下，独立 ``preview.py`` 没有升层计划，最终核心分辨率等于其 ``grid_resolution``；
+因此预览 256 单层时外壳为 16 层、实际网格为 288。新 version 2 不再按 ``max_hits`` 决定壳层宽度。
 需要查看 256 → 512 训练计划的原始初始化图时，使用训练入口保存的 ``0000-initial.png``。
 中心、半径、外壳宽度和图像目录写入 ``data.initialization``，
 随 checkpoint 保存；续训、升层和评价复用它们，不重新压缩已训练体素。

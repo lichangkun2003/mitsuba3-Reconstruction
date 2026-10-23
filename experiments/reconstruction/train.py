@@ -122,7 +122,7 @@ CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
 CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再解码；渲染与损失仍在线性空间。
 CONFIG.data.scene_mode = "auto"  # 合成场景：有界白色背景；COLMAP：无界远景层、无白色背景尾项。
-CONFIG.data.background_layers = 8  # 初始化远景层数；独立于 render.max_hits，升层时随体素细分。
+CONFIG.data.background_layers = 4  # 初始化远景层数；独立于 render.max_hits，升层时随体素细分。
 CONFIG.data.background_opacity = 0.5  # 远景新生体素 opacity；允许后续优化和删除。
 
 CONFIG.render.width = 800
@@ -225,7 +225,7 @@ def parse_arguments():
     parser.add_argument("--dataset")
     parser.add_argument("--scene-mode", choices=("auto", "bounded", "unbounded"),
                         help="auto: bounded synthetic / unbounded COLMAP; override for a new scene")
-    parser.add_argument("--background-layers", type=int, help="Initial radial shell width in voxels (default: 8)")
+    parser.add_argument("--background-layers", type=int, help="Initial radial shell width in voxels (default: 4)")
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
     parser.add_argument("--output-dir", help="Override automatic outputs/SCENE-MM.DD-Eindex/training; on resume the default reuses the checkpoint's experiment")
     parser.add_argument("--build-dir")
@@ -1068,7 +1068,7 @@ def run_training(distributed=None):
             runtime, training_output = config.runtime, config.training.output
             # Fields introduced after a checkpoint must use their legacy
             # dataclass defaults, not the latest experiment's CONFIG switches.
-            config.data = DataConfig()
+            config.data = DataConfig(background_layers=8)  # Historical default for saves without this field.
             config.render = RenderConfig()
             config.topology = TopologySettings()
             config.gradient = GradientSettings()

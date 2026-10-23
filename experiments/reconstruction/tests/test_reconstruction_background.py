@@ -76,10 +76,10 @@ class BackgroundConfigTests(unittest.TestCase):
     def test_shell_layers_independent_of_hit_capacity(self):
         config = preview.PreviewConfig()
         config.render.max_hits = 1
-        self.assertEqual(config.data.background_layers, 8)
+        self.assertEqual(config.data.background_layers, 4)
         preview.validate_config(config)
         config.render.max_hits = 32
-        self.assertEqual(config.data.background_layers, 8)
+        self.assertEqual(config.data.background_layers, 4)
         preview.validate_config(config)
 
     def test_old_resume_configuration_gets_equivalent_defaults(self):
