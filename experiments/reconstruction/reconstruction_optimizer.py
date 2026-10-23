@@ -56,7 +56,8 @@ class FalcorOptimizer:
     D3D page-exhaustion fallback to SGD while retaining the ordinary Adam rule.
     """
 
-    def __init__(self, model, config: OptimizerConfig | None = None, *, sparse_updates=True):
+    def __init__(self, model, config: OptimizerConfig | None = None, *, sparse_updates=True,
+                 replay_updates=True):
         import drjit as dr
         import mitsuba as mi
         self.dr, self.mi = dr, mi
@@ -65,7 +66,32 @@ class FalcorOptimizer:
         # Dense execution is retained as a numerical/performance reference.
         # It does not alter the optimizer/checkpoint configuration or algorithm.
         self.sparse_updates = sparse_updates
+        self.replay_updates = replay_updates
+        self._update_frozen = self._update_model = self._update_key = None
+        self._update_calls = self._update_recordings = self._update_replays = 0
+        self._update_bypasses = self._update_clears = 0
+        # All mutable buffers are explicit PyTree arguments. The closure must
+        # not retain a model, its snapshot, or old optimizer state.
+        def native_update(model, gradients, appearance, geometry, carving,
+                          means, squares, steps, settings, allowed, check_moments):
+            accepted = model.optimizer_step_device(gradients, appearance, geometry, carving,
+                means, squares, steps, settings, allowed, check_moments)
+            dr.eval(accepted, *means.values(), *squares.values(), *steps.values())
+            return accepted
+        self._native_update = native_update
         self.reset(model)
+
+    def clear_replay(self):
+        """Release recorded buffers before replacing topology or optimizer state."""
+        self._update_frozen = self._update_model = self._update_key = None
+        self._update_clears += 1
+
+    def statistics(self):
+        return {"execution": "device_sparse" if self.sparse_updates else "dense_reference",
+                "replay_enabled": self.replay_updates, "calls": self._update_calls,
+                "recordings": self._update_recordings, "replays": self._update_replays,
+                "bypasses": self._update_bypasses, "clears": self._update_clears,
+                "host_length_readbacks": 0, "capacity_rows": self.count}
 
     @property
     def state(self):
@@ -85,6 +111,7 @@ class FalcorOptimizer:
         self._state_exposed = True
 
     def reset(self, model):
+        self.clear_replay()
         self.update_healthy = self.mi.Bool(True)
         self.count = int(model.active_voxel_count)
         self.dimensions = {
@@ -119,7 +146,7 @@ class FalcorOptimizer:
                     expected = self.count if key == "steps" else self.count * self.dimensions[name]
                     if dr.width(value) != expected:
                         raise ValueError(f"Invalid optimizer state size: {name}.{key}")
-                    if key != "steps":
+                    if key != "steps" and expected:
                         valid &= dr.all(dr.isfinite(value))
         return valid
 
@@ -202,6 +229,85 @@ class FalcorOptimizer:
                               coarse_to_fine=coarse_to_fine, update_allowed=update_allowed)
 
     def _step_sparse(self, model, out, *, sample_count, epoch, coarse_to_fine, update_allowed):
+        """Device-counted compact rows; no per-view host length readbacks."""
+        dr, mi, cfg = self.dr, self.mi, self.config
+        if not callable(getattr(model, "optimizer_step_device", None)):
+            raise RuntimeError("Device sparse Adam requires optimizer_step_device; rebuild this source checkout")
+        if int(model.active_voxel_count) != self.count:
+            raise ValueError("Topology changed: call optimizer.remap() or reset() before step")
+        if sample_count < 1:
+            raise ValueError("sample_count must be positive")
+        if self._state_exposed:
+            # Different array wrappers may share storage (the native scope
+            # separates that storage). Reusing one mutable wrapper for two
+            # state slots cannot represent independent Adam groups.
+            owners = [id(value) for state in self._state.values() for value in state.values()]
+            if len(set(owners)) != len(owners):
+                raise ValueError("Optimizer state slots must use distinct array objects")
+        guarded = update_allowed is not None
+        allowed = self.update_healthy & update_allowed if guarded else mi.Bool(True)
+        if guarded:
+            allowed &= self._check_external_state()
+        opacity_lr = self.effective_opacity_lr(epoch, coarse_to_fine)
+        counts = tuple(mi.UInt32(out[name]) for name in
+                       ("appearance_valid", "geometry_valid", "background_carve_valid"))
+        if any(dr.width(value) != self.count for value in counts):
+            raise ValueError("Validity counts must have one entry per voxel")
+        gradients = {name: mi.Float(out["gradients"][name]) for name in self.dimensions}
+        for name, value in gradients.items():
+            if dr.width(value) != self.count * self.dimensions[name]:
+                raise ValueError(f"Gradient {name} has the wrong size")
+        self._update_calls += 1
+        if self.count == 0:
+            self._update_bypasses += 1
+            if guarded:
+                self.update_healthy = allowed
+                dr.eval(allowed)
+            return {"effective_opacity_lr": opacity_lr, "backward_samples": sample_count,
+                    "accepted": self.update_healthy}
+        settings = {name: float(value) for name, value in asdict(cfg).items()}
+        settings.update(lr_opacity=float(opacity_lr), gradient_factor=cfg.grad_scale / sample_count)
+        means = {name: state["mean"] for name, state in self._state.items()}
+        squares = {name: state["squared_mean"] for name, state in self._state.items()}
+        steps = {name: state["steps"] for name, state in self._state.items()}
+        key = (self.count, tuple(self.dimensions.items()), tuple(float(v) for v in model.voxel_size),
+               tuple(sorted(settings.items())), guarded)
+        if self._update_model is not model or self._update_key != key:
+            self.clear_replay()
+            self._update_model, self._update_key = model, key
+        arguments = (model, gradients, *counts, means, squares, steps, settings, allowed, guarded)
+        # Separate genuine external aliases before recording/replaying writes,
+        # then stash the unique-owner reference counts across freeze's internal
+        # temporary references. Without this scope freeze records a full-table
+        # copy for every parameter and moment, including on later replays.
+        scope = model.optimizer_update_scope_begin(means, squares, steps)
+        try:
+            if self.replay_updates and dr.backend_v(mi.Float) == dr.JitBackend.CUDA:
+                if self._update_frozen is None:
+                    self._update_frozen = dr.freeze(self._native_update, limit=2, warn_after=8,
+                                                    auto_opaque=False)
+                before = self._update_frozen.n_recordings
+                try:
+                    accepted = self._update_frozen(*arguments)
+                finally:
+                    recorded = self._update_frozen.n_recordings - before
+                    self._update_recordings += recorded
+                self._update_replays += int(recorded == 0)
+            else:
+                self._update_bypasses += 1
+                accepted = self._native_update(*arguments)
+        finally:
+            mi._reconstruction_optimizer_update_scope_end(scope)
+        if guarded:
+            self.update_healthy = accepted
+        elif not bool(accepted[0]):
+            raise RuntimeError("Nonfinite or invalid sparse parameter update")
+        self._remember_state()
+        return {"effective_opacity_lr": opacity_lr, "backward_samples": sample_count,
+                "accepted": accepted}
+
+    def _step_compact_reference(self, model, out, *, sample_count, epoch, coarse_to_fine, update_allowed):
+        """Previous host-sized sparse path, retained only for diagnostics."""
         dr, mi, cfg = self.dr, self.mi, self.config
         if not callable(getattr(model, "set_parameters_sparse", None)):
             raise RuntimeError("Sparse Adam requires set_parameters_sparse; rebuild this source checkout")
@@ -390,6 +496,7 @@ class FalcorOptimizer:
 
     def remap(self, survivors, new_count: int, *, reset_radiance: bool = False):
         """Preserve surviving moments, append zero newborn state; all indices are old IDs."""
+        self.clear_replay()
         dr, mi = self.dr, self.mi
         source = mi.UInt32(survivors)
         kept = dr.width(source)
@@ -401,6 +508,7 @@ class FalcorOptimizer:
                 state["squared_mean"] = dr.zeros(mi.Float, new_count * self.dimensions[name])
                 state["steps"] = dr.zeros(mi.UInt32, new_count)
             self.count = new_count
+            self._remember_state()
             return
         destination = dr.arange(mi.UInt32, new_count)
         valid = destination < kept
@@ -420,6 +528,7 @@ class FalcorOptimizer:
                 state["steps"] = dr.gather(mi.UInt32, state["steps"], source_ids, valid)
         self.count = new_count
         dr.eval(*[value for state in self._state.values() for value in state.values()])
+        self._remember_state()
 
     def state_dict(self) -> dict:
         import numpy as np
@@ -428,6 +537,16 @@ class FalcorOptimizer:
         return {"config": asdict(self.config), "count": self.count, "dimensions": dict(self.dimensions),
                 "groups": {name: {key: np.array(value, copy=True) for key, value in state.items()}
                            for name, state in self._state.items()}}
+
+    def device_state_dict(self) -> dict:
+        """Borrow device state at a topology/replica boundary, without readback.
+
+        The receiver must finish transferring and release these references before
+        the next update. Persistent checkpoints still use state_dict().
+        """
+        return {"config": asdict(self.config), "count": self.count,
+                "dimensions": dict(self.dimensions),
+                "groups": {name: dict(state) for name, state in self._state.items()}}
 
     def load_state_dict(self, data: dict):
         if int(data["count"]) != self.count or data["dimensions"] != self.dimensions:
@@ -450,5 +569,6 @@ class FalcorOptimizer:
         if not bool(valid[0]):
             raise ValueError("Checkpoint optimizer moments must be finite")
         self.config, self._state = config, restored
+        self.clear_replay()
         self._state_exposed = False
         self._remember_state()

@@ -5,6 +5,7 @@
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
+#include <nanobind/stl/vector.h>
 #include <drjit/python.h>
 
 MI_PY_EXPORT(VoxelReconstruction) {
@@ -59,6 +60,11 @@ MI_PY_EXPORT(VoxelReconstruction) {
         result["dtype"] = "uint32";
         return result;
     }, "value"_a.noconvert());
+    m.def("_reconstruction_optimizer_update_scope_end", [](const std::vector<uint64_t> &handles) {
+        for (uint64_t handle : handles)
+            jit_var_unstash_ref(handle);
+    }, "handles"_a,
+       "Release optimizer tracing reference stashes; call from a finally block.");
     auto cls = nb::class_<Model, Object>(m, "VoxelReconstruction", nb::dynamic_attr(),
         "Point-cloud voxel ellipsoids with the Falcor NoLightTransport forward model.")
         .def(nb::init<const std::string &, uint32_t, const std::array<float, 3> &,
@@ -106,6 +112,62 @@ MI_PY_EXPORT(VoxelReconstruction) {
         .def("set_parameters_sparse", &Model::set_parameters_sparse,
              "appearance_indices"_a, "geometry_indices"_a, "parameters"_a, "allowed"_a,
              "Commit compact sorted appearance/geometry rows with one device acceptance gate.")
+        .def("optimizer_step_device", [](Model &model,
+                 const std::map<std::string, typename Model::FloatBuffer> &gradients,
+                 const typename Model::UIntBuffer &appearance_valid,
+                 const typename Model::UIntBuffer &geometry_valid,
+                 const typename Model::UIntBuffer &background_carve_valid,
+                 const nb::dict &means, const nb::dict &squared_means,
+                 const nb::dict &steps, const std::map<std::string, double> &settings,
+                 const typename Model::Mask &allowed, bool check_moments) {
+            // Borrow the actual bound Dr.Jit objects. Casting arrays by value
+            // would retain old full tables and trigger copy-on-write on scatter.
+            std::map<std::string, typename Model::FloatBuffer *> mean_ptrs, square_ptrs;
+            std::map<std::string, typename Model::UIntBuffer *> step_ptrs;
+            for (auto item : means)
+                mean_ptrs[nb::cast<std::string>(item.first)] =
+                    nb::cast<typename Model::FloatBuffer *>(item.second);
+            for (auto item : squared_means)
+                square_ptrs[nb::cast<std::string>(item.first)] =
+                    nb::cast<typename Model::FloatBuffer *>(item.second);
+            for (auto item : steps)
+                step_ptrs[nb::cast<std::string>(item.first)] =
+                    nb::cast<typename Model::UIntBuffer *>(item.second);
+            return model.optimizer_step_device(gradients, appearance_valid, geometry_valid,
+                background_carve_valid, mean_ptrs, square_ptrs, step_ptrs, settings,
+                allowed, check_moments);
+        }, "gradients"_a, "appearance_valid"_a, "geometry_valid"_a,
+           "background_carve_valid"_a, "means"_a, "squared_means"_a, "steps"_a,
+           "settings"_a, "allowed"_a, "check_moments"_a = true,
+           "Device-resident sparse Adam; mutates borrowed moment arrays and returns a shared acceptance mask.")
+        .def("optimizer_update_scope_begin", [](Model &model, const nb::dict &means,
+                 const nb::dict &squared_means, const nb::dict &steps) {
+            std::map<std::string, typename Model::FloatBuffer *> mean_ptrs, square_ptrs;
+            std::map<std::string, typename Model::UIntBuffer *> step_ptrs;
+            for (auto item : means)
+                mean_ptrs[nb::cast<std::string>(item.first)] =
+                    nb::cast<typename Model::FloatBuffer *>(item.second);
+            for (auto item : squared_means)
+                square_ptrs[nb::cast<std::string>(item.first)] =
+                    nb::cast<typename Model::FloatBuffer *>(item.second);
+            for (auto item : steps)
+                step_ptrs[nb::cast<std::string>(item.first)] =
+                    nb::cast<typename Model::UIntBuffer *>(item.second);
+            auto handles = model.optimizer_update_scope_begin(mean_ptrs, square_ptrs, step_ptrs);
+            try {
+                nb::list result;
+                for (uint64_t handle : handles)
+                    result.append(nb::int_(handle));
+                return result;
+            } catch (...) {
+                // Cover allocation/conversion failure while transferring the
+                // scope handles to Python, before its finally block can run.
+                for (uint64_t handle : handles)
+                    jit_var_unstash_ref(handle);
+                throw;
+            }
+        }, "means"_a, "squared_means"_a, "steps"_a,
+           "Detach genuine aliases and begin a sparse-optimizer recording/replay scope.")
         .def("set_growth_candidates", [](Model &model, const nb::dict &state) {
             if (!state.contains("cell_indices"))
                 throw nb::value_error("set_growth_candidates(): missing cell_indices");
@@ -186,5 +248,6 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("rgb_deletion_version") = nb::int_(Model::rgb_deletion_version);
     cls.attr("distortion_version") = nb::int_(Model::distortion_version);
     cls.attr("octree_version") = nb::int_(Model::octree_version);
+    cls.attr("optimizer_device_version") = nb::int_(Model::optimizer_device_version);
     drjit::bind_traverse(cls);
 }

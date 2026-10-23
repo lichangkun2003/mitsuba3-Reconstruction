@@ -43,10 +43,16 @@ venv 解释器使用 ``..\envs\mitsuba\Scripts\python.exe``。完整 Bicycle 训
 
 当前 CUDA RGB-only 默认启用 ``topology.gpu_topology=True``：候选几何、同格父体素
 支持统计、RGB 生长／删除资格、冷却与保护期、新模型拼接和优化器状态重映射在 GPU
-完成。接触条件使用双精度；生长间隔、每视角更新顺序和同分择优规则保持原定义。
+完成。接触条件使用双精度；生长间隔和同分择优规则保持原定义，单卡仍每视角更新一次。
 ``--no-gpu-topology``（或 ``topology.gpu_topology=False``）保留 NumPy 对照。
-``--gpu-topology`` 显式启用设备路径。升层拟合、存档、出图，以及当前多卡
-控制通道传输仍有明确的主机边界；动态压紧的数量与轮末日志标量也允许少量同步。
+``--gpu-topology`` 显式启用设备路径。升层拟合也在 GPU 执行：保留 FP64 几何、
+原 18 轮边界二分、子格优先／父体素次序、opacity 光学厚度衰减和 DC 颜色继承。
+完全内含子格直接采用原代码最终覆盖的解析结果，省去其结果会被丢弃的二分；
+这不是新的分裂近似。数量与校验标量可回读，普通升层不回读完整父模型。
+新生命周期和 Adam 在设备上重置，原生索引与八叉树仍在 GPU 重建。
+CPU ``refine_state`` 保留为 ``--no-gpu-topology`` 的对照。
+存档、出图仍有明确的主机边界；显式 ``save_each_level=True`` 的调用保留旧层存档语义。
+正常训练关闭这项额外旧层存档。多卡模型／候选／Adam 缓冲使用 GPU 广播，控制通道仅传元数据。
 
 候选生成先在 GPU 压紧成熟、未被禁止且位于允许生长区域的父体素，再计算双精度
 椭球几何与各邻接方向。禁止生长的远景父体不进入这些计算；全场体素仍参与占用索引，
@@ -56,15 +62,19 @@ venv 解释器使用 ``..\envs\mitsuba\Scripts\python.exe``。完整 Bicycle 训
 Adam 默认按 ``appearance_valid`` / ``geometry_valid`` 分别压紧本视角的有效体素，
 只对这些行读取参数和动量、计算更新并写回。不是按梯度是否非零筛选：有效的零梯度
 仍按原规则衰减动量并推进该参数组的独立步数；无效体素保持参数、动量和步数不变。
-参数与 Adam 状态共用整批有限值检查后的接受标记，通过 ``set_parameters_sparse()``
+参数与 Adam 状态共用整批有限值检查后的接受标记，通过 ``optimizer_step_device()``
 提交；缺少该接口的旧构建会报错，必须增量编译。模型与 checkpoint 仍保存完整数组，
-没有改动续训状态格式、学习率、裁剪、旋转更新或每视角一次更新的顺序。
-``dr.compress`` 会为紧凑数组长度产生少量同步，因此这条路径不是完全异步。
+没有改动学习率、裁剪、旋转更新或单卡每视角一次更新的顺序。
+索引列表使用固定容量缓冲区，前缀和及有效长度都留在 GPU，不再每视角执行两次
+``dr.compress`` 回读长度。设备端以最多 32768 行一批遍历有效索引：先检查全部组，
+再重算并提交，避免全体素数乘参数维度的候选／回滚临时表。
+``--freeze-native`` 同时开启 Adam 重放；正常更新不复制整张参数／动量表，
+外部持有旧快照时仍保留写时复制语义。拓扑或状态更换后重新记录。
 原始梯度的全量有限值检查、全场占用索引等工作仍然存在，不能把开销视为全部与有效体素数成正比。
 
 默认 ``training.sync_view_checks=False`` 将逐视角损失及有效性摘要留在 GPU，epoch
 结束或诊断抽样边界统一读取。无效梯度、参数或 Adam 状态会锁存错误并阻止本次与
-后续更新；错误在下次检查边界报告。每视角仍更新一次，未扩大完整步骤重放范围。
+后续更新；错误在下次检查边界报告。单卡每视角更新一次，Adam 与前向／梯度分别重放。
 ``--sync-view-checks`` 可恢复逐视角同步诊断。默认视角进度不显示即时 loss，epoch
 汇总仍给出完整 loss。新日志 ``epoch_validation_seconds`` 包含队列等待，比较加速
 应使用整个 epoch 的 ``seconds``，不能只比较异步提交阶段的 ``gradients`` 数字。
@@ -268,6 +278,67 @@ Distortion 对照实验
 公式、截断路径语义、梯度范围及运行示例见
 ``docs/reconstruction_training.rst`` 的“可选 Distortion”一节。
 
+HPC 多卡视角批次
+---------------
+
+``train_multigpu.py`` 在 Linux Slurm 同节点运行，省略 ``--workers`` 时自动使用
+``CUDA_VISIBLE_DEVICES`` 中的全部 N 张分配 GPU。每张卡计算不同的完整训练视角，
+全部完成后用实际 B 个视角的平均梯度共同更新一次 Adam；尾批不足 N 时不重复视角，
+空闲 rank 贡献零且不计入 B。169 个视角、两卡时每轮是 85 次更新。
+N=1 保持现有逐视角路径，N>1 只支持 RGB-only 均匀 1 spp，明确拒绝 legacy alpha／contour。
+
+多卡主 RNG 统一生成视角顺序和各视角 seed，每张卡用局部 RNG 采样自己的图。
+学习率不自动乘卡数；批次更新改变优化轨迹，不能要求结果与单卡逐视角更新完全相等。
+``global_step`` 仍统计训练视角数，``optimizer_step`` 统计实际更新次数。
+新 checkpoint 保存 ``update_protocol``，必须使用相同 N 续训；旧逐视角／像素分片
+checkpoint 不能直接接入 N>1 新协议，可继续单卡恢复或独立评价。
+
+RGB 生长／删除证据按视角独立通过 NCCL 传送，再由 rank 0 投票，不将不同相机混成一票。
+候选、模型与 Adam 缓冲也通过 GPU 广播，控制通道只传元数据；没有为此增加证据前向。
+训练结束后 N 个 rank 分配不同评价视角，默认训练前 10 张、测试全部、每视角 64 spp。
+选择的视角总数不会乘 N；seed、PNG 与 PSNR 评价规则保持不变。
+
+先申请同节点一项任务，例如两卡、16 CPU：
+
+.. code-block:: bash
+
+   srun --partition=cscc-gpu-p --qos=gpu-debug-qos \
+     --nodes=1 --ntasks=1 --gres=gpu:a100-sxm4-40gb:2 \
+     --cpus-per-task=16 --mem=80G --time=01:00:00 --pty bash
+
+本地提交并 push 后，在服务器分配内拉取和增量编译：
+
+.. code-block:: bash
+
+   test -n "${SLURM_JOB_ID:-}" &&
+   source /apps/local/conda_init.sh &&
+   conda activate "$HOME/envs/mitsuba" &&
+   cd "$HOME/projects/reconstruction/mitsuba" &&
+   git -c submodule.recurse=false -c fetch.recurseSubmodules=false pull --ff-only &&
+   git submodule sync --recursive &&
+   git submodule update --init --recursive &&
+   cmake --build build --parallel "${SLURM_CPUS_PER_TASK:-1}" &&
+   source build/setpath.sh
+
+使用集群现有 NCCL 库；可按该集群环境执行
+``module load nvidia/comm_libs/nccl/11.4``，或设置 ``MITSUBA_NCCL_LIBRARY`` 指向已有库。
+保留总计 1500 轮计划，先运行前 10 轮；省略 ``--workers`` 自动采用申请到的 GPU 数量：
+
+.. code-block:: bash
+
+   "$HOME/envs/mitsuba/bin/python" -u -I experiments/reconstruction/train_multigpu.py \
+     --dataset datasets/bicycle --scene-mode unbounded \
+     --background-layers 4 --background-opacity 0.5 \
+     --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
+     --traversal octree --distortion-weight 0 --freeze-native --gpu-topology \
+     --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
+
+前 10 轮不会触发完整训练结束后的评价，保存恢复点；这不会把层级预算改成 10 轮。
+``--ntasks`` 始终为 1，启动器自行创建 N 个进程，CPU 配额按 N 均分。
+调度器的 GPU 可见列表与 Slurm 变量原样保留，不按本地物理编号重选卡。
+本机生成数据检查不能验证实际多 A100 的 NCCL 性能、完整训练质量或加速幅度。
+协议、恢复限制与更多测试命令见 ``docs/reconstruction_training.rst``。
+
 目录导航
 --------
 
@@ -283,7 +354,7 @@ Distortion 对照实验
    * - ``preview.py``
      - 检查点云初始化和一个相机视角的前向结果，不执行训练。
    * - ``train_multigpu.py``
-     - Linux Slurm 同节点双 GPU 训练／评价启动器，目前不支持 Windows。
+     - Linux Slurm 同节点 N GPU 训练／评价启动器；每卡一个视角，平均梯度后一起更新，不支持 Windows。
    * - ``reconstruction_*.py``
      - 参考图、优化器、拓扑、checkpoint、性能记录等共用实现。
    * - ``tests/``

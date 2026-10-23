@@ -393,7 +393,7 @@ def merge_evaluation_workers(workers, selected_indices_by_split, metric_color_sp
 
 
 def _run_distributed_evaluation(config, distributed, progress_callback):
-    """Evaluate disjoint whole cameras on two devices without NCCL or image transfer."""
+    """Evaluate disjoint whole cameras on allocated devices without image transfer."""
     started = time.perf_counter()
     primary = distributed.rank == 0
     repository = preview.REPOSITORY
@@ -401,8 +401,10 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
     output = preview.workspace_path(config.output_directory, workspace)
     if output.is_relative_to(repository):
         raise ValueError("Keep evaluation outputs and caches outside the Git checkout")
-    if distributed.world_size != 2 or distributed.rank not in (0, 1):
-        raise ValueError("Distributed evaluation requires exactly two ranks")
+    if (type(distributed.world_size) is not int or distributed.world_size < 1
+            or type(distributed.rank) is not int
+            or not 0 <= distributed.rank < distributed.world_size):
+        raise ValueError("Distributed evaluation rank must fit within a positive world size")
     report = {
         "status": "running", "started_utc": datetime.now(timezone.utc).isoformat(),
         "scope": "Source CUDA checkpoint evaluation; no parameter updates",

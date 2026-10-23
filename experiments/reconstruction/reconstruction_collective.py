@@ -1,7 +1,7 @@
-"""Two-rank NCCL reductions on the CUDA stream owned by Dr.Jit.
+"""N-rank NCCL reductions on the CUDA stream owned by Dr.Jit.
 
 The caller starts one process per allocated device, selects its logical device
-before constructing arrays, and supervises both processes. No GPU identifier or
+before constructing arrays, and supervises every process. No GPU identifier or
 Slurm environment variable is changed here. This module never stages gradients
 through NumPy, and cannot be used inside ``dr.freeze``.
 """
@@ -33,7 +33,7 @@ class _UniqueId(ctypes.Structure):
 
 def _load_nccl(library=None):
     if sys.platform != "linux":
-        raise RuntimeError("Two-GPU reconstruction currently requires Linux and NCCL; use one GPU on Windows")
+        raise RuntimeError("Multi-GPU reconstruction currently requires Linux and NCCL; use one GPU on Windows")
     explicit = library or os.environ.get("MITSUBA_NCCL_LIBRARY")
     if explicit:
         candidates = [os.fspath(explicit)]
@@ -69,6 +69,8 @@ def _bind_nccl(lib):
         "ncclCommInitRank": [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int],
         "ncclAllReduce": [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
                           ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p],
+        "ncclBroadcast": [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                          ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p],
         "ncclGroupStart": [],
         "ncclGroupEnd": [],
         "ncclCommDestroy": [ctypes.c_void_p],
@@ -95,8 +97,9 @@ class NcclCollective:
     """
 
     def __init__(self, rank, world_size, connection, mi, dr, np, library=None):
-        if world_size != 2 or rank not in (0, 1):
-            raise ValueError("NCCL reconstruction currently supports exactly two local ranks")
+        if (type(world_size) is not int or world_size < 1
+                or type(rank) is not int or not 0 <= rank < world_size):
+            raise ValueError("NCCL rank must fit within a positive world size")
         self.rank, self.world_size, self.connection = int(rank), int(world_size), connection
         self.mi, self.dr, self.np = mi, dr, np
         self._comm = ctypes.c_void_p()
@@ -104,6 +107,9 @@ class NcclCollective:
         self._failed = False
         self._sequence = 0
         self._stats = {"views": 0, "calls": 0, "payload_bytes": 0, "seconds": 0.}
+        from train_multigpu import WorkerContext
+        self._control = (connection if isinstance(connection, WorkerContext)
+                         else WorkerContext(rank, world_size, connection, 1))
         required = ("_reconstruction_cuda_context", "_reconstruction_cuda_push_context",
                     "_reconstruction_cuda_pop_context", "_reconstruction_float_buffer_info",
                     "_reconstruction_uint_buffer_info")
@@ -112,6 +118,9 @@ class NcclCollective:
         self.device = dict(mi._reconstruction_cuda_context())
         if self.device["device_count"] < world_size or self.device["device"] != rank:
             raise RuntimeError("Each NCCL worker must first select its own allocated logical CUDA device")
+        if world_size == 1:
+            self._lib, self.library, self.version = None, None, None
+            return
         self._lib, self.library = _load_nccl(library)
         _bind_nccl(self._lib)
         version = ctypes.c_int()
@@ -120,12 +129,11 @@ class NcclCollective:
         uid = _UniqueId()
         if rank == 0:
             self._check(self._lib.ncclGetUniqueId(ctypes.byref(uid)), "ncclGetUniqueId")
-            self.connection.send(("nccl_unique_id", ctypes.string_at(ctypes.byref(uid), ctypes.sizeof(uid))))
-        else:
-            tag, encoded = self.connection.recv()
-            if tag != "nccl_unique_id" or not isinstance(encoded, bytes) or len(encoded) != ctypes.sizeof(uid):
-                raise RuntimeError("Invalid NCCL initialization message from rank zero")
-            ctypes.memmove(ctypes.byref(uid), encoded, len(encoded))
+        encoded = self._control.broadcast(ctypes.string_at(ctypes.byref(uid), ctypes.sizeof(uid))
+                                          if rank == 0 else None)
+        if not isinstance(encoded, bytes) or len(encoded) != ctypes.sizeof(uid):
+            raise RuntimeError("Invalid NCCL initialization message from rank zero")
+        ctypes.memmove(ctypes.byref(uid), encoded, len(encoded))
         try:
             with self._context():
                 self._check(self._lib.ncclCommInitRank(ctypes.byref(self._comm), world_size, uid, rank),
@@ -153,28 +161,10 @@ class NcclCollective:
 
     def broadcast(self, value=None):
         """Broadcast a small CPU control object; never use for gradient arrays."""
-        sequence = self._sequence
-        self._sequence += 1
-        if self.rank == 0:
-            self.connection.send(("nccl_control_broadcast", sequence, value))
-            return value
-        tag, received_sequence, received = self.connection.recv()
-        if tag != "nccl_control_broadcast" or sequence != received_sequence:
-            raise RuntimeError("NCCL control broadcast order differs between ranks")
-        return received
+        return self._control.broadcast(value)
 
     def barrier(self):
-        sequence = self._sequence
-        self._sequence += 1
-        token = ("nccl_control_barrier", sequence)
-        if self.rank == 0:
-            self.connection.send(token)
-            received = self.connection.recv()
-        else:
-            received = self.connection.recv()
-            self.connection.send(token)
-        if received != token:
-            raise RuntimeError("NCCL control barrier order differs between ranks")
+        self._control.barrier()
 
     def _pack(self, arrays, array_type):
         values = [array_type(value) for value in arrays]
@@ -198,7 +188,11 @@ class NcclCollective:
         return result
 
     def reduce_view(self, accumulator, loss_sum, finite, raw_alpha=None, alpha=None):
-        """Collectively SUM a full view's disjoint ray contributions on the GPU."""
+        """SUM gradient/count contributions on GPU; caller supplies normalization.
+
+        Kept for legacy pixel-sharded callers. Whole-view batches should use
+        ``reduce_batch`` and keep each camera's RGB topology vote separate.
+        """
         if self._closed or self._failed:
             raise RuntimeError("NCCL collective is closed or has failed")
         started = time.perf_counter()
@@ -228,6 +222,8 @@ class NcclCollective:
 
         def prepare(value, dtype, operation):
             array_type = mi.Float if dtype == _NCCL_FLOAT32 else mi.UInt32
+            if self.world_size == 1:
+                return array_type(value)
             # A fresh undefined allocation is essential: a literal zero array
             # would still be folded to zero by JIT after an external write.
             destination = dr.empty(array_type, dr.width(value))
@@ -274,17 +270,18 @@ class NcclCollective:
             descriptors.append((int(source_info["pointer"]), int(destination_info["pointer"]),
                                 width, dtype, operation))
         try:
-            with self._context():
-                self._check(self._lib.ncclGroupStart(), "ncclGroupStart")
-                try:
-                    for source, destination, width, dtype, operation in descriptors:
-                        self._check(self._lib.ncclAllReduce(source, destination, width, dtype, operation,
-                                                          self._comm, self.device["stream"]), "ncclAllReduce")
-                finally:
-                    self._check(self._lib.ncclGroupEnd(), "ncclGroupEnd")
-            # This is the only explicit stream synchronization of a reduction.
-            # It also makes destination ownership independent of NCCL lifetimes.
-            dr.sync_thread()
+            if self.world_size > 1:
+                with self._context():
+                    self._check(self._lib.ncclGroupStart(), "ncclGroupStart")
+                    try:
+                        for source, destination, width, dtype, operation in descriptors:
+                            self._check(self._lib.ncclAllReduce(source, destination, width, dtype, operation,
+                                                              self._comm, self.device["stream"]), "ncclAllReduce")
+                    finally:
+                        self._check(self._lib.ncclGroupEnd(), "ncclGroupEnd")
+                # This is the only explicit stream synchronization of a reduction.
+                # It also makes destination ownership independent of NCCL lifetimes.
+                dr.sync_thread()
             result = {"gradients": self._unpack(global_gradients, GRADIENT_KEYS, gradient_widths, mi.Float)}
             result.update(self._unpack(global_validity, SUM_COUNTER_KEYS, validity_widths, mi.UInt32))
             result.update(self._unpack(global_evidence, MAX_COUNTER_KEYS, evidence_widths, mi.UInt32))
@@ -305,8 +302,95 @@ class NcclCollective:
             self._failed = True
             raise
 
+    def reduce_batch(self, accumulator, loss_sum, finite):
+        """Reduce one full-view-per-rank batch without mixing camera votes.
+
+        Gradients and validity counts are SUMs, not averages. The training
+        driver normalizes by the number of actual views (including short final
+        batches) when making its one Adam update. RGB topology evidence must be
+        consumed per view through ``broadcast_arrays``; mixing its raw gains
+        here would change the voting algorithm.
+        """
+        invalid = [key for key in accumulator
+                   if any(key.startswith(f"{kind}_") for kind in ("growth", "deletion"))]
+        if invalid:
+            raise ValueError(f"Whole-view batches require separate per-camera topology evidence: {invalid}")
+        result, loss, finite, _, _ = self.reduce_view(accumulator, loss_sum, finite)
+        self._stats["batches"] = self._stats.get("batches", 0) + 1
+        return result, loss, finite
+
+    def broadcast_arrays(self, fields, *, root, uint_keys=()):
+        """Broadcast one camera's GPU arrays, preserving its separate vote.
+
+        All ranks pass the same names, array lengths and ``uint_keys``. Only
+        ``root`` supplies meaningful contents; other ranks may reuse local
+        evidence buffers or zero placeholders. Integer counters must be listed
+        in ``uint_keys``; remaining fields are float32. No image/evidence data
+        is transferred through CPU memory, and no raw evidence is summed across
+        cameras. This operation cannot be recorded inside ``dr.freeze``.
+        """
+        if self._closed or self._failed:
+            raise RuntimeError("NCCL collective is closed or has failed")
+        if type(root) is not int or not 0 <= root < self.world_size:
+            raise ValueError("Broadcast source rank must fit within the world size")
+        uint_keys = set(uint_keys)
+        if not uint_keys.issubset(fields) or any(not isinstance(name, str) for name in fields):
+            raise ValueError("Broadcast fields must be named arrays, including every uint_key")
+        if not fields:
+            return {}
+        started = time.perf_counter()
+        dr, mi = self.dr, self.mi
+        result, operations = {}, []
+        for name in sorted(fields):
+            dtype = _NCCL_UINT32 if name in uint_keys else _NCCL_FLOAT32
+            array_type = mi.UInt32 if dtype == _NCCL_UINT32 else mi.Float
+            source = array_type(fields[name])
+            if self.world_size == 1:
+                result[name] = source
+            else:
+                # NCCL supports an in-place source-rank broadcast. Its bytes
+                # already equal the result, so preserve source ownership and
+                # avoid a second complete model/Adam allocation on rank zero.
+                destination = source if self.rank == root else dr.empty(array_type, dr.width(source))
+                operations.append((source, destination, dtype))
+                result[name] = destination
+        if operations:
+            dr.eval(*[array for source, destination, _ in operations for array in (source, destination)])
+        descriptors = []
+        for source, destination, dtype in operations:
+            width = int(dr.width(source))
+            if not width:
+                continue
+            info = (mi._reconstruction_float_buffer_info if dtype == _NCCL_FLOAT32
+                    else mi._reconstruction_uint_buffer_info)
+            source_info, destination_info = info(source), info(destination)
+            if int(source_info["size"]) != width or int(destination_info["size"]) != width:
+                raise RuntimeError("NCCL broadcast pointer metadata does not match the allocated array")
+            descriptors.append((int(source_info["pointer"]), int(destination_info["pointer"]), width, dtype))
+        try:
+            if descriptors:
+                with self._context():
+                    self._check(self._lib.ncclGroupStart(), "ncclGroupStart")
+                    try:
+                        for source, destination, width, dtype in descriptors:
+                            self._check(self._lib.ncclBroadcast(source, destination, width, dtype, root,
+                                                               self._comm, self.device["stream"]),
+                                        "ncclBroadcast")
+                    finally:
+                        self._check(self._lib.ncclGroupEnd(), "ncclGroupEnd")
+                dr.sync_thread()
+            self._stats["broadcasts"] = self._stats.get("broadcasts", 0) + 1
+            self._stats["calls"] += len(descriptors)
+            self._stats["payload_bytes"] += sum(width * 4 for _, _, width, _ in descriptors)
+            self._stats["seconds"] += time.perf_counter() - started
+            return result
+        except BaseException:
+            self._failed = True
+            raise
+
     def statistics(self):
-        return {"backend": "nccl", "version": self.version, "library": self.library,
+        return {"backend": "nccl" if self.world_size > 1 else "single-rank",
+                "version": self.version, "library": self.library,
                 "rank": self.rank, "world_size": self.world_size,
                 "device": dict(self.device), "payload_scope": "per-rank reduced input bytes, not wire traffic",
                 **self._stats}

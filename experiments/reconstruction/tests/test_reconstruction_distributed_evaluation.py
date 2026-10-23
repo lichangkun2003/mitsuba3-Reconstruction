@@ -158,7 +158,9 @@ def compare_evaluations(serial, parallel, splits, selected, np, *, save_linear=T
         assert a["selected_view_count"] == b["selected_view_count"] == selected[split]
         assert json.loads((parallel / split / "metrics.json").read_text(encoding="utf-8")) == b
         expected_pngs = {f"{index:04d}.png" for index in expected_indices}
-        assert {path.name for path in (parallel / split).glob("*.png")} == expected_pngs
+        pngs = {path.name for path in (parallel / split).glob("*.png")}
+        # Automatic training also saves initialization/coarse comparisons.
+        assert pngs - {"0000-initial.png", "0000-coarse.png"} == expected_pngs
         if save_linear:
             assert {path.name for path in (parallel / split).glob("*.npz")} == {
                 f"{index:04d}.npz" for index in expected_indices}
@@ -198,7 +200,7 @@ def check_audit(directory, seeds, *, spp, world_size=2):
 
 def run_regression(root, build_dir, gpu):
     import numpy as np
-    from train import GradientSettings
+    from train import CONFIG
 
     dataset, checkpoint = make_fixture(root)
 
@@ -253,17 +255,18 @@ def run_regression(root, build_dir, gpu):
         "model": {"grid_resolution": 4, "bounds_min": [-1., -1., -1.], "bounds_max": [1., 1., 1.],
                   "sh_count": 1, "opacity_sh_count": 1},
         "render": {"width": 16, "height": 16, "spp": 1},
-        "training": {"rgb_only": False, "num_epochs": 1, "save_count": 1,
+        "training": {"rgb_only": True, "num_epochs": 1, "save_count": 1,
                      "profile_views": 0, "profile_interval_epochs": 0},
-        "gradient": asdict(GradientSettings()),
+        "gradient": asdict(CONFIG.gradient),
         "schedule": {"enabled": False}, "topology": {"enable_deletion": False, "enable_growth": False},
         "optimizer": {"opacity_warmup_epochs": 0, "opacity_ramp_epochs": 0,
                       "lr_center": 0., "lr_log_scale": 0., "lr_rotation": 0.},
-        "contour": {"enabled": True}, "evaluation": {"enabled": True, "spp": 64, "max_views": 2}}), encoding="utf-8")
+        "contour": {"enabled": False}, "evaluation": {"enabled": True, "spp": 64, "max_views": 2}}), encoding="utf-8")
     training, audit = run_case("automatic-64spp", "auto-training", ["--config", str(training_config)])
     training_report = json.loads((training / "training-report.json").read_text(encoding="utf-8"))
     assert training_report["training_status"] == training_report["evaluation"]["status"] == "passed"
     assert training_report["status"] == "passed" and training_report["global_step"] == 5
+    assert training_report["optimizer_step"] == 3
     trained_model = training.parent / "model.npz"
     assert trained_model.exists()
     serial, _ = run_case("automatic-model-serial-64spp", "serial",

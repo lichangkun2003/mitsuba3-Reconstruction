@@ -71,8 +71,10 @@ class _Dr:
 
 
 class _Lib:
-    def __init__(self):
+    def __init__(self, world_size=2):
+        self.world_size = world_size
         self.calls = []
+        self.broadcast_calls = []
         self.grouped = False
 
     def ncclGroupStart(self):
@@ -93,11 +95,10 @@ class _Lib:
         source_array = np.ctypeslib.as_array((ctype * count).from_address(source))
         destination_array = np.ctypeslib.as_array((ctype * count).from_address(destination))
         # Deliberately different peer values catch SUM versus MAX mistakes.
-        peer = source_array + 1
         if operation == _NCCL_SUM:
-            destination_array[:] = source_array + peer
+            destination_array[:] = source_array * self.world_size + self.world_size * (self.world_size - 1) // 2
         elif operation == _NCCL_MAX:
-            destination_array[:] = np.maximum(source_array, peer)
+            destination_array[:] = source_array + self.world_size - 1
         elif operation == _NCCL_MIN:
             destination_array[:] = 0  # The other rank detected a nonfinite value.
         else:
@@ -105,12 +106,24 @@ class _Lib:
         self.calls.append((count, dtype, operation))
         return 0
 
+    def ncclBroadcast(self, source, destination, count, dtype, root, comm, stream):
+        assert self.grouped and stream == 77
+        assert (source == destination) == (root == 0), "Source-rank broadcasts should retain their existing buffer"
+        ctype = ctypes.c_float if dtype == _NCCL_FLOAT32 else ctypes.c_uint32
+        source_array = np.ctypeslib.as_array((ctype * count).from_address(source))
+        destination_array = np.ctypeslib.as_array((ctype * count).from_address(destination))
+        # Fake root-specific values ensure evidence from different cameras is
+        # broadcast separately rather than added together or treated as rank 0.
+        destination_array[:] = source_array + root * 10
+        self.broadcast_calls.append((count, dtype, root))
+        return 0
+
     @staticmethod
     def ncclGetErrorString(code):
         return b"mock error"
 
 
-def _fixture():
+def _fixture(world_size=2):
     def info(value):
         return {"pointer": value.ctypes.data, "size": value.size}
 
@@ -123,10 +136,10 @@ def _fixture():
     )
     collective.dr = _Dr()
     collective.np = np
-    collective.rank, collective.world_size = 0, 2
+    collective.rank, collective.world_size = 0, world_size
     collective._closed = collective._failed = False
     collective._comm = ctypes.c_void_p(33)
-    collective._lib = _Lib()
+    collective._lib = _Lib(world_size)
     collective.device = {"context": 88, "stream": 77, "device": 0, "raw_device": 0, "device_count": 2}
     collective.version, collective.library = 21800, "cpu-mock"
     collective._stats = {"views": 0, "calls": 0, "payload_bytes": 0, "seconds": 0.}
@@ -156,8 +169,8 @@ def main():
         np.testing.assert_array_equal(result[key], source[key] + 1)
     np.testing.assert_array_equal(loss, [15.])
     np.testing.assert_array_equal(finite, [False])
-    np.testing.assert_array_equal(out_raw, raw + (raw + 1))
-    np.testing.assert_array_equal(out_alpha, alpha + (alpha + 1))
+    np.testing.assert_array_equal(out_raw, raw * 2 + 1)
+    np.testing.assert_array_equal(out_alpha, alpha * 2 + 1)
     assert collective.dr.syncs == 1
     assert [operation for _, _, operation in collective._lib.calls] == [
         _NCCL_SUM, _NCCL_SUM, _NCCL_MAX, _NCCL_SUM, _NCCL_MIN, _NCCL_SUM, _NCCL_SUM]
@@ -185,6 +198,49 @@ def main():
     assert out_raw is None and out_alpha is None
     assert empty.statistics()["calls"] == 2
     assert empty.dr.syncs == 1
+
+    batch = _fixture(4)
+    source = _accumulator(2)
+    result, loss, finite = batch.reduce_batch(source, 3., True)
+    assert batch.statistics()["batches"] == 1
+    assert len(batch._lib.calls) == 5
+    np.testing.assert_array_equal(result["appearance_valid"], source["appearance_valid"] * 4 + 6)
+    before = len(batch._lib.calls)
+    for kind in ("growth", "deletion"):
+        mixed = dict(source, **{f"{kind}_gain": _float([1.])})
+        try:
+            batch.reduce_batch(mixed, 0., True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Distinct-camera raw topology votes must never be reduced together")
+    assert len(batch._lib.calls) == before
+    fields = {"gain": _float([.1, .2]), "observed": _uint([3, 4]), "empty": _float([])}
+    for root in range(4):
+        result = batch.broadcast_arrays(fields, root=root, uint_keys=("observed",))
+        for name in fields:
+            np.testing.assert_array_equal(result[name], fields[name] + root * 10)
+        assert result["observed"].dtype == np.uint32
+        if root == 0:
+            assert result["observed"].ctypes.data == fields["observed"].ctypes.data
+    assert batch.statistics()["broadcasts"] == 4
+    assert batch.dr.syncs == 5
+    assert len(batch._lib.broadcast_calls) == 8
+    prior_syncs = batch.dr.syncs
+    assert batch.broadcast_arrays({}, root=0) == {}
+    assert batch.broadcast_arrays({"empty": _float([])}, root=0)["empty"].size == 0
+    assert batch.dr.syncs == prior_syncs
+
+    single = _fixture()
+    single.world_size, single._lib = 1, None
+    result, loss, finite = single.reduce_batch(_accumulator(2), 5., True)
+    np.testing.assert_array_equal(result["gradients"][GRADIENT_KEYS[0]], _accumulator(2)["gradients"][GRADIENT_KEYS[0]])
+    np.testing.assert_array_equal(loss, [5.])
+    np.testing.assert_array_equal(finite, [True])
+    copies = single.broadcast_arrays(fields, root=0, uint_keys=("observed",))
+    for name in fields:
+        np.testing.assert_array_equal(copies[name], fields[name])
+    assert single.statistics()["calls"] == 0 and single.dr.syncs == 0
 
     for malformed in ("groups", "counts", "scalar", "missing_component", "component_shape"):
         broken, value = _fixture(), _accumulator(2)

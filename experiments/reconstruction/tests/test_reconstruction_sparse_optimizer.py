@@ -1,7 +1,7 @@
 """CUDA sparse Adam parity with the retained dense implementation.
 
-No images or dataset are rendered. The optional benchmark includes compression,
-validation, parameter/moment commits and GPU completion in every timed step.
+No images or dataset are rendered. The optional benchmark includes device-side
+selection, validation, parameter/moment commits and GPU completion in every step.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -30,10 +31,11 @@ def fixture(count=7, *, sh=4):
     return original_tests.seed_checkpoint(cells=tuple(range(count)), sh=sh)
 
 
-def capture(model, optimizer):
+def capture(model, optimizer, *, expose_state=True):
     result = {name: np.array(value, copy=True) for name, value in model.snapshot().items()}
+    groups = optimizer.state if expose_state else optimizer.state_dict()["groups"]
     result.update({f"{name}/{field}": np.array(value, copy=True)
-                   for name, group in optimizer.state.items() for field, value in group.items()})
+                   for name, group in groups.items() for field, value in group.items()})
     return result
 
 
@@ -90,6 +92,96 @@ class SparseOptimizerTests(unittest.TestCase):
                                sample_count=2, epoch=iteration, update_allowed=mi.Bool(True))
                 self.assertFalse(optimizer._state_exposed)
         self.assert_pair(models, optimizers)
+
+    def test_record_and_replay_have_no_host_compaction_or_synchronization(self):
+        count = 29
+        models, optimizers = paired(fixture(count))
+        ids = np.arange(count)
+        masks = [
+            (np.zeros(count), np.zeros(count)),
+            (ids % 3 != 0, ids % 4 < 2),
+            (np.ones(count), np.ones(count)),
+            (np.zeros(count), np.ones(count)),
+            (np.ones(count), np.zeros(count)),
+            (np.zeros(count), np.zeros(count)),
+        ]
+        # Upload references before the forbidden-sync region, as a renderer
+        # would supply gradients already on the device. Start with an empty
+        # selection: recording must not specialize its length or later masks.
+        batches = [[gradients(model, iteration, appearance=app, geometry=geom,
+                              zero=iteration == 2)
+                    for iteration, (app, geom) in enumerate(masks)] for model in models]
+        allowed = mi.Bool(True)
+        dr.eval(batches, allowed)
+        dr.sync_thread()
+        for iteration, out in enumerate(batches[0]):
+            optimizers[0].step(models[0], out, epoch=iteration, update_allowed=allowed)
+        with patch.object(dr, "compress", side_effect=AssertionError("Host-sized compaction used")):
+            with dr.scoped_set_flag(dr.JitFlag.ForbidSynchronization, True):
+                for iteration, out in enumerate(batches[1]):
+                    result = optimizers[1].step(models[1], out, epoch=iteration,
+                                                update_allowed=allowed)
+                    dr.eval(result["accepted"], models[1].snapshot())
+                    self.assertFalse(optimizers[1]._state_exposed)
+        self.assertTrue(bool(np.asarray(result["accepted"])[0]))
+        statistics = optimizers[1].statistics()
+        self.assertLessEqual(statistics["recordings"], 2)
+        self.assertGreaterEqual(statistics["replays"], len(masks) - 2)
+        self.assert_pair(models, optimizers)
+
+    def test_multiple_device_batches_and_partial_tail_match_dense(self):
+        count = 65553
+        payload = original_tests.seed_checkpoint(cells=np.arange(count, dtype=np.uint32),
+                                                 resolution=64, sh=1)
+        models, optimizers = paired(payload)
+        tail = np.zeros(count, np.uint32)
+        tail[[0, 32767, 32768, 65535, 65536, count - 1]] = 1
+        for iteration, (appearance, geometry) in enumerate((
+                (np.ones(count), np.ones(count)), (tail, 1 - tail),
+                (np.zeros(count), np.zeros(count)))):
+            for model, optimizer in zip(models, optimizers):
+                optimizer.step(model, gradients(model, iteration,
+                    appearance=appearance, geometry=geometry), update_allowed=mi.Bool(True))
+            # Do not expose mutable state: this also exercises the ordinary
+            # cached execution path through full, partial, then zero batches.
+            assert_equal(self, *(capture(model, optimizer, expose_state=False)
+                                for model, optimizer in zip(models, optimizers)))
+
+    def test_single_voxel_scalar_buffers_replay_without_synchronization(self):
+        for sh in (1, 9):
+            with self.subTest(opacity_sh_count=sh):
+                models, optimizers = paired(fixture(1, sh=sh))
+                masks = ((True, True), (False, False), (True, True),
+                         (False, True), (True, False), (True, True))
+                batches = []
+                for model in models:
+                    sequence = []
+                    for iteration, (app, geom) in enumerate(masks):
+                        out = gradients(model, iteration, appearance=np.array([app]),
+                                        geometry=np.array([geom]), zero=iteration == 2)
+                        # Unlike a one-element linspace whose lone element is
+                        # deliberately zeroed by gradients(), this also makes
+                        # the scalar opacity parameter and moments change.
+                        out["gradients"]["opacity_sh"] = mi.Float(np.full(
+                            sh, 0. if iteration == 2 else .25 * (iteration + 1), np.float32))
+                        sequence.append(out)
+                    batches.append(sequence)
+                allowed = mi.Bool(True)
+                dr.eval(batches, allowed)
+                dr.sync_thread()
+                for out in batches[0]:
+                    optimizers[0].step(models[0], out, update_allowed=allowed)
+                # A one-element gather can become a direct scalar reference;
+                # a subsequent in-place scatter must not leave that input dirty.
+                # Do not materialize snapshots or read values between updates.
+                with patch.object(dr, "compress", side_effect=AssertionError("Host-sized compaction used")):
+                    with dr.scoped_set_flag(dr.JitFlag.ForbidSynchronization, True):
+                        for out in batches[1]:
+                            result = optimizers[1].step(models[1], out, update_allowed=allowed)
+                            dr.eval(result["accepted"])
+                self.assertTrue(bool(np.asarray(result["accepted"])[0]))
+                self.assertGreater(optimizers[1].statistics()["replays"], 0)
+                self.assert_pair(models, optimizers)
 
     def test_multistep_independent_masks_zero_gradients_and_group_steps(self):
         for guarded in (False, True):
@@ -156,30 +248,29 @@ class SparseOptimizerTests(unittest.TestCase):
             optimizer.step(model, out)
         self.assert_pair(models, optimizers)
 
-    def test_nonfinite_moment_rejects_entire_transaction_and_latches(self):
+    def test_late_batch_moment_overflow_rejects_entire_transaction_and_latches(self):
+        count = 65553
+        payload = original_tests.seed_checkpoint(cells=np.arange(count, dtype=np.uint32),
+                                                 resolution=64, sh=1)
         for sparse in (False, True):
             with self.subTest(sparse=sparse):
-                model = restore_model(fixture(), mi)
-                optimizer = FalcorOptimizer(model, sparse_updates=sparse)
-                before = capture(model, optimizer)
-                original_adam = optimizer._adam
-
-                def broken_adam(*args, **kwargs):
-                    result = original_adam(*args, **kwargs)
-                    state = kwargs.get("state")
-                    if state is None:
-                        state = optimizer.state[args[0]]
-                    state["mean"] = state["mean"] * mi.Float(float("nan"))
-                    return result
-
-                optimizer._adam = broken_adam
-                result = optimizer.step(model, gradients(model), update_allowed=mi.Bool(True))
+                model = restore_model(copy.deepcopy(payload), mi)
+                optimizer = FalcorOptimizer(model, OptimizerConfig(gradient_clip=1e30),
+                                            sparse_updates=sparse)
+                before = capture(model, optimizer, expose_state=False)
+                out = gradients(model, appearance=np.ones(count), geometry=np.ones(count))
+                radiance = np.array(out["gradients"]["radiance_sh"], copy=True)
+                # The input itself is finite. Its square overflows only in the
+                # last batch, after earlier groups/batches could have committed
+                # if validation and updates were incorrectly interleaved.
+                radiance[-1] = np.float32(1e30)
+                out["gradients"]["radiance_sh"] = mi.Float(radiance)
+                result = optimizer.step(model, out, update_allowed=mi.Bool(True))
                 self.assertFalse(bool(np.asarray(result["accepted"])[0]))
-                assert_equal(self, capture(model, optimizer), before, exact=True)
-                optimizer._adam = original_adam
+                assert_equal(self, capture(model, optimizer, expose_state=False), before, exact=True)
                 result = optimizer.step(model, gradients(model, 1), update_allowed=mi.Bool(True))
                 self.assertFalse(bool(np.asarray(result["accepted"])[0]))
-                assert_equal(self, capture(model, optimizer), before, exact=True)
+                assert_equal(self, capture(model, optimizer, expose_state=False), before, exact=True)
 
     def test_false_guard_is_atomic_and_latched(self):
         models, optimizers = paired()
@@ -222,6 +313,23 @@ class SparseOptimizerTests(unittest.TestCase):
             assert_equal(self, actual, expected, exact=True)
         self.assert_pair(models, optimizers)
 
+    def test_snapshot_and_moment_aliases_survive_already_recorded_updates(self):
+        models, optimizers = paired()
+        for model, optimizer in zip(models, optimizers):
+            for iteration in range(2):
+                optimizer.step(model, gradients(model, iteration), update_allowed=mi.Bool(True))
+            # Hold independent array handles after recording, when replay must
+            # perform copy-on-write for newly introduced external aliases too.
+            held = dict(model.snapshot())
+            held.update({f"{name}/{field}": type(value)(value)
+                         for name, state in optimizer.state.items() for field, value in state.items()})
+            expected = {name: np.array(value, copy=True) for name, value in held.items()}
+            for iteration in range(2, 5):
+                optimizer.step(model, gradients(model, iteration), update_allowed=mi.Bool(True))
+            actual = {name: np.array(value, copy=True) for name, value in held.items()}
+            assert_equal(self, actual, expected, exact=True)
+        self.assert_pair(models, optimizers)
+
     def test_inactive_inplace_moment_corruption_rejects_transaction(self):
         models, optimizers = paired()
         for model, optimizer in zip(models, optimizers):
@@ -234,6 +342,20 @@ class SparseOptimizerTests(unittest.TestCase):
                                     update_allowed=mi.Bool(True))
             self.assertFalse(bool(np.asarray(result["accepted"])[0]))
             assert_equal(self, capture(model, optimizer), before, exact=True)
+
+    def test_same_mutable_array_in_two_moment_slots_is_rejected_without_update(self):
+        model = restore_model(fixture(), mi)
+        optimizer = FalcorOptimizer(model)
+        optimizer.step(model, gradients(model), update_allowed=mi.Bool(True))
+        state = optimizer.state
+        # Sharing storage through distinct array handles has normal COW
+        # semantics (tested above). One Python mutable object in two slots
+        # cannot represent independent Adam moments and must be rejected.
+        state["log_scales"]["mean"] = state["centers"]["mean"]
+        before = capture(model, optimizer)
+        with self.assertRaisesRegex(ValueError, "distinct array objects"):
+            optimizer.step(model, gradients(model, 1), update_allowed=mi.Bool(True))
+        assert_equal(self, capture(model, optimizer), before, exact=True)
 
     def test_remap_load_and_model_parameter_replacement(self):
         models, optimizers = paired()
@@ -249,6 +371,38 @@ class SparseOptimizerTests(unittest.TestCase):
         saved = optimizers[0].state_dict()
         optimizers[1].load_state_dict(copy.deepcopy(saved))
         self.assert_pair(models, optimizers)
+
+    def test_replay_tracks_replaced_model_reset_and_remapped_storage(self):
+        models, optimizers = paired()
+        phases = ("initial", "replace_model", "remap_same_shape", "load",
+                  "reset_resize", "remap_grow", "remap_empty", "remap_from_empty")
+        for phase_index, phase in enumerate(phases):
+            with self.subTest(phase=phase):
+                for index, optimizer in enumerate(optimizers):
+                    if phase == "replace_model":
+                        payload = fixture()
+                        payload["model_state"]["centers"][:] = np.tile([.4, .6, .5], 7)
+                        payload["model_state"]["opacity_sh"][:] = .2
+                        models[index] = restore_model(payload, mi)
+                    elif phase == "remap_same_shape":
+                        optimizer.remap(np.array([5, 1, 3], np.uint32), 7, reset_radiance=True)
+                    elif phase == "load":
+                        optimizer.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+                    elif phase == "reset_resize":
+                        models[index] = restore_model(fixture(37), mi)
+                        optimizer.reset(models[index])
+                    elif phase == "remap_grow":
+                        optimizer.remap(np.array([2, 0, 4], np.uint32), 41)
+                        models[index] = restore_model(fixture(41), mi)
+                    elif phase in ("remap_empty", "remap_from_empty"):
+                        count = 0 if phase == "remap_empty" else 13
+                        optimizer.remap(np.zeros(0, np.uint32), count)
+                        models[index] = restore_model(fixture(count), mi)
+                    for iteration in range(2):
+                        optimizer.step(models[index], gradients(models[index], phase_index + iteration),
+                                       update_allowed=mi.Bool(True))
+                assert_equal(self, *(capture(model, optimizer, expose_state=False)
+                                    for model, optimizer in zip(models, optimizers)))
 
     def test_loading_invalid_moments_does_not_partially_replace_state(self):
         models, optimizers = paired()
@@ -272,10 +426,15 @@ def benchmark(voxels, iterations):
                                              resolution=resolution, sh=9)
     payload["model_metadata"]["opacity_sh_count"] = 1
     payload["model_state"]["opacity_sh"] = np.zeros(voxels, np.float32)
-    models, optimizers = paired(payload)
+    labels = ("dense_reference", "host_compact_reference", "device_sparse")
+    models = [restore_model(copy.deepcopy(payload), mi) for _ in labels]
+    optimizers = [FalcorOptimizer(model, sparse_updates=index != 0,
+                                 replay_updates=index == 2)
+                  for index, model in enumerate(models)]
     del payload
     print(json.dumps({"benchmark": "optimizer only; GPU completion included", "voxels": voxels,
-                      "iterations": iterations, "compression_sync_included": True}))
+                      "iterations": iterations, "device_completion_included": True,
+                      "implementations": list(labels)}))
     for fraction in (.01, .1, .5, 1.):
         count = max(1, int(voxels * fraction))
         mask = np.zeros(voxels, np.uint32)
@@ -284,19 +443,33 @@ def benchmark(voxels, iterations):
         dr.eval(*[value for out in outs for value in out["gradients"].values()],
                 *[out[name] for out in outs for name in
                   ("appearance_valid", "geometry_valid", "background_carve_valid")])
+        allowed = mi.Bool(True)
+
+        def update(index):
+            optimizer, model, out = optimizers[index], models[index], outs[index]
+            if index == 1:
+                # Benchmark the previous implementation, including both
+                # dr.compress() length synchronizations and its commits.
+                return optimizer._step_compact_reference(model, out, sample_count=1,
+                    epoch=0, coarse_to_fine=True, update_allowed=allowed)
+            return optimizer.step(model, out, update_allowed=allowed)
+
         # Warm initial counters/guards and JIT caches, then alternate order to
         # reduce drift bias. A first-step-only warmup misses later kernels.
         for _ in range(5):
-            for model, optimizer, out in zip(models, optimizers, outs):
-                optimizer.step(model, out, update_allowed=mi.Bool(True))
+            for index, model in enumerate(models):
+                update(index)
                 dr.eval(*model.snapshot().values())
                 dr.sync_thread()
-        durations = [[], []]
+        durations = [[] for _ in labels]
         for iteration in range(iterations):
-            for index in ((0, 1) if iteration % 2 == 0 else (1, 0)):
+            order = [(iteration + offset) % len(labels) for offset in range(len(labels))]
+            if iteration % 2:
+                order.reverse()
+            for index in order:
                 dr.sync_thread()
                 started = time.perf_counter()
-                optimizers[index].step(models[index], outs[index], update_allowed=mi.Bool(True))
+                update(index)
                 # step() materializes its moments. Complete the native model
                 # scatters too, without exposing the optimizer's mutable state.
                 dr.eval(*models[index].snapshot().values())
@@ -304,9 +477,11 @@ def benchmark(voxels, iterations):
                 durations[index].append(time.perf_counter() - started)
         medians = [statistics.median(values) for values in durations]
         print(json.dumps({"active_fraction": fraction, "active_voxels": count,
-                          "dense_seconds": medians[0], "sparse_seconds": medians[1],
-                          "dense_over_sparse": medians[0] / medians[1],
-                          "samples": {"dense": durations[0], "sparse": durations[1]}}))
+                          "seconds": dict(zip(labels, medians)),
+                          "dense_over_device": medians[0] / medians[2],
+                          "host_compact_over_device": medians[1] / medians[2],
+                          "samples": dict(zip(labels, durations)),
+                          "device_replay": optimizers[2].statistics()}))
         del outs
         gc.collect()
 

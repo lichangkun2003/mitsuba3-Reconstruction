@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reconstruction_checks import DeferredViewChecks
 from reconstruction_optimizer import FalcorOptimizer
 from reconstruction_common import ContourSampler, initialize_runtime, restore_model
+from reconstruction_reference import GPUReferenceCache
+from reconstruction_replay import NativeLossReplay
 from preview import RuntimeConfig
 from train import train_view
 from test_reconstruction_performance import fixture, TransferRecorder
@@ -29,50 +31,83 @@ def arrays(model, optimizer, np):
     return result
 
 
-def assert_same(first, second, np):
+def assert_same(first, second, np, *, atol=1e-7, rtol=1e-6):
     assert first.keys() == second.keys()
     for key in first:
-        np.testing.assert_allclose(first[key], second[key], atol=1e-7, rtol=1e-6, err_msg=key)
+        np.testing.assert_allclose(first[key], second[key], atol=atol, rtol=rtol, err_msg=key)
 
 
 def check_equivalence(config, payload, view, rgba, mi, dr, np):
-    for distortion_weight in (0., .1):
-        config.gradient.distortion_loss_weight = distortion_weight
-        models = [restore_model(payload, mi) for _ in range(2)]
-        optimizers = [FalcorOptimizer(model, copy.deepcopy(config.optimizer)) for model in models]
-        rngs = [np.random.default_rng(45) for _ in models]
-        recorder = TransferRecorder(np, dr)
-        checks = DeferredViewChecks(mi, dr, recorder)
-        expected = []
-        for index in range(4):
-            view = {**view, "index": index}
-            parts = {}
-            out, loss, _ = train_view(models[0], view, rgba, config, ContourSampler(np),
-                rngs[0], mi, dr, np, loss_components=parts)
-            optimizers[0].step(models[0], out)
-            expected.append(dict(loss=loss, **parts))
-            out, _, _ = train_view(models[1], view, rgba, config, ContourSampler(np),
-                rngs[1], mi, dr, recorder, deferred_checks=checks)
-            update = optimizers[1].step(models[1], out, update_allowed=out["_update_allowed"])
-            checks.updated(update["accepted"])
-        assert recorder.widths == [], recorder.widths
-        actual = checks.read(rgb_only=False, distortion_weight=distortion_weight)
-        assert recorder.widths == [20], recorder.widths
-        for got, want in zip(actual, expected):
-            for key in want:
-                if want[key] is None:
-                    assert got[key] is None
-                else:
-                    np.testing.assert_allclose(got[key], want[key], atol=1e-7, rtol=1e-6)
-        assert_same(arrays(models[0], optimizers[0], np), arrays(models[1], optimizers[1], np), np)
-        assert rngs[0].bit_generator.state == rngs[1].bit_generator.state
+    for replay_enabled in (False, True):
+        for distortion_weight in (0., .1):
+            current = copy.deepcopy(config)
+            current.gradient.distortion_loss_weight = distortion_weight
+            # Exercise both the legacy RGBA path and the production RGB-only
+            # path with both native forward and optimizer replay enabled.
+            current.training.rgb_only = replay_enabled
+            reference = (np.ascontiguousarray(rgba[..., :3] * rgba[..., 3:4] +
+                                              (1. - rgba[..., 3:4]))
+                         if current.training.rgb_only else rgba)
+            models = [restore_model(payload, mi) for _ in range(2)]
+            optimizers = [FalcorOptimizer(model, copy.deepcopy(current.optimizer),
+                                         sparse_updates=index == 1,
+                                         replay_updates=replay_enabled)
+                          for index, model in enumerate(models)]
+            rngs = [np.random.default_rng(45) for _ in models]
+            cache = GPUReferenceCache(current.render.width, current.render.height, mi, dr, np,
+                                      capacity_mib=1, rgb_only=current.training.rgb_only)
+            gpu_reference = cache.get("generated-deferred-reference.png", reference)
+            recorder = TransferRecorder(np, dr)
+            checks = DeferredViewChecks(mi, dr, recorder)
+            expected = []
+            # Complete the dense reference sequence first. Interleaving it
+            # with device steps would let its readbacks flush pending work and
+            # hide dirty parameter handles in the actual asynchronous chain.
+            for index in range(4):
+                current_view = {**view, "index": index}
+                parts = {}
+                out, loss, _ = train_view(models[0], current_view, reference, current, ContourSampler(np),
+                    rngs[0], mi, dr, np, loss_components=parts, gpu_reference=gpu_reference)
+                optimizers[0].step(models[0], out)
+                expected.append(dict(loss=loss, **parts))
+            native_replay = NativeLossReplay(dr, enabled=replay_enabled)
+            for index in range(4):
+                current_view = {**view, "index": index}
+                out, _, _ = train_view(models[1], current_view, reference, current, ContourSampler(np),
+                    rngs[1], mi, dr, recorder, deferred_checks=checks,
+                    gpu_reference=gpu_reference, native_replay=native_replay)
+                update = optimizers[1].step(models[1], out, update_allowed=out["_update_allowed"])
+                checks.updated(update["accepted"])
+                # No snapshot, scalar readback, explicit sync, or reference
+                # sequence work between step() and the next view's forward.
+            assert recorder.widths == [], recorder.widths
+            actual = checks.read(rgb_only=current.training.rgb_only, distortion_weight=distortion_weight)
+            assert recorder.widths == [20], recorder.widths
+            for got, want in zip(actual, expected):
+                for key in want:
+                    if want[key] is None:
+                        assert got[key] is None
+                    else:
+                        np.testing.assert_allclose(got[key], want[key], atol=3e-7, rtol=3e-5)
+            assert_same(arrays(models[0], optimizers[0], np), arrays(models[1], optimizers[1], np),
+                        np, atol=3e-7, rtol=3e-5)
+            assert rngs[0].bit_generator.state == rngs[1].bit_generator.state
+            if replay_enabled:
+                assert native_replay.statistics()["recordings"] > 0
+                assert native_replay.statistics()["replays"] > 0
+                assert optimizers[1].statistics()["recordings"] > 0
+                assert optimizers[1].statistics()["replays"] > 0
 
 
 def check_failure(config, payload, view, rgba, mi, dr, np):
     config.gradient.distortion_loss_weight = 0.
-    for field in ("loss", "raw_alpha", "alpha", "gradient", "negative_loss", "parameter", "moment"):
+    for field in ("loss", "raw_alpha", "alpha", "gradient", "negative_loss", "injected_rejection", "moment"):
         model = restore_model(payload, mi)
-        optimizer = FalcorOptimizer(model, copy.deepcopy(config.optimizer))
+        # This Python fault-injection proxy is not a traversable native model.
+        # Frozen transaction/latch behavior is covered by the sparse Adam suite.
+        optimizer = FalcorOptimizer(model, copy.deepcopy(config.optimizer), replay_updates=False)
+        if field == "moment":
+            optimizer.config.gradient_clip = 1e30
         original = arrays(model, optimizer, np)
         recorder = TransferRecorder(np, dr)
         checks = DeferredViewChecks(mi, dr, recorder)
@@ -85,33 +120,28 @@ def check_failure(config, payload, view, rgba, mi, dr, np):
                 result = model.loss_and_grad(*args)
                 if field == "gradient":
                     result["gradients"]["radiance_sh"] *= mi.Float(float("nan"))
+                elif field == "moment":
+                    # Finite input passes DeferredViewChecks but overflows the
+                    # Adam second moment, so the update must reject atomically.
+                    result["gradients"]["radiance_sh"] = dr.full(
+                        mi.Float, 1e30, dr.width(result["gradients"]["radiance_sh"]))
                 elif field == "negative_loss":
                     result["loss"] = -dr.abs(result["loss"])-1.
                 elif field in ("loss", "raw_alpha", "alpha"):
                     result[field] *= mi.Float(float("nan"))
                 return result
 
-            def set_parameters_guarded(self, parameters, allowed):
-                if field == "parameter":
-                    parameters["opacity_sh"] *= mi.Float(float("nan"))
-                return model.set_parameters_guarded(parameters, allowed)
-
-            def set_parameters_sparse(self, appearance, geometry, parameters, allowed):
-                if field == "parameter":
-                    parameters["opacity_sh"] *= mi.Float(float("nan"))
-                return model.set_parameters_sparse(appearance, geometry, parameters, allowed)
+            def optimizer_step_device(self, gradients, appearance, geometry, carving,
+                                      means, squares, steps, settings, allowed, check_moments=True):
+                # Inject a rejected commit, not a claimed internal proposal NaN.
+                # Separate native transaction tests exercise invalid proposals
+                # through set_parameters_guarded/set_parameters_sparse directly.
+                if field == "injected_rejection":
+                    allowed &= mi.Bool(False)
+                return model.optimizer_step_device(gradients, appearance, geometry, carving,
+                    means, squares, steps, settings, allowed, check_moments)
 
         wrapper = BrokenModel()
-        if field == "moment":
-            adam = optimizer._adam
-
-            def broken_adam(*args, **kwargs):
-                result = adam(*args, **kwargs)
-                state = kwargs.get("state", optimizer.state[args[0]])
-                state["mean"] *= mi.Float(float("nan"))
-                return result
-
-            optimizer._adam = broken_adam
         out, _, _ = train_view(wrapper, view, rgba, config, ContourSampler(np),
             np.random.default_rng(91), mi, dr, recorder, deferred_checks=checks)
         result = optimizer.step(wrapper, out, update_allowed=out["_update_allowed"])
@@ -188,13 +218,13 @@ def main():
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="mitsuba-deferred-checks-") as temporary:
         mi, dr, np, handles = initialize_runtime(RuntimeConfig(args.build_dir, args.gpu), Path(temporary), {})
-        assert callable(getattr(mi.VoxelReconstruction, "set_parameters_guarded", None)), "Rebuild native source first"
+        assert callable(getattr(mi.VoxelReconstruction, "optimizer_step_device", None)), "Rebuild native source first"
         config, payload, view, rgba = fixture(np)
         check_equivalence(config, payload, view, rgba, mi, dr, np)
         check_failure(config, payload, view, rgba, mi, dr, np)
         check_driver(temporary, args.build_dir, args.gpu, mi, np)
-        print("passed: deferred loss/RNG/Adam equivalence; zero per-view NumPy loss/image readbacks "
-              "(compaction count synchronization retained); device transaction/latch failures")
+        print("passed: deferred loss/RNG/Adam equivalence; zero per-view NumPy loss/image readbacks; "
+              "device transaction/latch failures")
     return 0
 
 

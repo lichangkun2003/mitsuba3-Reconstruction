@@ -565,6 +565,378 @@ VoxelReconstruction<Float, Spectrum>::set_parameters_sparse(
     return accepted;
 }
 
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
+VoxelReconstruction<Float, Spectrum>::optimizer_step_device(
+    const std::map<std::string, FloatBuffer> &gradients,
+    const UIntBuffer &appearance_valid, const UIntBuffer &geometry_valid,
+    const UIntBuffer &background_carve_valid,
+    const std::map<std::string, FloatBuffer *> &means,
+    const std::map<std::string, FloatBuffer *> &squared_means,
+    const std::map<std::string, UIntBuffer *> &steps,
+    const std::map<std::string, double> &settings, const Mask &allowed,
+    bool check_moments) {
+    if constexpr (!dr::is_jit_v<Float>) {
+        Throw("VoxelReconstruction.optimizer_step_device(): requires a JIT variant.");
+    } else {
+        auto setting = [&](const char *name) {
+            auto found = settings.find(name);
+            if (found == settings.end() || !std::isfinite(found->second))
+                Throw("VoxelReconstruction.optimizer_step_device(): invalid setting %s.", name);
+            return float(found->second);
+        };
+        const float beta1 = setting("beta1"), beta2 = setting("beta2"),
+                    epsilon = setting("epsilon"), clip = setting("gradient_clip"),
+                    gradient_factor = setting("gradient_factor"),
+                    carve_scale = std::max(setting("background_carve_multiplier"), 1.f) - 1.f,
+                    max_scale = setting("max_scale_voxels"),
+                    rotation_limit = setting("rotation_step_limit");
+        // Python evaluates these scalar differences in double precision before
+        // converting them to Float. Match that order (not 1.f - float(beta)).
+        const float weight1 = float(1. - settings.at("beta1")),
+                    weight2 = float(1. - settings.at("beta2"));
+        const bool direction_guard = setting("geometry_direction_guard") != 0.f;
+        struct Group {
+            const char *name;
+            uint32_t size;
+            bool geometry;
+            FloatBuffer *parameter;
+            float rate, limit;
+        };
+        const std::array<Group, 5> groups = {{
+            {"radiance_sh", m_sh_count * 3, false, &m_radiance,
+                setting("lr_radiance"), setting("radiance_step_limit")},
+            {"opacity_sh", m_opacity_sh_count, false, &m_opacity,
+                setting("lr_opacity"), setting("opacity_step_limit")},
+            {"centers", 3, true, &m_centers,
+                setting("lr_center"), setting("center_step_limit")},
+            {"log_scales", 3, true, &m_log_scales,
+                setting("lr_log_scale"), setting("log_scale_step_limit")},
+            {"rotation_tangent", 3, true, &m_rotations,
+                setting("lr_rotation"), rotation_limit}
+        }};
+        if (dr::width(allowed) != 1 || appearance_valid.size() != m_active_count ||
+            geometry_valid.size() != m_active_count || background_carve_valid.size() != m_active_count)
+            Throw("VoxelReconstruction.optimizer_step_device(): invalid mask/count sizes.");
+        for (const Group &group : groups) {
+            const size_t size = size_t(m_active_count) * group.size;
+            auto mean = means.find(group.name), square = squared_means.find(group.name);
+            auto clock = steps.find(group.name);
+            auto gradient = gradients.find(group.name);
+            if (mean == means.end() || square == squared_means.end() || clock == steps.end() ||
+                !mean->second || !square->second || !clock->second ||
+                mean->second->size() != size || square->second->size() != size ||
+                clock->second->size() != m_active_count ||
+                (group.rate > 0.f && (gradient == gradients.end() || gradient->second.size() != size)))
+                Throw("VoxelReconstruction.optimizer_step_device(): invalid group %s.", group.name);
+        }
+        if (!m_active_count)
+            return allowed;
+
+        // Inclusive scan gives stable IDs and the device-side list length.
+        // Unlike compress(), neither list length is fetched by the CPU. The
+        // spare tail of each list is never addressed by the bounded loops.
+        auto compact = [&](const UIntBuffer &counts, bool enabled) {
+            if (!enabled)
+                return std::make_pair(dr::zeros<UIntBuffer>(1), UInt32(0));
+            UIntBuffer ordinal = dr::arange<UIntBuffer>(m_active_count);
+            auto active = (counts > 0u) & allowed;
+            UIntBuffer prefix = dr::prefix_sum(UIntBuffer(active), false);
+            UInt32 count = dr::gather<UInt32>(prefix, UInt32(m_active_count - 1));
+            UIntBuffer rows = dr::zeros<UIntBuffer>(m_active_count);
+            dr::scatter(rows, ordinal, prefix - 1u, active);
+            dr::eval(rows, count);
+            return std::make_pair(std::move(rows), std::move(count));
+        };
+        auto appearance = compact(appearance_valid, groups[0].rate > 0.f || groups[1].rate > 0.f);
+        auto geometry = compact(geometry_valid, groups[2].rate > 0.f || groups[3].rate > 0.f ||
+                                              groups[4].rate > 0.f);
+        const uint32_t batch_size = std::min(m_active_count, uint32_t(32768));
+        const UInt32 lanes = dr::arange<UInt32>(batch_size);
+        const auto clean = [](const Float &value) {
+            return dr::select(dr::isfinite(value), value, 0.f);
+        };
+        // Never fall back to an evaluated loop: that would read the loop's
+        // termination condition on the CPU at every chunk.
+        dr::scoped_set_flag symbolic_loops(JitFlag::SymbolicLoops, true);
+
+        // The transaction is validated first, then recomputed and committed.
+        // This avoids both full-table rollback copies and N*SH proposal arrays.
+        // All groups share the final scalar gate, including late-chunk errors.
+        Mask accepted = allowed;
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            if (pass == 1)
+                dr::eval(accepted);
+            for (const Group &group : groups) {
+                if (group.rate <= 0.f)
+                    continue;
+                const bool rotation = std::string(group.name) == "rotation_tangent";
+                const bool centers = std::string(group.name) == "centers";
+                const bool scales = std::string(group.name) == "log_scales";
+                const auto &compact_rows = group.geometry ? geometry : appearance;
+                const UIntBuffer &rows = compact_rows.first;
+                const UInt32 &count = compact_rows.second;
+                const FloatBuffer &gradient = gradients.at(group.name);
+                FloatBuffer &mean_target = *means.at(group.name),
+                            &square_target = *squared_means.at(group.name);
+                UIntBuffer &clock_target = *steps.at(group.name);
+
+                auto row_scale = [&](const UInt32 &ids, const Mask &active) {
+                    if (!group.geometry)
+                        return Float(1.f);
+                    Float carve = Float(dr::gather<UInt32>(background_carve_valid, ids, active));
+                    Float hits = Float(dr::gather<UInt32>(geometry_valid, ids, active));
+                    return 1.f + carve_scale * dr::clip(carve / dr::maximum(hits, 1.f), 0.f, 1.f);
+                };
+                auto adam = [&](const UInt32 &index, const Mask &active,
+                                const FloatBuffer &mean_buffer, const FloatBuffer &square_buffer,
+                                const Float &bias1, const Float &bias2, const Float &scale) {
+                    Float original = clean(dr::gather<Float>(gradient, index, active) * gradient_factor);
+                    Float grad = dr::clip(original, -clip, clip);
+                    Float mean = beta1 * dr::gather<Float>(mean_buffer, index, active) + weight1 * grad;
+                    Float square = beta2 * dr::gather<Float>(square_buffer, index, active) +
+                                   weight2 * dr::square(grad);
+                    Float delta = clean(group.rate * (mean / bias1) /
+                        (dr::sqrt(dr::maximum(square / bias2, 0.f)) + epsilon));
+                    if (group.geometry && direction_guard) {
+                        Mask blocked = (original == 0.f) | (mean * original < 0.f);
+                        mean = dr::select(blocked, 0.f, mean);
+                        delta = dr::select(blocked, 0.f, delta);
+                    }
+                    return std::make_tuple(mean, square, delta * scale);
+                };
+                auto update_component = [&](const FloatBuffer &parameter, const UInt32 &ids,
+                                            uint32_t component, const Float &delta, const Mask &active) {
+                    Float old = dr::gather<Float>(parameter, ids * group.size + component, active);
+                    Float result = old - dr::clip(delta, -group.limit, group.limit);
+                    if (!group.geometry)
+                        result = clean(result);
+                    else if (centers)
+                        result = dr::clip(result, .01f, .99f);
+                    else if (scales) {
+                        const float lower = std::max(m_size[component] * 1e-4f, 1e-8f);
+                        const float upper = std::max(m_size[component] * max_scale, lower);
+                        result = dr::clip(clean(result), dr::log(Float(lower)), dr::log(Float(upper)));
+                    }
+                    return result;
+                };
+                auto update_rotation = [&](const FloatBuffer &parameter, const UInt32 &ids,
+                                           const std::array<Float, 3> &delta, const Mask &active) {
+                    Vector3f tangent(-delta[0], -delta[1], -delta[2]);
+                    Float length = dr::norm(tangent);
+                    Float factor = dr::minimum(1.f, rotation_limit / dr::maximum(length, 1e-30f));
+                    tangent *= factor;
+                    length *= factor;
+                    Float scale = dr::select(length > 1e-8f,
+                        dr::sin(length * .5f) / dr::maximum(length, 1e-30f), 0.f);
+                    Vector3f vector = tangent * scale;
+                    Float scalar = dr::select(length > 1e-8f, dr::cos(length * .5f), 1.f);
+                    Float old_w = dr::gather<Float>(parameter, ids * 4, active);
+                    Vector3f old_v;
+                    for (uint32_t c = 0; c < 3; ++c)
+                        old_v[c] = dr::gather<Float>(parameter, ids * 4 + c + 1, active);
+                    Float new_w = old_w * scalar - dr::dot(old_v, vector);
+                    Vector3f new_v = old_w * vector + scalar * old_v + dr::cross(old_v, vector);
+                    Float norm_squared = dr::square(new_w) + dr::dot(new_v, new_v);
+                    Mask safe = dr::isfinite(norm_squared) & (norm_squared > 1e-20f);
+                    Float inv_norm = dr::rsqrt(dr::select(safe, norm_squared, 1.f));
+                    return std::array<Float, 4>{
+                        dr::select(safe, new_w * inv_norm, 1.f),
+                        dr::select(safe, new_v.x() * inv_norm, 0.f),
+                        dr::select(safe, new_v.y() * inv_norm, 0.f),
+                        dr::select(safe, new_v.z() * inv_norm, 0.f)};
+                };
+
+                if (pass == 0) {
+                    struct ValidateState {
+                        UInt32 ordinal;
+                        Mask finite;
+                        DRJIT_STRUCT(ValidateState, ordinal, finite)
+                    } state{lanes, dr::full<Mask>(true, batch_size)};
+                    dr::tie(state) = dr::while_loop(dr::make_tuple(std::move(state)),
+                        [&](const ValidateState &s) { return s.ordinal < count; },
+                        [&](ValidateState &s) {
+                            Mask active = s.ordinal < count;
+                            UInt32 ids = dr::gather<UInt32>(rows, s.ordinal, active);
+                            UInt32 next_clock = dr::gather<UInt32>(clock_target, ids, active) + 1u;
+                            Float exponent(next_clock);
+                            Float bias1 = dr::maximum(1.f - dr::pow(Float(beta1), exponent), 1e-8f);
+                            Float bias2 = dr::maximum(1.f - dr::pow(Float(beta2), exponent), 1e-8f);
+                            Float scale = row_scale(ids, active);
+                            std::array<Float, 3> rotation_delta;
+                            for (uint32_t component = 0; component < group.size; ++component) {
+                                auto [mean, square, delta] = adam(ids * group.size + component,
+                                    active, mean_target, square_target, bias1, bias2, scale);
+                                if (check_moments)
+                                    s.finite &= !active | (dr::isfinite(mean) & dr::isfinite(square));
+                                if (rotation)
+                                    rotation_delta[component] = delta;
+                                else
+                                    s.finite &= !active | dr::isfinite(update_component(
+                                        *group.parameter, ids, component, delta, active));
+                            }
+                            if (rotation)
+                                for (const Float &value : update_rotation(*group.parameter, ids, rotation_delta, active))
+                                    s.finite &= !active | dr::isfinite(value);
+                            s.ordinal += batch_size;
+                        }, "Voxel reconstruction Adam validation");
+                    // C++ dr::all() returns a host bool and synchronizes; the
+                    // asynchronous primitive retains the reduction on device.
+                    accepted &= state.finite.all_async_();
+                } else {
+                    // A length-one gather is optimized by Dr.Jit into a
+                    // direct scalar input, rather than a pointer load. Writing
+                    // that same scalar inside the kernel would then make its
+                    // input dirty. Preserve only these four-byte read sources;
+                    // ordinary multi-voxel tables need no extra storage/copy.
+                    FloatBuffer scalar_mean, scalar_square, scalar_parameter;
+                    UIntBuffer scalar_clock;
+                    if (mean_target.size() == 1)
+                        scalar_mean = FloatBuffer::steal(jit_var_copy_opaque(mean_target.index()));
+                    if (square_target.size() == 1)
+                        scalar_square = FloatBuffer::steal(jit_var_copy_opaque(square_target.index()));
+                    if (group.parameter->size() == 1)
+                        scalar_parameter = FloatBuffer::steal(jit_var_copy_opaque(group.parameter->index()));
+                    if (clock_target.size() == 1)
+                        scalar_clock = UIntBuffer::steal(jit_var_copy_opaque(clock_target.index()));
+                    struct CommitState {
+                        UInt32 ordinal;
+                        FloatBuffer mean, square, parameter;
+                        UIntBuffer clock;
+                        DRJIT_STRUCT(CommitState, ordinal, mean, square, parameter, clock)
+                    } state{lanes, std::move(mean_target), std::move(square_target),
+                            std::move(*group.parameter), std::move(clock_target)};
+                    // Move owners into/out of the loop state. Holding an extra
+                    // array copy here would force full-table COW on every view.
+                    dr::tie(state) = dr::while_loop(dr::make_tuple(std::move(state)),
+                        [&](const CommitState &s) { return (s.ordinal < count) & accepted; },
+                        [&](CommitState &s) {
+                            Mask active = (s.ordinal < count) & accepted;
+                            UInt32 ids = dr::gather<UInt32>(rows, s.ordinal, active);
+                            UInt32 next_clock = dr::gather<UInt32>(scalar_clock.size() ? scalar_clock : s.clock,
+                                                                 ids, active) + 1u;
+                            Float exponent(next_clock);
+                            Float bias1 = dr::maximum(1.f - dr::pow(Float(beta1), exponent), 1e-8f);
+                            Float bias2 = dr::maximum(1.f - dr::pow(Float(beta2), exponent), 1e-8f);
+                            Float scale = row_scale(ids, active);
+                            std::array<Float, 3> rotation_delta;
+                            std::vector<Float> next_means, next_squares, next_parameters;
+                            next_means.reserve(group.size);
+                            next_squares.reserve(group.size);
+                            next_parameters.reserve(rotation ? 4 : group.size);
+                            for (uint32_t component = 0; component < group.size; ++component) {
+                                UInt32 index = ids * group.size + component;
+                                auto [mean, square, delta] = adam(index, active,
+                                    scalar_mean.size() ? scalar_mean : s.mean,
+                                    scalar_square.size() ? scalar_square : s.square, bias1, bias2, scale);
+                                next_means.push_back(std::move(mean));
+                                next_squares.push_back(std::move(square));
+                                if (rotation)
+                                    rotation_delta[component] = delta;
+                                else
+                                    next_parameters.push_back(update_component(
+                                        scalar_parameter.size() ? scalar_parameter : s.parameter,
+                                        ids, component, delta, active));
+                            }
+                            if (rotation) {
+                                auto values = update_rotation(s.parameter, ids, rotation_delta, active);
+                                for (uint32_t component = 0; component < 4; ++component)
+                                    next_parameters.push_back(std::move(values[component]));
+                            }
+                            // Read all old components before starting writes.
+                            // Compact IDs are unique, and different coefficient
+                            // addresses are disjoint, so NoConflicts is exact.
+                            for (uint32_t component = 0; component < group.size; ++component) {
+                                UInt32 index = ids * group.size + component;
+                                dr::scatter(s.mean, dr::detach(next_means[component]), index, active, ReduceMode::NoConflicts);
+                                dr::scatter(s.square, dr::detach(next_squares[component]), index, active, ReduceMode::NoConflicts);
+                            }
+                            for (uint32_t component = 0; component < next_parameters.size(); ++component)
+                                dr::scatter(s.parameter, dr::detach(next_parameters[component]),
+                                    ids * uint32_t(next_parameters.size()) + component, active, ReduceMode::NoConflicts);
+                            dr::scatter(s.clock, next_clock, ids, active, ReduceMode::NoConflicts);
+                            s.ordinal += batch_size;
+                        }, "Voxel reconstruction Adam commit");
+                    mean_target = std::move(state.mean);
+                    square_target = std::move(state.square);
+                    *group.parameter = std::move(state.parameter);
+                    clock_target = std::move(state.clock);
+                    dr::schedule(mean_target, square_target, *group.parameter, clock_target);
+                }
+            }
+        }
+        // Buffers above have already been scheduled. eval(accepted) alone can
+        // be a no-op when the scalar gate is evaluated, leaving scatter side
+        // effects pending when the next renderer records gathers from them.
+        dr::schedule(accepted);
+        dr::eval();
+        return accepted;
+    }
+}
+
+MI_VARIANT std::vector<uint64_t>
+VoxelReconstruction<Float, Spectrum>::optimizer_update_scope_begin(
+    const std::map<std::string, FloatBuffer *> &means,
+    const std::map<std::string, FloatBuffer *> &squared_means,
+    const std::map<std::string, UIntBuffer *> &steps) {
+    std::vector<uint64_t> handles;
+    if constexpr (!dr::is_jit_v<Float>) {
+        Throw("VoxelReconstruction.optimizer_update_scope_begin(): requires a JIT variant.");
+    } else {
+        std::vector<FloatBuffer *> floats{&m_radiance, &m_opacity, &m_centers, &m_log_scales, &m_rotations};
+        std::vector<UIntBuffer *> clocks;
+        for (const auto &[name, value] : means) {
+            if (!value)
+                Throw("VoxelReconstruction.optimizer_update_scope_begin(): null moment %s.", name.c_str());
+            floats.push_back(value);
+        }
+        for (const auto &[name, value] : squared_means) {
+            if (!value)
+                Throw("VoxelReconstruction.optimizer_update_scope_begin(): null moment %s.", name.c_str());
+            floats.push_back(value);
+        }
+        for (const auto &[name, value] : steps) {
+            if (!value)
+                Throw("VoxelReconstruction.optimizer_update_scope_begin(): null clock %s.", name.c_str());
+            clocks.push_back(value);
+        }
+        for (FloatBuffer *value : floats)
+            dr::schedule(*value);
+        for (UIntBuffer *value : clocks)
+            dr::schedule(*value);
+        dr::eval();
+        auto make_unique = [](auto &value) {
+            using Buffer = std::decay_t<decltype(value)>;
+            if (!value.size())
+                return;
+            // Literals may share their JIT node even before any Python alias
+            // exists. Materialize each writable buffer independently once.
+            if (jit_var_ref(value.index()) > 1 || value.state() != VarState::Evaluated)
+                value = Buffer::steal(jit_var_copy_opaque(value.index()));
+        };
+        for (FloatBuffer *value : floats)
+            make_unique(*value);
+        for (UIntBuffer *value : clocks)
+            make_unique(*value);
+        // Genuine user snapshots/moment aliases have now retained their old
+        // allocation. Frozen tracing may add references after this point, but
+        // those bookkeeping references do not require new device copies.
+        handles.reserve(floats.size() + clocks.size());
+        try {
+            for (FloatBuffer *value : floats)
+                if (value->size())
+                    handles.push_back(jit_var_stash_ref(value->index()));
+            for (UIntBuffer *value : clocks)
+                if (value->size())
+                    handles.push_back(jit_var_stash_ref(value->index()));
+        } catch (...) {
+            for (uint64_t handle : handles)
+                jit_var_unstash_ref(handle);
+            throw;
+        }
+    }
+    return handles;
+}
+
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::clear_growth_candidates() {
     if (m_growth_count) {
         dr::scatter(m_index, dr::full<IntBuffer>(-1, m_growth_cells.size()), m_growth_cells);

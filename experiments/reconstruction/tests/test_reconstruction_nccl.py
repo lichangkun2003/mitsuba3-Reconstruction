@@ -1,6 +1,6 @@
-"""Real two-GPU NCCL and reconstruction equivalence test inside HPC Slurm.
+"""Real N-GPU NCCL and reconstruction equivalence test inside HPC Slurm.
 
-Run this once in a one-task, two-GPU allocation before production training.
+Run this once in a one-task GPU allocation before production training.
 The parent imports no CUDA framework. Workers use generated arrays/scenes and
 temporary directories; no dataset or reconstruction experiment is created.
 """
@@ -35,23 +35,28 @@ def _known_reductions(context, collective, mi, dr, np):
         for i, name in enumerate(MAX_COUNTER_KEYS):
             source[name] = mi.UInt32((np.arange(count, dtype=np.uint32) + i + context.rank) % 2)
         raw, alpha = None, None
-        image = np.arange(7, dtype=np.float32) * .125
+        image = np.arange(max(7, context.world_size + 1), dtype=np.float32) * .125
         if step in (0, 2):
             begin, end = shard_pixel_range(len(image), context.rank, context.world_size)
             shard = np.zeros_like(image)
             shard[begin:end] = image[begin:end]
             raw, alpha = mi.Float(shard), mi.Float(shard * .5)
-        local_finite = not (step == 1 and context.rank == 1)
+        local_finite = not (step == 1 and context.rank == context.world_size - 1)
         result, loss, finite, reduced_raw, reduced_alpha = collective.reduce_view(
             source, mi.Float(step + context.rank + 1), mi.Bool(local_finite), raw, alpha)
         for i, (name, dimension) in enumerate(zip(GRADIENT_KEYS, (27, 9, 3, 3, 3))):
             base = np.arange(count * dimension, dtype=np.float32) * .125 + step + i
-            np.testing.assert_array_equal(np.asarray(result["gradients"][name]), base * 3)
+            np.testing.assert_array_equal(np.asarray(result["gradients"][name]),
+                                          base * (context.world_size * (context.world_size + 1) // 2))
         for i, name in enumerate(SUM_COUNTER_KEYS):
-            np.testing.assert_array_equal(np.asarray(result[name]), (np.arange(count, dtype=np.uint32) + i + step) * 3)
-        for name in MAX_COUNTER_KEYS:
-            np.testing.assert_array_equal(np.asarray(result[name]), np.ones(count, dtype=np.uint32))
-        np.testing.assert_array_equal(np.asarray(loss), [2 * step + 3])
+            np.testing.assert_array_equal(np.asarray(result[name]),
+                (np.arange(count, dtype=np.uint32) + i + step) * (context.world_size * (context.world_size + 1) // 2))
+        for i, name in enumerate(MAX_COUNTER_KEYS):
+            expected = (np.ones(count, dtype=np.uint32) if context.world_size > 1
+                        else (np.arange(count, dtype=np.uint32) + i) % 2)
+            np.testing.assert_array_equal(np.asarray(result[name]), expected)
+        np.testing.assert_array_equal(np.asarray(loss),
+            [context.world_size * step + context.world_size * (context.world_size + 1) // 2])
         np.testing.assert_array_equal(np.asarray(finite), [step != 1])
         if raw is None:
             assert reduced_raw is None and reduced_alpha is None
@@ -61,6 +66,35 @@ def _known_reductions(context, collective, mi, dr, np):
     return {"known_reductions": "passed", "steps": 4,
             "checks": ["gradient_sum", "validity_sum", "evidence_max", "finite_min",
                        "scalar_loss_sum", "uneven_disjoint_images", "empty_topology"]}
+
+
+def _known_batches(context, collective, mi, dr, np):
+    from reconstruction_collective import GRADIENT_KEYS, SUM_COUNTER_KEYS, MAX_COUNTER_KEYS
+    # Include a short final batch: its padding rank must contribute zero and
+    # must not change the caller's actual-view normalization.
+    for actual_views in sorted({1, context.world_size, max(1, context.world_size - 1)}):
+        active = context.rank < actual_views
+        local = context.rank + 1 if active else 0
+        accumulator = {"gradients": {key: mi.Float([local, local * 2]) for key in GRADIENT_KEYS}}
+        accumulator.update({key: mi.UInt32([int(active), 0]) for key in SUM_COUNTER_KEYS + MAX_COUNTER_KEYS})
+        total = actual_views * (actual_views + 1) // 2
+        result, loss, finite = collective.reduce_batch(accumulator, mi.Float(local), mi.Bool(True))
+        for key in GRADIENT_KEYS:
+            np.testing.assert_array_equal(np.asarray(result["gradients"][key]), [total, total * 2])
+        np.testing.assert_array_equal(np.asarray(result["appearance_valid"]), [actual_views, 0])
+        np.testing.assert_array_equal(np.asarray(loss), [total])
+        assert bool(np.asarray(finite)[0])
+    fields = {"gain": mi.Float([context.rank + .25, context.rank + .5]),
+              "observed": mi.UInt32([context.rank + 1, context.rank + 2]),
+              "empty": dr.empty(mi.Float, 0)}
+    for source_rank in range(context.world_size):
+        result = collective.broadcast_arrays(fields, root=source_rank, uint_keys=("observed",))
+        np.testing.assert_array_equal(np.asarray(result["gain"]), [source_rank + .25, source_rank + .5])
+        np.testing.assert_array_equal(np.asarray(result["observed"]), [source_rank + 1, source_rank + 2])
+        assert dr.width(result["empty"]) == 0
+    np.testing.assert_array_equal(np.asarray(fields["gain"]), [context.rank + .25, context.rank + .5])
+    return {"view_batches": "passed", "checks": ["full_and_short_batch_sums",
+            "validity_sum", "per_camera_root_broadcast", "source_buffers_preserved", "empty_arrays"]}
 
 
 def _compare_native(context, collective, directory, mi, dr, np):
@@ -160,6 +194,7 @@ def _worker_main(context, arguments):
         with NcclCollective(context.rank, context.world_size, context.connection, mi, dr, np,
                             library=args.nccl_library) as collective:
             checks = [_known_reductions(context, collective, mi, dr, np),
+                      _known_batches(context, collective, mi, dr, np),
                       _compare_native(context, collective, directory, mi, dr, np)]
             context.barrier()
             print(json.dumps({"status": "passed", "rank": context.rank,
@@ -172,8 +207,9 @@ def main(argv=None):
     parser.add_argument("--build-dir")
     parser.add_argument("--nccl-library")
     parser.add_argument("--worker-timeout", type=float, default=600.)
+    parser.add_argument("--workers", type=int, default=None)
     args = parser.parse_args(argv)
-    allocation = validate_allocation()
+    allocation = validate_allocation(workers=args.workers)
     arguments = []
     for name in ("build_dir", "nccl_library"):
         if getattr(args, name):

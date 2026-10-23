@@ -6,6 +6,7 @@
 #include <map>
 #include <string>
 #include <tuple>
+#include <vector>
 
 NAMESPACE_BEGIN(mitsuba)
 
@@ -36,6 +37,8 @@ public:
     static constexpr uint32_t distortion_version = 1;
     /// GPU occupancy octree, including separately tagged hypothetical leaves.
     static constexpr uint32_t octree_version = 1;
+    /// Device-resident compact Adam, including transactional moment updates.
+    static constexpr uint32_t optimizer_device_version = 1;
 
     VoxelReconstruction(const std::string &filename, uint32_t resolution,
                         const std::array<float, 3> &grid_min,
@@ -76,6 +79,30 @@ public:
                                const UIntBuffer &geometry_indices,
                                const std::map<std::string, FloatBuffer> &parameters,
                                const Mask &allowed);
+
+    /// Compact active row IDs without returning their lengths to the host.
+    /// Borrow moment arrays in place: no full-table snapshots/copies are made.
+    /// A validation pass precedes a commit pass using the same scalar gate;
+    /// fixed-size device batches bound temporary storage independently of SH
+    /// table size. Per-view/group clocks and zero-gradient updates are retained.
+    Mask optimizer_step_device(
+        const std::map<std::string, FloatBuffer> &gradients,
+        const UIntBuffer &appearance_valid, const UIntBuffer &geometry_valid,
+        const UIntBuffer &background_carve_valid,
+        const std::map<std::string, FloatBuffer *> &means,
+        const std::map<std::string, FloatBuffer *> &squared_means,
+        const std::map<std::string, UIntBuffer *> &steps,
+        const std::map<std::string, double> &settings, const Mask &allowed,
+        bool check_moments = true);
+
+    /// Enter before frozen recording/replay. Detach genuine external aliases,
+    /// then stash the unique owners' reference counts so tracing's temporary
+    /// references do not force full parameter/moment copies. The caller must
+    /// release every returned handle with jit_var_unstash_ref(), also on error.
+    std::vector<uint64_t> optimizer_update_scope_begin(
+        const std::map<std::string, FloatBuffer *> &means,
+        const std::map<std::string, FloatBuffer *> &squared_means,
+        const std::map<std::string, UIntBuffer *> &steps);
 
     /// Install immutable hypothetical proposals, allowing repeated target cells.
     /// Each input row retains its own evidence index. They never change trace(),

@@ -1466,14 +1466,7 @@ class TopologyManager:
         from reconstruction_topology_gpu import get_gpu_lifecycle
         device = get_gpu_lifecycle(self, model)
         if device is not None:
-            refine = (self.schedule.enabled and self.core_resolution < self.schedule.target_resolution and
-                      int(completed_epochs) - self.level_start_epoch >= self.level_budget)
-            if not refine:
-                return device.finish(model, optimizer, int(completed_epochs))
-            # The unchanged geometric child fitter is a once-per-level host
-            # boundary, separate from repeated GPU growth/deletion events.
-            device.materialize()
-            self._gpu_lifecycle = None
+            return device.finish(model, optimizer, int(completed_epochs))
         np, cfg, schedule = self.np, self.settings, self.schedule
         boundary = int(completed_epochs)
         self._materialize_growth()

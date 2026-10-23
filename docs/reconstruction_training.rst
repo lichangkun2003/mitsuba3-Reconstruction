@@ -5,7 +5,8 @@ RGB-only 训练、在线生长与删除（当前默认）
 ----------------------------------------
 
 本阶段从新的初始化开始，使用 800 × 800、每像素 1 spp、总计 1000 个 epoch。
-每个 epoch 遍历全部训练视角；单卡和双卡使用相同总轮数及 coarse-to-fine 调度。
+每个 epoch 遍历全部训练视角；单卡和多卡使用相同总轮数及 coarse-to-fine 调度。
+多卡按下文 N 视角批次更新，因此同轮数的 Adam 更新次数与单卡不同。
 常用参数集中在 ``experiments/reconstruction/train.py`` 顶部的 ``CONFIG`` 赋值区，
 切换场景修改 ``CONFIG.data.dataset``，不要修改预览脚本的 ``CONFIG``。
 
@@ -91,8 +92,9 @@ RGB 收益与持续低 opacity 两条删除分支，总开关关闭时两者均�
      --distortion-weight 0.01 --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
 
 若本机是 venv 布局，解释器改为 ``..\envs\mitsuba\Scripts\python.exe``。
-双卡入口 ``train_multigpu.py`` 同样透传此选项；仍先 SUM 合并同一视角的
-像素分片梯度与损失，不按卡数重复平均。
+多卡入口 ``train_multigpu.py`` 同样透传此选项。当前 N 卡协议每卡计算一个完整视角，
+各视角的 RGB 与 distortion 梯度求和后除以本批实际视角数 B，再执行一次 Adam；
+不足 N 个视角的尾批按 B 平均，不把空闲 rank 计入分母。
 
 **定义。** 当前体素每次 hard hit 提供一个 opacity，而不是一段连续密度。
 因此采用离散点对距离正则，参考
@@ -307,8 +309,9 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 删除压紧、出生拼接和 Adam 状态重映射使用设备数组。几何仍为双精度，排序／平局规则
 及冷却、等待、保护期不变，没有为投票增加前向。可使用 ``--no-gpu-topology`` 或设置
 ``topology.gpu_topology=False`` 使用原 NumPy 对照，``--gpu-topology`` 显式启用。
-升层拟合、存档／恢复和当前多卡控制通道仍是主机边界；
-动态数组数量和轮末诊断标量允许少量同步。GPU 路径不为生长投票回读完整图像或模型。
+升层拟合现在同样使用设备数组，详细规则见下文“GPU 升层”。存档／恢复保留显式主机边界；
+动态数组数量和轮末诊断标量允许少量同步。多卡模型、候选及 Adam 使用 GPU 广播，
+控制通道只传元数据。GPU 路径不为生长投票回读完整图像或模型。
 生成器先用成熟期、删除候选标记和静态生长区域筛出合法父体，在 GPU 上压紧一次，
 之后才展开 FP64 椭球几何和 26 邻域（配置关闭时为 6 邻域）计算。无界远景父体因此
 不再参与接触计算；压紧只减少工作量，不改变原有候选集合。输出保留原模型父体 ID，
@@ -494,7 +497,7 @@ checkpoint 保存内部证据版本，使用版本 2 或更早 RGB 生长证据�
 
 两条命令都自动创建新的实验目录。需要短跑时添加 ``--stop-after-epochs 10``，保持
 ``--epochs 1000``，避免改变完整调度。训练后的 64 spp 只用于评价出图，不改变训练 spp。
-双卡平台要求和资源分配方式见下文“同节点两张 GPU 训练与评价”。
+多卡平台要求和资源分配方式见下文“同节点 N 张 GPU 训练与评价”。
 十轮只检查正常训练路径，不会触发默认 warmup 后的生长或删除。
 第一次生长／删除证据在第 30 轮；观察删除的第二次确认机会可短跑 41 轮，
 但是否实际删除仍取决于 RGB 收益或持续低 opacity 的确认条件。从仓库根目录执行 Windows 短跑：
@@ -544,7 +547,7 @@ RGB 删除回归以实际移除体素后重新渲染的结果校验收益，覆�
 下文保留通用运行细节与旧实现说明，其中 alpha 监督、contour 和旧生长／删除规则
 属于 legacy 配置；当前实验以本节及当前 ``CONFIG`` 为准。
 
-单卡训练入口为 ``experiments/reconstruction/train.py``，实验性的同节点双卡启动器为
+单卡训练入口为 ``experiments/reconstruction/train.py``，实验性的同节点 N 卡启动器为
 ``experiments/reconstruction/train_multigpu.py``，评价入口为
 ``experiments/reconstruction/evaluate.py``。它们共享场景表达、相机、源码运行环境和
 前向渲染工具；``preview.py`` 继续用于初始化检查。
@@ -559,9 +562,10 @@ RGB 删除回归以实际移除体素后重新渲染的结果校验收益，覆�
 ------------------
 
 一个 epoch 完整遍历训练相机 JSON 的所有视角。默认每轮打乱视角顺序；每个视角的
-每个像素仅发射一条射线，即固定 1 spp。完整视角的梯度累加结束后更新一次参数。
+每个像素仅发射一条射线，即固定 1 spp。单卡在完整视角的梯度累加结束后更新一次参数；
+N 卡入口每卡并行处理一个不同视角，本批实际 B 个视角完成后用平均梯度更新一次。
 ``training.chunk_size=0`` 默认整图提交；800 × 800 时一次提交 640000 条射线。
-设为正整数可显式限制每批射线数，不改变每个视角的更新次数。
+设为正整数可显式限制每批射线数，不改变上述按视角或视角批次更新的规则。
 ``data.camera_index`` 是沿用的预览配置字段，训练遍历全部视角，不使用它截取训练集。
 
 训练包括颜色与 alpha 损失、外观与几何梯度、分组 Adam、体素拓扑操作及分辨率调度。
@@ -835,7 +839,7 @@ checkpoint 恢复及评价复用这些值；显式不一致的初始化设置会
 不会写入 checkpoint 或输出目录；恢复时可调整容量，不改变已保存的模型、优化器和随机数状态。
 
 数据集在一次运行期间视为固定输入，不支持训练中修改参考图片。缓存复用相同的 float32 数值，
-不改变随机数消耗、训练视角顺序、1 spp、每视角一次更新或拓扑证据规则。
+缓存本身不改变随机数消耗、训练视角顺序、1 spp 或所选更新协议与拓扑证据规则。
 训练后自动评价和独立评价保持原读取流程，不继承这个训练缓存。
 
 每轮 ``training.jsonl`` 和最终 ``training-report.json`` 的 ``reference_cache`` 包含
@@ -854,9 +858,10 @@ checkpoint 恢复及评价复用这些值；显式不一致的初始化设置会
 仍被正在执行的调用引用的淘汰数组，以及模型、梯度和射线记录；不能据此推断显存峰值。
 
 legacy 模式的 CPU 参考图仍用于 contour 和旧生长证据；当前 RGB 生长直接复用原生前向
-的参考 RGB 与渲染结果，不另读 CPU 参考图投票。子像素随机采样继续使用原 NumPy 随机数流，
+的参考 RGB 与渲染结果，不另读 CPU 参考图投票。单卡子像素采样继续使用原 NumPy 随机数流，
+多卡使用下文可保存的逐视角 seed 协议；
 偏移和需要时的 PDF 权重仍需上传；显存缓存只省掉固定参考图的重复上传，不改变采样、
-损失、梯度或逐视角更新。缓存不写入 checkpoint，恢复进程重新填充，并在自动评价前释放。
+损失、梯度或更新规则。缓存不写入 checkpoint，恢复进程重新填充，并在自动评价前释放。
 ``gpu_reference_cache`` 随逐轮日志、训练报告及性能汇总记录容量、驻留字节数、图片数、
 ``hits``、``misses``、``uploads``、``uploaded_bytes`` 和 ``evictions``。
 上传统计只计算显存缓存负责的上传；关闭缓存或单图过大时原路径的上传不计入该字段。
@@ -864,10 +869,10 @@ legacy 模式的 CPU 参考图仍用于 contour 和旧生长证据；当前 RGB 
 原生调用重放
 ------------
 
-默认 ``training.freeze_native=True`` 使用 ``dr.freeze`` 记录原生 ``loss_and_grad``
-中的 GPU 工作，兼容的后续调用直接重放，减少重复追踪和组织计算图的主机开销。
+默认 ``training.freeze_native=True`` 使用 ``dr.freeze`` 分别记录原生 ``loss_and_grad``
+与设备端稀疏 Adam 中的 GPU 工作，兼容的后续调用直接重放，减少重复追踪和组织计算图的主机开销。
 它不缓存渲染结果：模型参数、相机射线、参考图和 PDF 每次都是当前调用的输入，Adam
-替换后的参数立即参与下一视角。原来的解析外观梯度、几何代理梯度及每视角一次更新保持不变；
+替换后的参数立即参与下一次训练计算。原来的解析外观梯度、几何代理梯度及单卡每视角更新保持不变；
 这不是将算法改为普通自动微分，也不表示将全部计算融合成一个 GPU 内核。
 
 重放缓存按原生设置、输入宽度、网格和 SH 元数据区分记录，最多保留 8 个配置条目，
@@ -889,7 +894,7 @@ legacy 模式的 CPU 参考图仍用于 contour 和旧生长证据；当前 RGB 
 默认 ``training.chunk_size=0`` 让一个视角的全部射线一起进入前向和梯度计算，随后进行一次 Adam 更新。
 整图提交仍会执行多个 GPU 内核，并不等于只启动一个内核，也不保证所有设备上都最快。
 它需要更多显存；显存不足时，可以显式设置 ``--chunk-size 65536`` 等正整数，仍保持
-800 × 800、1 spp 和每视角一次更新。程序不会自行降低 spp、图像分辨率或回退 CPU。
+800 × 800、1 spp 和单卡每视角一次更新。程序不会自行降低 spp、图像分辨率或回退 CPU。
 已有 JSON 配置中的正数 ``chunk_size`` 仍然生效；用 ``--chunk-size 0`` 可以覆盖旧配置，
 包括从 checkpoint 恢复时的分批设置。此处的 0 约定仅用于训练入口；评价仍使用其正数分批参数。
 
@@ -905,10 +910,10 @@ legacy 模式的 CPU 参考图仍用于 contour 和旧生长证据；当前 RGB 
   epoch 结束或抽样诊断边界统一回读。GPU 错误锁存阻止无效梯度、参数与 Adam 状态
   提交，并阻止后续视角更新；主机在下次检查边界报告错误。每视角一次 Adam 不变。
   进度行不读取即时 loss，epoch 汇总保留全部损失分量。
-* 默认训练更新使用 ``set_parameters_sparse()`` 在 GPU 验证并提交紧凑的有效参数行，
+* 默认训练更新使用 ``optimizer_step_device()`` 在 GPU 验证并提交紧凑的有效参数行，
   参数与 Adam 状态使用同一个接受标记。整表对照保留 ``set_parameters_guarded()``；
   公共 ``set_parameters()`` 仍保持同步验证。``--sync-view-checks`` 恢复逐视角即时
-  检查，用于调试；未将 Adam 扩大纳入完整步骤重放。
+  检查，用于调试。Adam 与前向／梯度分别重放，仍按每视角梯度、更新的顺序执行。
 * ``epoch_validation_seconds`` 记录轮末摘要检查及剩余 GPU 队列等待。异步模式下的
   ``view_stage_seconds`` 是主机提交和隐式等待时间，不是 GPU 阶段用时；比较吞吐
   使用完整 ``seconds``，不可把减少的主机等待误报为内核算术加速。
@@ -939,8 +944,10 @@ GPU 体素 ID。颜色／opacity 与中心／轴长／旋转使用各自的 ID�
 各组独立步数、样本数归一化、梯度裁剪、参数步长限制、几何方向门控、旋转更新和
 每视角一次提交的顺序均不变。
 
-候选参数与动量全部计算完后，原生 ``set_parameters_sparse()`` 检查 ID 范围／严格顺序
-及提交值的有限性，与原始梯度检查和错误锁存共同形成一个整批接受标记。
+原生 ``optimizer_step_device()`` 从有效计数构造有序唯一 ID，列表容量为体素数，
+有效长度由 GPU 前缀和计算并留在设备端。固定至多 32768 个线程通道循环处理实际有效行。
+第一遍检查所有参数组的更新值和动量，与原始梯度检查和错误锁存共同形成一个整批接受标记；
+第二遍重算并提交，不分配全体素数乘 SH 维度的候选参数或回滚副本。
 参数和 Adam 状态按该标记同时提交或保留，不允许只提交部分参数组。
 恢复或外部替换的完整动量状态仍需验证；正常连续更新不再每视角重新扫描未触及的动量行。
 为兼容直接修改 ``optimizer.state`` 的诊断代码，一旦公开了该可写引用，后续更新会保守地
@@ -950,15 +957,19 @@ GPU 体素 ID。颜色／opacity 与中心／轴长／旋转使用各自的 ID�
 格式未改变，拓扑增删后的状态重映射规则也未改变。
 
 这项更新包含 C++ 接口和 Python 绑定，同步后先增量编译并重新启动训练进程。
-缺少 ``set_parameters_sparse()`` 的构建会明确报错。已有模型不需要转换；
+缺少 ``optimizer_step_device()`` 的构建会明确报错。已有模型不需要转换；
 数值／性能对照保留 ``FalcorOptimizer(..., sparse_updates=False)`` 的整表实现。
 ``--sync-view-checks`` 只控制检查时机，不切换回整表 Adam。
 
-两类 ``dr.compress`` 会读取紧凑数组长度，产生少量 GPU 同步，不能称为完全异步；
-性能测量必须计入压紧和队列等待。全梯度原始有限值检查仍覆盖完整梯度缓冲，
+普通 guarded 更新不再使用 ``dr.compress`` 或主机长度回读。``--freeze-native`` 同时控制
+Adam 的录制／重放；所有可变参数和动量都是本次调用输入，外部旧快照仍按写时复制保护。
+正常唯一持有的缓冲区不会因录制内部的引用而整表复制。模型替换、reset、remap、load
+或优化器设置改变时丢弃旧记录。日志 ``optimizer_execution`` 提供真实录制／重放次数。
+性能测量必须包含轮末 GPU 完成等待。全梯度原始有限值检查仍覆盖完整梯度缓冲，
 全场占用索引和拓扑数据也没有被替换为局部模型。本修改减少参数与动量的无效算术、
 读写和重复检查，不保证在有效体素占比很高或规模很小时提速；完整吞吐仍需实测。
 
+以下是旧的主机长度压紧路径的历史数据，不代表设备端批处理版本的速度。
 Windows／RTX 4060 Laptop 的合成微基准使用 524,288 个体素，每组预热 5 次，
 交替测量整表与稀疏实现各 9 次。下面为中位数，计入压紧、验证、参数／动量提交及
 GPU 完成，不包含前向或反向。两组有效掩码相同，比例分别如下：
@@ -989,6 +1000,35 @@ GPU 完成，不包含前向或反向。两组有效掩码相同，比例分别�
    & ..\envs\mitsuba\Scripts\python.exe -I `
      experiments/reconstruction/tests/test_reconstruction_sparse_optimizer.py --benchmark
 
+2026-10-23 的设备端版本另以 262,144 个体素、9 个 radiance SH 系数、1 个 opacity
+系数测量，仍使用 RTX 4060 Laptop。每组预热 5 次，三条实现交替执行，各测量 7 次，
+计时包含 GPU 完成。当前工具同时输出整表、旧主机长度压紧及新设备端重放的结果：
+
+.. list-table:: 设备端 Adam 与旧压紧实现，中位数
+   :header-rows: 1
+
+   * - 有效体素比例
+     - 旧压紧（ms）
+     - 设备端重放（ms）
+   * - 1%
+     - 1.305
+     - 0.399
+   * - 10%
+     - 2.138
+     - 1.040
+   * - 50%
+     - 3.771
+     - 2.993
+   * - 100%
+     - 6.615
+     - 4.377
+
+复现此规模可在上面的命令后加 ``--benchmark-voxels 262144 --benchmark-iterations 7``。
+48 次设备端调用共录制 1 次、重放 47 次；禁止同步的回归同时覆盖首次录制、空有效集合、
+单体素与后续有效数量变化。实际训练入口及连续视角测试比较损失、参数、Adam 状态和随机序列，
+不在新路径视角之间插入快照回读。单体素的标量缓冲读取使用设备端副本，避免原位写入与
+Dr.Jit 单元素 gather 优化冲突；多体素表不增加这种副本。
+
 此测量不能推算整轮加速，也不代表 RTX 5090／A100 的实际时间。
 有效比例高时压紧、索引及散写可能抵消减少全表操作的收益。
 
@@ -1014,13 +1054,14 @@ RGB 删除对应 ``rgb_deletion_device_views``、``rgb_deletion_cpu_views`` 和
 
 此前这一性能优化没有修改原生接口，但当前新增在线 RGB 生长修改了 C++ 与绑定，必须重新编译。
 当前默认 RGB 生长与旧 alpha 生长算法不同，不能直接将它们的耗时差解释为同算法提速。
-要比较刚才的 512 阶段，可在同样的双卡分配中从旧实验保存点继续若干轮，保留全部算法设置：
+旧逐视角／像素分片实验若要比较 512 阶段，应使用单卡入口从旧保存点继续，保留算法设置。
+当前 N>1 视角批次协议不接续这种旧优化轨迹：
 
 .. code-block:: bash
 
    # 将下面 checkpoint 和输出路径中的实验名替换为实际名称；输出目录须尚未使用。
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
-     --workers 2 --resume outputs/原实验/training/epoch-00467.npz --no-rgb-only \
+   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
+     --resume outputs/原实验/training/epoch-00467.npz --no-rgb-only \
      --output-dir outputs/原实验-topology-check/training \
      --stop-after-epochs 20 --chunk-size 0 --freeze-native \
      --profile-views 3 --profile-interval-epochs 10 --no-profile-stages
@@ -1588,40 +1629,53 @@ Windows 默认构建目录为 ``mitsuba/build/Release``，Linux 为 ``mitsuba/bu
 ``datasets/lego``、checkpoint 与输出。共享配置使用相对路径；无需把本机绝对路径
 写入 Git。输出和缓存禁止放进源码仓库。
 
-同节点两张 GPU 训练与评价（实验性）
+同节点 N 张 GPU 训练与评价（实验性）
 ----------------------------------------
 
-``experiments/reconstruction/train_multigpu.py`` 启动两个独立进程，分别使用调度器可见的逻辑
-GPU 0 和 1。当前仅支持 Linux Slurm、同一节点、两个工作进程。普通 Windows 本地训练
-继续使用 ``train.py``。这里没有承诺两倍加速：每个视角都需要梯度汇总，
-收益取决于射线计算量、模型大小、通信及同步成本。真实双 A100 的 NCCL 通信、数值一致性、
-完整收敛和速度尚需在服务器验证；本地的 CPU 模拟通信测试不等于真实双卡验证。
+``experiments/reconstruction/train_multigpu.py`` 默认读取调度器的 ``CUDA_VISIBLE_DEVICES``，
+用全部 N 张已分配 GPU 创建 N 个工作进程；``--workers N`` 可显式选择不超过可见数量的
+工作进程。仅支持 Linux Slurm 同一节点，Windows 本地继续使用 ``train.py``。
+每个 rank 持有完整模型，不是把模型按空间拆开；显存不会按 N 等分。
 
-本地 RTX 4060 Laptop 的源码增量构建、CUDA 缓冲外部写入、整图与像素分片数值对照已通过。
-另外使用两个进程共享一张 GPU、测试专用的主机归约验证了完整训练、4 → 8 升层、
-contour/Adam/RNG 状态和单卡/双进程之间的 checkpoint 恢复；生产路径不使用该主机归约。
+当前训练协议为 ``view_batch``：按照当轮打乱后的相机顺序，每张卡处理一个不同的完整视角。
+本批计算期间模型保持固定，各视角仍为 1 spp。所有卡完成后，在 GPU 上 SUM 合并各视角
+梯度，再以实际视角数 B 平均，所有模型副本各执行同样的一次 Adam 更新。有效体素计数
+用于合并本批的有效掩码；有效的零梯度仍推进对应参数组步数，无效体素仍不更新。
+例如 169 个视角、两卡时每轮更新 85 次，最后一个视角单独成为 B=1 的尾批；
+空闲 rank 参与通信但贡献零梯度，不重复训练视角、不计入平均分母。N 大于视角数也同理。
 
-双卡拆分的是同一视角内的像素射线。两个进程保持相同模型、相机顺序、CPU 随机采样及
-contour 提案，每张卡计算各自不重叠的半幅像素。每个像素仍为 1 spp，每个 epoch
-仍遍历全部视角。通过 NCCL 在 GPU 上将梯度、有效计数和损失做 SUM 归约，legacy 布尔删除证据
-用 MAX 合并，有限值状态合并检查。梯度不除以卡数，也不把不同视角组成新的训练 batch。
-拿到相同的完整视角梯度后，两份模型副本各执行相同的一次 Adam 更新，逻辑全局步数只加 1。
-浮点求和的分组和次序会改变，因此不保证与单卡逐位相同。
+这会改变相对于单卡每视角更新的优化轨迹与每轮 Adam 步数，学习率不自动乘 N。
+因此新多卡结果不应与逐视角单卡参数或 loss 作严格相等断言，应比较收敛曲线与评价指标。
+``N=1`` 保持现有逐视角更新路径。N>1 当前只支持 RGB-only 均匀采样，legacy alpha 或
+contour 训练明确报错，避免暗中改变其历史状态与证据语义。
 
-rank 0 负责实验目录、日志、拓扑生长/删除/升层及 checkpoint；
-拓扑改变后将模型与 Adam 状态同步给 rank 1，并清除旧的原生重放记录。需要 contour
-历史或 legacy 生长证据时，额外合并预测 alpha；当前 RGB 生长只合并候选级
-``growth_gain``、``growth_observed``、``growth_unknown``，然后由 rank 0 投一次完整视角票。
-RGB 删除同样对 ``deletion_gain``、``deletion_observed``、``deletion_unknown`` 做 SUM，
-在 rank 0 按完整视角的可靠命中数归一化，不能先投分片票再合并。
-普通轮次不因此回读完整 RGB 图像。
+N>1 的随机协议使用共享、可保存的主 RNG 生成相机顺序及每视角 seed；各 rank 为自己
+视角创建局部 RNG 生成子像素样本，不直接用全局采样流推进不同数量的像素。
+同协议、同 N 的恢复保留主 RNG 和更新计数；不承诺与旧单卡采样流逐样本相同。
+``global_step`` 继续统计已处理的训练视角数，新增 ``optimizer_step`` 统计实际批次更新数。
+日志还记录 ``views_per_update`` 与 ``updates_per_epoch``。
 
-完整训练结束后，两个进程继续执行最终 train/test 评价，默认训练集前十个、测试集全部视角，
-每视角 64 spp。评价把已选中的 train/test 视角合并为任务列表，再交错分给两个 rank；
+rank 0 负责目录、日志、拓扑生长／删除／升层及 checkpoint。生长与删除证据按各自视角
+独立通过 NCCL 传到 rank 0，再用原归一化和阈值投票；不把 N 个相机的收益先混成一票，
+也不为投票追加前向。候选缓冲、拓扑替换后的模型与 Adam 状态使用 GPU 广播，
+CPU 控制通道只传形状、元数据及协议消息；拓扑变化后清除旧重放记录。
+普通轮次不为多卡训练回读整幅 RGB 图像或完整模型。
+
+checkpoint 仍只由 rank 0 保存一份，但训练状态新增 ``update_protocol`` 和
+``optimizer_step``。新批次 checkpoint 要用相同 N 和协议续训；改变 N 请开始新实验。
+旧逐视角／像素分片 checkpoint 可以沿原单卡路径继续，不能作为 N>1 新批次训练的续训点；
+这些兼容限制不妨碍独立加载最终模型评价。
+
+本地生成场景检查覆盖分批、尾批、平均梯度、证据独立及协议恢复；测试主机只有一张 GPU，
+不能验证真实多 A100 的 NCCL 吞吐、并发显存或完整收敛。旧像素分片的单卡等价测试仍可
+作为旧路径回归，不能代替当前视角批次的数学与通信验证。加速幅度必须在实际分配上测量。
+
+完整训练结束后，N 个进程继续执行最终 train/test 评价，默认训练集前十个、测试集全部视角，
+每视角 64 spp。评价把已选中的 train/test 视角合并为任务列表，再交错分给 N 个 rank；
 每张卡加载完整模型，独立渲染分到的整个视角。这里不拆分同一视角的 samples、不计算梯度，
 也不使用 NCCL。每个视角的 seed、64 spp 累积顺序、文件名和 PSNR 协议保持原样。
 只有 rank 0 写共享配置、汇总指标和报告，合并后的视角记录恢复为各划分原相机顺序，
-汇总指标由逐视角结果重新计算，不直接平均两个 rank 的平均 PSNR。
+汇总指标由逐视角结果重新计算，不直接平均各 rank 的平均 PSNR。
 
 ``test_reconstruction_distributed_evaluation.py`` 已在本地用两个进程共享一张 RTX 4060
 验证：奇数视角数、无任务的第二进程、对端参考图失败、主进程独占共享报告，以及训练后
@@ -1640,12 +1694,13 @@ RGB 删除同样对 ``deletion_gain``、``deletion_observed``、``deletion_unkno
      --nodes=1 --ntasks=1 --gres=gpu:a100-sxm4-40gb:2 --cpus-per-task=16 --mem=80G \
      --time=01:00:00 --pty bash
 
-这是首次短测试的资源示例；正式实验按集群 QoS 允许的时限安排。启动器自身创建两个
-进程，不要再用 ``--ntasks=2`` 启动两份启动器。它要求有效的 Slurm 作业、至少两个不同
-的 ``CUDA_VISIBLE_DEVICES`` 条目，以及至少 2 个 ``SLURM_CPUS_PER_TASK``。
+这是两卡 16 CPU 的短测试示例；申请 N 张时替换 GPU 数量并保证 CPU 配额不少于 N。
+正式实验按集群 QoS 允许的时限安排。启动器自身创建工作进程，始终使用 ``--ntasks=1``，
+不要额外启动 N 份启动器。它要求有效的 Slurm 作业、非空且互不重复的 GPU 分配条目，
+以及至少 N 个 ``SLURM_CPUS_PER_TASK``。
 每个子进程原样继承 ``CUDA_VISIBLE_DEVICES`` 和所有 ``SLURM_*`` 变量，仅通过 Dr.Jit
 选择可见逻辑设备，不重写物理卡号。16 个 CPU 配额分为每进程 8 个 Dr.Jit 线程；
-奇数配额向下均分，不超过调度器总配额。两份参考图缓存各自占用内存和显存。
+一般情况下 CPU 配额按 N 向下均分，不超过调度器总配额。各 rank 的参考图缓存各自占内存和显存。
 
 本地先提交并 push；服务器在没有旧训练使用同一构建目录时同步和增量编译：
 
@@ -1655,7 +1710,7 @@ RGB 删除同样对 ``deletion_gain``、``deletion_observed``、``deletion_unkno
    source /apps/local/conda_init.sh &&
    conda activate "$HOME/envs/mitsuba" &&
    cd "$HOME/projects/reconstruction/mitsuba" &&
-   git -c submodule.recurse=false pull --ff-only &&
+   git -c submodule.recurse=false -c fetch.recurseSubmodules=false pull --ff-only &&
    git submodule sync --recursive &&
    git submodule update --init --recursive &&
    cmake --build build --parallel "${SLURM_CPUS_PER_TASK:-1}" &&
@@ -1675,37 +1730,43 @@ Python 环境中的 NVIDIA NCCL 包也会被搜索。启动器不会自动安装
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_nccl.py
 
-该检查与 CPU 模拟测试 ``test_reconstruction_collective.py`` 不同；它需要两张实际
-CUDA 设备及上述 NCCL 库。通信检查通过后再运行短训练，检查真实场景的行为与吞吐。
+该检查与 CPU 模拟测试 ``test_reconstruction_collective.py`` 不同；它使用本次分配的实际
+CUDA 设备，N>1 时需要上述 NCCL 库。通信检查通过后再运行短训练，检查真实场景的行为与吞吐。
 
-先保持 1000 轮的完整分辨率调度，执行前 10 轮并保存恢复点：
+先保持 Bicycle 总计 1500 轮的完整分辨率调度，执行前 10 轮并保存恢复点。
+省略 ``--workers`` 即使用本次分配的全部 GPU；以下选项与最近单卡速度测试一致：
 
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
-     --workers 2 --worker-timeout 600 \
-     --dataset datasets/lego --epochs 1000 --stop-after-epochs 10 \
-     --chunk-size 0 --freeze-native --gpu-reference-cache-mib 1024 \
-     --profile-views 3 --profile-interval-epochs 10 --no-profile-stages
+     --worker-timeout 600 \
+     --dataset datasets/bicycle --scene-mode unbounded \
+     --background-layers 4 --background-opacity 0.5 \
+     --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
+     --traversal octree --distortion-weight 0 --freeze-native --gpu-topology \
+     --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
 
 ``--stop-after-epochs 10`` 表示本次进程最多额外完成 10 轮；恢复时同样从恢复点继续计数。
 它仅限制本次执行的轮数边界，不把总训练预算改成 10，也不提前
-导出声称完成 1000 轮的 ``model.npz``。它在完整 epoch 和拓扑更新结束后保存中间
+导出声称完成 1500 轮的 ``model.npz``。它在完整 epoch 和拓扑更新结束后保存中间
 checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这个提前停止边界时
 自动跳过最终评价，保留配置中的评价开关，恢复到全部轮次完成后仍可自动出图。直接使用
-``--epochs 10`` 会重新分配 coarse-to-fine 预算，不能作为上述 1000 轮实验的早期速度对照。
+``--epochs 10`` 会重新分配 coarse-to-fine 预算，不能作为上述 1500 轮实验的早期速度对照。
 
 为了比较同一节点和同一版本的单卡基线，可在双卡测试结束后运行：
 
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
-     --dataset datasets/lego --epochs 1000 --stop-after-epochs 10 \
-     --chunk-size 0 --freeze-native --gpu-reference-cache-mib 1024 \
-     --profile-views 3 --profile-interval-epochs 10 --no-profile-stages
+     --dataset datasets/bicycle --scene-mode unbounded \
+     --background-layers 4 --background-opacity 0.5 \
+     --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
+     --traversal octree --distortion-weight 0 --freeze-native --gpu-topology \
+     --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
 
-两个命令分别自动分配实验目录。先比较预热后的普通轮次，再单独比较第 10 轮的拓扑事件；
-同时检查 loss、保存参数及有效计数/删除证据，不能只根据每轮时间判断移植正确。
+两个命令分别自动分配实验目录。先比较预热后的完整普通轮时间，再单独比较拓扑事件轮。
+批次更新与单卡逐视角更新的轨迹不同，需比较收敛与最终评价，不能要求对应参数完全一致；
+也不能只根据每轮时间判断算法质量。默认生长 warmup 为 20 轮，前 10 轮不测生长事件。
 单卡入口即使看见两个 GPU，也只使用一张卡，并保留调度器环境。
 
 短测试确认后，在有足够剩余作业时间的终端开启新的完整双卡实验：
@@ -1713,22 +1774,23 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
-     --workers 2 --worker-timeout 600 \
-     --dataset datasets/lego --epochs 1000 --chunk-size 0 \
-     --freeze-native --gpu-reference-cache-mib 1024 \
-     --profile-views 3 --profile-interval-epochs 10 --no-profile-stages \
+     --worker-timeout 600 \
+     --dataset datasets/bicycle --scene-mode unbounded \
+     --background-layers 4 --background-opacity 0.5 --epochs 1500 --chunk-size 0 \
+     --traversal octree --distortion-weight 0 --freeze-native --gpu-topology \
+     --profile-views 0 --profile-interval-epochs 0 --no-profile-stages \
      --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
 
 若要继续前面的短实验，可给同一启动器传 ``--resume`` 和实际保存的中间 checkpoint
-相对路径，省略 ``--stop-after-epochs``。checkpoint 格式沿用单卡格式；它不是每个 rank
-各保存一份模型。恢复后的浮点结果仍需按数值容差和训练曲线检查。
+相对路径，省略 ``--stop-after-epochs``，保留相同 GPU 工作进程数和其余算法设置。
+它不是每个 rank 各保存一份模型；恢复会检查新 ``update_protocol`` 及实际更新次数。
 
 已有最终模型时，可在同一双卡资源分配中单独出图，无需重新训练。从仓库目录运行：
 
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
-     --evaluate --workers 2 --worker-timeout 600 \
+     --evaluate --worker-timeout 600 \
      --checkpoint outputs/lego-10.15-E1/model.npz \
      --split both --spp 64 --train-max-views 10 --test-max-views 0 \
      --output-dir outputs/lego-10.15-E1
@@ -1736,14 +1798,15 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
 把示例实验目录替换为实际目录。``--evaluate`` 将其余评价参数转交给
 ``evaluate.py``，不进入训练流程；这里使用 ``--spp``、``--train-max-views``、
 ``--test-max-views``，训练后自动评价使用对应的 ``--eval-`` 前缀参数。输出保存到同一实验目录的
-``train/``、``test/`` 和共享评价报告中，重跑会更新相应图片与指标。两种双卡入口都沿用
-同一份 Slurm 分配，16 个 CPU 分为每进程 8 个线程，不另起 Slurm 作业。
+``train/``、``test/`` 和共享评价报告中，重跑会更新相应图片与指标。两种多卡入口都沿用
+同一份 Slurm 分配，CPU 按工作进程数均分，不另起 Slurm 作业。
 
-双卡 ``training.jsonl`` 增加 ``epoch_communication_seconds``、
+多卡 ``training.jsonl`` 增加 ``epoch_communication_seconds``、
 ``epoch_communication_bytes`` 以及 ``collective`` 的累计统计。通信墙钟包含打包、物化、
-调用和同步等待，可能等待此前发出的 GPU 运算；它已经包含在 ``gradients`` 中，不能再次
-加到 epoch 总时间，也不能当作纯 NCCL 传输时间。``payload_bytes`` 及每轮的字节差值
-表示每个 rank 参与归约的逻辑输入字节数，不是 NVLink/PCIe 实际传输流量。
+调用和同步等待，可能等待此前发出的 GPU 运算；归约在 ``gradients``，逐视角证据传送在
+``topology_observation``，模型同步在轮末拓扑中，均已包含于 epoch 总时间，不能重复相加，
+也不能当作纯 NCCL 传输时间。``payload_bytes`` 及每轮的字节差值表示每个 rank
+参与归约／广播的逻辑数组字节数，不是 NVLink/PCIe 实际传输流量。
 抽样内核报告仍主要描述 rank 0 的 Dr.Jit 运算，NCCL 内核不会自动被归入 Dr.Jit 内核统计。
 
 双卡评价报告区分从开始到两边完成的总墙钟时间与各工作进程的分阶段耗时之和。
@@ -1754,8 +1817,42 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
 
 任一子进程失败、超时或收到中断，启动器会终止并回收同伴进程，避免一张卡一直等待归约。
 默认 ``--worker-timeout 600`` 表示某个进程连续 600 秒没有报告进展时终止；对于很慢的
-首次编译、拓扑操作或评价，可显式提高为 ``--worker-timeout 1200``。正常训练每视角报告
+首次编译、拓扑操作或评价，可显式提高为 ``--worker-timeout 1200``。正常训练每批报告
 进展，父进程心跳消息按秒节流，不增加逐像素通信。
+
+GPU 升层
+--------
+
+默认 RGB GPU topology 的升层通过 ``reconstruction_refinement_gpu.refine_state_gpu``
+直接处理父模型设备缓冲。它保持 NumPy ``refine_state`` 的 FP64 几何、归一四元数、
+父 opacity 筛选、有限盒内拟合、18 轮二分、preferred center、DC 颜色继承及光学厚度衰减。
+输出仍按子格编号优先、父体素原顺序压紧，core／shell 分辨率元数据同步翻倍；
+不生成完整八倍父 SH 临时表，最终子体素数量确定后才分配颜色与 opacity 缓冲。
+
+完全处于父椭球内的子格，直接使用原 CPU 代码在拟合末尾采用的解析覆盖结果，
+跳过其结果会被覆盖的二分；其判定与最终模型规则没有改变。边界子格仍完整执行原拟合。
+没有可表示子体素或超过 ``max_active_voxels`` 时拒绝替换并保留旧模型。
+空模型保留原翻倍元数据、空数组行为。新生命周期与 Adam 按旧规则清零，原生占据索引和
+八叉树在 GPU 重建。数量压紧及错误标量允许少量同步，普通升层不整表回读父模型。
+
+``--no-gpu-topology`` 保留 NumPy 对照。训练按既定保存计划关闭额外的
+``schedule.save_each_level``；其他调用若显式开启它，仍生成可序列化的旧层 checkpoint，
+该显式存档会回读模型、优化器和生命周期，不能把此情况称为完全没有主机传输。
+日志 ``topology.refinement_backend="cuda"`` 及 ``refinement_stage_seconds`` 分别报告
+拟合、可选旧层存档和重置阶段；外层 ``epoch_topology_seconds`` 还包含后续模型替换等工作。
+
+本地对照命令：
+
+.. code-block:: powershell
+
+   & ..\envs\mitsuba\Scripts\python.exe -I `
+     experiments/reconstruction/tests/test_reconstruction_refinement_gpu.py --benchmark
+
+检查覆盖旋转／各向异性／相切与内含子格、opacity 阈值和极端 logit、连续两次升层、
+容量拒绝、空模型、生命周期／Adam 重置及旧层保存。地址及顺序严格一致，浮点参数以
+``rtol=4e-6, atol=3e-7`` 对照；不同 FP64 运算顺序仍不承诺逐位一致。
+RTX 4060 Laptop 的 8192 父体素→60320 子体素合成拟合，CPU 1.535 秒、GPU 0.250 秒，
+含输入上传，不含原生模型／八叉树重建。这个局部数据不能外推完整 Bicycle 升层或 A100 加速比。
 
 Checkpoint 与恢复
 -----------------
@@ -1881,10 +1978,10 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 评价的参考合成默认继承 checkpoint 中的 ``data.reference_compositing``，
 缺字段的旧 checkpoint 使用 ``linear``。单卡、双卡及训练后的自动评价共用此规则。
 
-单卡入口使用一张 GPU 出图；经 ``train_multigpu.py`` 启动的完整训练保留两个
-工作进程，把上述已选视角分配到两张卡独立出图。选择范围与每视角 spp 不变，不将
+单卡入口使用一张 GPU 出图；经 ``train_multigpu.py`` 启动的完整训练保留 N 个
+工作进程，把上述已选视角分配到 N 张卡独立出图。选择范围与每视角 spp 不变，不将
 ``--eval-train-max-views 10`` 解释为每张卡各十个训练视角。双卡单独出图的 ``--evaluate`` 命令见
-上文“同节点两张 GPU 训练与评价”。
+上文“同节点 N 张 GPU 训练与评价”。
 
 如果评价失败，已经完成的 ``model.npz`` 保留，进程以非零状态退出；
 ``training-report.json`` 中的 ``training_status`` 与 ``evaluation`` 分别记录训练和评价结果，
@@ -1989,9 +2086,10 @@ PNG 同时用于显示与可复算的正式指标。进行论文或其他实现�
 迁移保留 NoLightTransport 的硬椭球前向、外观梯度、几何代理规则、分组更新和拓扑调度，
 同时有以下需要在实验中记录的实现差异：
 
-* 前向、梯度、参数更新、删除证据累积和生长投票使用 CUDA/Dr.Jit。生长候选生成、
-  升层拟合、边界处的生命周期判定和模型重排仍有 CPU NumPy 工作及模型快照，尚未全部迁移到 GPU。
-  几何及生长投影保留 float64 精度，再写回 float32 模型；临界阈值附近可能与 Falcor 的
+* 前向、梯度、参数更新、删除证据累积和生长投票使用 CUDA/Dr.Jit。默认 RGB GPU 拓扑路径的
+  候选生成、升层拟合、生命周期判定和模型重排也使用设备数组，CPU NumPy 路径保留为对照。
+  序列化仍显式回读，动态长度和诊断标量也有少量同步。几何及生长投影保留 float64 精度，
+  再写回 float32 模型；临界阈值附近可能与 Falcor 的
   GPU float32 决策不同，拓扑性能也不能假定与原实现相同。
 * 多个增长提案竞争同一格时，使用确定性的胜者选择；Falcor 的原子竞争顺序不确定。
   删除后的剩余体素保留顺序，而 Falcor 使用空洞/供体搬移，索引顺序可能不同。

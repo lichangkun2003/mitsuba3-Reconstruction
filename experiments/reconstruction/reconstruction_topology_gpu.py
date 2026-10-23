@@ -2,7 +2,7 @@
 
 Only compact event reductions cross to the host at epoch boundaries. Model
 rows, proposal statistics, cooldowns and Adam remaps stay in device arrays.
-Serialization and the existing coarse-to-fine fitter are explicit host borders.
+Serialization is an explicit host border; coarse-to-fine fitting stays on CUDA.
 """
 
 from __future__ import annotations
@@ -437,6 +437,50 @@ class GPUTopologyLifecycle:
         self.manager.count = new_count
         dr.eval(*self.fields.values(), self.candidates)
 
+    def refine(self, model, optimizer, boundary, event):
+        """Replace fitted children without copying the parent model to NumPy."""
+        from reconstruction_refinement_gpu import refine_state_gpu
+        from reconstruction_topology import model_checkpoint
+        m, dr = self.manager, self.dr
+        started = time.perf_counter()
+        replacement = refine_state_gpu(device_checkpoint(model), m.schedule, m.settings.max_active_voxels)
+        dr.sync_thread()
+        fitted = time.perf_counter()
+        if m.schedule.save_each_level:
+            # This opt-in API explicitly requests a serializable old-level
+            # checkpoint. Normal training disables it and incurs no readback.
+            m.before_refine_checkpoint = {
+                **model_checkpoint(model), "optimizer_state": optimizer.state_dict(),
+                "topology_state": m.state_dict()}
+            event["pre_refine_checkpoint_available"] = True
+        checkpointed = time.perf_counter()
+        m.resolution = replacement["model_metadata"]["resolution"]
+        m.core_resolution = replacement["model_metadata"].get("core_resolution", m.resolution)
+        m.level_start_epoch = boundary
+        # Host lifecycle arrays remain empty placeholders until serialization.
+        # Allocate actual new-row fields directly on the GPU; old row histories
+        # are discarded at refinement just as in the NumPy implementation.
+        m._initialize_lifecycle(0)
+        m.count = len(replacement["model_state"]["cell_indices"])
+        self.fields = {name: dr.zeros(type(value), m.count) for name, value in self.fields.items()}
+        self.candidates = dr.zeros(self.Bool, m.count)
+        self.cooldown_cells = dr.empty(self.UInt, 0)
+        self.cooldown_expiry = dr.empty(self.Int64, 0)
+        m.completed_windows = 0
+        m.cooldown = {}
+        m.pending_growth = None
+        m._growth_world_cache = m._growth_device = m._rgb_growth_device = None
+        m._gpu_lifecycle = self
+        optimizer.remap(dr.empty(self.UInt, 0), m.count)
+        dr.eval(*self.fields.values(), self.candidates)
+        event.update(refined=True, resolution=m.resolution, active_voxel_count=m.count,
+                     refinement_backend="cuda", refinement_stage_seconds={
+                         "fit": fitted - started, "pre_refine_checkpoint": checkpointed - fitted,
+                         "reset": time.perf_counter() - checkpointed})
+        if m.core_resolution != m.resolution:
+            event["core_resolution"] = m.core_resolution
+        return replacement, event
+
     def finish(self, model, optimizer, boundary):
         m, dr, cfg = self.manager, self.dr, self.manager.settings
         m.before_refine_checkpoint = None
@@ -459,6 +503,9 @@ class GPUTopologyLifecycle:
             event["core_resolution"] = m.core_resolution
         if cfg.use_low_opacity_deletion:
             event["deletion_opacity_requested"] = m._low_opacity_deletion_due(boundary)
+        if (m.schedule.enabled and m.core_resolution < m.schedule.target_resolution and
+                boundary - m.level_start_epoch >= m.level_budget):
+            return self.refine(model, optimizer, boundary, event)
         rgb = self.evaluate_rgb_deletion(boundary, event)
         opacity = self.evaluate_opacity(model, boundary, event)
         event["evidence_window_evaluated"] = rgb is not None
@@ -514,7 +561,7 @@ class GPUTopologyLifecycle:
         return checkpoint, event
 
     def materialize(self):
-        """Serialize once at checkpoints/refinement; never called per view."""
+        """Serialize once at explicit checkpoints; never called per view."""
         m, np, dr = self.manager, self.manager.np, self.dr
         dr.eval(*self.fields.values(), self.candidates, self.cooldown_cells, self.cooldown_expiry)
         for name, value in self.fields.items():
