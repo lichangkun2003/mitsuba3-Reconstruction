@@ -97,6 +97,73 @@ def _known_batches(context, collective, mi, dr, np):
             "validity_sum", "per_camera_root_broadcast", "source_buffers_preserved", "empty_arrays"]}
 
 
+def _rgb_batches(context, collective, mi, dr, np):
+    from reconstruction_collective import GRADIENT_KEYS, SUM_COUNTER_KEYS, MAX_COUNTER_KEYS
+    # Compare new compact/dense paths against legacy dense SUM on real NCCL,
+    # including a tail, an empty topology, and an all-rows-active fallback.
+    width = max(64, context.world_size * 4)
+    for dense, count, tail in ((False, width, False), (False, width, True),
+                               (True, width, False), (False, 0, False)):
+        context.heartbeat(f"rgb-batch-{dense}-{count}-{tail}", force=True)
+        active = not tail or context.rank < max(1, context.world_size - 1)
+        selected = (np.arange(count) if dense else np.asarray([context.rank + 1, 0])) if active else np.asarray([], np.int64)
+        selected = selected[selected < count]
+        host = {key: np.zeros(count, np.uint32) for key in SUM_COUNTER_KEYS + MAX_COUNTER_KEYS}
+        host["appearance_valid"][selected] = context.rank + 1
+        host["geometry_valid"][selected] = (context.rank + 1) * 2
+        if count and context.rank == 0:
+            host["appearance_valid"][-1] = 1  # Valid-zero row still required by Adam.
+        value = {key: mi.UInt32(array) for key, array in host.items()}
+        value["gradients"] = {}
+        for key, dimension in zip(GRADIENT_KEYS, (27, 1, 3, 3, 3)):
+            rows = np.zeros((count, dimension), np.float32)
+            rows[selected] = np.arange(1, dimension + 1, dtype=np.float32) * (context.rank + 1) * .125
+            if count and key == "centers" and context.rank == 0:
+                rows[-2] = .5  # Unexpected nonzero invalid-row data is preserved too.
+            value["gradients"][key] = mi.Float(rows.reshape(-1))
+        value.update(rgb_loss_sum=mi.Float(context.rank + .125 if active else 0),
+                     distortion_loss_sum=mi.Float(.125 if active else 0))
+        local_loss = value["rgb_loss_sum"] + value["distortion_loss_sum"]
+        reference, loss, finite, _, _ = collective.reduce_view(value, local_loss, mi.Bool(True))
+        for mode in ("auto", "dense"):
+            actual, actual_loss, actual_finite = collective.reduce_batch(
+                value, local_loss, mi.Bool(True), rgb_only=True, mode=mode)
+            for key in GRADIENT_KEYS:
+                np.testing.assert_allclose(np.asarray(actual["gradients"][key]),
+                                           np.asarray(reference["gradients"][key]), rtol=2e-6, atol=2e-7)
+            for key in SUM_COUNTER_KEYS + MAX_COUNTER_KEYS:
+                np.testing.assert_array_equal(np.asarray(actual[key]), np.asarray(reference[key]))
+            for key in ("rgb_loss_sum", "distortion_loss_sum"):
+                np.testing.assert_allclose(np.asarray(actual[key]), np.asarray(reference[key]), rtol=2e-6)
+            np.testing.assert_allclose(np.asarray(actual_loss), np.asarray(loss), rtol=2e-6)
+            np.testing.assert_array_equal(np.asarray(actual_finite), np.asarray(finite))
+    for fault in ("nonfinite", "legacy_evidence"):
+        value = {key: dr.zeros(mi.UInt32, width) for key in SUM_COUNTER_KEYS + MAX_COUNTER_KEYS}
+        value["gradients"] = {key: dr.zeros(mi.Float, width * dimension)
+                              for key, dimension in zip(GRADIENT_KEYS, (27, 1, 3, 3, 3))}
+        local_finite = mi.Bool(True)
+        if context.rank == context.world_size - 1:
+            if fault == "nonfinite":
+                bad = np.zeros(width, np.float32)
+                bad[width - 1] = np.nan  # No valid counter, still must not disappear.
+                value["gradients"]["opacity_sh"] = mi.Float(bad)
+                local_finite &= dr.all(dr.isfinite(value["gradients"]["opacity_sh"]))
+            else:
+                value["background_evidence"] = dr.full(mi.UInt32, 1, width)
+        for mode in ("auto", "dense"):
+            reduced, loss, finite = collective.reduce_batch(value, mi.Float(2.), local_finite,
+                                                            rgb_only=True, mode=mode)
+            # A JIT consumer reads the external NCCL result before any host
+            # conversion; one bad peer rejects the complete batch on all ranks.
+            accepted = finite & dr.all(dr.isfinite(reduced["gradients"]["opacity_sh"]))
+            marker = dr.select(accepted, loss, -1.)
+            dr.eval(marker)
+            np.testing.assert_array_equal(np.asarray(marker), [-1.])
+    return {"rgb_batches": "passed", "checks": ["compact_vs_dense", "dense_union_fallback",
+        "tail_idle_rank", "empty_topology", "valid_zero_rows", "unexpected_nonzero_invalid_rows",
+        "loss_components", "async_consumer_ordering", "peer_nonfinite_guard", "legacy_evidence_guard"]}
+
+
 def _compare_native(context, collective, directory, mi, dr, np):
     from reconstruction_common import ContourSampler, restore_model
     from reconstruction_optimizer import FalcorOptimizer
@@ -195,6 +262,7 @@ def _worker_main(context, arguments):
                             library=args.nccl_library) as collective:
             checks = [_known_reductions(context, collective, mi, dr, np),
                       _known_batches(context, collective, mi, dr, np),
+                      _rgb_batches(context, collective, mi, dr, np),
                       _compare_native(context, collective, directory, mi, dr, np)]
             context.barrier()
             print(json.dumps({"status": "passed", "rank": context.rank,

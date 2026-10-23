@@ -87,13 +87,15 @@ def _bind_nccl(lib):
 
 
 class NcclCollective:
-    """Synchronous view boundary, asynchronous operations on one CUDA stream.
+    """GPU reductions on one CUDA stream, with explicit external ownership.
 
     Each ``reduce_view`` call returns fresh device buffers after one final stream
     synchronization. SUM applies to gradients, counts and raw RGB topology
     evidence; MAX unions legacy alpha deletion flags. Optional images must have
     full-size arrays with each rank's
     disjoint pixel shard filled and every other pixel exactly zero.
+    The RGB batch path keeps the final NCCL writes asynchronous using completion
+    events; sparse union compression still reads its scalar output length.
     """
 
     def __init__(self, rank, world_size, connection, mi, dr, np, library=None):
@@ -106,6 +108,8 @@ class NcclCollective:
         self._closed = False
         self._failed = False
         self._sequence = 0
+        self._owners = None
+        self._launch_owners = None
         self._stats = {"views": 0, "calls": 0, "payload_bytes": 0, "seconds": 0.}
         from train_multigpu import WorkerContext
         self._control = (connection if isinstance(connection, WorkerContext)
@@ -138,6 +142,8 @@ class NcclCollective:
             with self._context():
                 self._check(self._lib.ncclCommInitRank(ctypes.byref(self._comm), world_size, uid, rank),
                             "ncclCommInitRank")
+            from reconstruction_cuda_owners import CudaOwnerQueue
+            self._owners = CudaOwnerQueue(dr)
         except BaseException:
             self._failed = True
             if self._comm:
@@ -302,7 +308,184 @@ class NcclCollective:
             self._failed = True
             raise
 
-    def reduce_batch(self, accumulator, loss_sum, finite):
+    def _allreduce_fields(self, fields, *, wait):
+        """Reduce independent contiguous buffers, without concat/unpack copies.
+
+        ``wait=False`` is enabled only with the CUDA event owner queue. Sources
+        must outlive the external NCCL read, including temporary compact gathers.
+        Every operation uses the Dr.Jit stream, so later consumers are ordered
+        after NCCL even when the host continues submitting the next update.
+        """
+        dr, mi = self.dr, self.mi
+        result, operations = {}, []
+        for name, (source, dtype, operation) in fields.items():
+            array_type = mi.Float if dtype == _NCCL_FLOAT32 else mi.UInt32
+            source = array_type(source)
+            if self.world_size == 1 or not dr.width(source):
+                result[name] = source
+                continue
+            destination = dr.empty(array_type, dr.width(source))
+            operations.append((source, destination, dtype, operation))
+            result[name] = destination
+        if not operations:
+            return result
+        queue = getattr(self, "_owners", None)
+        if queue is not None:
+            queue.reap()
+        dr.eval(*[array for source, destination, _, _ in operations
+                  for array in (source, destination)])
+        descriptors = []
+        for source, destination, dtype, operation in operations:
+            width = int(dr.width(source))
+            info = (mi._reconstruction_float_buffer_info if dtype == _NCCL_FLOAT32
+                    else mi._reconstruction_uint_buffer_info)
+            source_info, destination_info = info(source), info(destination)
+            if int(source_info["size"]) != width or int(destination_info["size"]) != width:
+                raise RuntimeError("NCCL buffer pointer metadata does not match the allocated array")
+            descriptors.append((int(source_info["pointer"]), int(destination_info["pointer"]),
+                                width, dtype, operation))
+        self._launch_owners = operations
+        try:
+            with self._context():
+                self._check(self._lib.ncclGroupStart(), "ncclGroupStart")
+                try:
+                    for source, destination, width, dtype, operation in descriptors:
+                        self._check(self._lib.ncclAllReduce(source, destination, width, dtype, operation,
+                                                          self._comm, self.device["stream"]), "ncclAllReduce")
+                finally:
+                    self._check(self._lib.ncclGroupEnd(), "ncclGroupEnd")
+            nbytes = sum(width * 4 for _, _, width, _, _ in descriptors)
+            if wait or queue is None:
+                dr.sync_thread()
+                if queue is not None:
+                    queue.reap()
+                self._stats["rgb_explicit_syncs"] = self._stats.get("rgb_explicit_syncs", 0) + 1
+            else:
+                # Account for both source and destination owners in the bound.
+                queue.retain(operations, nbytes * 2)
+            self._launch_owners = None
+            self._stats["calls"] += len(descriptors)
+            self._stats["payload_bytes"] += nbytes
+            return result
+        except BaseException:
+            self._failed = True
+            raise
+
+    def _reduce_rgb_batch(self, accumulator, loss_sum, finite, mode):
+        """Exact RGB-only reduction, optionally using a common sparse row set.
+
+        Counts and nonzero-gradient support are unioned before compression.
+        Thus valid zero gradients keep Adam's moment/clock updates, while even
+        unexpected gradients in invalid rows are retained rather than dropped.
+        Only the compressed list length reaches the host; IDs and all values
+        stay on the GPU. Dense fallback is selected from the common union, so
+        every rank performs exactly the same sequence of NCCL operations.
+        """
+        dr, mi = self.dr, self.mi
+        if mode not in ("auto", "dense"):
+            raise ValueError("RGB batch reduction mode must be 'auto' or 'dense'")
+        if set(accumulator["gradients"]) != set(GRADIENT_KEYS):
+            raise ValueError("Expected exactly the five reconstruction gradient groups")
+        counts = {name: mi.UInt32(accumulator[name]) for name in SUM_COUNTER_KEYS + MAX_COUNTER_KEYS}
+        count = int(dr.width(counts["appearance_valid"]))
+        if any(dr.width(value) != count for value in counts.values()):
+            raise ValueError("All validity and evidence arrays must have one value per voxel")
+        gradients = {name: mi.Float(accumulator["gradients"][name]) for name in GRADIENT_KEYS}
+        widths = {name: int(dr.width(value)) for name, value in gradients.items()}
+        if any((width % count if count else width) for width in widths.values()):
+            raise ValueError("Every gradient group must have an integral number of values per voxel")
+        dimensions = {name: width // count if count else 0 for name, width in widths.items()}
+        if count and any(not dimension for dimension in dimensions.values()):
+            raise ValueError("Nonempty topologies require nonempty gradient groups")
+        loss_sum, finite = mi.Float(loss_sum), mi.Bool(finite)
+        if dr.width(loss_sum) != 1 or dr.width(finite) != 1:
+            raise ValueError("Loss and finite-status reductions require scalar device arrays")
+        present = [name in accumulator for name in LOSS_COMPONENT_KEYS]
+        if any(present) and not all(present):
+            raise ValueError("Distortion reductions require both RGB and distortion loss sums")
+        component_names = LOSS_COMPONENT_KEYS if all(present) else ()
+        if any(dr.width(accumulator[name]) != 1 for name in component_names):
+            raise ValueError("Loss component reductions require scalar device arrays")
+        # Native RGB-only tracing guarantees these arrays are zero. Guard that
+        # contract on the device; a mistakenly opted-in alpha caller must fail
+        # the existing whole-batch finite/allowed guard, not lose its evidence.
+        for name in ("background_carve_valid", *MAX_COUNTER_KEYS):
+            if count:
+                finite &= dr.all(counts[name] == 0)
+        packed_losses = (dr.concat([loss_sum, *[mi.Float(accumulator[name]) for name in component_names]])
+                         if component_names else loss_sum)
+        fields = {name: (counts[name], _NCCL_UINT32, _NCCL_SUM)
+                  for name in ("appearance_valid", "geometry_valid")}
+        fields.update(losses=(packed_losses, _NCCL_FLOAT32, _NCCL_SUM),
+                      finite=(mi.UInt32(finite), _NCCL_UINT32, _NCCL_MIN))
+        dense_bytes = (sum(widths.values()) + count * 5 + dr.width(packed_losses) + 1) * 4
+        selected, ids, union_count = "dense", None, count
+        if mode == "auto" and self.world_size > 1 and count:
+            support = (counts["appearance_valid"] > 0) | (counts["geometry_valid"] > 0)
+            for name, value in gradients.items():
+                support |= dr.block_reduce(dr.ReduceOp.Or, mi.UInt32(value != 0), dimensions[name]) != 0
+            fields["support"] = (mi.UInt32(support), _NCCL_UINT32, _NCCL_MAX)
+            reduced = self._allreduce_fields(fields, wait=False)
+            # compress synchronizes only to obtain its output length. No IDs,
+            # gradients, validity tables or images are copied to CPU memory.
+            ids = dr.compress(reduced.pop("support") != 0)
+            union_count = int(dr.width(ids))
+            queue = getattr(self, "_owners", None)
+            if queue is not None:
+                queue.reap()
+            self._stats["rgb_count_readbacks"] = self._stats.get("rgb_count_readbacks", 0) + 1
+            if union_count * 4 <= count * 3:
+                selected = "compact"
+                compact = {}
+                for name, value in gradients.items():
+                    dimension = dimensions[name]
+                    if union_count:
+                        lane = dr.arange(mi.UInt32, union_count * dimension)
+                        index = dr.gather(mi.UInt32, ids, lane // dimension) * dimension + lane % dimension
+                        compact[name] = dr.gather(mi.Float, value, index)
+                    else:
+                        compact[name] = dr.empty(mi.Float, 0)
+                communicated = self._allreduce_fields(
+                    {name: (value, _NCCL_FLOAT32, _NCCL_SUM) for name, value in compact.items()}, wait=False)
+                global_gradients = {}
+                for name, value in communicated.items():
+                    output = dr.zeros(mi.Float, widths[name])
+                    if union_count:
+                        dimension = dimensions[name]
+                        lane = dr.arange(mi.UInt32, union_count * dimension)
+                        index = dr.gather(mi.UInt32, ids, lane // dimension) * dimension + lane % dimension
+                        dr.scatter(output, value, index)
+                    global_gradients[name] = output
+            else:
+                global_gradients = self._allreduce_fields(
+                    {name: (value, _NCCL_FLOAT32, _NCCL_SUM) for name, value in gradients.items()}, wait=False)
+        else:
+            fields.update({name: (value, _NCCL_FLOAT32, _NCCL_SUM) for name, value in gradients.items()})
+            reduced = self._allreduce_fields(fields, wait=False)
+            global_gradients = {name: reduced.pop(name) for name in GRADIENT_KEYS}
+        result = {"gradients": global_gradients,
+                  "appearance_valid": reduced["appearance_valid"], "geometry_valid": reduced["geometry_valid"]}
+        result.update({name: dr.zeros(mi.UInt32, count)
+                       for name in ("background_carve_valid", *MAX_COUNTER_KEYS)})
+        losses = self._unpack(reduced["losses"], ("loss_sum", *component_names),
+                              [1] * (1 + len(component_names)), mi.Float)
+        global_loss = losses.pop("loss_sum")
+        result.update(losses)
+        self._stats["rgb_batches"] = self._stats.get("rgb_batches", 0) + 1
+        key = f"rgb_{selected}_batches"
+        self._stats[key] = self._stats.get(key, 0) + 1
+        self._stats["rgb_dense_equivalent_bytes"] = self._stats.get("rgb_dense_equivalent_bytes", 0) + dense_bytes
+        if mode == "auto" and self.world_size > 1:
+            self._stats["rgb_union_rows_total"] = self._stats.get("rgb_union_rows_total", 0) + union_count
+            self._stats["rgb_rows_total"] = self._stats.get("rgb_rows_total", 0) + count
+        self._stats["rgb_last_mode"] = selected
+        self._stats["rgb_last_union_voxels"] = union_count if mode == "auto" and self.world_size > 1 else None
+        self._stats["rgb_last_voxels"] = count
+        self._stats["rgb_last_union_density"] = union_count / count if count and mode == "auto" and self.world_size > 1 else None
+        self._stats["views"] += 1
+        return result, global_loss, mi.Bool(reduced["finite"] != 0)
+
+    def reduce_batch(self, accumulator, loss_sum, finite, *, rgb_only=False, mode="auto"):
         """Reduce one full-view-per-rank batch without mixing camera votes.
 
         Gradients and validity counts are SUMs, not averages. The training
@@ -315,7 +498,16 @@ class NcclCollective:
                    if any(key.startswith(f"{kind}_") for kind in ("growth", "deletion"))]
         if invalid:
             raise ValueError(f"Whole-view batches require separate per-camera topology evidence: {invalid}")
-        result, loss, finite, _, _ = self.reduce_view(accumulator, loss_sum, finite)
+        if rgb_only:
+            if self._closed or self._failed:
+                raise RuntimeError("NCCL collective is closed or has failed")
+            started = time.perf_counter()
+            before_bytes = self._stats["payload_bytes"]
+            result, loss, finite = self._reduce_rgb_batch(accumulator, loss_sum, finite, mode)
+            self._stats["rgb_payload_bytes"] = self._stats.get("rgb_payload_bytes", 0) + self._stats["payload_bytes"] - before_bytes
+            self._stats["seconds"] += time.perf_counter() - started
+        else:
+            result, loss, finite, _, _ = self.reduce_view(accumulator, loss_sum, finite)
         self._stats["batches"] = self._stats.get("batches", 0) + 1
         return result, loss, finite
 
@@ -389,21 +581,46 @@ class NcclCollective:
             raise
 
     def statistics(self):
+        owners = getattr(self, "_owners", None)
         return {"backend": "nccl" if self.world_size > 1 else "single-rank",
                 "version": self.version, "library": self.library,
                 "rank": self.rank, "world_size": self.world_size,
                 "device": dict(self.device), "payload_scope": "per-rank reduced input bytes, not wire traffic",
-                **self._stats}
+                **self._stats, "buffer_owners": owners.statistics() if owners is not None else None}
 
     def close(self, abort=False):
         if self._closed:
             return
+        owners = getattr(self, "_owners", None)
+        try:
+            if self._comm:
+                abort = abort or self._failed
+                if not abort and owners is not None:
+                    try:
+                        owners.finish()
+                    except BaseException:
+                        # Failed event/wait cleanup must still abort transport.
+                        # Keep ownership and allow a later close() retry.
+                        self._failed = True
+                        with self._context():
+                            self._check(self._lib.ncclCommAbort(self._comm), "ncclCommAbort")
+                        self._comm = ctypes.c_void_p()
+                        raise
+                with self._context():
+                    function = self._lib.ncclCommAbort if abort else self._lib.ncclCommDestroy
+                    self._check(function(self._comm), function.__name__)
+                self._comm = ctypes.c_void_p()
+            if owners is not None:
+                owners.finish()
+            # Cover a partially enqueued group that failed before its event was
+            # recorded. Never release these owners if the stream wait fails.
+            if getattr(self, "_launch_owners", None) is not None:
+                self.dr.sync_thread()
+        except BaseException:
+            self._failed = True
+            raise
+        self._launch_owners = None
         self._closed = True
-        if self._comm:
-            with self._context():
-                function = self._lib.ncclCommAbort if abort or self._failed else self._lib.ncclCommDestroy
-                self._check(function(self._comm), function.__name__)
-            self._comm = ctypes.c_void_p()
 
     def __enter__(self):
         return self

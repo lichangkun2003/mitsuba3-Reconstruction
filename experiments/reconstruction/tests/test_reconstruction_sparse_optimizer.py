@@ -82,6 +82,97 @@ class SparseOptimizerTests(unittest.TestCase):
     def assert_pair(self, models, optimizers):
         assert_equal(self, capture(models[0], optimizers[0]), capture(models[1], optimizers[1]))
 
+    def test_full_and_tail_batch_replays_survive_epoch_boundaries(self):
+        models, optimizers = paired(fixture(29))
+        sample_counts = (4, 4, 1) * 5
+        batches = [[gradients(model, iteration, zero=iteration == 7)
+                    for iteration in range(len(sample_counts))] for model in models]
+        allowed = mi.Bool(True)
+        dr.eval(batches, allowed)
+        dr.sync_thread()
+        for iteration, (out, count) in enumerate(zip(batches[0], sample_counts)):
+            optimizers[0].step(models[0], out, sample_count=count,
+                               epoch=iteration // 3, update_allowed=allowed)
+        with patch.object(dr, "compress", side_effect=AssertionError("Host-sized compaction used")):
+            with dr.scoped_set_flag(dr.JitFlag.ForbidSynchronization, True):
+                for iteration, (out, count) in enumerate(zip(batches[1], sample_counts)):
+                    optimizers[1].step(models[1], out, sample_count=count,
+                                       epoch=iteration // 3, update_allowed=allowed)
+                    if iteration == 5:
+                        warmed = optimizers[1].statistics()
+                    if iteration > 5:
+                        self.assertEqual(optimizers[1].statistics()["recordings"], warmed["recordings"])
+                        self.assertEqual(optimizers[1].statistics()["clears"], warmed["clears"])
+        stats = optimizers[1].statistics()
+        self.assertEqual(stats["cached_batch_variants"], 2)
+        self.assertEqual(stats["batch_variant_evictions"], 0)
+        self.assertLessEqual(stats["recordings"], 4)
+        self.assert_pair(models, optimizers)
+
+    def test_batch_cache_is_bounded_and_invalidated_by_config_and_state_changes(self):
+        models, optimizers = paired()
+        sparse = optimizers[1]
+        for count in (4, 1, 4, 1, 2):
+            for model, optimizer in zip(models, optimizers):
+                optimizer.step(model, gradients(model), sample_count=count, update_allowed=mi.Bool(True))
+        self.assertEqual(sparse.statistics()["cached_batch_variants"], 2)
+        self.assertEqual(sparse.statistics()["batch_variant_evictions"], 1)
+        for optimizer in optimizers:
+            optimizer.config.lr_radiance *= .5
+        for model, optimizer in zip(models, optimizers):
+            optimizer.step(model, gradients(model), sample_count=4, update_allowed=mi.Bool(True))
+        self.assertEqual(sparse.statistics()["cached_batch_variants"], 1)
+        for model, optimizer in zip(models, optimizers):
+            optimizer.step(model, gradients(model), sample_count=1, update_allowed=mi.Bool(True))
+        self.assertEqual(sparse.statistics()["cached_batch_variants"], 2)
+        for action in ("load", "remap", "reset"):
+            with self.subTest(action=action):
+                for model, optimizer in zip(models, optimizers):
+                    if action == "load":
+                        optimizer.load_state_dict(optimizer.state_dict())
+                    elif action == "remap":
+                        optimizer.remap(np.array([5, 1, 3], np.uint32), 7, reset_radiance=True)
+                    else:
+                        optimizer.reset(model)
+                    self.assertEqual(optimizer.statistics()["cached_batch_variants"], 0)
+                    for count in (4, 1, 4, 1):
+                        optimizer.step(model, gradients(model), sample_count=count,
+                                       update_allowed=mi.Bool(True))
+                assert_equal(self, *(capture(model, optimizer, expose_state=False)
+                                    for model, optimizer in zip(models, optimizers)))
+
+    def test_both_batch_variants_preserve_aliases_and_atomic_finite_guards(self):
+        models, optimizers = paired()
+        for model, optimizer in zip(models, optimizers):
+            for count in (4, 1, 4, 1):
+                optimizer.step(model, gradients(model), sample_count=count, update_allowed=mi.Bool(True))
+        # Genuine external aliases must remain untouched even when switching to
+        # a previously recorded variant. Neither recording may own old state.
+        snapshots = [model.snapshot() for model in models]
+        aliases = [mi.Float(optimizer.state["radiance_sh"]["mean"]) for optimizer in optimizers]
+        old_snapshots = [{key: np.array(value, copy=True) for key, value in snapshot.items()}
+                         for snapshot in snapshots]
+        old_means = [np.array(value, copy=True) for value in aliases]
+        for count in (4, 1, 4):
+            for model, optimizer in zip(models, optimizers):
+                optimizer.step(model, gradients(model, count), sample_count=count,
+                               update_allowed=mi.Bool(True))
+        self.assert_pair(models, optimizers)
+        for snapshot, old, alias, mean in zip(snapshots, old_snapshots, aliases, old_means):
+            assert_equal(self, {key: np.array(value) for key, value in snapshot.items()}, old, exact=True)
+            np.testing.assert_array_equal(np.array(alias), mean)
+        # An inactive corrupted moment must reject the entire transaction, not
+        # merely be skipped by the compact row selection or a cached variant.
+        for model, optimizer in zip(models, optimizers):
+            dr.scatter(optimizer.state["rotation_tangent"]["mean"], mi.Float(float("nan")), mi.UInt32(0))
+            before = capture(model, optimizer)
+            zeros = np.zeros(int(model.active_voxel_count), np.uint32)
+            for count in (1, 4):
+                result = optimizer.step(model, gradients(model, appearance=zeros, geometry=zeros),
+                                        sample_count=count, update_allowed=mi.Bool(True))
+                self.assertFalse(bool(result["accepted"][0]))
+                assert_equal(self, capture(model, optimizer), before, exact=True)
+
     def test_unexposed_state_fastpath_multistep_matches_dense(self):
         models, optimizers = paired(fixture(29))
         # No capture(), state_dict(), or mutable-state access inside this loop.
@@ -398,9 +489,9 @@ class SparseOptimizerTests(unittest.TestCase):
                         count = 0 if phase == "remap_empty" else 13
                         optimizer.remap(np.zeros(0, np.uint32), count)
                         models[index] = restore_model(fixture(count), mi)
-                    for iteration in range(2):
+                    for iteration, sample_count in enumerate((4, 1, 4, 1)):
                         optimizer.step(models[index], gradients(models[index], phase_index + iteration),
-                                       update_allowed=mi.Bool(True))
+                                       sample_count=sample_count, update_allowed=mi.Bool(True))
                 assert_equal(self, *(capture(model, optimizer, expose_state=False)
                                     for model, optimizer in zip(models, optimizers)))
 

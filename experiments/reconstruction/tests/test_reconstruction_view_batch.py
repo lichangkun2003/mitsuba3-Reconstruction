@@ -28,6 +28,18 @@ from reconstruction_batch_epoch import _finite_accumulator, run_view_batch_epoch
 
 
 class SchedulingTests(unittest.TestCase):
+    def test_batch_transport_configuration_preserves_update_protocol(self):
+        import train
+        for mode in ("auto", "dense"):
+            with patch.object(sys, "argv", ["train.py", "--batch-reduction", mode]):
+                args = train.parse_arguments()
+            config = copy.deepcopy(train.CONFIG)
+            train.apply_arguments(config, args, {})
+            self.assertEqual(config.training.batch_reduction, mode)
+            self.assertEqual(config.training.num_epochs, train.CONFIG.training.num_epochs)
+            self.assertEqual(config.optimizer, train.CONFIG.optimizer)
+            self.assertEqual(view_batch_protocol(4)["views_per_update"], 4)
+
     def test_order_and_short_tail_without_duplicate_views(self):
         order = np.array([4, 0, 2, 1, 3])
         self.assertEqual(list(iter_view_batches(order, 3)), [(4, 0, 2), (1, 3)])
@@ -165,7 +177,8 @@ def _fake_epoch(losses=(1., 3., 9.), *, gradient_nan=False, sync=False, rank=0):
         def statistics(self):
             return dict(calls=0, payload_bytes=0, seconds=0.)
 
-        def reduce_batch(self, accumulator, loss, finite):
+        def reduce_batch(self, accumulator, loss, finite, *, rgb_only=False, mode="auto"):
+            assert rgb_only and mode in ("auto", "dense")
             self.indices = list(range(self.batch_index * 2, min(self.batch_index * 2 + 2, 3)))
             self.sources = {source: partial(index) for source, index in enumerate(self.indices)}
             neutral = zero_view_partial(model, mi, dr)

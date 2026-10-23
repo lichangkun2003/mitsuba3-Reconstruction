@@ -58,6 +58,7 @@ class TrainingSettings:
     gpu_reference_cache_mib: int = 1024  # Float32 reference planes on the GPU; 0 disables.
     freeze_native: bool = True  # Replay native GPU work between topology changes.
     sync_view_checks: bool = False  # Diagnostic: read loss/validity after every view.
+    batch_reduction: str = "auto"  # Multi-GPU RGB batches: exact sparse union, or dense diagnostic transport.
     seed: int = 42
     shuffle: bool = True
     save_count: int = 3  # Total snapshots, including the final model.npz.
@@ -67,7 +68,7 @@ class TrainingSettings:
 @dataclass
 class GradientSettings:
     alpha_loss_weight: float = .5
-    distortion_loss_weight: float = 0.  # Optional hard-hit depth concentration; 0 preserves the baseline.
+    distortion_loss_weight: float = 0.  # Legacy checkpoint/schema default; CONFIG enables it for new experiments.
     geometry_tau_voxel_fraction: float = .12
     geometry_grad_clamp: float = 5
     alpha_geometry_weight: float = .1
@@ -136,7 +137,7 @@ CONFIG.model.opacity_sh_count = 1  # 仅优化 DC logit；opacity = sigmoid(Y0 *
 CONFIG.gradient.alpha_loss_weight = 0.
 CONFIG.gradient.alpha_geometry_weight = 0.
 CONFIG.gradient.background_carve_weight = 0.
-CONFIG.gradient.distortion_loss_weight = 0.  # 显式使用 --distortion-weight 0.01 开启深度集中正则；0 为原基线。
+CONFIG.gradient.distortion_loss_weight = 0.1  # 新实验默认开启深度集中正则；--distortion-weight 0 显式关闭。
 CONFIG.gradient.geometry_transition_only = False  # hit/miss 均保留正负 RGB 几何信号。
 CONFIG.gradient.geometry_two_sided_boundary = False  # 保留原 sigmoid，不叠加额外带宽门控。
 CONFIG.contour.enabled = False  # 所有像素均匀采样，不读取 alpha 轮廓标签。
@@ -220,7 +221,7 @@ def parse_arguments():
     parser.add_argument("--rgb-only", action=argparse.BooleanOptionalAction, default=None,
                         help="Use RGB-only training (CONFIG default); requires DC opacity and disabled reference-alpha priors")
     parser.add_argument("--distortion-weight", type=float,
-                        help="Nonnegative hard-hit distortion loss weight (default: 0, disabled); try 0.01 for an ablation")
+                        help="Nonnegative hard-hit distortion loss weight (CONFIG default: 0.1); 0 explicitly disables it")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--stop-after-epochs", type=int,
                         help="Stop after N additional complete epochs, saving a resumable checkpoint without changing the full schedule or publishing model.npz")
@@ -245,6 +246,8 @@ def parse_arguments():
                         help="Replay native GPU work without repeated tracing (default: enabled); stage diagnostics run directly")
     parser.add_argument("--sync-view-checks", action=argparse.BooleanOptionalAction, default=None,
                         help="Diagnostic per-view loss/validity readback; default keeps guards on GPU and reports at epoch/profile boundaries")
+    parser.add_argument("--batch-reduction", choices=("auto", "dense"),
+                        help="Multi-GPU RGB transport: auto selects exact sparse union/dense by coverage; dense skips compaction for comparison")
     parser.add_argument("--gpu-topology", action=argparse.BooleanOptionalAction, default=None,
                         help="Build RGB growth candidates and update topology on GPU (default); --no-gpu-topology selects the NumPy reference")
     parser.add_argument("--skip-evaluation", action="store_true", help="Save the final model without automatic train/test evaluation")
@@ -275,6 +278,7 @@ def apply_arguments(config, args, values):
         (args.gpu_reference_cache_mib, "training", "gpu_reference_cache_mib"),
         (args.freeze_native, "training", "freeze_native"),
         (getattr(args, "sync_view_checks", None), "training", "sync_view_checks"),
+        (getattr(args, "batch_reduction", None), "training", "batch_reduction"),
         (getattr(args, "gpu_topology", None), "topology", "gpu_topology"),
         (args.rgb_only, "training", "rgb_only"),
         (getattr(args, "distortion_weight", None), "gradient", "distortion_loss_weight"),
@@ -402,6 +406,8 @@ def validate(config):
         raise ValueError("training.freeze_native must be a boolean")
     if not isinstance(config.training.sync_view_checks, bool):
         raise ValueError("training.sync_view_checks must be a boolean")
+    if config.training.batch_reduction not in ("auto", "dense"):
+        raise ValueError("training.batch_reduction must be 'auto' or 'dense'")
     if isinstance(config.gradient.distortion_loss_weight, bool):
         raise ValueError("gradient.distortion_loss_weight must be finite and nonnegative")
     for name, value in asdict(config.gradient).items():
@@ -1104,8 +1110,11 @@ def run_training(distributed=None):
         if view_batch_mode:
             report["training_protocol"]["gradient_reduction"] = (
                 "sum over pixels within each view, then mean over actual views in the batch")
+            report["training_protocol"]["batch_reduction"] = config.training.batch_reduction
             emit(f"Multi-GPU training: {world_size} distinct views per Adam update; "
                  "tail batch averaged by its actual view count; learning rates unchanged", flush=True)
+            emit(f"Batch gradient transport: {config.training.batch_reduction} "
+                 "(FP32; GPU event-managed buffers)", flush=True)
         performance.metadata["traversal"] = report["traversal"]
         rgb_growth_enabled = config.topology.use_rgb_growth and config.topology.enable_growth and (
             not config.schedule.enabled or config.schedule.enable_coarse_growth)
@@ -1655,7 +1664,7 @@ def run_training(distributed=None):
                      "optimizer_execution": optimizer.statistics(),
                      "topology_execution": topology.statistics() if primary else None,
                      "view_stage_seconds": stage_totals,
-                     "view_stage_timing": ("host submission plus per-batch NCCL synchronization; rank-zero timings"
+                     "view_stage_timing": ("rank-zero host submission; optional union-length sync and bounded event waits; epoch validation completes GPU work"
                         if view_batch_mode else "host submission (asynchronous except sampled diagnostics)"
                         if deferred_checks is not None else "synchronized per-view checks"),
                      "epoch_validation_seconds": validation_seconds,
@@ -1670,6 +1679,18 @@ def run_training(distributed=None):
                 entry["collective"] = communication_after
                 entry["epoch_communication_seconds"] = communication_after["seconds"] - communication_before["seconds"]
                 entry["epoch_communication_bytes"] = communication_after["payload_bytes"] - communication_before["payload_bytes"]
+                if view_batch_mode:
+                    transport = {name: communication_after.get(name, 0) - communication_before.get(name, 0)
+                        for name in ("rgb_dense_equivalent_bytes", "rgb_payload_bytes",
+                                     "rgb_compact_batches", "rgb_dense_batches",
+                                     "rgb_union_rows_total", "rgb_rows_total", "rgb_count_readbacks")}
+                    baseline = transport["rgb_dense_equivalent_bytes"]
+                    rows = transport["rgb_rows_total"]
+                    transport["payload_fraction_of_legacy_dense"] = (
+                        transport["rgb_payload_bytes"] / baseline if baseline else None)
+                    transport["mean_union_fraction"] = (
+                        transport["rgb_union_rows_total"] / rows if rows else None)
+                    entry["epoch_batch_transport"] = transport
             if primary:
                 with (output / history_name).open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(entry) + "\n")

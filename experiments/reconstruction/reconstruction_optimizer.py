@@ -7,6 +7,7 @@ Rotation gradients/moments are local tangent vectors; parameters remain wxyz.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 import math
 
@@ -67,9 +68,11 @@ class FalcorOptimizer:
         # It does not alter the optimizer/checkpoint configuration or algorithm.
         self.sparse_updates = sparse_updates
         self.replay_updates = replay_updates
-        self._update_frozen = self._update_model = self._update_key = None
+        self._update_cache = OrderedDict()
+        self._update_model = self._update_key = None
         self._update_calls = self._update_recordings = self._update_replays = 0
         self._update_bypasses = self._update_clears = 0
+        self._update_evictions = 0
         # All mutable buffers are explicit PyTree arguments. The closure must
         # not retain a model, its snapshot, or old optimizer state.
         def native_update(model, gradients, appearance, geometry, carving,
@@ -83,7 +86,8 @@ class FalcorOptimizer:
 
     def clear_replay(self):
         """Release recorded buffers before replacing topology or optimizer state."""
-        self._update_frozen = self._update_model = self._update_key = None
+        self._update_cache.clear()
+        self._update_model = self._update_key = None
         self._update_clears += 1
 
     def statistics(self):
@@ -91,6 +95,8 @@ class FalcorOptimizer:
                 "replay_enabled": self.replay_updates, "calls": self._update_calls,
                 "recordings": self._update_recordings, "replays": self._update_replays,
                 "bypasses": self._update_bypasses, "clears": self._update_clears,
+                "cached_batch_variants": len(self._update_cache),
+                "batch_variant_evictions": self._update_evictions,
                 "host_length_readbacks": 0, "capacity_rows": self.count}
 
     @property
@@ -271,7 +277,8 @@ class FalcorOptimizer:
         squares = {name: state["squared_mean"] for name, state in self._state.items()}
         steps = {name: state["steps"] for name, state in self._state.items()}
         key = (self.count, tuple(self.dimensions.items()), tuple(float(v) for v in model.voxel_size),
-               tuple(sorted(settings.items())), guarded)
+               tuple(sorted((name, value) for name, value in settings.items()
+                            if name != "gradient_factor")), guarded)
         if self._update_model is not model or self._update_key != key:
             self.clear_replay()
             self._update_model, self._update_key = model, key
@@ -283,14 +290,26 @@ class FalcorOptimizer:
         scope = model.optimizer_update_scope_begin(means, squares, steps)
         try:
             if self.replay_updates and dr.backend_v(mi.Float) == dr.JitBackend.CUDA:
-                if self._update_frozen is None:
-                    self._update_frozen = dr.freeze(self._native_update, limit=2, warn_after=8,
-                                                    auto_opaque=False)
-                before = self._update_frozen.n_recordings
+                # Full batches and the final partial batch have distinct exact
+                # gradient factors. Keep both recordings across epoch boundaries
+                # instead of invalidating each other twice per epoch. All other
+                # settings, topology/model changes and state replacement still
+                # invalidate the complete cache. The bounded LRU also avoids
+                # retaining arbitrary historical factors for external callers.
+                factor = settings["gradient_factor"]
+                frozen = self._update_cache.pop(factor, None)
+                if frozen is None:
+                    if len(self._update_cache) == 2:
+                        self._update_cache.popitem(last=False)
+                        self._update_evictions += 1
+                    frozen = dr.freeze(self._native_update, limit=2, warn_after=8,
+                                       auto_opaque=False)
+                self._update_cache[factor] = frozen
+                before = frozen.n_recordings
                 try:
-                    accepted = self._update_frozen(*arguments)
+                    accepted = frozen(*arguments)
                 finally:
-                    recorded = self._update_frozen.n_recordings - before
+                    recorded = frozen.n_recordings - before
                     self._update_recordings += recorded
                 self._update_replays += int(recorded == 0)
             else:

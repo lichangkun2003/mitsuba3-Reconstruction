@@ -72,6 +72,13 @@ Adam 默认按 ``appearance_valid`` / ``geometry_valid`` 分别压紧本视角�
 外部持有旧快照时仍保留写时复制语义。拓扑或状态更换后重新记录。
 原始梯度的全量有限值检查、全场占用索引等工作仍然存在，不能把开销视为全部与有效体素数成正比。
 
+多卡视角批次默认 ``--batch-reduction auto``：在 GPU 求各卡涉及体素的并集，稀疏时仅
+归约这些行的 FP32 梯度，覆盖率高时自动走整表。有效零梯度计数、实际批次平均和独立
+相机拓扑票保持不变。并集长度有一次标量回读；梯度传输通过 CUDA 事件保留缓冲区，
+不立即等待 CPU。``--batch-reduction dense`` 保留整表通信对照，记录的 ``collective``
+统计可用于判断当前场景是否受益。完整批次与短尾批次缓存各自的 Adam 重放版本。
+这项通信与缓存优化仅改 Python；实际多 A100 提速需在 HPC 验证。
+
 默认 ``training.sync_view_checks=False`` 将逐视角损失及有效性摘要留在 GPU，epoch
 结束或诊断抽样边界统一读取。无效梯度、参数或 Adam 状态会锁存错误并阻止本次与
 后续更新；错误在下次检查边界报告。单卡每视角更新一次，Adam 与前向／梯度分别重放。
@@ -263,8 +270,8 @@ opacity，不是 ``T*a`` 贡献、参考 alpha 或未经 sigmoid 的系数；仅
 Distortion 对照实验
 -------------------
 
-保持现有生长、删除和 1 spp 配置，在原训练命令后添加
-``--distortion-weight 0.01`` 可尝试沿射线贡献集中正则；``0`` 为默认值，恢复原目标。
+保持现有生长、删除和 1 spp 配置，新实验默认以权重 ``0.1`` 开启沿射线贡献集中正则。
+命令可显式指定 ``--distortion-weight 0.1``；``--distortion-weight 0`` 才关闭此项。
 代码配置位置为 ``CONFIG.gradient.distortion_loss_weight``。
 它使用实际 hard hit 的 ``T*opacity`` 和归一化深度点对距离，反向同时更新 opacity
 与深度相关几何，不增加一次前向，也不使用参考 alpha。它不直接给空洞创建新候选。
@@ -274,7 +281,7 @@ Distortion 对照实验
 ``mi.VoxelReconstruction.distortion_version >= 1``，再新开实验。
 权重保存在 checkpoint 中；开启与关闭应分别运行，不在续训时更改。
 ``training.jsonl`` 分开记录 RGB、未加权 Distortion、加权 Distortion 和总 loss，
-便于与原实验比较；``0.01`` 是待验证的初始权重，不保证改善 PSNR 或补洞。
+便于与原实验比较；权重 ``0.1`` 的效果需通过实验评价。
 公式、截断路径语义、梯度范围及运行示例见
 ``docs/reconstruction_training.rst`` 的“可选 Distortion”一节。
 
@@ -330,7 +337,7 @@ RGB 生长／删除证据按视角独立通过 NCCL 传送，再由 rank 0 投�
      --dataset datasets/bicycle --scene-mode unbounded \
      --background-layers 4 --background-opacity 0.5 \
      --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
-     --traversal octree --distortion-weight 0 --freeze-native --gpu-topology \
+     --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
 
 前 10 轮不会触发完整训练结束后的评价，保存恢复点；这不会把层级预算改成 10 轮。

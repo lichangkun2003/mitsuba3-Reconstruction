@@ -74,14 +74,14 @@ RGB 收益与持续低 opacity 两条删除分支，总开关关闭时两者均�
 
 在 ``CONFIG.gradient.distortion_loss_weight``、JSON 的
 ``gradient.distortion_loss_weight`` 或命令行 ``--distortion-weight`` 设置权重。
-默认 ``0`` 保留原实验；首轮对照可用 ``0.01``，它是待验证的起点，
-不代表对本模型已经调好的最优值。该项从第一轮开始生效，升层时权重不变。
+当前新实验默认 ``0.1`` 开启此项；显式 ``0`` 关闭。通用设置类保留 ``0`` 作为旧
+checkpoint 缺字段时的兼容值。该项从第一轮开始生效，升层时权重不变。
 更改权重应新开实验，续训使用 checkpoint 保存的权重，不能中途悄悄切换目标。
 需重新编译 C++，非零权重要求 ``mi.VoxelReconstruction.distortion_version >= 1``。
 
 .. code-block:: powershell
 
-   # 在仓库根目录增量编译，完成后用原训练命令附加 --distortion-weight 0.01。
+   # 在仓库根目录增量编译，完成后用原训练命令附加 --distortion-weight 0.1。
    cmake --build build --config Release --parallel 8
    if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
 
@@ -89,7 +89,7 @@ RGB 收益与持续低 opacity 两条删除分支，总开关关闭时两者均�
    & "..\envs\mitsuba\python.exe" -u -I .\experiments\reconstruction\train.py `
      --dataset datasets/hotdog --gpu 0 --epochs 1000 --chunk-size 0 `
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages `
-     --distortion-weight 0.01 --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
+     --distortion-weight 0.1 --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
 
 若本机是 venv 布局，解释器改为 ``..\envs\mitsuba\Scripts\python.exe``。
 多卡入口 ``train_multigpu.py`` 同样透传此选项。当前 N 卡协议每卡计算一个完整视角，
@@ -149,7 +149,7 @@ tangent 的导数。深度最小点位于网格段内部时使用解析导数；
 零权重的 ``mean_distortion_loss=0`` 表示该项未计算，不能当作场景已经没有厚层。
 原生 ``loss_and_grad`` 同样返回逐射线 ``rgb_loss``、``distortion_loss`` 和总 ``loss``。
 
-应对照相同场景、随机种子、轮数、拓扑配置下的 ``0`` 与 ``0.01`` 实验，
+应对照相同场景、随机种子、轮数、拓扑配置下的 ``0`` 与 ``0.1`` 实验，
 检查 train/test 图、PSNR、洞口及厚层，而不只比较总 loss。
 该项鼓励有效贡献集中，但降低 opacity 同样可以降低它；它不能为零命中洞口创造
 候选，也不能证明留下的是正确表面。过强权重可能损失细结构或加重破洞。
@@ -1644,6 +1644,31 @@ Windows 默认构建目录为 ``mitsuba/build/Release``，Linux 为 ``mitsuba/bu
 例如 169 个视角、两卡时每轮更新 85 次，最后一个视角单独成为 B=1 的尾批；
 空闲 rank 参与通信但贡献零梯度，不重复训练视角、不计入平均分母。N 大于视角数也同理。
 
+多卡 RGB 批次默认使用 ``training.batch_reduction="auto"``（命令行
+``--batch-reduction auto``）。先在 GPU 合并有效计数及非零梯度行的并集，再仅传输并集
+对应的 FP32 梯度；有效但梯度为零的行也保留，计数不变。并集太密时自动改为整表传输，
+避免压紧和散回的额外成本。RGB-only 恒为零的旧 alpha 证据和 carving 计数不再整表传输，
+仍检查这些字段确实为零。原始梯度的非有限值检查及归约溢出检查保留。
+这只是通信实现变化，不改变随机采样、批次数、平均分母、Adam 或各相机的拓扑票。
+不同归约布局可能带来 FP32 加法顺序的微小舍入差异，不承诺逐位一致。
+
+并集索引和数据始终位于 GPU；变长通信需要回读并集长度这个标量，因此 auto 仍有一次
+长度同步。梯度传输后用 CUDA 事件保留发送／接收缓冲区，后续计算在同一条流上有序执行，
+不再为释放通信缓冲而立即等待整个 GPU。事件队列有内存与条目上限，达到上限时等待最旧项。
+关闭通信器前会排空队列；模型和拓扑广播仍保留独立的同步边界。
+完整批次和短尾批次各自缓存 Adam 重放，避免仅因 B 改变而每轮重新录制两次。
+
+``--batch-reduction dense`` 可跳过并集整理，使用相同算法的整表梯度传输作对照；这仍享有
+去除零字段、直接归约数组和事件管理的优化。两种设置均可用于同 N 的 checkpoint 续训。
+比较时保持场景、阶段、采样及视角顺序一致，先让参考图缓存预热，再比较完整 epoch 时间。
+稀疏覆盖率和通信量会记录在 ``training.jsonl`` 的 ``collective`` 中；是否优于 dense 需在
+实际多 GPU 上测量，不能仅用减少的字节数推算加速比。
+每轮 ``epoch_batch_transport`` 给出实际传输量、旧整表等价量、两者比值、平均并集覆盖率
+和 compact／dense 批次数；``collective.buffer_owners`` 记录事件等待和保留内存峰值。
+事件管理后 ``gradients`` 与 ``epoch_communication_seconds`` 可能只计入提交而尚未等待
+最后的 GPU 工作；等待可能落在后续批次或 ``epoch_validation_seconds``。判断是否加速应
+使用 ``seconds``，不能把某个提交阶段的变短直接视为 GPU 计算减少。
+
 这会改变相对于单卡每视角更新的优化轨迹与每轮 Adam 步数，学习率不自动乘 N。
 因此新多卡结果不应与逐视角单卡参数或 loss 作严格相等断言，应比较收敛曲线与评价指标。
 ``N=1`` 保持现有逐视角更新路径。N>1 当前只支持 RGB-only 均匀采样，legacy alpha 或
@@ -1669,6 +1694,12 @@ checkpoint 仍只由 rank 0 保存一份，但训练状态新增 ``update_protoc
 本地生成场景检查覆盖分批、尾批、平均梯度、证据独立及协议恢复；测试主机只有一张 GPU，
 不能验证真实多 A100 的 NCCL 吞吐、并发显存或完整收敛。旧像素分片的单卡等价测试仍可
 作为旧路径回归，不能代替当前视角批次的数学与通信验证。加速幅度必须在实际分配上测量。
+
+通信实现的本地数值／生命周期检查为
+``tests/test_reconstruction_rgb_collective.py --cuda`` 和
+``tests/test_reconstruction_cuda_owners.py --cuda``；它们使用同一张 GPU，不能验证 NCCL
+跨卡通信。HPC 的 ``tests/test_reconstruction_nccl.py --workers N`` 同时覆盖 auto／dense、
+空闲尾批、稀疏与稠密并集及异常数值保护，作为实际跨卡通信检查。
 
 完整训练结束后，N 个进程继续执行最终 train/test 评价，默认训练集前十个、测试集全部视角，
 每视角 64 spp。评价把已选中的 train/test 视角合并为任务列表，再交错分给 N 个 rank；
@@ -1743,7 +1774,7 @@ CUDA 设备，N>1 时需要上述 NCCL 库。通信检查通过后再运行短�
      --dataset datasets/bicycle --scene-mode unbounded \
      --background-layers 4 --background-opacity 0.5 \
      --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
-     --traversal octree --distortion-weight 0 --freeze-native --gpu-topology \
+     --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
 
 ``--stop-after-epochs 10`` 表示本次进程最多额外完成 10 轮；恢复时同样从恢复点继续计数。
@@ -1761,7 +1792,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
      --dataset datasets/bicycle --scene-mode unbounded \
      --background-layers 4 --background-opacity 0.5 \
      --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
-     --traversal octree --distortion-weight 0 --freeze-native --gpu-topology \
+     --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
 
 两个命令分别自动分配实验目录。先比较预热后的完整普通轮时间，再单独比较拓扑事件轮。
@@ -1777,7 +1808,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
      --worker-timeout 600 \
      --dataset datasets/bicycle --scene-mode unbounded \
      --background-layers 4 --background-opacity 0.5 --epochs 1500 --chunk-size 0 \
-     --traversal octree --distortion-weight 0 --freeze-native --gpu-topology \
+     --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages \
      --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
 
