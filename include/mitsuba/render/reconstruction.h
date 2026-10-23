@@ -68,6 +68,15 @@ public:
     Mask set_parameters_guarded(const std::map<std::string, FloatBuffer> &parameters,
                                 const Mask &allowed);
 
+    /// Commit compact rows without scanning/replacing full parameter buffers.
+    /// Appearance and geometry row IDs must each be strictly increasing and
+    /// in bounds. Invalid IDs, nonfinite values, or a false scalar guard reject
+    /// the whole transaction on device. The returned gate also commits Adam.
+    Mask set_parameters_sparse(const UIntBuffer &appearance_indices,
+                               const UIntBuffer &geometry_indices,
+                               const std::map<std::string, FloatBuffer> &parameters,
+                               const Mask &allowed);
+
     /// Install immutable hypothetical proposals, allowing repeated target cells.
     /// Each input row retains its own evidence index. They never change trace(),
     /// actual parameter buffers, occupancy snapshots, or the training image/gradient.

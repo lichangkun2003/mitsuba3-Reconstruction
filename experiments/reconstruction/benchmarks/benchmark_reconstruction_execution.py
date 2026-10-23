@@ -69,8 +69,9 @@ def parse_arguments(argv=None):
 def mode_state(name, use_replay, use_gpu_reference, payload, config, args, mi, dr, np):
     model = restore_model(payload, mi)
     optimizer = FalcorOptimizer(model, config.optimizer)
-    dr.eval(*model.snapshot().values(),
-            *[array for group in optimizer.state.values() for array in group.values()])
+    # Adam materializes its own state during the required warm-up. Accessing
+    # the legacy writable state dictionary enables conservative full checks.
+    dr.eval(*model.snapshot().values())
     return {"name": name, "model": model, "optimizer": optimizer,
             "rng": np.random.default_rng(SEED), "sampler": ContourSampler(np),
             "replay": NativeLossReplay(dr, enabled=use_replay),

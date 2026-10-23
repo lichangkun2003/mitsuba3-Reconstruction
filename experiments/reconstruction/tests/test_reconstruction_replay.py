@@ -192,7 +192,8 @@ def run_checks(mi, dr, np):
     assert chunks.statistics()["recordings"] == 2
     full = host(model.loss_and_grad(*inputs, options))
     composed = {}
-    ray_fields = {"rgb", "raw_rgb", "alpha", "raw_alpha", "hit_count", "loss"}
+    ray_fields = {"rgb", "raw_rgb", "alpha", "raw_alpha", "hit_count", "loss",
+                  "rgb_loss", "distortion_loss"}
     for field in full:
         arrays = [piece[field] for piece in pieces]
         if field in ray_fields:

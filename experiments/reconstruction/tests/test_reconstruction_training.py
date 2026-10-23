@@ -131,6 +131,9 @@ def main():
                   "render": {"width": 16, "height": 16, "spp": 1},
                   "runtime": {"build_dir": args.build_dir, "gpu": args.gpu},
                   "training": {"rgb_only": False, "num_epochs": 3, "chunk_size": 0, "profile_views": 2,
+                               "profile_interval_epochs": 50, "profile_stages": True,
+                               "reference_cache_mib": 1024, "gpu_reference_cache_mib": 1024,
+                               "freeze_native": True,
                                "save_count": 3, "output": str(run / "full")},
                   "gradient": asdict(GradientSettings()),
                   "evaluation": {"max_views": 1},  # Exercise the default 64 spp on a subset.

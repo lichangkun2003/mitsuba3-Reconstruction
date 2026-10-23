@@ -304,7 +304,7 @@ class TopologyTests(unittest.TestCase):
         np.testing.assert_array_equal(opt.state_dict()["groups"]["radiance_sh"]["steps"], [0])
         np.testing.assert_array_equal(opt.state_dict()["groups"]["centers"]["steps"], [1])
         json.dumps({k: v for k, v in manager.state_dict().items() if isinstance(v, dict)})
-        restored = TopologyManager(restore_model(replacement, mi), 8)
+        restored = self.manager(restore_model(replacement, mi), enable_growth=False)
         restored.load_state_dict(manager.state_dict())
         self.assertEqual(restored.cooldown, manager.cooldown)
 

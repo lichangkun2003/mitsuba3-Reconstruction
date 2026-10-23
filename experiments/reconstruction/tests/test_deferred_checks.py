@@ -96,13 +96,19 @@ def check_failure(config, payload, view, rgba, mi, dr, np):
                     parameters["opacity_sh"] *= mi.Float(float("nan"))
                 return model.set_parameters_guarded(parameters, allowed)
 
+            def set_parameters_sparse(self, appearance, geometry, parameters, allowed):
+                if field == "parameter":
+                    parameters["opacity_sh"] *= mi.Float(float("nan"))
+                return model.set_parameters_sparse(appearance, geometry, parameters, allowed)
+
         wrapper = BrokenModel()
         if field == "moment":
             adam = optimizer._adam
 
             def broken_adam(*args, **kwargs):
                 result = adam(*args, **kwargs)
-                optimizer.state[args[0]]["mean"] *= mi.Float(float("nan"))
+                state = kwargs.get("state", optimizer.state[args[0]])
+                state["mean"] *= mi.Float(float("nan"))
                 return result
 
             optimizer._adam = broken_adam
@@ -187,7 +193,8 @@ def main():
         check_equivalence(config, payload, view, rgba, mi, dr, np)
         check_failure(config, payload, view, rgba, mi, dr, np)
         check_driver(temporary, args.build_dir, args.gpu, mi, np)
-        print("passed: deferred loss/RNG/Adam equivalence; zero per-view scalar readbacks; device transaction/latch failures")
+        print("passed: deferred loss/RNG/Adam equivalence; zero per-view NumPy loss/image readbacks "
+              "(compaction count synchronization retained); device transaction/latch failures")
     return 0
 
 

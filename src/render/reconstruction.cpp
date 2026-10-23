@@ -502,6 +502,69 @@ VoxelReconstruction<Float, Spectrum>::set_parameters_guarded(
     return accepted;
 }
 
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
+VoxelReconstruction<Float, Spectrum>::set_parameters_sparse(
+    const UIntBuffer &appearance_indices, const UIntBuffer &geometry_indices,
+    const std::map<std::string, FloatBuffer> &parameters, const Mask &allowed) {
+    if (dr::width(allowed) != 1)
+        Throw("VoxelReconstruction.set_parameters_sparse(): allowed must be a scalar mask.");
+    struct Destination {
+        uint32_t width;
+        FloatBuffer *buffer;
+        const UIntBuffer *rows;
+    };
+    // Keep pointers here: copying target buffers would force a full-size copy
+    // on write even when only a few compact rows participate in this update.
+    const std::map<std::string, Destination> destinations = {
+        {"centers", {3, &m_centers, &geometry_indices}},
+        {"log_scales", {3, &m_log_scales, &geometry_indices}},
+        {"rotations", {4, &m_rotations, &geometry_indices}},
+        {"radiance_sh", {3 * m_sh_count, &m_radiance, &appearance_indices}},
+        {"opacity_sh", {m_opacity_sh_count, &m_opacity, &appearance_indices}}};
+    for (const auto &[key, values] : parameters) {
+        auto target = destinations.find(key);
+        if (target == destinations.end() ||
+            values.size() != target->second.rows->size() * target->second.width)
+            Throw("VoxelReconstruction.set_parameters_sparse(): unknown key or wrong compact size: %s.",
+                  key.c_str());
+    }
+
+    Mask accepted = allowed;
+    for (const UIntBuffer *rows : {&appearance_indices, &geometry_indices}) {
+        if (!rows->size())
+            continue;
+        UIntBuffer ordinal = dr::arange<UIntBuffer>(rows->size());
+        UIntBuffer previous = dr::gather<UIntBuffer>(*rows, ordinal - 1, ordinal > 0);
+        accepted &= dr::all((*rows < m_active_count) &
+                            ((ordinal == 0) | (*rows > previous)));
+    }
+    for (const auto &[key, values] : parameters) {
+        if (values.size())
+            accepted &= dr::all(dr::isfinite(values));
+        dr::schedule(values);
+    }
+    // Resolve the complete guard and every compact proposal before mutating
+    // any destination. This both makes rejection atomic across all groups and
+    // breaks lazy gather dependencies on the old model buffers. No CPU readback
+    // or full target selection/finite scan is needed.
+    dr::schedule(accepted);
+    dr::eval();
+    for (const auto &[key, values] : parameters) {
+        if (!values.size())
+            continue;
+        const Destination &target = destinations.at(key);
+        // Dr.Jit rejects even a fully masked scatter into an empty target.
+        // Any nonempty proposal for an empty model already has accepted=false.
+        if (!target.buffer->size())
+            continue;
+        UIntBuffer component = dr::arange<UIntBuffer>(values.size());
+        UIntBuffer address = dr::gather<UIntBuffer>(*target.rows, component / target.width)
+                           * target.width + component % target.width;
+        dr::scatter(*target.buffer, dr::detach(values), address, accepted);
+    }
+    return accepted;
+}
+
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::clear_growth_candidates() {
     if (m_growth_count) {
         dr::scatter(m_index, dr::full<IntBuffer>(-1, m_growth_cells.size()), m_growth_cells);

@@ -1225,6 +1225,8 @@ def run_training(distributed=None):
             gradients_stage_scope="forward paths, loss, hit/candidate gradients and reductions; deferred mode records host submission time",
             validation_readback="each view" if config.training.sync_view_checks else "epoch and sampled-profile boundaries; GPU-latched update guard",
             sync_view_checks=config.training.sync_view_checks,
+            optimizer_execution="sparse valid-voxel Adam; compact native transaction",
+            optimizer_compaction_sync="appearance/geometry list lengths; includes prior queued work",
             native_stage_profiling="synchronized sampled views only; bypasses frozen replay" if config.training.profile_stages else "disabled",
             freeze_native=config.training.freeze_native,
             gpu_reference_cache_mib=config.training.gpu_reference_cache_mib)
@@ -1302,9 +1304,9 @@ def run_training(distributed=None):
         if config.training.rgb_only and int(model.opacity_sh_count) != 1:
             raise ValueError("RGB-only model/checkpoint must contain exactly one opacity coefficient per voxel")
         optimizer = FalcorOptimizer(model, config.optimizer)
-        if not config.training.sync_view_checks and not callable(getattr(model, "set_parameters_guarded", None)):
-            raise RuntimeError("Deferred GPU update checks require a rebuilt native set_parameters_guarded binding; "
-                               "incrementally rebuild this checkout, or use --sync-view-checks for diagnostics")
+        if not callable(getattr(model, "set_parameters_sparse", None)):
+            raise RuntimeError("Sparse Adam requires a rebuilt native set_parameters_sparse binding; "
+                               "incrementally rebuild this checkout before training")
         topology = TopologyManager(model, len(views), settings=config.topology,
             schedule=replace(config.schedule, save_each_level=False),
             opacity_warmup=config.optimizer.opacity_warmup_epochs, opacity_ramp=config.optimizer.opacity_ramp_epochs)

@@ -103,6 +103,9 @@ MI_PY_EXPORT(VoxelReconstruction) {
         .def("set_parameters_guarded", &Model::set_parameters_guarded,
              "parameters"_a, "allowed"_a,
              "Device-only finite transaction; returns the scalar acceptance mask for optimizer state.")
+        .def("set_parameters_sparse", &Model::set_parameters_sparse,
+             "appearance_indices"_a, "geometry_indices"_a, "parameters"_a, "allowed"_a,
+             "Commit compact sorted appearance/geometry rows with one device acceptance gate.")
         .def("set_growth_candidates", [](Model &model, const nb::dict &state) {
             if (!state.contains("cell_indices"))
                 throw nb::value_error("set_growth_candidates(): missing cell_indices");
