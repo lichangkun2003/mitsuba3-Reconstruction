@@ -84,7 +84,7 @@ class CoarseToFineConfig:
     start_resolution: int = 256
     target_resolution: int = 512
     total_epochs: int = 1000
-    level_weights: tuple[int, int] = (6, 4)  # Coarse and fine epoch weights.
+    level_weights: tuple[int, ...] = (6, 4)  # One weight per level; four-weight legacy schedules remain readable.
     parent_opacity_threshold: float = 0.
     opacity_optical_depth_scale: float = .65
     child_face_overlap: float = .1
@@ -138,7 +138,7 @@ def _growth_opacity_coefficients(state, metadata, parent_ids, settings, np):
 
 
 def level_budgets(start: int, target: int, total: int, weights=(6, 4)) -> dict[int, int]:
-    """Allocate coarse/fine epochs; retain four-weight legacy checkpoint budgets."""
+    """Allocate two/three levels; retain four-weight legacy checkpoint budgets."""
     if (start < 1 or target < start or target > 1024 or
             start & (start - 1) or target & (target - 1)):
         raise ValueError("Coarse-to-fine requires power-of-two start <= target <= 1024")
@@ -146,20 +146,25 @@ def level_budgets(start: int, target: int, total: int, weights=(6, 4)) -> dict[i
     while resolutions[-1] < target:
         resolutions.append(resolutions[-1] * 2)
     count = len(resolutions)
-    if (total < count or total > 1000000 or len(weights) not in (2, 4)
+    if (total < count or total > 1000000 or len(weights) not in (2, 3, 4)
             or any(type(w) is not int or w <= 0 for w in weights)):
-        raise ValueError("Invalid coarse-to-fine total or level weights: use two positive integers")
+        raise ValueError("Invalid coarse-to-fine total or level weights: use one positive integer per level")
     if count == 1:
         return {start: total}
-    if len(weights) == 2:
-        if count != 2:
-            raise ValueError("Two level weights require exactly two resolutions (target = 2 * start)")
-        # Round the coarse share to the nearest epoch (ties round up), give
-        # the remainder to the fine level, and keep at least one epoch each.
+    if len(weights) in (2, 3):
+        if count != len(weights):
+            raise ValueError("Level weights must match the number of resolutions")
+        # Round cumulative shares (ties up), retaining the historical two-level
+        # transition and at least one epoch at every intermediate resolution.
         denominator = sum(weights)
-        coarse = (2 * total * weights[0] + denominator) // (2 * denominator)
-        coarse = max(1, min(total - 1, coarse))
-        return {start: coarse, target: total - coarse}
+        budgets, cumulative, previous = {}, 0, 0
+        for level, (resolution, weight) in enumerate(zip(resolutions, weights)):
+            cumulative += weight
+            end = (2 * total * cumulative + denominator) // (2 * denominator)
+            end = max(previous + 1, min(total - (count - level - 1), end))
+            budgets[resolution] = end - previous
+            previous = end
+        return budgets
     # Older checkpoints/configs used four interpolated weights and reserved
     # one epoch per level first. Preserve their original transition epochs.
     values = []
@@ -191,6 +196,9 @@ def model_checkpoint(model, fields=None) -> dict:
         metadata["core_resolution"] = core_resolution
     if getattr(model, "scene_mapping", "") == "radial_seed_shell":
         metadata["scene_mapping"] = "radial_seed_shell"
+    if getattr(model, "background_refinement", "") == "fixed_layers":
+        metadata.update(background_refinement="fixed_layers",
+                        background_layers=int(model.background_layers))
     return {
         "model_state": {name: np.array(value, copy=True) for name, value in snapshot.items()},
         "model_metadata": metadata,
@@ -399,12 +407,17 @@ def refine_state(checkpoint: dict, config: CoarseToFineConfig, max_active_voxels
     """Port of Shader/RefineGrid.cs.slang, retaining only fitted child volumes."""
     import numpy as np
     state, metadata = checkpoint["model_state"], dict(checkpoint["model_metadata"])
+    fixed_shell = metadata.get("background_refinement") == "fixed_layers"
+    if fixed_shell:
+        from reconstruction_shell_refinement import fixed_shell_metadata, remap_children_numpy
+        next_metadata = fixed_shell_metadata(metadata)
+    else:
+        next_metadata = dict(metadata, resolution=metadata["resolution"] * 2)
+        if "core_resolution" in metadata:
+            next_metadata["core_resolution"] *= 2
     n = len(state["cell_indices"])
     if n == 0:
-        metadata["resolution"] *= 2
-        if "core_resolution" in metadata:
-            metadata["core_resolution"] *= 2
-        return {"model_metadata": metadata,
+        return {"model_metadata": next_metadata,
                 "model_state": {key: np.array(value, copy=True) for key, value in state.items()}}
     center, axes, rotation, quaternion, size, metric, extent = _geometry(state, metadata, np)
     inverse_metric = np.linalg.inv(metric)
@@ -471,9 +484,24 @@ def refine_state(checkpoint: dict, config: CoarseToFineConfig, max_active_voxels
     count = sum(len(block[0]) for block in blocks)
     if count == 0:
         raise RuntimeError("Refinement produced no representable children; preserve the old grid")
-    if count > max_active_voxels:
+    if not fixed_shell and count > max_active_voxels:
         raise RuntimeError("Refinement exceeds max_active_voxels")
     parent_ids = np.concatenate([block[0] for block in blocks])
+    geometry = {
+        "cell_indices": np.concatenate([block[1] for block in blocks]).astype(np.uint32),
+        "centers": np.concatenate([block[2] for block in blocks]).astype(np.float32).ravel(),
+        "log_scales": np.concatenate([block[3] for block in blocks]).astype(np.float32).ravel(),
+        "rotations": quaternion[parent_ids].astype(np.float32).ravel(),
+    }
+    if fixed_shell:
+        geometry = remap_children_numpy(
+            metadata, geometry["cell_indices"], geometry["centers"], geometry["log_scales"],
+            geometry["rotations"], parent_ids)
+        parent_ids = geometry.pop("parents")
+        inherit_shell = geometry.pop("inherit_shell")
+        count = len(parent_ids)
+        if count > max_active_voxels:
+            raise RuntimeError("Refinement exceeds max_active_voxels")
     new_radiance = np.zeros((count, metadata["sh_count"], 3), dtype=np.float32)
     new_radiance[:, 0] = radiance[parent_ids, 0]
     new_opacity = np.zeros((count, metadata["opacity_sh_count"]), dtype=np.float32)
@@ -487,14 +515,13 @@ def refine_state(checkpoint: dict, config: CoarseToFineConfig, max_active_voxels
         small = np.maximum(tau, 1e-30)
         child_logit = np.where(tau > 15, tau, np.where(tau < 1e-4, np.log(small), np.log(np.expm1(np.minimum(tau, 15)))))
         new_opacity[:, 0] = np.minimum(child_logit, parent_logit) / y0
-    metadata["resolution"] *= 2
-    if "core_resolution" in metadata:
-        metadata["core_resolution"] *= 2
-    return {"model_metadata": metadata, "model_state": {
-        "cell_indices": np.concatenate([block[1] for block in blocks]).astype(np.uint32),
-        "centers": np.concatenate([block[2] for block in blocks]).astype(np.float32).ravel(),
-        "log_scales": np.concatenate([block[3] for block in blocks]).astype(np.float32).ravel(),
-        "rotations": quaternion[parent_ids].astype(np.float32).ravel(),
+    if fixed_shell:
+        # The shell keeps its radial count: do not attenuate its per-hit
+        # opacity as though two optical-depth layers had been introduced.
+        new_radiance[inherit_shell] = radiance[parent_ids[inherit_shell]]
+        new_opacity[inherit_shell] = opacity[parent_ids[inherit_shell]]
+    return {"model_metadata": next_metadata, "model_state": {
+        **geometry,
         "radiance_sh": new_radiance.ravel(), "opacity_sh": new_opacity.ravel(),
     }}
 
@@ -571,10 +598,15 @@ class TopologyManager:
         # to the core diameter, while every address and geometric operation
         # continues to use the actual enclosing grid resolution.
         self.core_resolution = int(getattr(model, "core_resolution", model.resolution))
+        self.background_refinement = getattr(model, "background_refinement", "")
+        self.background_layers = int(getattr(model, "background_layers", 0))
         self._model_opacity_sh_count = getattr(model, "opacity_sh_count", None)
         self.level_start_epoch = 0
-        self.schedule_start_resolution = self.core_resolution
-        self.budgets = (level_budgets(self.core_resolution, self.schedule.target_resolution, self.schedule.total_epochs,
+        # A checkpoint can already be at 512/1024 while its three weights still
+        # describe the entire 256->512->1024 run. Construct those original
+        # budgets before load_state_dict restores the current level's epoch.
+        self.schedule_start_resolution = min(self.core_resolution, self.schedule.start_resolution)
+        self.budgets = (level_budgets(self.schedule_start_resolution, self.schedule.target_resolution, self.schedule.total_epochs,
                                      self.schedule.level_weights) if self.schedule.enabled else {self.core_resolution: self.schedule.total_epochs})
         self.cooldown = {}
         self.pending_growth = None
@@ -601,13 +633,18 @@ class TopologyManager:
 
     def _validate(self):
         cfg, schedule = self.settings, self.schedule
-        if not 1 <= self.core_resolution <= self.resolution <= 1024:
-            raise ValueError("Topology requires 1 <= core resolution <= grid resolution <= 1024")
+        if not (1 <= self.core_resolution <= 1024 and self.core_resolution <= self.resolution <= 1040):
+            raise ValueError("Topology requires core resolution <= 1024 and grid resolution <= 1040")
         if self.core_resolution not in self.budgets:
             raise ValueError("Topology epoch budgets do not contain the current core resolution")
-        if (schedule.enabled and
-                self.resolution * schedule.target_resolution > 1024 * self.core_resolution):
-            raise ValueError("Coarse-to-fine enclosing grid resolution would exceed 1024")
+        if self.background_refinement == "fixed_layers":
+            if self.background_layers < 1 or self.resolution != self.core_resolution + 2*self.background_layers:
+                raise ValueError("Fixed shell requires a consistent core and background layer count")
+            target_grid = schedule.target_resolution + 2*self.background_layers
+        else:
+            target_grid = self.resolution * schedule.target_resolution / self.core_resolution
+        if schedule.enabled and (schedule.target_resolution > 1024 or target_grid > 1040):
+            raise ValueError("Coarse-to-fine exceeds core 1024 or enclosing grid 1040")
         if not 1 <= self.view_count <= 32767:
             raise ValueError("Training requires 1..32767 distinct cameras")
         if not isinstance(cfg.use_rgb_growth, bool):

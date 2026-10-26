@@ -84,6 +84,40 @@ class CheckpointTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "centers"):
             checkpoint.save_checkpoint(self.path, invalid, self.metadata)
 
+    def test_fixed_eight_layer_1024_model_round_trip_and_metadata_guards(self):
+        extent = 1040/1024
+        metadata = dict(self.metadata, resolution=1040, core_resolution=1024,
+                        grid_min=[-extent]*3, grid_max=[extent]*3,
+                        scene_mapping="radial_seed_shell", background_refinement="fixed_layers",
+                        background_layers=8)
+        checkpoint.save_checkpoint(self.path, self.model, metadata)
+        self.assertEqual(checkpoint.load_checkpoint(self.path)["model_metadata"], metadata)
+        for changes in ({"background_layers": 4}, {"background_layers": True},
+                        {"background_refinement": "unknown"}, {"core_resolution": 1025},
+                        {"resolution": 1041}, {"scene_mapping": "bounded"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                checkpoint.validate_model_state(self.model, {**metadata, **changes})
+        legacy = dict(metadata, resolution=544, core_resolution=512,
+                      grid_min=[-544/512]*3, grid_max=[544/512]*3)
+        legacy.pop("background_refinement")
+        legacy.pop("background_layers")
+        checkpoint.save_checkpoint(self.path, self.model, legacy)
+        self.assertEqual(checkpoint.load_checkpoint(self.path)["model_metadata"], legacy)
+
+    def test_fixed_layer_metadata_survives_model_restore_and_resave(self):
+        from reconstruction_common import restore_model, model_metadata
+        metadata = dict(self.metadata, resolution=1040, core_resolution=1024,
+                        grid_min=[-1040/1024]*3, grid_max=[1040/1024]*3,
+                        scene_mapping="radial_seed_shell", background_refinement="fixed_layers",
+                        background_layers=8)
+        def from_state(resolution, lo, hi, state, sh, opacity_sh, **kwargs):
+            return SimpleNamespace(resolution=resolution, grid_min=lo, grid_max=hi,
+                                   sh_count=sh, opacity_sh_count=opacity_sh, **kwargs)
+        mi = SimpleNamespace(UInt32=lambda v: v, Float=lambda v: v,
+                             VoxelReconstruction=SimpleNamespace(from_state=from_state))
+        restored = restore_model({"model_metadata": metadata, "model_state": self.model}, mi)
+        self.assertEqual(model_metadata(restored), metadata)
+
     def test_failed_first_save_leaves_no_checkpoint(self):
         with patch.object(checkpoint.os, "replace", side_effect=OSError("simulated replacement failure")):
             with self.assertRaises(OSError):

@@ -125,7 +125,7 @@ CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
 CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再解码；渲染与损失仍在线性空间。
 CONFIG.data.scene_mode = "auto"  # 合成场景：有界白色背景；COLMAP：无界远景层、无白色背景尾项。
-CONFIG.data.background_layers = 4  # 初始化远景层数；独立于 render.max_hits，升层时随体素细分。
+CONFIG.data.background_layers = 8  # 新无界场景各层级均保留8层远景；升层时物理厚度减小。
 CONFIG.data.background_opacity = 0.5  # 远景新生体素 opacity；允许后续优化和删除。
 
 CONFIG.render.width = 800
@@ -182,7 +182,7 @@ CONFIG.training.freeze_native = True  # 重放原生计算；拓扑变化后重�
 CONFIG.schedule.enabled = True
 CONFIG.schedule.start_resolution = 256
 CONFIG.schedule.target_resolution = 512
-CONFIG.schedule.level_weights = (6, 4)  # 粗、细层级轮数比例；1500 轮分成 900 / 600。
+CONFIG.schedule.level_weights = (6, 4)  # 512终点默认6:4；1024终点默认(4,3,3)。
 CONFIG.training.num_epochs = 1500  # 整个实验总轮数，每轮遍历全部训练视角。
 CONFIG.training.save_count = 3  # 包含最终 model.npz，共保存三次。
 CONFIG.training.output = None  # 自动创建 outputs/场景-MM.DD-E编号/training。
@@ -223,12 +223,16 @@ def parse_arguments():
     parser.add_argument("--distortion-weight", type=float,
                         help="Nonnegative hard-hit distortion loss weight (CONFIG default: 0.1); 0 explicitly disables it")
     parser.add_argument("--epochs", type=int)
+    parser.add_argument("--target-resolution", type=int, choices=(512, 1024),
+                        help="Final core grid resolution (start remains 256 by default)")
+    parser.add_argument("--level-weights", type=int, nargs="+",
+                        help="Positive epoch weights per level: 6 4 for 256->512, or 4 3 3 for 256->512->1024")
     parser.add_argument("--stop-after-epochs", type=int,
                         help="Stop after N additional complete epochs, saving a resumable checkpoint without changing the full schedule or publishing model.npz")
     parser.add_argument("--dataset")
     parser.add_argument("--scene-mode", choices=("auto", "bounded", "unbounded"),
                         help="auto: bounded synthetic / unbounded COLMAP; override for a new scene")
-    parser.add_argument("--background-layers", type=int, help="Initial radial shell width in voxels (default: 4)")
+    parser.add_argument("--background-layers", type=int, help="Radial shell layers retained at every level for new scenes (default: 8)")
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
     parser.add_argument("--output-dir", help="Override automatic outputs/SCENE-MM.DD-Eindex/training; on resume the default reuses the checkpoint's experiment")
     parser.add_argument("--build-dir")
@@ -264,6 +268,8 @@ def parse_arguments():
 def apply_arguments(config, args, values):
     update(config, values)
     for value, group, key in ((args.epochs, "training", "num_epochs"),
+        (getattr(args, "target_resolution", None), "schedule", "target_resolution"),
+        (getattr(args, "level_weights", None), "schedule", "level_weights"),
         (args.dataset, "data", "dataset"), (args.output_dir, "training", "output"),
         (getattr(args, "scene_mode", None), "data", "scene_mode"),
         (getattr(args, "background_layers", None), "data", "background_layers"),
@@ -315,6 +321,12 @@ def apply_arguments(config, args, values):
             "reference_compositing" not in values.get("data", {})):
         config.data.reference_compositing = "linear"
     config.schedule.total_epochs = config.training.num_epochs
+    if (not getattr(args, "resume", None) and config.schedule.start_resolution == 256
+            and config.schedule.target_resolution == 1024
+            and getattr(args, "level_weights", None) is None
+            and "level_weights" not in values.get("schedule", {})
+            and tuple(config.schedule.level_weights) == (6, 4)):
+        config.schedule.level_weights = (4, 3, 3)
 
 
 def validate(config):

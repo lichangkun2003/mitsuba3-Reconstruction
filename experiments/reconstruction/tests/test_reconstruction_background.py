@@ -76,10 +76,10 @@ class BackgroundConfigTests(unittest.TestCase):
     def test_shell_layers_independent_of_hit_capacity(self):
         config = preview.PreviewConfig()
         config.render.max_hits = 1
-        self.assertEqual(config.data.background_layers, 4)
+        self.assertEqual(config.data.background_layers, 8)
         preview.validate_config(config)
         config.render.max_hits = 32
-        self.assertEqual(config.data.background_layers, 4)
+        self.assertEqual(config.data.background_layers, 8)
         preview.validate_config(config)
 
     def test_old_resume_configuration_gets_equivalent_defaults(self):
@@ -102,6 +102,34 @@ class BackgroundConfigTests(unittest.TestCase):
         self.assertEqual(config.data.scene_mode, "unbounded")
         self.assertEqual(config.data.background_layers, 8)
         self.assertEqual(config.data.background_opacity, .5)
+
+    def test_target_resolution_cli_defaults_and_explicit_level_weights(self):
+        import train
+        for options, expected in (([], (6, 4)),
+                (["--target-resolution", "1024"], (4, 3, 3)),
+                (["--target-resolution", "1024", "--level-weights", "5", "3", "2"], (5, 3, 2))):
+            with self.subTest(options=options), patch.object(sys, "argv", ["train.py", *options]):
+                args = train.parse_arguments()
+                config = copy.deepcopy(train.CONFIG)
+                train.apply_arguments(config, args, {})
+                self.assertEqual(tuple(config.schedule.level_weights), expected)
+                train.validate(config)
+        with patch.object(sys, "argv", ["train.py", "--target-resolution", "1024"]):
+            args = train.parse_arguments()
+        config = copy.deepcopy(train.CONFIG)
+        train.apply_arguments(config, args, {"schedule": {"level_weights": [6, 4]}})
+        with self.assertRaises(ValueError):
+            train.validate(config)
+
+    def test_resume_does_not_replace_saved_schedule_weights(self):
+        import train
+        with patch.object(sys, "argv", ["train.py", "--resume", "model.npz"]):
+            args = train.parse_arguments()
+        config = copy.deepcopy(train.CONFIG)
+        config.schedule.target_resolution = 1024
+        config.schedule.level_weights = (6, 4)
+        train.apply_arguments(config, args, {})
+        self.assertEqual(config.schedule.level_weights, (6, 4))
 
     def test_evaluation_keeps_saved_scene_configuration(self):
         import evaluate

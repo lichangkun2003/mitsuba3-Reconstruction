@@ -42,7 +42,7 @@ class DataConfig:
     images: str | None = None  # COLMAP image folder; None selects the scene's downsampled images.
     initialization: dict | None = None  # Resolved COLMAP normalization/shell, persisted for resume/evaluation.
     scene_mode: str = "auto"  # auto: synthetic bounded, COLMAP unbounded; explicit override supported.
-    background_layers: int = 4  # Initial radial shell width in voxels; independent of ray hit capacity.
+    background_layers: int = 8  # New unbounded scenes retain this radial layer count at every level.
     background_opacity: float = 0.5  # Initial per-voxel opacity in the complete far-field shell.
 
 
@@ -200,6 +200,8 @@ def scene_background_protocol(data, render) -> dict:
             "background_linear_rgb": list(render.background),
             "background_role": "residual ray transmittance color; no environment illumination",
             "initial_background_layers": data.background_layers if mode == "unbounded" else None,
+            "background_refinement": (saved.get("background_refinement", "preserve_physical_width")
+                                      if mode == "unbounded" else None),
             "initial_background_opacity": data.background_opacity if mode == "unbounded" else None}
 
 
@@ -208,7 +210,7 @@ def parse_config(workspace: Path) -> PreviewConfig:
     parser.add_argument("--config", help="JSON config, relative to the workspace parent")
     parser.add_argument("--dataset")
     parser.add_argument("--scene-mode", choices=("auto", "bounded", "unbounded"))
-    parser.add_argument("--background-layers", type=int, help="Initial radial shell width in voxels (default: 4)")
+    parser.add_argument("--background-layers", type=int, help="Radial shell layers retained at every level for new scenes (default: 8)")
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
     parser.add_argument("--point-cloud")
     parser.add_argument("--cameras")

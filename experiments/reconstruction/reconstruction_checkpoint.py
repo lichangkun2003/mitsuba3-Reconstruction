@@ -42,16 +42,21 @@ def validate_model_state(state: dict, metadata: dict) -> None:
     required = {"resolution", "grid_min", "grid_max", "sh_count", "opacity_sh_count"}
     if not required.issubset(metadata):
         raise ValueError(f"Missing model metadata: {sorted(required - metadata.keys())}")
-    resolution = _integer(metadata["resolution"], "resolution", 1, 1024)
-    if "core_resolution" in metadata:
-        _integer(metadata["core_resolution"], "core_resolution", 1, resolution)
+    resolution = _integer(metadata["resolution"], "resolution", 1, 1040)
+    core = _integer(metadata.get("core_resolution", resolution), "core_resolution", 1, min(resolution, 1024))
     mapping = metadata.get("scene_mapping", "bounded")
     if mapping not in ("bounded", "radial_seed_shell"):
         raise ValueError("Unknown initialization scene_mapping")
     if mapping == "radial_seed_shell":
-        core = metadata.get("core_resolution", resolution)
         if core >= resolution or (resolution-core) % 2:
             raise ValueError("Radial shell metadata requires positive symmetric padding")
+    policy = metadata.get("background_refinement")
+    if policy is not None or "background_layers" in metadata:
+        if mapping != "radial_seed_shell" or policy != "fixed_layers":
+            raise ValueError("Background refinement metadata requires a fixed_layers radial shell")
+        layers = _integer(metadata.get("background_layers"), "background_layers", 1)
+        if resolution != core + 2 * layers:
+            raise ValueError("Fixed-layer background metadata must match grid padding")
     sh = _integer(metadata["sh_count"], "sh_count", 1, 16)
     opacity_sh = _integer(metadata["opacity_sh_count"], "opacity_sh_count", 1, 16)
     lo, hi = np.asarray(metadata["grid_min"]), np.asarray(metadata["grid_max"])

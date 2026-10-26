@@ -82,10 +82,14 @@ class InitializationIntegrationTests(unittest.TestCase):
         prepared = common.prepare_dataset(self.config, np)
         self.assertEqual((self.config.render.width, self.config.render.height), (16, 12))
         self.assertEqual(self.config.data.initialization, prepared["initialization"])
-        self.assertEqual(prepared["initialization"]["shell_layers"], self.config.render.max_hits)
+        self.assertEqual(prepared["initialization"]["shell_layers"], self.config.data.background_layers)
         self.assertEqual((prepared["resolution"], prepared["core_resolution"]), (272, 256))
         mi = self.native()
-        result = common.initialize_model(self.config, self.scene, mi, np, prepared=prepared)
+        with patch.dict(sys.modules, {"drjit": SimpleNamespace()}), patch(
+                "reconstruction_background.initialize_background_model", return_value=sentinel.colmap_model) as shell:
+            result = common.initialize_model(self.config, self.scene, mi, np, prepared=prepared)
+        self.assertEqual(shell.call_args.kwargs,
+                         {"opacity": .5, "refinement": "fixed_layers", "layers": 8})
         self.assertIs(result, sentinel.colmap_model)
         mi.VoxelReconstruction.assert_not_called()
         args = mi.VoxelReconstruction.from_points.call_args.args
@@ -102,8 +106,8 @@ class InitializationIntegrationTests(unittest.TestCase):
         self.config.schedule.enabled = False
         self.config.model.grid_resolution = 256
         prepared = common.prepare_dataset(self.config, np)
-        self.assertEqual((prepared["resolution"], prepared["core_resolution"]), (288, 256))
-        self.assertEqual(prepared["grid_max"], [1.125] * 3)
+        self.assertEqual((prepared["resolution"], prepared["core_resolution"]), (272, 256))
+        self.assertEqual(prepared["grid_max"], [1.0625] * 3)
         self.assertEqual((2 * prepared["grid_max"][0]) / prepared["resolution"], 2 / 256)
 
     def test_train_test_views_reuse_saved_transform_and_matching_reference_names(self):

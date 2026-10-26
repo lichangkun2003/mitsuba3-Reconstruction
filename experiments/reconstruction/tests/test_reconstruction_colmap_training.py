@@ -64,11 +64,11 @@ def run_check(args, output):
         "model": {"grid_resolution": 4, "opacity_sh_count": 1},
         "render": {"width": 93, "height": 97, "spp": 1, "max_hits": 2},
         "runtime": {"build_dir": args.build_dir, "gpu": args.gpu},
-        "training": {"rgb_only": True, "num_epochs": 2, "chunk_size": 0,
-                     "save_count": 2, "profile_views": 0, "profile_interval_epochs": 0,
+        "training": {"rgb_only": True, "num_epochs": 3, "chunk_size": 0,
+                     "save_count": 3, "profile_views": 0, "profile_interval_epochs": 0,
                      "output": str(full)},
-        "schedule": {"enabled": True, "start_resolution": 4, "target_resolution": 8,
-                     "level_weights": [1, 1]},
+        "schedule": {"enabled": True, "start_resolution": 4, "target_resolution": 16,
+                     "level_weights": [1, 1, 1]},
         "topology": {"enable_growth": False, "enable_deletion": False},
         "evaluation": {"spp": 1, "max_views": None},
     }
@@ -91,28 +91,32 @@ def run_check(args, output):
     assert report["initial_render"]["resolution"] == 6
     assert report["initial_render"]["view_index"] == 1  # Global index 0 belongs to the held-out split.
     assert (report["initial_render"]["width"], report["initial_render"]["height"]) == (16, 12)
-    assert final["model_metadata"]["resolution"] == 12
-    assert final["model_metadata"]["core_resolution"] == 8
+    assert final["model_metadata"]["resolution"] == 18
+    assert final["model_metadata"]["core_resolution"] == 16
     assert final["model_metadata"]["scene_mapping"] == "radial_seed_shell"
+    assert final["model_metadata"]["background_refinement"] == "fixed_layers"
+    assert final["model_metadata"]["background_layers"] == 1
     assert tuple(final["config"]["render"]["background"]) == (0., 0., 0.)
     assert first["training_state"]["global_step"] == 7
-    assert final["training_state"]["global_step"] == 14
-    assert final["training_state"]["completed_epochs"] == 2
-    np.testing.assert_array_equal(final["model_metadata"]["grid_min"], [-1.5] * 3)
-    np.testing.assert_array_equal(final["model_metadata"]["grid_max"], [1.5] * 3)
+    assert final["training_state"]["global_step"] == 21
+    assert final["training_state"]["completed_epochs"] == 3
+    np.testing.assert_array_equal(final["model_metadata"]["grid_min"], [-1.125] * 3)
+    np.testing.assert_array_equal(final["model_metadata"]["grid_max"], [1.125] * 3)
     initialization = final["config"]["data"]["initialization"]
     assert first["config"]["data"]["initialization"] == initialization
     np.testing.assert_allclose(initialization["center"], [0., 0., -2.], atol=1e-15)
     np.testing.assert_allclose(initialization["radius"], .66, atol=1e-15)
     assert initialization["shell_width"] == .5
-    assert initialization["shell_layers"] == 2
-    assert initialization["version"] == 2
+    assert initialization["shell_layers"] == 1
+    assert initialization["version"] == 3
+    assert initialization["background_refinement"] == "fixed_layers"
     assert initialization["background_layers"] == 1
     assert initialization["background_opacity"] == .5
     assert not (dataset / "init_points.ply").exists()
     history = [json.loads(line) for line in (full / "training.jsonl").read_text().splitlines()]
-    assert [row["training_resolution"] for row in history] == [6, 12]
+    assert [row["training_resolution"] for row in history] == [6, 10, 18]
     assert history[0]["topology"]["refined"] is True
+    assert history[1]["topology"]["refined"] is True
     assert final["model_state"]["radiance_sh"].size > 0
     assert not np.array_equal(first["model_state"]["radiance_sh"], final["model_state"]["radiance_sh"])
 
@@ -143,7 +147,7 @@ def run_check(args, output):
     assert recovered["model_metadata"] == final["model_metadata"]
     assert recovered["config"]["data"]["initialization"] == initialization
     assert recovered["training_state"]["rng_state"] == final["training_state"]["rng_state"]
-    assert recovered["training_state"]["global_step"] == 14
+    assert recovered["training_state"]["global_step"] == 21
     for key, value in final["model_state"].items():
         np.testing.assert_allclose(recovered["model_state"][key], value, atol=2e-6, rtol=2e-6,
                                    err_msg=f"resumed model {key}")
@@ -157,7 +161,7 @@ def run_check(args, output):
         assert resume_evaluation["splits"][split]["aggregate"]["view_count"] == count
     return {"status": "passed", "output": str(output), "checks": [
         "COLMAP binary initialization without PLY", "fixed camera normalization and thin shell",
-        "storage grid 6 -> 12 with core 4 -> 8", "sorted filename split: 7 train / 2 test",
+        "fixed shell storage 6 -> 10 -> 18 with core 4 -> 8 -> 16", "sorted filename split: 7 train / 2 test",
         "full scaled fx/fy/cx/cy and 16x12 reference alignment", "all-view train/test evaluation",
         "resume preserves model, Adam, RNG and initialization metadata"]}
 

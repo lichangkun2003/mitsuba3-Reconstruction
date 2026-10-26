@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 
 
-def initialize_background_model(model, mi, dr, np, opacity=.5):
+def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=None, layers=None):
     """Keep core seeds and fill the far shell with covering, black ellipsoids.
 
     Existing far-cell radiance is retained, but its initial geometry and opacity
@@ -25,6 +25,11 @@ def initialize_background_model(model, mi, dr, np, opacity=.5):
     resolution, core = int(model.resolution), int(model.core_resolution)
     if not 0 < core < resolution or (resolution - core) % 2:
         raise ValueError("A background shell requires a positive, symmetric grid padding")
+    if refinement not in (None, "fixed_layers"):
+        raise ValueError("Unknown background refinement policy")
+    if refinement == "fixed_layers" and (type(layers) is not int or layers < 1
+                                         or resolution != core + 2 * layers):
+        raise ValueError("Fixed-layer background metadata must match grid padding")
     extent = resolution / core
     if (not np.allclose(model.grid_min, [-extent]*3, rtol=0, atol=1e-7)
             or not np.allclose(model.grid_max, [extent]*3, rtol=0, atol=1e-7)):
@@ -75,6 +80,9 @@ def initialize_background_model(model, mi, dr, np, opacity=.5):
         resolution, model.grid_min, model.grid_max, state, sh, opacity_sh,
         core_resolution=core)
     result.scene_mapping = "radial_seed_shell"
+    if refinement == "fixed_layers":
+        result.background_refinement = refinement
+        result.background_layers = layers
     result.background_initialization = dict(
         region="cell_AABB_intersects_radial_shell", opacity=opacity,
         color="point_seed_radiance_else_black", seed_voxels=int(model.active_voxel_count),

@@ -140,7 +140,9 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
             import drjit as dr
             from reconstruction_background import initialize_background_model
             return initialize_background_model(model, mi, dr, np,
-                opacity=prepared["initialization"]["background_opacity"])
+                opacity=prepared["initialization"]["background_opacity"],
+                refinement=prepared["initialization"].get("background_refinement"),
+                layers=prepared["initialization"].get("background_layers"))
         return model
     lo, hi = np.asarray(config.model.bounds_min), np.asarray(config.model.bounds_max)
     center, half = (lo + hi) / 2, (hi - lo) / 2 * config.model.bounds_padding
@@ -342,6 +344,9 @@ def model_metadata(model) -> dict:
         metadata["core_resolution"] = core
     if getattr(model, "scene_mapping", "bounded") == "radial_seed_shell":
         metadata["scene_mapping"] = "radial_seed_shell"
+        if hasattr(model, "background_refinement"):
+            metadata["background_refinement"] = model.background_refinement
+            metadata["background_layers"] = int(model.background_layers)
     return metadata
 
 
@@ -354,6 +359,9 @@ def restore_model(checkpoint, mi):
         metadata["grid_max"], state, metadata["sh_count"], metadata["opacity_sh_count"], **options)
     if metadata.get("scene_mapping") == "radial_seed_shell":
         model.scene_mapping = "radial_seed_shell"
+        if "background_refinement" in metadata:
+            model.background_refinement = metadata["background_refinement"]
+            model.background_layers = metadata["background_layers"]
     return model
 
 

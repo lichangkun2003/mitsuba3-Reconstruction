@@ -94,14 +94,74 @@ def _refine(checkpoint, config, max_active_voxels, dr):
     state = {name: (U if name == "cell_indices" else F)(value)
              for name, value in checkpoint["model_state"].items()}
     n = len(state["cell_indices"])
-    resolution = int(metadata["resolution"])
-    metadata["resolution"] *= 2
-    if "core_resolution" in metadata:
-        metadata["core_resolution"] *= 2
+    fixed_shell = metadata.get("background_refinement") == "fixed_layers"
+    if fixed_shell:
+        from reconstruction_shell_refinement import fixed_shell_metadata, remap_children_gpu
+        metadata = fixed_shell_metadata(metadata)
+    else:
+        metadata["resolution"] *= 2
+        if "core_resolution" in metadata:
+            metadata["core_resolution"] *= 2
     if not n:
         return {"model_metadata": metadata, "model_state": state}
+    result, parents = _fit_children(state, checkpoint["model_metadata"], config,
+                                   max_active_voxels, fixed_shell, dr)
+    total = len(parents)
+    if fixed_shell:
+        result = remap_children_gpu(
+            checkpoint["model_metadata"], result["cell_indices"], result["centers"],
+            result["log_scales"], result["rotations"], parents, dr)
+        parents = result.pop("parents")
+        inherit_shell = result.pop("inherit_shell")
+        total = len(parents)
+        if total > max_active_voxels:
+            raise RuntimeError("Refinement exceeds max_active_voxels")
+    # No child SH table is allocated until radial compression and deduplication
+    # have completed. This bounds the largest appearance allocation by the
+    # replacement model size, rather than all eight children of every parent.
+    y0 = 1 / (2 * math.sqrt(math.pi))
+    opacity_count = metadata["opacity_sh_count"]
+    rows = dr.arange(U, total)
+    sh_count = metadata["sh_count"]
+    result["radiance_sh"] = dr.zeros(F, total * sh_count * 3)
+    for component in range(3):
+        dc = dr.gather(F, state["radiance_sh"], parents * sh_count * 3 + component)
+        dr.scatter(result["radiance_sh"], dc, rows * sh_count * 3 + component)
+    if fixed_shell:
+        for coefficient in range(3, sh_count * 3):
+            value = dr.gather(F, state["radiance_sh"], parents * sh_count * 3 + coefficient)
+            dr.scatter(result["radiance_sh"], value, rows * sh_count * 3 + coefficient, inherit_shell)
+    result["opacity_sh"] = dr.zeros(F, total * opacity_count)
+    dc = dr.gather(F, state["opacity_sh"], parents * opacity_count)
+    parent_dc = dc
+    attenuation = min(max(float(config.opacity_optical_depth_scale), .01), 1.)
+    if attenuation < 1:
+        logit = D(dc) * y0
+        tau = dr.select(logit > 15, logit, dr.maximum(logit, 0.) + dr.log1p(dr.exp(-dr.abs(logit)))) * attenuation
+        child_logit = dr.select(tau > 15, tau, dr.select(tau < 1e-4, dr.log(dr.maximum(tau, 1e-30)),
+                                                     dr.log(dr.expm1(dr.minimum(tau, 15.)))))
+        dc = F(dr.minimum(child_logit, logit) / y0)
+    if fixed_shell:
+        dc = dr.select(inherit_shell, parent_dc, dc)
+        for coefficient in range(1, opacity_count):
+            value = dr.gather(F, state["opacity_sh"], parents * opacity_count + coefficient)
+            dr.scatter(result["opacity_sh"], value, rows * opacity_count + coefficient, inherit_shell)
+    dr.scatter(result["opacity_sh"], dc, rows * opacity_count)
+    dr.eval(*result.values())
+    return {"model_metadata": metadata, "model_state": result}
+
+
+def _fit_children(state, metadata, config, max_active_voxels, fixed_shell, dr):
+    """Finish geometry before allocating or remapping any appearance tables.
+
+    Keeping this stage in its own scope releases parent-sized FP64 fitting
+    temporaries before the shell's sort/reduction workspace is allocated.
+    """
+    U, D, F, B = dr.cuda.UInt32, dr.cuda.Float64, dr.cuda.Float32, dr.cuda.Bool
+    n = len(state["cell_indices"])
+    resolution = int(metadata["resolution"])
     center, axes, quaternion, size, metric, extent = geometry_gpu(
-        state, checkpoint["model_metadata"], dr)
+        state, metadata, dr)
     inverse = _inverse_3x3(metric, dr)
     index = dr.arange(U, n)
     y0 = 1 / (2 * math.sqrt(math.pi))
@@ -194,7 +254,7 @@ def _refine(checkpoint, config, max_active_voxels, dr):
         if not len(ids):
             continue
         total += len(ids)
-        if total > max_active_voxels:
+        if not fixed_shell and total > max_active_voxels:
             raise RuntimeError("Refinement exceeds max_active_voxels")
         cells = _gather(state["cell_indices"], ids, dr)
         old = [cells % resolution, cells // resolution % resolution, cells // (resolution * resolution)]
@@ -211,21 +271,5 @@ def _refine(checkpoint, config, max_active_voxels, dr):
               for name in ("cell_indices", "centers", "log_scales")}
     parents = dr.concat([piece["parents"] for piece in pieces])
     result["rotations"] = _pack(_gather(quaternion, parents, dr), F, dr)
-    rows = dr.arange(U, total)
-    sh_count = metadata["sh_count"]
-    result["radiance_sh"] = dr.zeros(F, total * sh_count * 3)
-    for component in range(3):
-        dc = dr.gather(F, state["radiance_sh"], parents * sh_count * 3 + component)
-        dr.scatter(result["radiance_sh"], dc, rows * sh_count * 3 + component)
-    result["opacity_sh"] = dr.zeros(F, total * opacity_count)
-    dc = dr.gather(F, state["opacity_sh"], parents * opacity_count)
-    attenuation = min(max(float(config.opacity_optical_depth_scale), .01), 1.)
-    if attenuation < 1:
-        logit = D(dc) * y0
-        tau = dr.select(logit > 15, logit, dr.maximum(logit, 0.) + dr.log1p(dr.exp(-dr.abs(logit)))) * attenuation
-        child_logit = dr.select(tau > 15, tau, dr.select(tau < 1e-4, dr.log(dr.maximum(tau, 1e-30)),
-                                                     dr.log(dr.expm1(dr.minimum(tau, 15.)))))
-        dc = F(dr.minimum(child_logit, logit) / y0)
-    dr.scatter(result["opacity_sh"], dc, rows * opacity_count)
-    dr.eval(*result.values())
-    return {"model_metadata": metadata, "model_state": result}
+    dr.eval(*result.values(), parents)
+    return result, parents

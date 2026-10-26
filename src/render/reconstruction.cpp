@@ -146,7 +146,7 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     double opacity_threshold, uint32_t sh_count, uint32_t opacity_sh_count)
     : m_resolution(resolution), m_core_resolution(resolution), m_active_count(0), m_sh_count(sh_count),
       m_opacity_sh_count(opacity_sh_count), m_min(grid_min), m_max(grid_max) {
-    if (resolution < 1 || resolution > 1024)
+    if (resolution < 1 || resolution > max_core_resolution)
         Throw("VoxelReconstruction: resolution must be in [1, 1024].");
     if (sh_count < 1 || sh_count > 16 || opacity_sh_count < 1 || opacity_sh_count > 16)
         Throw("VoxelReconstruction: SH coefficient counts must be in [1, 16].");
@@ -169,8 +169,10 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     : m_resolution(resolution), m_core_resolution(core_resolution ? core_resolution : resolution),
       m_active_count(0), m_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count),
       m_min(grid_min), m_max(grid_max) {
-    if (resolution < 1 || resolution > 1024 || m_core_resolution > resolution)
-        Throw("VoxelReconstruction.from_points(): invalid storage or core resolution.");
+    if (resolution < 1 || resolution > max_grid_resolution ||
+        m_core_resolution > max_core_resolution || m_core_resolution > resolution)
+        Throw("VoxelReconstruction.from_points(): storage resolution must be in [1, 1040], "
+              "with core resolution in [1, 1024] not exceeding storage.");
     if (sh_count < 1 || sh_count > 16 || opacity_sh_count < 1 || opacity_sh_count > 16)
         Throw("VoxelReconstruction.from_points(): SH coefficient counts must be in [1, 16].");
     for (size_t axis = 0; axis < 3; ++axis) {
@@ -231,7 +233,8 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
       m_active_count((uint32_t) cells.size()),
       m_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count),
       m_min(grid_min), m_max(grid_max) {
-    if (!resolution || resolution > 1024 || m_core_resolution > resolution ||
+    if (!resolution || resolution > max_grid_resolution ||
+        m_core_resolution > max_core_resolution || m_core_resolution > resolution ||
         sh_count < 1 || sh_count > 16 || opacity_sh_count < 1 || opacity_sh_count > 16)
         Throw("VoxelReconstruction.from_state(): invalid grid, occupancy, or SH counts.");
     for (size_t a = 0; a < 3; ++a) {

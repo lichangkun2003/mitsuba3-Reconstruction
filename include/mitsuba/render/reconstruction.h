@@ -28,6 +28,13 @@ public:
     using IntBuffer = mitsuba::DynamicBuffer<Int32>;
     using SpatialAnchor = dr::uint64_array_t<UInt32>;
 
+    /// Core resolution plus eight shell cells on each side at the finest level.
+    static constexpr uint32_t max_core_resolution = 1024;
+    static constexpr uint32_t max_grid_resolution = max_core_resolution + 16;
+    // Flattened DDA cells use signed Int32 arithmetic before conversion to IDs.
+    static_assert(uint64_t(max_grid_resolution) * max_grid_resolution * max_grid_resolution <= INT32_MAX);
+    static_assert(uint64_t(3) * max_grid_resolution + 3 <= UINT32_MAX);
+
     /// Version of the alpha-independent RGB training contract exposed to Python.
     static constexpr uint32_t rgb_only_version = 1;
     /// Multiple independent parent proposals per empty cell; record capacity

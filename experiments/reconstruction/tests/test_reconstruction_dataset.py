@@ -149,18 +149,19 @@ class ColmapDatasetTests(unittest.TestCase):
         prepared = self.prepare(scene_mode="unbounded", start_core_resolution=64,
                                 target_core_resolution=512, shell_layers=2)
         metadata = prepared["initialization"]
-        self.assertEqual(metadata["version"], 2)
+        self.assertEqual(metadata["version"], 3)
         self.assertEqual(metadata["scene_mode"], "unbounded")
         self.assertEqual(metadata["scene_mapping"], "radial_seed_shell")
-        self.assertEqual(metadata["background_layers"], 4)
+        self.assertEqual(metadata["background_layers"], 8)
+        self.assertEqual(metadata["background_refinement"], "fixed_layers")
         self.assertEqual(metadata["background_opacity"], .5)
-        self.assertEqual(metadata["shell_layers"], 32)
-        self.assertEqual(metadata["shell_width"], .125)
-        self.assertEqual(prepared["resolution"], 72)
-        self.assertEqual(prepared["grid_max"], [1.125] * 3)
+        self.assertEqual(metadata["shell_layers"], 8)
+        self.assertEqual(metadata["shell_width"], .25)
+        self.assertEqual(prepared["resolution"], 80)
+        self.assertEqual(prepared["grid_max"], [1.25] * 3)
         self.assertEqual(2 * prepared["grid_max"][0] / prepared["resolution"], 2 / 64)
         points, _ = dataset.read_colmap_points(self.model / "points3D.bin")
-        expected = dataset.contract_points(points, metadata["center"], metadata["radius"], .125)
+        expected = dataset.contract_points(points, metadata["center"], metadata["radius"], .25)
         np.testing.assert_array_equal(prepared["positions"], expected)
         # Ray capacity is not involved in either the explicit shell or point map.
         other = self.prepare(scene_mode="unbounded", start_core_resolution=64,
@@ -168,7 +169,7 @@ class ColmapDatasetTests(unittest.TestCase):
         self.assertEqual(other["initialization"], metadata)
         np.testing.assert_array_equal(other["positions"], prepared["positions"])
 
-    def test_v2_saved_initialization_restores_exactly_and_rejects_overrides(self):
+    def test_v3_saved_initialization_restores_exactly_and_rejects_overrides(self):
         prepared = self.prepare(scene_mode="unbounded", background_layers=8,
                                 background_opacity=.4)
         metadata = prepared["initialization"]
@@ -181,7 +182,8 @@ class ColmapDatasetTests(unittest.TestCase):
             with self.subTest(option=option), self.assertRaises(ValueError):
                 self.prepare(initialization=metadata, **option)
         for key, value in (("scene_mapping", "projective_shell"), ("version", 99),
-                           ("shell_width", .3), ("shell_layers", 99)):
+                           ("shell_width", .3), ("shell_layers", 99),
+                           ("background_refinement", "preserve_physical_width")):
             broken = dict(metadata, **{key: value})
             with self.subTest(key=key), self.assertRaises(ValueError):
                 self.prepare(initialization=broken)
@@ -189,6 +191,36 @@ class ColmapDatasetTests(unittest.TestCase):
         cameras_only = self.prepare(initialization=metadata, load_points=False)
         self.assertEqual(cameras_only["views"], prepared["views"])
         self.assertIsNone(cameras_only["positions"])
+
+    def test_v2_saved_initialization_keeps_physical_width_and_original_points(self):
+        for layers in (4, 8):
+            with self.subTest(layers=layers):
+                fresh = self.prepare(scene_mode="unbounded", background_layers=layers)
+                old = copy.deepcopy(fresh["initialization"])
+                old["version"] = 2
+                old.pop("background_refinement")
+                old["shell_layers"] = layers * 2
+                restored = self.prepare(initialization=old)
+                self.assertEqual(restored["initialization"], old)
+                self.assertEqual(restored["resolution"], 256 + 2*layers)
+                np.testing.assert_array_equal(restored["positions"], fresh["positions"])
+                malformed = {**old, "background_refinement": "fixed_layers"}
+                with self.assertRaisesRegex(ValueError, "silently change"):
+                    self.prepare(initialization=malformed)
+
+    def test_fixed_layers_support_1024_target_without_expanding_shell_count(self):
+        prepared = self.prepare(scene_mode="unbounded", target_core_resolution=1024)
+        metadata = prepared["initialization"]
+        self.assertEqual(prepared["resolution"], 272)
+        self.assertEqual(metadata["background_layers"], 8)
+        self.assertEqual(metadata["shell_layers"], 8)
+        restored = self.prepare(initialization=metadata, target_core_resolution=1024,
+                                split="test", load_points=False)
+        self.assertEqual(restored["initialization"], metadata)
+        final_start = self.prepare(scene_mode="unbounded", start_core_resolution=1024,
+                                  target_core_resolution=1024)
+        self.assertEqual(final_start["resolution"], 1040)
+        self.assertEqual(final_start["grid_max"], [1040/1024]*3)
 
     def test_bounded_colmap_fits_points_without_radial_contraction(self):
         prepared = self.prepare(scene_mode="bounded")
@@ -234,8 +266,10 @@ class ColmapDatasetTests(unittest.TestCase):
         for value in (0, 1, -.1, float("nan"), float("inf"), True):
             with self.subTest(opacity=value), self.assertRaises(ValueError):
                 self.prepare(scene_mode="unbounded", background_opacity=value)
+        with self.assertRaisesRegex(ValueError, "maximum of 1040"):
+            self.prepare(scene_mode="unbounded", target_core_resolution=1024, background_layers=9)
         with self.assertRaisesRegex(ValueError, "maximum of 1024"):
-            self.prepare(scene_mode="unbounded", target_core_resolution=1024)
+            self.prepare(scene_mode="unbounded", target_core_resolution=2048)
         with self.assertRaisesRegex(ValueError, "powers of two"):
             self.prepare(scene_mode="bounded", start_core_resolution=300)
         self.assertEqual(self.prepare(scene_mode="bounded", target_core_resolution=1024)["resolution"], 256)

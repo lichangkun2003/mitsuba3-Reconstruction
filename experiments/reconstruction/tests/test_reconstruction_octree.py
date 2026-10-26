@@ -212,10 +212,12 @@ def check_compact_storage_scaling(mi, dr, np):
     maximum, reports = 0., []
     # Check the small model first: an old binary must fail before constructing
     # resolution=1024, whose historical dense leaf index alone used 4 GiB.
-    for resolution in (64, 256, 1024):
+    for resolution in (64, 256, 1024, 1040):
         coordinates = [(resolution-1, resolution-1, resolution-1), (0, 0, resolution-1),
                        (resolution//2, resolution//2, resolution//2), (resolution-1, 0, 0)]
         checkpoint = payload(np, resolution, coordinates)
+        if resolution > 1024:
+            checkpoint["model_metadata"]["core_resolution"] = 1024
         model = restore_model(checkpoint, mi)
         statistics = compact_storage(model, len(coordinates))
         reports.append({"resolution": resolution, **statistics})
@@ -238,7 +240,10 @@ def check_compact_storage_scaling(mi, dr, np):
             host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., False), dr, np),
             host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., True), dr, np),
             np, f"compact_sparse_trace_{resolution}"))
-        empty = restore_model(payload(np, resolution, []), mi)
+        empty_checkpoint = payload(np, resolution, [])
+        if resolution > 1024:
+            empty_checkpoint["model_metadata"]["core_resolution"] = 1024
+        empty = restore_model(empty_checkpoint, mi)
         compact_storage(empty, 0)
         empty_result, error = compare_loss(empty, ray, mi, dr, np, f"compact_empty_{resolution}")
         maximum = max(maximum, error)
@@ -247,8 +252,101 @@ def check_compact_storage_scaling(mi, dr, np):
     first = reports[0]["spatial_index_allocated_bytes"] + reports[0]["octree_allocated_bytes"]
     last = reports[-1]["spatial_index_allocated_bytes"] + reports[-1]["octree_allocated_bytes"]
     assert last <= 16*max(first, 1), ("Storage followed grid volume instead of sparse occupancy", reports)
-    return {"check": "compact_sparse_storage_to_1024_preserves_unsorted_rows_and_empty_models",
+    return {"check": "compact_sparse_storage_to_1040_preserves_unsorted_rows_and_empty_models",
             "storage": reports, "max_absolute_error": maximum, "status": "passed"}
+
+
+def check_core_1024_shell_storage(mi, dr, np):
+    """Exercise all three coordinate bits above 1023, including Morton bit 32."""
+    resolution = 1040
+    # All eight combinations are necessary: a truncated Morton sort can alias
+    # or misorder upper-z leaves even if one isolated high-address leaf works.
+    coordinates = [(5 + 1024*(bits & 1), 7 + 1024*((bits >> 1) & 1),
+                    11 + 1024*((bits >> 2) & 1)) for bits in (7, 0, 4, 1, 6, 2, 5, 3)]
+    checkpoint = payload(np, resolution, coordinates)
+    checkpoint["model_metadata"]["core_resolution"] = 1024
+    model = restore_model(checkpoint, mi)
+    storage = compact_storage(model, len(coordinates))
+    assert storage["octree_levels"] == 11
+    assert int(model.core_resolution) == 1024 and int(model.resolution) == 1040
+    xy = [(5, 7), (1029, 7), (5, 1031), (1029, 1031)]
+    origins = [[x+.5, y+.5, -1.] for x, y in xy] + \
+              [[x+.5, y+.5, resolution+1.] for x, y in xy] + [[20.5, 20.5, -1.]]
+    directions = [[0., 0., 1.]]*4 + [[0., 0., -1.]]*4 + [[0., 0., 1.]]
+    ray = rays(mi, np, origins, directions, float(resolution+2))
+    baseline, maximum = compare_loss(model, ray, mi, dr, np, "core1024_high_coordinate_bits")
+    np.testing.assert_array_equal(baseline["hit_count"], [2]*8 + [0])
+    np.testing.assert_array_equal(baseline["appearance_valid"], [2]*8)
+    colors = checkpoint["model_state"]["radiance_sh"].reshape(-1, 3) * Y00
+    expected = []
+    for backwards in (False, True):
+        for x, y in xy:
+            rows = sorted((i for i, cell in enumerate(coordinates) if cell[:2] == (x, y)),
+                          key=lambda i: coordinates[i][2], reverse=backwards)
+            expected.append(.35*colors[rows[0]] + .65*.35*colors[rows[1]] + .65**2)
+    expected.append(np.ones(3))
+    np.testing.assert_allclose(baseline["raw_rgb"], np.asarray(expected).T,
+                               rtol=3e-5, atol=3e-6, err_msg="Independent 33-bit Morton leaf-ID oracle")
+    assert np.any(np.abs(baseline["gradients.radiance_sh"]) > 0)
+    baseline_trace = host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., True), dr, np)
+    maximum = max(maximum, compare(baseline_trace,
+        host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., False), dr, np), np, "core1024_trace"))
+
+    proposal_coordinates = [(1029, 1031, 1024), (5, 7, 1024), (1029, 1031, 1024)]
+    proposals = state(np, resolution, proposal_coordinates, opacity=.25)
+    model.set_growth_candidates(device_state(proposals, mi))
+    compact_storage(model, len(coordinates) + 2)
+    with_candidates, error = compare_loss(model, ray, mi, dr, np, "core1024_candidate_high_bits",
+                                          collect_growth_evidence=1.)
+    maximum = max(maximum, error, compare(baseline,
+        {key: value for key, value in with_candidates.items() if not key.startswith("growth_")},
+        np, "core1024_candidates_leave_real_hits_unchanged"))
+    np.testing.assert_array_equal(with_candidates["growth_observed"], [2, 2, 2])
+    np.testing.assert_array_equal(with_candidates["growth_unknown"], 0)
+    expected_gains = []
+    for index in range(len(proposal_coordinates)):
+        inserted = copy.deepcopy(checkpoint)
+        for key, value in proposals.items():
+            width = 1 if key == "cell_indices" else len(value)//len(proposal_coordinates)
+            inserted["model_state"][key] = np.concatenate((
+                checkpoint["model_state"][key], value[index*width:(index+1)*width]))
+        inserted_model = restore_model(inserted, mi)
+        inserted_result = host(inserted_model.loss_and_grad(*inputs(mi, ray), settings()), dr, np)
+        expected_gains.append(float(np.sum(baseline["rgb_loss"] - inserted_result["rgb_loss"])))
+    np.testing.assert_allclose(with_candidates["growth_gain"], expected_gains,
+                               rtol=3e-5, atol=3e-6, err_msg="33-bit candidate insertion oracle")
+    model.clear_growth_candidates()
+    maximum = max(maximum, compare(baseline,
+        host(model.loss_and_grad(*inputs(mi, ray), settings()), dr, np), np, "core1024_overlay_clear"))
+
+    # Point initialization and checkpoint construction must enforce the same
+    # distinction between core resolution and padded storage resolution.
+    positions = np.asarray(coordinates, np.float32).reshape(-1) + np.float32(.5)
+    point_model = mi.VoxelReconstruction.from_points(positions, np.full_like(positions, .5),
+        resolution, [0.]*3, [float(resolution)]*3, 1, 1, core_resolution=1024)
+    assert int(point_model.resolution) == 1040 and int(point_model.core_resolution) == 1024
+    np.testing.assert_array_equal(np.sort(np.asarray(point_model.snapshot()["cell_indices"])),
+                                  np.sort(checkpoint["model_state"]["cell_indices"]))
+    rejected = []
+    for actual, core in ((1041, 1024), (1040, 1025), (1040, 0), (512, 1024)):
+        bad = payload(np, actual, [(0, 0, 0)])
+        if core:
+            bad["model_metadata"]["core_resolution"] = core
+        for constructor in ("state", "points"):
+            try:
+                if constructor == "state":
+                    restore_model(bad, mi)
+                else:
+                    mi.VoxelReconstruction.from_points(np.full(3, .5, np.float32),
+                        np.full(3, .5, np.float32), actual, [0.]*3, [float(actual)]*3,
+                        1, 1, core_resolution=core)
+            except (RuntimeError, ValueError):
+                rejected.append([constructor, actual, core])
+            else:
+                raise AssertionError(f"Invalid core/storage resolution accepted: {constructor}, {actual}, {core}")
+    return {"check": "core1024_storage1040_33bit_morton_hits_gradients_and_candidates",
+            "storage": storage, "rejected_resolutions": rejected,
+            "max_absolute_error": maximum, "status": "passed"}
 
 
 def check_compact_candidate_lifecycle(mi, dr, np):
@@ -944,7 +1042,8 @@ def main():
                                                 Path(temporary), {})
         assert int(getattr(mi.VoxelReconstruction, "octree_version", 0)) >= 1, \
             "Rebuild this checkout before running octree regression"
-        for check in (check_compact_storage_scaling, check_compact_candidate_lifecycle,
+        for check in (check_compact_storage_scaling, check_core_1024_shell_storage,
+                      check_compact_candidate_lifecycle,
                       check_compact_invalid_cells,
                       check_boundaries_and_default, check_sparse_random_and_non_power_two,
                       check_long_empty_block_exits,
