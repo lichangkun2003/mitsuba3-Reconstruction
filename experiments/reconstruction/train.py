@@ -41,6 +41,7 @@ from reconstruction_performance import PerformanceRecorder
 from reconstruction_progress import ProgressLine
 from reconstruction_reference import GPUReferenceCache
 from reconstruction_replay import NativeLossReplay
+from reconstruction_sampling import PrefetchedUniformSampler
 from reconstruction_growth_rgb import RGB_GROWTH_EVIDENCE_VERSION
 from reconstruction_topology import (TopologyManager, TopologySettings, CoarseToFineConfig,
                                      level_budgets, validate_growth_opacity)
@@ -51,6 +52,7 @@ class TrainingSettings:
     rgb_only: bool = False  # Legacy schema default; CONFIG enables RGB-only phase 1.
     num_epochs: int = 1000
     chunk_size: int = 0  # 0: submit the whole image; positive: explicit ray batches.
+    sampling_workers: int = 2  # Single-GPU RGB: prefetch the exact CPU RNG stream; 0 disables.
     profile_views: int = 0  # Record JIT/cache/device timings for the first N views.
     profile_interval_epochs: int = 50  # Sample one view periodically and on entering each resolution; 0 disables.
     profile_stages: bool = True  # Synchronize native phase boundaries only in sampled views.
@@ -238,6 +240,8 @@ def parse_arguments():
     parser.add_argument("--build-dir")
     parser.add_argument("--gpu", type=int, help="Local physical index; ignored under Slurm")
     parser.add_argument("--chunk-size", type=int, help="0 (default): full image; positive: maximum rays per batch")
+    parser.add_argument("--sampling-workers", type=int,
+                        help="CPU workers for single-GPU RGB sampling (default: 2); 0 disables prefetch")
     parser.add_argument("--traversal", choices=("octree", "dda"),
                         help="Spatial traversal (default: octree); dda is the comparison path")
     parser.add_argument("--profile-views", type=int, help="Record kernel/cache timings for the first N processed views")
@@ -276,6 +280,7 @@ def apply_arguments(config, args, values):
         (getattr(args, "background_opacity", None), "data", "background_opacity"),
         (args.build_dir, "runtime", "build_dir"), (args.gpu, "runtime", "gpu"),
         (args.chunk_size, "training", "chunk_size"),
+        (getattr(args, "sampling_workers", None), "training", "sampling_workers"),
         (getattr(args, "traversal", None), "render", "traversal"),
         (args.profile_views, "training", "profile_views"),
         (args.profile_interval_epochs, "training", "profile_interval_epochs"),
@@ -406,7 +411,7 @@ def validate(config):
         value = getattr(config.training, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"training.{name} must be a positive integer")
-    for name in ("chunk_size", "profile_views", "profile_interval_epochs", "reference_cache_mib", "gpu_reference_cache_mib"):
+    for name in ("chunk_size", "sampling_workers", "profile_views", "profile_interval_epochs", "reference_cache_mib", "gpu_reference_cache_mib"):
         value = getattr(config.training, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"training.{name} must be a nonnegative integer")
@@ -506,8 +511,22 @@ def _save_training_view_zero(config, model, views, path, mi, dr, np, *,
                 seconds=time.perf_counter()-started)
 
 
-def make_sampler(config, np):
-    return UniformSampler(np) if config.training.rgb_only else ContourSampler(np, **asdict(config.contour))
+def make_sampler(config, np, *, sampling_workers=0, previous=None):
+    if isinstance(previous, PrefetchedUniformSampler):
+        if config.training.rgb_only and previous.workers == sampling_workers:
+            # Uniform sampling has no topology-dependent history. Retain the
+            # worker pool and cumulative counters across resolution changes.
+            previous.clear()
+            return previous
+        previous.close()
+    if config.training.rgb_only:
+        return (PrefetchedUniformSampler(np, workers=sampling_workers) if sampling_workers
+                else UniformSampler(np))
+    return ContourSampler(np, **asdict(config.contour))
+
+
+def sampling_statistics(sampler):
+    return sampler.statistics() if isinstance(sampler, PrefetchedUniformSampler) else {"workers": 0}
 
 
 def validate_resume_supervision(config, checkpoint):
@@ -976,6 +995,7 @@ def finalize_experiment_output(config, model_path, output, report, performance, 
         performance.write(report["status"], training_status=report["training_status"],
             reference_cache=report.get("reference_cache"), gpu_reference_cache=report.get("gpu_reference_cache"),
             native_replay=report.get("native_replay"), collective=report.get("collective"),
+            sampling_execution=report.get("sampling_execution"),
             topology_execution=report.get("topology_execution"),
             training_report=str(output / "training-report.json"))
         if naming["status"] == "renamed":
@@ -1029,6 +1049,7 @@ def run_training(distributed=None):
     gpu_reference_cache = None
     native_replay = None
     optimizer = None
+    sampler = None
     collective = None
     topology = None
     model = None
@@ -1113,6 +1134,8 @@ def run_training(distributed=None):
                         raise ValueError("Resume output belongs to a different configuration; choose a new --output-dir")
         validate_traversal(config.render, mi, report)
         world_size = distributed.world_size if distributed is not None else 1
+        sampling_workers = (min(config.training.sampling_workers, report["cpu_threads"]["actual"])
+                            if world_size == 1 else 0)
         view_batch_mode = world_size > 1
         if view_batch_mode and (not config.training.rgb_only or config.contour.enabled):
             raise ValueError("Multi-view GPU batches currently require RGB-only uniform sampling; "
@@ -1311,7 +1334,7 @@ def run_training(distributed=None):
                  config.topology.deletion_warmup_epochs, "warmup epochs per level;",
                  config.topology.deletion_protection_epochs, "newborn protection epochs", flush=True)
         rng = np.random.default_rng(config.training.seed)
-        sampler = make_sampler(config, np)
+        sampler = make_sampler(config, np, sampling_workers=sampling_workers)
         completed, global_step, optimizer_step = 0, 0, 0
         if checkpoint:
             emit("Restoring voxel model and training state", flush=True)
@@ -1379,7 +1402,7 @@ def run_training(distributed=None):
                 if replacement is not None:
                     model = restore_model(replacement, mi)
                 if transition.get("refined", False):
-                    sampler = make_sampler(config, np)
+                    sampler = make_sampler(config, np, sampling_workers=sampling_workers, previous=sampler)
                 topology.before_refine_checkpoint = None
 
         emit("Training epochs by core resolution:", json.dumps(topology.budgets), flush=True)
@@ -1664,7 +1687,7 @@ def run_training(distributed=None):
                 transition = new_optimizer = None
             if event.get("refined", False):
                 # Falcor resets contour proposals whenever grid resolution changes.
-                sampler = make_sampler(config, np)
+                sampler = make_sampler(config, np, sampling_workers=sampling_workers, previous=sampler)
             entry = {"epoch": epoch+1, "global_step": global_step, "mean_loss": epoch_loss / len(views),
                      "optimizer_step": optimizer_step, "views_per_update": world_size,
                      "updates_per_epoch": (len(views) + world_size - 1) // world_size,
@@ -1683,6 +1706,7 @@ def run_training(distributed=None):
                      "reference_cache": reference_cache.statistics(),
                      "gpu_reference_cache": gpu_reference_cache.statistics(),
                      "native_replay": native_replay.statistics(),
+                     "sampling_execution": sampling_statistics(sampler),
                      "optimizer_execution": optimizer.statistics(),
                      "topology_execution": topology.statistics() if primary else None,
                      "view_stage_seconds": stage_totals,
@@ -1730,6 +1754,7 @@ def run_training(distributed=None):
             performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
             publish_performance("running", training_status="running",
                               gpu_reference_cache=entry["gpu_reference_cache"], native_replay=entry["native_replay"],
+                              sampling_execution=entry["sampling_execution"],
                               optimizer_execution=entry["optimizer_execution"],
                               topology_execution=entry["topology_execution"])
         performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
@@ -1773,6 +1798,10 @@ def run_training(distributed=None):
             raise
     finally:
         progress_line.finish()
+        if sampler is not None:
+            if isinstance(sampler, PrefetchedUniformSampler):
+                sampler.close()
+            report["sampling_execution"] = sampling_statistics(sampler)
         if callable(getattr(model, "statistics", None)):
             report["final_model_statistics"] = dict(model.statistics())
         if reference_cache is not None:
@@ -1802,6 +1831,7 @@ def run_training(distributed=None):
         publish_performance(report["status"], training_status=report["training_status"],
             reference_cache=report.get("reference_cache"), gpu_reference_cache=report.get("gpu_reference_cache"),
             native_replay=report.get("native_replay"), collective=report.get("collective"),
+            sampling_execution=report.get("sampling_execution"),
             optimizer_execution=report.get("optimizer_execution"),
             topology_execution=report.get("topology_execution"),
             training_report=str(output / "training-report.json"))
@@ -1873,6 +1903,7 @@ def main(distributed=None):
                 evaluation=report["evaluation"], reference_cache=report.get("reference_cache"),
                 gpu_reference_cache=report.get("gpu_reference_cache"), native_replay=report.get("native_replay"),
                 collective=report.get("collective"),
+                sampling_execution=report.get("sampling_execution"),
                 topology_execution=report.get("topology_execution"),
                 training_report=str(output / "training-report.json"), evaluation_report=str(evaluation_report))
     return 0 if report["status"] == "passed" else 1

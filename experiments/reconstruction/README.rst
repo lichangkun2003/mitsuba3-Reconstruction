@@ -104,6 +104,26 @@ Adam 默认按 ``appearance_valid`` / ``geometry_valid`` 分别压紧本视角�
 普通轮对照工具为 ``tests/benchmark_training_checks.py``，使用生成场景、相同随机
 流与原生重放，计时含轮末 GPU 等待。减少主机同步不保证 GPU 已饱和时仍有明显提速。
 
+单卡 RGB 训练默认 ``--sampling-workers 2``，在 CPU 后台预取四个视角的均匀采样，
+让随机数生成与 GPU 训练重叠。每次消费才推进主 RNG，保持原有 PCG64 随机序列、
+轮间 shuffle 和 checkpoint 状态；升层清空预取，退出时回收线程。
+``--sampling-workers 0`` 恢复同步采样；多卡、非 RGB 训练及其他 RNG 类型使用同步路径。
+线程数受运行时 CPU 配额限制，``sampling_execution`` 记录实际线程数和预取计数。
+默认额外保留四组采样数组，约每像素 48 字节，另有工作线程的临时数组。
+
+真实场景的固定初始拓扑对照可使用：
+
+.. code-block:: powershell
+
+   & ..\envs\mitsuba\python.exe -B -I `
+     experiments/reconstruction/benchmarks/benchmark_reconstruction_rgb_steps.py `
+     --dataset datasets/bicycle --gpu 0 --views 169 --warmup 2 --repeats 5 `
+     --sampling-workers 2
+
+改为 ``--sampling-workers 0`` 可测同步对照。每个视角仍更新一次 Adam，计时包含
+轮末 GPU 等待；预热、解码、拓扑变化、保存和评价不计入吞吐。
+``--cprofile`` 和 ``--kernel-history`` 在吞吐测量后单独记录诊断，避免混入基准时间。
+
 默认 ``CONFIG.render.traversal = "octree"`` 使用 GPU 八叉占用索引跳过空区域，
 预览、训练和评价均启用。正常叶子仍执行原有椭球求交、合成及 near-miss 几何梯度；
 生长候选标记单独维护，仅在收集生长证据时参与遍历，不改变真实命中数、颜色或透射率。
@@ -367,7 +387,7 @@ RGB 生长／删除证据按视角独立通过 NCCL 传送，再由 rank 0 投�
    * - ``tests/``
      - 数值与功能回归测试，不是日常实验入口。
    * - ``benchmarks/``
-     - 保留旧 alpha 监督模式的前向与执行方式基准；当前 RGB-only 速度请用 ``train.py`` 短跑测量。
+     - ``benchmark_reconstruction_rgb_steps.py`` 测真实场景 RGB 训练步；其他工具含旧 alpha 监督模式基准。完整训练速度用 ``train.py`` 短跑测量。
    * - ``tools/smoke_gpu.py``
      - 程序生成 Cornell box 的基础 CUDA 环境检查。
    * - ``tools/deploy_windows.ps1``
