@@ -1653,13 +1653,17 @@ Windows 默认构建目录为 ``mitsuba/build/Release``，Linux 为 ``mitsuba/bu
 不同归约布局可能带来 FP32 加法顺序的微小舍入差异，不承诺逐位一致。
 
 并集索引和数据始终位于 GPU；变长通信需要回读并集长度这个标量，因此 auto 仍有一次
-长度同步。梯度传输后用 CUDA 事件保留发送／接收缓冲区，后续计算在同一条流上有序执行，
+长度同步。auto 的梯度传输后用 CUDA 事件保留发送／接收缓冲区，后续计算在同一条流上有序执行，
 不再为释放通信缓冲而立即等待整个 GPU。事件队列有内存与条目上限，达到上限时等待最旧项。
 关闭通信器前会排空队列；模型和拓扑广播仍保留独立的同步边界。
 完整批次和短尾批次各自缓存 Adam 重放，避免仅因 B 改变而每轮重新录制两次。
 
-``--batch-reduction dense`` 可跳过并集整理，使用相同算法的整表梯度传输作对照；这仍享有
-去除零字段、直接归约数组和事件管理的优化。两种设置均可用于同 N 的 checkpoint 续训。
+``--batch-reduction dense`` 可跳过并集整理，使用相同算法的整表梯度传输作对照；保留
+去除零字段、直接归约数组的优化。此前 HPC 的全异步 dense 路径触发过非有限值保护，
+当前显式 dense 在 NCCL 完成后才将结果交给 JIT／Adam，恢复每批一次流等待；这是一项保守
+处理，尚不能据此断言具体故障根因。等待不回读梯度或模型，不改变求和、平均或更新公式。
+``collective.rgb_explicit_syncs`` 会记录这些等待，启动日志显示 ``NCCL completion wait``。
+auto 保持原有实现；两种设置均可用于同 N 的 checkpoint 续训。
 比较时保持场景、阶段、采样及视角顺序一致，先让参考图缓存预热，再比较完整 epoch 时间。
 稀疏覆盖率和通信量会记录在 ``training.jsonl`` 的 ``collective`` 中；是否优于 dense 需在
 实际多 GPU 上测量，不能仅用减少的字节数推算加速比。
@@ -1699,7 +1703,9 @@ checkpoint 仍只由 rank 0 保存一份，但训练状态新增 ``update_protoc
 ``tests/test_reconstruction_rgb_collective.py --cuda`` 和
 ``tests/test_reconstruction_cuda_owners.py --cuda``；它们使用同一张 GPU，不能验证 NCCL
 跨卡通信。HPC 的 ``tests/test_reconstruction_nccl.py --workers N`` 同时覆盖 auto／dense、
-空闲尾批、稀疏与稠密并集及异常数值保护，作为实际跨卡通信检查。
+空闲尾批、稀疏与稠密并集及异常数值保护，作为实际跨卡通信检查；还连续执行原生前向、
+NCCL 和重放 Adam，最后统一回读验证，避免逐批读回掩盖连续训练中的依赖问题。
+该检查还包含百万体素规模的 dense 已知值归约，以覆盖小场景无法触及的大消息传输。
 
 完整训练结束后，N 个进程继续执行最终 train/test 评价，默认训练集前十个、测试集全部视角，
 每视角 64 spp。评价把已选中的 train/test 视角合并为任务列表，再交错分给 N 个 rank；

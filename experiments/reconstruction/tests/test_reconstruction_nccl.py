@@ -164,6 +164,66 @@ def _rgb_batches(context, collective, mi, dr, np):
         "loss_components", "async_consumer_ordering", "peer_nonfinite_guard", "legacy_evidence_guard"]}
 
 
+def _large_dense_batches(context, collective, mi, dr, np):
+    """Exercise production-sized NCCL messages, returning only eight flags.
+
+    A tiny generated scene cannot cover NCCL's large-message protocol. Every
+    gradient here has a rank-specific, opaque known value. Check all elements
+    on the GPU, retain only one scalar result per batch, and read them together
+    at the end. Do not retain whole output tables across batches: each transfer
+    owns approximately 312 MiB of source/destination storage before temporary
+    reductions and allocator rounding, keeping live allocations below 1 GiB.
+    """
+    from reconstruction_collective import GRADIENT_KEYS, MAX_COUNTER_KEYS
+
+    count, batches = 1_048_576, 8
+    dimensions = (27, 1, 3, 3, 3)
+    rank_factor = context.rank + 1
+    sum_factor = context.world_size * (context.world_size + 1) // 2
+
+    def submit(step):
+        source = {"gradients": {
+            name: dr.opaque(mi.Float, (step + 1) * (index + 1) * .125 * rank_factor,
+                            shape=count * dimension)
+            for index, (name, dimension) in enumerate(zip(GRADIENT_KEYS, dimensions))}}
+        source.update(appearance_valid=dr.opaque(mi.UInt32, rank_factor, shape=count),
+                      geometry_valid=dr.opaque(mi.UInt32, 2 * rank_factor, shape=count),
+                      background_carve_valid=dr.zeros(mi.UInt32, count),
+                      rgb_loss_sum=dr.opaque(mi.Float, 2. * rank_factor),
+                      distortion_loss_sum=dr.opaque(mi.Float, 10. * rank_factor))
+        source.update({name: dr.zeros(mi.UInt32, count) for name in MAX_COUNTER_KEYS})
+        reduced, loss, finite = collective.reduce_batch(
+            source, dr.opaque(mi.Float, 3. * rank_factor), mi.Bool(True),
+            rgb_only=True, mode="dense")
+        valid = finite & (loss == 3. * sum_factor)
+        for index, name in enumerate(GRADIENT_KEYS):
+            expected = (step + 1) * (index + 1) * .125 * sum_factor
+            valid &= dr.all(reduced["gradients"][name] == expected)
+        valid &= dr.all(reduced["appearance_valid"] == sum_factor)
+        valid &= dr.all(reduced["geometry_valid"] == 2 * sum_factor)
+        valid &= dr.all(reduced["background_carve_valid"] == 0)
+        for name in MAX_COUNTER_KEYS:
+            valid &= dr.all(reduced[name] == 0)
+        valid &= (reduced["rgb_loss_sum"] == 2. * sum_factor)
+        valid &= (reduced["distortion_loss_sum"] == 10. * sum_factor)
+        dr.eval(valid)
+        return mi.UInt32(valid)
+
+    flags = []
+    for step in range(batches):
+        context.heartbeat(f"large-dense-batch-{step + 1}", force=True)
+        flags.append(submit(step))
+    np.testing.assert_array_equal(np.asarray(dr.concat(flags)), np.ones(batches, np.uint32),
+                                  err_msg="Large dense NCCL transfer or following GPU consumer is incorrect")
+    return {"large_dense_batches": "passed", "batches": batches, "voxels": count,
+            "gradient_dimensions": list(dimensions),
+            "largest_gradient_elements": count * max(dimensions),
+            "gradient_payload_bytes_per_rank_per_batch": count * sum(dimensions) * 4,
+            "host_readback_uint32_values": batches,
+            "checks": ["opaque_rank_specific_inputs", "all_elements_verified_on_gpu",
+                       "continuous_large_messages", "single_final_scalar_readback"]}
+
+
 def _compare_native(context, collective, directory, mi, dr, np):
     from reconstruction_common import ContourSampler, restore_model
     from reconstruction_optimizer import FalcorOptimizer
@@ -244,6 +304,138 @@ def _compare_native(context, collective, directory, mi, dr, np):
                        "contour_history", "Adam_parameters_and_moments", "replica_bit_equality"]}
 
 
+def _continuous_rgb_native(context, collective, directory, mi, dr, np):
+    """Keep native/NCCL/Adam consumers queued across many complete batches.
+
+    In particular, do not convert any device array to NumPy inside the batch
+    loop: doing so would mask missing external-write dependencies. The legacy
+    reduction is an explicitly synchronized oracle, run in a separate pass so
+    its waits cannot accidentally synchronize the dense/auto pass under test.
+    """
+    from reconstruction_batch_epoch import _finite_accumulator
+    from reconstruction_checks import DeferredViewChecks
+    from reconstruction_common import UniformSampler, restore_model
+    from reconstruction_optimizer import FalcorOptimizer
+    from reconstruction_reference import GPUReferenceCache
+    from reconstruction_replay import NativeLossReplay
+    from reconstruction_view_batch import zero_view_partial
+    from train import compute_view_shard
+    from test_reconstruction_performance import fixture
+
+    config, payload, original_view, rgba = fixture(np)
+    config.training.rgb_only = True
+    config.model.opacity_sh_count = 1
+    config.gradient.distortion_loss_weight = .1
+    payload["model_metadata"]["opacity_sh_count"] = 1
+    payload["model_state"]["opacity_sh"] = payload["model_state"]["opacity_sh"][:1].copy()
+    # Keep the generated geometry near its initial shape over this long test;
+    # the test targets ordering/transport, not convergence or topology changes.
+    for name in ("lr_radiance", "lr_opacity", "lr_center", "lr_log_scale", "lr_rotation"):
+        setattr(config.optimizer, name, getattr(config.optimizer, name) * .1)
+    reference_rgb = rgba[..., :3].copy() + np.float32(context.rank * .01)
+    cache = GPUReferenceCache(16, 16, mi, dr, np, capacity_mib=1, rgb_only=True)
+    reference = cache.get(Path(directory) / "continuous-generated-reference.png", reference_rgb)
+    batch_count, ray_count = 64, 16 * 16
+    expected_views = sum(1 if step % 7 == 6 else context.world_size for step in range(batch_count))
+    results = {}
+    for mode in ("legacy", "dense", "auto"):
+        context.heartbeat(f"continuous-native-{mode}", force=True)
+        model = restore_model(copy.deepcopy(payload), mi)
+        optimizer = FalcorOptimizer(model, copy.deepcopy(config.optimizer))
+        replay = NativeLossReplay(dr)
+        sampler, rng = UniformSampler(np), np.random.default_rng(9100 + context.rank)
+        checks = DeferredViewChecks(mi, dr, np)
+        for step in range(batch_count):
+            # Repeated partial batches exercise idle ranks and both exact Adam
+            # normalization factors, including switching back to full batches.
+            actual_views = 1 if step % 7 == 6 else context.world_size
+            if context.rank < actual_views:
+                view = copy.deepcopy(original_view)
+                view["index"] = context.rank
+                view["camera"]["position"][0] += context.rank * .015 + (step % 5 - 2) * .005
+                offsets, inverse_pdf, token = sampler.sample(view["index"], reference_rgb, rng)
+                accumulator, loss, finite, _, _ = compute_view_shard(
+                    model, view, reference_rgb, config, offsets, inverse_pdf, token, mi, dr,
+                    collect_deletion_evidence=False, collect_growth_evidence=False,
+                    gpu_reference=reference, native_replay=replay)
+            else:
+                accumulator, loss, finite, _, _ = zero_view_partial(model, mi, dr)
+                accumulator.update(rgb_loss_sum=mi.Float(0), distortion_loss_sum=mi.Float(0))
+            finite = _finite_accumulator(accumulator, loss, finite, dr)
+            if mode == "legacy":
+                reduced, loss, finite, _, _ = collective.reduce_view(accumulator, loss, finite)
+            else:
+                reduced, loss, finite = collective.reduce_batch(
+                    accumulator, loss, finite, rgb_only=True, mode=mode)
+            finite = _finite_accumulator(reduced, loss, finite, dr)
+            divisor = actual_views * ray_count
+            checks.add(step, dr.concat([loss / divisor, mi.Float(finite),
+                reduced["rgb_loss_sum"] / divisor, reduced["distortion_loss_sum"] / divisor]))
+            update = optimizer.step(model, reduced, sample_count=actual_views,
+                                    epoch=0, coarse_to_fine=False, update_allowed=finite)
+            checks.updated(update["accepted"])
+            # Deliberately no checks.read(), np.asarray(), scalar indexing,
+            # snapshot, or explicit stream wait at this batch boundary.
+            if step % 16 == 15:
+                context.heartbeat(f"continuous-native-{mode}-batch-{step + 1}")
+
+        measurements = checks.read(rgb_only=True, distortion_weight=.1)
+        assert len(measurements) == batch_count
+        parameters = {name: np.array(value) for name, value in model.snapshot().items()}
+        state = optimizer.state_dict()["groups"]
+        assert optimizer.statistics()["calls"] == batch_count
+        assert optimizer.statistics()["replays"] > 0
+        assert replay.statistics()["replays"] > 0
+        assert any(np.any(group["steps"] > 1) for group in state.values()), "No actual Adam updates occurred"
+        for name, value in parameters.items():
+            assert np.isfinite(value).all(), f"{mode}: nonfinite final parameter {name}"
+        for group, fields in state.items():
+            for name, value in fields.items():
+                assert np.isfinite(value).all(), f"{mode}: nonfinite Adam {group}.{name}"
+        # Test real rank agreement only after the entire unsynchronized pass.
+        root = context.broadcast((parameters, state) if context.rank == 0 else None)
+        for name, value in parameters.items():
+            np.testing.assert_array_equal(value, root[0][name], err_msg=f"{mode} replica {name}")
+        for group, fields in state.items():
+            for name, value in fields.items():
+                np.testing.assert_array_equal(value, root[1][group][name],
+                                              err_msg=f"{mode} replica Adam {group}.{name}")
+        results[mode] = (parameters, state, measurements)
+        replay.clear()
+        optimizer.clear_replay()
+
+    maximum_parameter_error = 0.
+    for mode in ("dense", "auto"):
+        parameters, state, measurements = results[mode]
+        for name, value in parameters.items():
+            expected = results["legacy"][0][name]
+            if name == "cell_indices":
+                np.testing.assert_array_equal(value, expected)
+            else:
+                maximum_parameter_error = max(maximum_parameter_error, float(np.max(np.abs(value - expected))))
+                np.testing.assert_allclose(value, expected, rtol=2e-4, atol=2e-6,
+                                           err_msg=f"{mode} continuous parameter {name}")
+        for group, fields in state.items():
+            for name, value in fields.items():
+                expected = results["legacy"][1][group][name]
+                if name == "steps":
+                    np.testing.assert_array_equal(value, expected)
+                else:
+                    np.testing.assert_allclose(value, expected, rtol=3e-4, atol=2e-6,
+                                               err_msg=f"{mode} continuous Adam {group}.{name}")
+        for step, (actual, expected) in enumerate(zip(measurements, results["legacy"][2])):
+            for name in ("loss", "rgb_loss", "distortion_loss"):
+                np.testing.assert_allclose(actual[name], expected[name], rtol=2e-4, atol=2e-6,
+                                           err_msg=f"{mode} continuous batch {step} {name}")
+    cache.clear()
+    return {"continuous_rgb_native": "passed", "batches_per_mode": batch_count,
+            "views_per_mode": expected_views, "modes": ["legacy", "dense", "auto"],
+            "max_parameter_absolute_error": maximum_parameter_error,
+            "checks": ["no_per_batch_numpy_readback", "native_replay_to_nccl_to_frozen_adam",
+                       "repeated_idle_tail_ranks", "deferred_finite_guard", "legacy_synchronized_parity",
+                       "Adam_parameters_moments_and_clocks", "replica_bit_equality"]}
+
+
 def _worker_main(context, arguments):
     # Importing these inside each spawned worker keeps CUDA out of the parent.
     from reconstruction_collective import NcclCollective
@@ -263,7 +455,9 @@ def _worker_main(context, arguments):
             checks = [_known_reductions(context, collective, mi, dr, np),
                       _known_batches(context, collective, mi, dr, np),
                       _rgb_batches(context, collective, mi, dr, np),
-                      _compare_native(context, collective, directory, mi, dr, np)]
+                      _large_dense_batches(context, collective, mi, dr, np),
+                      _compare_native(context, collective, directory, mi, dr, np),
+                      _continuous_rgb_native(context, collective, directory, mi, dr, np)]
             context.barrier()
             print(json.dumps({"status": "passed", "rank": context.rank,
                               "checks": checks, "collective": collective.statistics()}), flush=True)

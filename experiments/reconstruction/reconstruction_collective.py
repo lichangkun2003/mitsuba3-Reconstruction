@@ -94,8 +94,9 @@ class NcclCollective:
     evidence; MAX unions legacy alpha deletion flags. Optional images must have
     full-size arrays with each rank's
     disjoint pixel shard filled and every other pixel exactly zero.
-    The RGB batch path keeps the final NCCL writes asynchronous using completion
-    events; sparse union compression still reads its scalar output length.
+    RGB auto batches retain asynchronous writes with completion events; sparse
+    union compression still reads its scalar output length. Explicit dense
+    batches wait for NCCL completion before exposing buffers to JIT consumers.
     """
 
     def __init__(self, rank, world_size, connection, mi, dr, np, library=None):
@@ -461,7 +462,12 @@ class NcclCollective:
                     {name: (value, _NCCL_FLOAT32, _NCCL_SUM) for name, value in gradients.items()}, wait=False)
         else:
             fields.update({name: (value, _NCCL_FLOAT32, _NCCL_SUM) for name, value in gradients.items()})
-            reduced = self._allreduce_fields(fields, wait=False)
+            # Explicit dense mode has no compress() completion boundary. An
+            # asynchronous dense HPC run failed the deferred finite guard;
+            # keep a completion wait until that integration is validated on
+            # real multi-GPU NCCL, including consecutive frozen Adam updates.
+            # This is a conservative boundary, not a diagnosis of the failure.
+            reduced = self._allreduce_fields(fields, wait=(mode == "dense"))
             global_gradients = {name: reduced.pop(name) for name in GRADIENT_KEYS}
         result = {"gradients": global_gradients,
                   "appearance_valid": reduced["appearance_valid"], "geometry_valid": reduced["geometry_valid"]}

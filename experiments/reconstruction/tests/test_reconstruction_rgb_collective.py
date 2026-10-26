@@ -171,6 +171,53 @@ def compare(test, output, oracle):
 
 
 class CpuTests(unittest.TestCase):
+    def test_dense_completes_external_writes_before_consumption(self):
+        peers = inputs()
+        stages, _, _ = packets(peers, "dense")
+        collective = _fixture(len(peers))
+        library = PeerLibrary(stages, 0)
+        pending = []
+
+        class DelayedLibrary:
+            ncclGroupStart = library.ncclGroupStart
+            ncclGroupEnd = staticmethod(lambda: 0)
+            ncclGetErrorString = library.ncclGetErrorString
+
+            @staticmethod
+            def ncclAllReduce(*args):
+                pending.append(args)
+                return 0
+
+        class DelayedDr(ArrayDr):
+            @staticmethod
+            def empty(array_type, size):
+                # Make a premature consumer fail deterministically, rather
+                # than depending on arbitrary contents of NumPy empty().
+                return np.full(size, np.nan if array_type is _float else 0,
+                               dtype=np.float32 if array_type is _float else np.uint32)
+
+            def sync_thread(self):
+                for args in pending:
+                    library.ncclAllReduce(*args)
+                library.ncclGroupEnd()
+                pending.clear()
+                super().sync_thread()
+
+        collective.dr = DelayedDr()
+        collective._lib = DelayedLibrary()
+        # An available owner queue must not suppress dense's completion wait.
+        retained = []
+        collective._owners = SimpleNamespace(reap=lambda: None,
+            retain=lambda owners, size: retained.append((owners, size)))
+        local = peers[0]
+        result = collective.reduce_batch(local, local["loss_sum"], local["finite"],
+                                         rgb_only=True, mode="dense")
+        compare(self, result, expected(peers))
+        self.assertEqual(collective.dr.syncs, 1)
+        self.assertEqual(collective._stats["rgb_explicit_syncs"], 1)
+        self.assertEqual(pending, [])
+        self.assertEqual(retained, [])
+
     def test_cleanup_failure_keeps_owners_and_can_be_retried(self):
         collective = _fixture(3)
         calls = []

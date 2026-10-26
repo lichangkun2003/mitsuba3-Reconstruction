@@ -1111,10 +1111,13 @@ def run_training(distributed=None):
             report["training_protocol"]["gradient_reduction"] = (
                 "sum over pixels within each view, then mean over actual views in the batch")
             report["training_protocol"]["batch_reduction"] = config.training.batch_reduction
+            completion = ("NCCL completion wait" if config.training.batch_reduction == "dense"
+                          else "GPU event-managed buffers; union-length synchronization")
+            report["training_protocol"]["batch_reduction_completion"] = completion
             emit(f"Multi-GPU training: {world_size} distinct views per Adam update; "
                  "tail batch averaged by its actual view count; learning rates unchanged", flush=True)
             emit(f"Batch gradient transport: {config.training.batch_reduction} "
-                 "(FP32; GPU event-managed buffers)", flush=True)
+                 f"(FP32; {completion})", flush=True)
         performance.metadata["traversal"] = report["traversal"]
         rgb_growth_enabled = config.topology.use_rgb_growth and config.topology.enable_growth and (
             not config.schedule.enabled or config.schedule.enable_coarse_growth)
