@@ -1,6 +1,7 @@
 #pragma once
 
 #include <mitsuba/render/interaction.h>
+#include <mitsuba/render/reconstruction_tree.h>
 #include <mitsuba/core/object.h>
 #include <array>
 #include <map>
@@ -25,6 +26,7 @@ public:
     using FloatBuffer = mitsuba::DynamicBuffer<Float>;
     using UIntBuffer = mitsuba::DynamicBuffer<UInt32>;
     using IntBuffer = mitsuba::DynamicBuffer<Int32>;
+    using SpatialAnchor = dr::uint64_array_t<UInt32>;
 
     /// Version of the alpha-independent RGB training contract exposed to Python.
     static constexpr uint32_t rgb_only_version = 1;
@@ -209,8 +211,7 @@ private:
         const UInt32 *compact_count);
     void initialize_seeds(const reconstruction::Result &loaded);
     void rebuild_octree();
-    void mark_octree(const UIntBuffer &cells, uint32_t bit_offset);
-    void refresh_octree_skips();
+    void update_spatial_statistics();
     Vector3f octree_boundary_times(const Vector3i &cell, const Vector3i &step,
                                   const Point3f &origin, const Vector3f &inv_d) const;
     void advance_empty_block(Vector3i &cell, Vector3f &next, Float &entry,
@@ -222,21 +223,17 @@ private:
                           UInt32 &iterations, const Vector3i &step,
                           const Vector3f &step_t, const Point3f &origin,
                           const Vector3f &inv_d, const Float &exit,
-                          Mask active, bool include_growth,
-                          UInt32 &queries, bool profile) const;
+                          Mask active, const UInt32 &log_size) const;
 
     uint32_t m_resolution, m_core_resolution, m_active_count, m_sh_count, m_opacity_sh_count;
     std::array<float, 3> m_min, m_max, m_size;
     std::map<std::string, uint64_t> m_statistics;
-    IntBuffer m_index;
     UIntBuffer m_cells;
-    // Flat parent levels, fine to coarse. Low eight bits describe normal
-    // children, bits 8..15 describe candidates. Bits 16..19 and 20..23 cache
-    // the largest empty ancestor's log2 size for normal and union occupancy.
-    // Leaf IDs remain in m_index; non-power-of-two resolutions are padded.
-    UIntBuffer m_octree = dr::zeros<UIntBuffer>(1);
-    std::array<uint32_t, 10> m_octree_offsets{};
-    uint32_t m_octree_resolution = 1, m_octree_levels = 0, m_octree_nodes = 0;
+    // Only occupied leaves and their ancestors are stored. A small independent
+    // candidate overlay avoids rebuilding the normal tree at every evidence
+    // window. Joint traversal intersects the two safe empty-block bounds.
+    using SpatialTree = CompactReconstructionTree<UIntBuffer, IntBuffer>;
+    SpatialTree m_tree, m_growth_tree;
     uint64_t m_topology_revision = 0;
     FloatBuffer m_centers, m_log_scales, m_rotations, m_radiance, m_opacity;
     uint32_t m_growth_count = 0;
@@ -251,7 +248,7 @@ private:
                 m_growth_rotations = dr::zeros<FloatBuffer>(1),
                 m_growth_radiance = dr::zeros<FloatBuffer>(1),
                 m_growth_opacity = dr::zeros<FloatBuffer>(1);
-    MI_TRAVERSE_CB(Object, m_index, m_cells, m_octree, m_centers, m_log_scales,
+    MI_TRAVERSE_CB(Object, m_cells, m_tree, m_growth_tree, m_centers, m_log_scales,
                    m_rotations, m_radiance, m_opacity, m_growth_cells, m_growth_next,
                    m_growth_centers, m_growth_log_scales, m_growth_rotations,
                    m_growth_radiance, m_growth_opacity)

@@ -191,6 +191,175 @@ def compare_loss(model, ray, mi, dr, np, label, **extra):
     return accelerated, maximum
 
 
+def compact_storage(model, unique_cells):
+    """Check actual index/hierarchy storage, including hypothetical leaves."""
+    statistics = dict(model.statistics())
+    required = {"spatial_index_entries", "spatial_index_allocated_bytes",
+                "octree_parent_nodes", "octree_allocated_bytes", "octree_levels"}
+    assert required.issubset(statistics), \
+        "Rebuild this checkout: compact spatial storage statistics are required"
+    assert statistics["spatial_index_entries"] == unique_cells, statistics
+    # Normal and candidate trees each contribute at most one ancestor per leaf
+    # per level. Logical counts exclude replay-compatible empty placeholders.
+    assert statistics["octree_parent_nodes"] <= unique_cells * statistics["octree_levels"], statistics
+    allocated = statistics["spatial_index_allocated_bytes"] + statistics["octree_allocated_bytes"]
+    assert allocated < 1024 * 1024, ("Sparse fixture allocated a dense spatial table", statistics)
+    return {key: int(statistics[key]) for key in sorted(required)}
+
+
+def check_compact_storage_scaling(mi, dr, np):
+    """High addresses retain row IDs while sparse allocation stays bounded."""
+    maximum, reports = 0., []
+    # Check the small model first: an old binary must fail before constructing
+    # resolution=1024, whose historical dense leaf index alone used 4 GiB.
+    for resolution in (64, 256, 1024):
+        coordinates = [(resolution-1, resolution-1, resolution-1), (0, 0, resolution-1),
+                       (resolution//2, resolution//2, resolution//2), (resolution-1, 0, 0)]
+        checkpoint = payload(np, resolution, coordinates)
+        model = restore_model(checkpoint, mi)
+        statistics = compact_storage(model, len(coordinates))
+        reports.append({"resolution": resolution, **statistics})
+        # Deliberately unsorted cell addresses must still select the original
+        # parameter rows, not their rank in a sorted/hash spatial structure.
+        forward = [[x+.5, y+.5, -1.] for x, y, _ in coordinates]
+        backward = [[x+.5, y+.5, resolution+1.] for x, y, _ in coordinates]
+        origins = forward + backward + [[.5, resolution-.5, -1.]]
+        directions = [[0., 0., 1.]]*4 + [[0., 0., -1.]]*4 + [[0., 0., 1.]]
+        ray = rays(mi, np, origins, directions, float(resolution+2))
+        result, error = compare_loss(model, ray, mi, dr, np, f"compact_sparse_{resolution}")
+        maximum = max(maximum, error)
+        np.testing.assert_array_equal(result["hit_count"], [1]*8 + [0])
+        np.testing.assert_array_equal(result["appearance_valid"], [2]*4)
+        colors = checkpoint["model_state"]["radiance_sh"].reshape(-1, 3) * Y00
+        expected = np.vstack((colors*.35 + .65, colors*.35 + .65, np.ones((1, 3))))
+        np.testing.assert_allclose(result["raw_rgb"], expected.T, rtol=3e-5, atol=3e-6,
+                                   err_msg="Spatial lookup changed the original voxel parameter row")
+        maximum = max(maximum, compare(
+            host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., False), dr, np),
+            host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., True), dr, np),
+            np, f"compact_sparse_trace_{resolution}"))
+        empty = restore_model(payload(np, resolution, []), mi)
+        compact_storage(empty, 0)
+        empty_result, error = compare_loss(empty, ray, mi, dr, np, f"compact_empty_{resolution}")
+        maximum = max(maximum, error)
+        np.testing.assert_array_equal(empty_result["hit_count"], 0)
+        np.testing.assert_array_equal(empty_result["raw_rgb"], 1.)
+    first = reports[0]["spatial_index_allocated_bytes"] + reports[0]["octree_allocated_bytes"]
+    last = reports[-1]["spatial_index_allocated_bytes"] + reports[-1]["octree_allocated_bytes"]
+    assert last <= 16*max(first, 1), ("Storage followed grid volume instead of sparse occupancy", reports)
+    return {"check": "compact_sparse_storage_to_1024_preserves_unsorted_rows_and_empty_models",
+            "storage": reports, "max_absolute_error": maximum, "status": "passed"}
+
+
+def check_compact_candidate_lifecycle(mi, dr, np):
+    """Overlay replacement changes only candidate leaves and preserves siblings."""
+    resolution = 64
+    checkpoint = payload(np, resolution, [(0, 0, 40), (63, 63, 63)])
+    model = restore_model(checkpoint, mi)
+    initial_storage = compact_storage(model, 2)
+    ray = rays(mi, np, [[.5, .5, -1.], [.55, .5, -1.], [63.5, 63.5, -1.]],
+               [[0., 0., 1.]], 66.)
+    baseline = host(model.loss_and_grad(*inputs(mi, ray), settings()), dr, np)
+    baseline_trace = host(model.trace(ray, mi.Color3f(1.), 1e-5, 16), dr, np)
+    proposals = state(np, resolution, [(0, 0, 2), (0, 0, 20), (0, 0, 2)], opacity=.25)
+    proposals["radiance_sh"].reshape(-1, 3)[:] = np.asarray(
+        [[.02, .08, .12], [.7, .8, .9], [.45, .1, .6]], np.float32) / Y00
+    maximum = 0.
+
+    def verify(label, expected_observed):
+        nonlocal maximum
+        compact_storage(model, 2 + len(np.unique(proposals["cell_indices"])))
+        result, error = compare_loss(model, ray, mi, dr, np, label, collect_growth_evidence=1.)
+        maximum = max(maximum, error, compare(baseline,
+            {key: value for key, value in result.items() if not key.startswith("growth_")}, np, label+"_real"))
+        maximum = max(maximum, compare(baseline_trace,
+            host(model.trace(ray, mi.Color3f(1.), 1e-5, 16), dr, np), np, label+"_trace"))
+        np.testing.assert_array_equal(result["growth_observed"], expected_observed)
+        np.testing.assert_array_equal(result["growth_unknown"], 0)
+        # An independent actual insertion checks candidate row lookup/order;
+        # equal DDA/octree outputs alone could share the same wrong lookup.
+        expected_gains = []
+        for index in range(len(proposals["cell_indices"])):
+            inserted = copy.deepcopy(checkpoint)
+            for key, value in proposals.items():
+                width = 1 if key == "cell_indices" else len(value)//3
+                inserted["model_state"][key] = np.concatenate((
+                    checkpoint["model_state"][key], value[index*width:(index+1)*width]))
+            inserted_model = restore_model(inserted, mi)
+            inserted_result = host(inserted_model.loss_and_grad(*inputs(mi, ray), settings()), dr, np)
+            expected_gains.append(float(np.sum(baseline["rgb_loss"] - inserted_result["rgb_loss"])))
+        np.testing.assert_allclose(result["growth_gain"], expected_gains, rtol=3e-5, atol=3e-6,
+                                   err_msg=label+"_independent_insertion")
+        return result
+
+    model.set_growth_candidates(device_state(proposals, mi))
+    original = verify("compact_interleaved_siblings", [2, 2, 2])
+    assert int(model.growth_candidate_count) == 3
+    assert abs(float(original["growth_gain"][0]-original["growth_gain"][2])) > 1e-4
+    malformed = copy.deepcopy(proposals)
+    malformed["cell_indices"][1] = checkpoint["model_state"]["cell_indices"][1]
+    revision = int(model.topology_revision)
+    try:
+        model.set_growth_candidates(device_state(malformed, mi))
+    except (RuntimeError, ValueError):
+        pass
+    else:
+        raise AssertionError("Candidate replacement accepted an occupied high-address cell")
+    assert int(model.topology_revision) == revision
+    maximum = max(maximum, compare(original,
+        verify("compact_rejected_replacement_keeps_overlay", [2, 2, 2]), np, "overlay_transaction"))
+    # Same allocation sizes, different empty leaf: old occupancy must disappear.
+    proposals["cell_indices"][1] = 1 + resolution*(1 + resolution*20)
+    model.set_growth_candidates(device_state(proposals, mi))
+    replaced = verify("compact_same_size_replacement", [2, 0, 2])
+    model.clear_growth_candidates()
+    model.clear_growth_candidates()
+    assert int(model.growth_candidate_count) == 0
+    compact_storage(model, 2)
+    maximum = max(maximum, compare(baseline,
+        host(model.loss_and_grad(*inputs(mi, ray), settings()), dr, np), np, "compact_cleared"))
+    # Both installing an overlay again and rebuilding from saved normal buffers
+    # must discard stale candidate links and recover the original row mapping.
+    model.set_growth_candidates(device_state(proposals, mi))
+    maximum = max(maximum, compare(replaced,
+        verify("compact_reinstalled", [2, 0, 2]), np, "same_overlay_reinstalled"))
+    model = restore_model({"model_metadata": checkpoint["model_metadata"],
+                           "model_state": model.snapshot()}, mi)
+    compact_storage(model, 2)
+    assert int(model.growth_candidate_count) == 0
+    maximum = max(maximum, compare(baseline,
+        host(model.loss_and_grad(*inputs(mi, ray), settings()), dr, np), np, "compact_restored"))
+    return {"check": "compact_candidate_siblings_replacement_clear_and_reload",
+            "initial_storage": initial_storage, "max_absolute_error": maximum, "status": "passed"}
+
+
+def check_compact_invalid_cells(mi, dr, np):
+    """Native sparse construction must reject aliased and illegal leaf keys."""
+    rejected = []
+    for resolution, coordinates, cells in (
+        (1, [(0, 0, 0), (0, 0, 0)], [0, 0]),
+        (7, [(6, 6, 6), (0, 0, 0), (3, 2, 1)], [342, 0, 342]),
+        (7, [(6, 6, 6), (0, 0, 0), (3, 2, 1)], [342, 343, 66]),
+        (7, [(6, 6, 6), (0, 0, 0), (3, 2, 1)], [342, 0, 0xffffffff]),
+    ):
+        checkpoint = payload(np, resolution, coordinates)
+        checkpoint["model_state"]["cell_indices"] = np.asarray(cells, np.uint32)
+        try:
+            restore_model(checkpoint, mi)
+        except (RuntimeError, ValueError):
+            rejected.append({"resolution": resolution, "cells": cells})
+        else:
+            raise AssertionError(f"Invalid sparse constructor cell keys accepted: {resolution}, {cells}")
+    # A rejected construction must not poison subsequent valid unsorted keys.
+    valid = payload(np, 7, [(6, 6, 6), (0, 0, 0), (3, 2, 1)])
+    model = restore_model(valid, mi)
+    compact_storage(model, 3)
+    np.testing.assert_array_equal(np.asarray(model.snapshot()["cell_indices"]),
+                                  valid["model_state"]["cell_indices"])
+    return {"check": "native_compact_constructor_rejects_duplicates_and_out_of_range_keys",
+            "rejected": rejected, "status": "passed"}
+
+
 def check_boundaries_and_default(mi, dr, np):
     coordinates = [(0, 0, 2), (0, 0, 5), (0, 0, 7), (3, 3, 3),
                    (4, 3, 3), (4, 4, 3), (4, 4, 4), (3, 4, 4), (3, 3, 4), (7, 7, 7)]
@@ -244,6 +413,7 @@ def check_sparse_random_and_non_power_two(mi, dr, np):
                        for i in cells]
         checkpoint = payload(np, resolution, coordinates)
         model = restore_model(checkpoint, mi)
+        compact_storage(model, len(cells))
         origins = rng.uniform(-.3*resolution, 1.3*resolution, (48, 3))
         directions = rng.uniform(.1*resolution, .9*resolution, (48, 3))-origins
         # Add rays guaranteed to encounter every occupied leaf, in both signs.
@@ -256,8 +426,28 @@ def check_sparse_random_and_non_power_two(mi, dr, np):
         maximum = max(maximum, error)
         assert np.all(result["appearance_valid"] > 0)
         empty = restore_model(payload(np, resolution, []), mi)
+        compact_storage(empty, 0)
         _, error = compare_loss(empty, ray, mi, dr, np, f"empty_resolution_{resolution}")
         maximum = max(maximum, error)
+        if resolution == 1:
+            # Zero parent levels must still support the candidate-only tree's
+            # leaf lookup, including multiple hypotheses for its only cell.
+            proposals = state(np, 1, [(0, 0, 0), (0, 0, 0)], opacity=.25)
+            empty.set_growth_candidates(device_state(proposals, mi))
+            compact_storage(empty, 1)
+            single_ray = rays(mi, np, [[.5, .5, -1.], [.5, .5, 2.]],
+                              [[0., 0., 1.], [0., 0., -1.]], 3.)
+            candidate_result, error = compare_loss(empty, single_ray, mi, dr, np,
+                "single_cell_candidate_only", collect_growth_evidence=1.)
+            maximum = max(maximum, error)
+            np.testing.assert_array_equal(candidate_result["hit_count"], 0)
+            np.testing.assert_array_equal(candidate_result["raw_rgb"], 1.)
+            np.testing.assert_array_equal(candidate_result["growth_observed"], [2, 2])
+            np.testing.assert_array_equal(candidate_result["growth_unknown"], 0)
+            empty.clear_growth_candidates()
+            compact_storage(empty, 0)
+            cleared_trace = host(empty.trace(single_ray, mi.Color3f(1.), 1e-5, 16), dr, np)
+            np.testing.assert_array_equal(cleared_trace["2"], 0)
     return {"check": "sparse_random_single_cell_non_power_two_and_empty_models",
             "max_absolute_error": maximum, "status": "passed"}
 
@@ -754,7 +944,9 @@ def main():
                                                 Path(temporary), {})
         assert int(getattr(mi.VoxelReconstruction, "octree_version", 0)) >= 1, \
             "Rebuild this checkout before running octree regression"
-        for check in (check_boundaries_and_default, check_sparse_random_and_non_power_two,
+        for check in (check_compact_storage_scaling, check_compact_candidate_lifecycle,
+                      check_compact_invalid_cells,
+                      check_boundaries_and_default, check_sparse_random_and_non_power_two,
                       check_long_empty_block_exits,
                       check_far_tangent_reference,
                       check_near_miss, check_growth_and_truncation, check_replay_mutations,

@@ -196,16 +196,14 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::initialize_seeds(
         {"covered_cells", s.coveredCells}, {"max_covered_cells", s.maxCoveredCells}};
 
     const size_t n = m_active_count;
-    const uint32_t resolution = m_resolution, sh_count = m_sh_count,
+    const uint32_t sh_count = m_sh_count,
                    opacity_sh_count = m_opacity_sh_count;
-    std::vector<int32_t> index(size_t(resolution) * resolution * resolution, -1);
     std::vector<uint32_t> cells(n);
     std::vector<float> centers(n * 3), scales(n * 3), rotations(n * 4),
         radiance(n * sh_count * 3, 0.f), opacity(n * opacity_sh_count, 0.f);
     constexpr float y00 = 0.28209479177387814f;
     for (size_t i = 0; i < n; ++i) {
         const auto &seed = loaded.seeds[i];
-        index.at(seed.voxelIndex) = (int32_t) i;
         cells[i] = seed.voxelIndex;
         for (size_t a = 0; a < 3; ++a) {
             centers[i * 3 + a] = seed.center[a];
@@ -215,7 +213,6 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::initialize_seeds(
         for (size_t a = 0; a < 4; ++a)
             rotations[i * 4 + a] = seed.rotation[a];
     }
-    m_index = dr::load<IntBuffer>(index.data(), index.size());
     m_cells = dr::load<UIntBuffer>(cells.data(), cells.size());
     m_centers = dr::load<FloatBuffer>(centers.data(), centers.size());
     m_log_scales = dr::load<FloatBuffer>(scales.data(), scales.size());
@@ -247,103 +244,38 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
             Throw("VoxelReconstruction.from_state(): missing %s.", key);
     if (!m_active_count) {
         m_cells = dr::zeros<UIntBuffer>(0);
-        m_index = dr::zeros<IntBuffer>(0);
         set_parameters(parameters);
         m_statistics = {{"restored_voxels", 0}};
         rebuild_octree();
         return;
     }
-    const size_t total = size_t(resolution) * resolution * resolution;
-    // Build occupancy in place on its backend. Atomic max resolves duplicate
-    // writers deterministically; gathering back each assigned row identifies
-    // every duplicate without allocating or reading a CPU dense grid.
-    UIntBuffer rows = dr::arange<UIntBuffer>(m_active_count);
-    auto in_bounds = cells < uint32_t(total);
-    m_index = dr::full<IntBuffer>(-1, total);
-    dr::scatter_reduce(ReduceOp::Max, m_index, IntBuffer(rows), cells, in_bounds);
-    auto valid = in_bounds & (dr::gather<IntBuffer>(m_index, cells, in_bounds) == IntBuffer(rows));
-    if (!dr::slice(dr::all(valid)))
-        Throw("VoxelReconstruction.from_state(): cell indices must be unique and in bounds.");
     m_cells = dr::detach(cells);
     set_parameters(parameters);
     m_statistics = {{"restored_voxels", m_active_count}};
     rebuild_octree();
 }
 
-MI_VARIANT void VoxelReconstruction<Float, Spectrum>::mark_octree(
-    const UIntBuffer &cells, uint32_t bit_offset) {
-    if (!cells.size() || !m_octree_levels)
-        return;
-    if (m_octree.size() != m_octree_nodes)
-        m_octree = dr::zeros<UIntBuffer>(m_octree_nodes);
-    UIntBuffer x = cells % m_resolution,
-               y = (cells / m_resolution) % m_resolution,
-               z = cells / (m_resolution * m_resolution);
-    for (uint32_t level = 0; level < m_octree_levels; ++level) {
-        uint32_t side = m_octree_resolution >> (level + 1);
-        UIntBuffer px = x >> (level + 1), py = y >> (level + 1),
-                   pz = z >> (level + 1);
-        UIntBuffer address = m_octree_offsets[level] + (pz * side + py) * side + px;
-        UIntBuffer child = ((x >> level) & 1u) |
-                           (((y >> level) & 1u) << 1) |
-                           (((z >> level) & 1u) << 2);
-        dr::scatter_reduce(ReduceOp::Or, m_octree,
-                           UIntBuffer(1u) << (child + bit_offset), address);
-    }
-    // Materialize once outside ray traversal/replay, without a CPU readback.
-    dr::eval(m_octree);
-    m_statistics["octree_allocated_bytes"] = uint64_t(m_octree.size()) * sizeof(uint32_t);
-}
-
-MI_VARIANT void VoxelReconstruction<Float, Spectrum>::refresh_octree_skips() {
-    if (!m_octree_levels || m_octree.size() != m_octree_nodes)
-        return;
-    // Propagate the largest empty ancestor top-down. Traversal needs only one
-    // lookup in the finest parent level, rather than an ascent for every ray.
-    for (uint32_t level = m_octree_levels; level-- > 0;) {
-        uint32_t side = m_octree_resolution >> (level + 1);
-        UIntBuffer index = dr::arange<UIntBuffer>(side * side * side);
-        UIntBuffer address = index + m_octree_offsets[level];
-        UIntBuffer bits = dr::gather<UIntBuffer>(m_octree, address) & 0xffffu;
-        UIntBuffer parent_normal(0), parent_union(0);
-        if (level + 1 < m_octree_levels) {
-            UIntBuffer x = index % side, y = (index / side) % side,
-                       z = index / (side * side);
-            uint32_t parent_side = side >> 1;
-            UIntBuffer parent_address = m_octree_offsets[level + 1] +
-                (((z >> 1) * parent_side + (y >> 1)) * parent_side + (x >> 1));
-            UIntBuffer parent = dr::gather<UIntBuffer>(m_octree, parent_address);
-            parent_normal = (parent >> 16) & 0xfu;
-            parent_union = (parent >> 20) & 0xfu;
-        }
-        UIntBuffer normal = dr::select((bits & 0xffu) == 0u,
-                                      dr::maximum(parent_normal, level + 1), 0u);
-        UIntBuffer combined = dr::select(bits == 0u,
-                                        dr::maximum(parent_union, level + 1), 0u);
-        dr::scatter(m_octree, bits | (normal << 16) | (combined << 20), address);
-        dr::eval(m_octree);
-    }
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::update_spatial_statistics() {
+    const uint64_t leaf_bytes = uint64_t(m_tree.leaf_ids.size() +
+                                        m_growth_tree.leaf_ids.size()) * sizeof(int32_t);
+    m_statistics["spatial_index_entries"] = uint64_t(m_tree.leaf_count) + m_growth_tree.leaf_count;
+    m_statistics["spatial_index_allocated_bytes"] = leaf_bytes;
+    m_statistics["octree_levels"] = m_tree.depth;
+    m_statistics["octree_padded_resolution"] = m_tree.padded_resolution;
+    m_statistics["octree_parent_nodes"] = uint64_t(m_tree.node_count) + m_growth_tree.node_count;
+    m_statistics["octree_allocated_bytes"] = m_tree.allocated_bytes() +
+                                             m_growth_tree.allocated_bytes() - leaf_bytes;
+    m_statistics["octree_normal_parent_nodes"] = m_tree.node_count;
+    m_statistics["octree_candidate_parent_nodes"] = m_growth_tree.node_count;
 }
 
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::rebuild_octree() {
-    m_octree_resolution = 1;
-    m_octree_levels = m_octree_nodes = 0;
-    while (m_octree_resolution < m_resolution)
-        m_octree_resolution <<= 1;
-    for (uint32_t side = m_octree_resolution >> 1; side; side >>= 1) {
-        m_octree_offsets[m_octree_levels++] = m_octree_nodes;
-        m_octree_nodes += side * side * side;
-    }
-    // Empty models keep a nonempty replay-compatible placeholder. Allocate the
-    // real hierarchy lazily if hypothetical candidates are subsequently added.
-    m_octree = dr::zeros<UIntBuffer>(m_active_count && m_octree_nodes ? m_octree_nodes : 1);
-    mark_octree(m_cells, 0);
-    refresh_octree_skips();
+    // Payload rows preserve parameter/Adam order, irrespective of Morton order.
+    // Validation and sorting only touch occupied leaves, never resolution^3.
+    m_tree.build(m_cells, IntBuffer(dr::arange<UIntBuffer>(m_active_count)), m_resolution);
+    m_growth_tree.clear(m_resolution);
+    update_spatial_statistics();
     ++m_topology_revision;
-    m_statistics["octree_levels"] = m_octree_levels;
-    m_statistics["octree_padded_resolution"] = m_octree_resolution;
-    m_statistics["octree_parent_nodes"] = m_octree_nodes;
-    m_statistics["octree_allocated_bytes"] = uint64_t(m_octree.size()) * sizeof(uint32_t);
 }
 
 MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Vector3f
@@ -364,16 +296,7 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::skip_empty_block(
     Vector3i &cell, Vector3f &next, Float &entry, UInt32 &iterations,
     const Vector3i &step, const Vector3f &step_t, const Point3f &origin,
     const Vector3f &inv_d, const Float &exit,
-    Mask active, bool include_growth, UInt32 &queries, bool profile) const {
-    if (!m_octree_levels)
-        return;
-    uint32_t side = m_octree_resolution >> 1;
-    UInt32 address = ((UInt32(cell.z()) >> 1) * side + (UInt32(cell.y()) >> 1)) *
-                    side + (UInt32(cell.x()) >> 1);
-    UInt32 node = dr::gather<UInt32>(m_octree, address, active);
-    UInt32 log_size = (node >> (include_growth ? 20 : 16)) & 0xfu;
-    if (profile)
-        queries += dr::select(active, 1u, 0u);
+    Mask active, const UInt32 &log_size) const {
     Mask skippable = active & (log_size > 0u);
     dr::tie(cell, next, entry, iterations) = dr::if_stmt(
         dr::make_tuple(cell, next, entry, iterations), skippable,
@@ -999,10 +922,8 @@ VoxelReconstruction<Float, Spectrum>::optimizer_update_scope_begin(
 
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::clear_growth_candidates() {
     if (m_growth_count) {
-        dr::scatter(m_index, dr::full<IntBuffer>(-1, m_growth_cells.size()), m_growth_cells);
-        m_octree &= 0xffu;
-        dr::eval(m_octree);
-        refresh_octree_skips();
+        m_growth_tree.clear(m_resolution);
+        update_spatial_statistics();
         ++m_topology_revision;
     }
     m_growth_count = 0;
@@ -1040,7 +961,13 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_growth_candidates(
     if (count && !dr::slice(dr::all(cells < uint32_t(total))))
         Throw("VoxelReconstruction.set_growth_candidates(): cells must be in bounds.");
     if (count && m_active_count) {
-        auto occupied = dr::gather<IntBuffer>(m_index, cells) >= 0;
+        UIntBuffer node(m_tree.root), level(m_tree.depth);
+        dr::uint64_array_t<UIntBuffer> anchor(0);
+        auto [ids, unused_skip] = m_tree.template lookup<UIntBuffer, IntBuffer>(
+            IntBuffer(cells % m_resolution), IntBuffer((cells / m_resolution) % m_resolution),
+            IntBuffer(cells / (m_resolution * m_resolution)), node, level, anchor,
+            dr::mask_t<UIntBuffer>(true));
+        auto occupied = ids >= 0;
         if (dr::slice(dr::any(occupied)))
             Throw("VoxelReconstruction.set_growth_candidates(): target cells must be empty.");
     }
@@ -1069,11 +996,14 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_growth_candidates(
                                following_row, UINT32_MAX), order);
         dr::eval(new_cells, new_heads, new_next);
     }
+    // Construct the replacement before mutating the installed overlay. A
+    // failed transaction must leave both the old candidates and replay intact.
+    SpatialTree new_tree;
+    if (count)
+        new_tree.build(new_cells, -2 - IntBuffer(new_heads), m_resolution);
     clear_growth_candidates();
     if (!count)
         return;
-    if (count && !m_index.size())
-        m_index = dr::full<IntBuffer>(-1, total);
     m_growth_cells = std::move(new_cells);
     m_growth_next = std::move(new_next);
     m_growth_centers = dr::detach(parameters.at("centers"));
@@ -1082,9 +1012,8 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_growth_candidates(
     m_growth_radiance = dr::detach(parameters.at("radiance_sh"));
     m_growth_opacity = dr::detach(parameters.at("opacity_sh"));
     m_growth_count = uint32_t(count);
-    dr::scatter(m_index, -2 - IntBuffer(new_heads), m_growth_cells);
-    mark_octree(m_growth_cells, 8);
-    refresh_octree_skips();
+    m_growth_tree = std::move(new_tree);
+    update_spatial_statistics();
     ++m_topology_revision;
 }
 
@@ -1175,26 +1104,29 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
         Vector3f next;
         Float entry, transmittance;
         Color3f color;
-        UInt32 hits, iterations;
-        DRJIT_STRUCT(LoopState, active, cell, next, entry, transmittance, color, hits, iterations)
-    } ls{active, cell, next, entry, Float(1.f), Color3f(0.f), UInt32(0), UInt32(0)};
+        UInt32 hits, iterations, tree_node, tree_level;
+        SpatialAnchor tree_anchor;
+        DRJIT_STRUCT(LoopState, active, cell, next, entry, transmittance, color, hits, iterations,
+                     tree_node, tree_level, tree_anchor)
+    } ls{active, cell, next, entry, Float(1.f), Color3f(0.f), UInt32(0), UInt32(0),
+         UInt32(m_tree.root), UInt32(m_tree.depth), SpatialAnchor(0)};
 
     dr::tie(ls) = dr::while_loop(dr::make_tuple(ls),
         [](const LoopState &s) { return s.active; },
         [&](LoopState &s) {
-            UInt32 spatial = UInt32((s.cell.z() * int(m_resolution) + s.cell.y()) * int(m_resolution) + s.cell.x());
-            Int32 id_signed = dr::gather<Int32>(m_index, spatial, s.active);
+            auto [id_signed, empty_log] = m_tree.template lookup<UInt32, Int32>(
+                s.cell.x(), s.cell.y(), s.cell.z(), s.tree_node, s.tree_level, s.tree_anchor, s.active);
             Mask occupied = s.active & (id_signed >= 0);
             UInt32 id = UInt32(dr::maximum(id_signed, 0));
             if (use_octree) {
                 Mask empty = s.active & !occupied;
-                s = dr::if_stmt(dr::make_tuple(s, empty), empty,
-                    [this, step, step_t, origin = ray.o, inv_d, exit](LoopState s, const Mask &empty) {
-                        UInt32 queries(0);
+                s = dr::if_stmt(dr::make_tuple(s, empty, empty_log), empty,
+                    [this, step, step_t, origin = ray.o, inv_d, exit](
+                        LoopState s, const Mask &empty, const UInt32 &empty_log) {
                         skip_empty_block(s.cell, s.next, s.entry, s.iterations,
-                                         step, step_t, origin, inv_d, exit, empty, false, queries, false);
+                                         step, step_t, origin, inv_d, exit, empty, empty_log);
                         return s;
-                    }, [](LoopState s, const Mask &) { return s; },
+                    }, [](LoopState s, const Mask &, const UInt32 &) { return s; },
                     "Voxel reconstruction octree trace skip");
             }
             Float end = dr::minimum(dr::minimum(s.next.x(), dr::minimum(s.next.y(), s.next.z())), exit);
@@ -1531,21 +1463,36 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         Color3f color;
         UInt32 hits,candidates,iterations,growth_hits;
         UInt32 traversal_steps, traversal_skipped, traversal_leaves, traversal_queries;
+        UInt32 tree_node, tree_level, growth_node, growth_level;
+        SpatialAnchor tree_anchor, growth_anchor;
         Float distortion_mass, distortion_moment, distortion;
         DRJIT_STRUCT(State,active,cell,next,entry,transmittance,color,hits,candidates,
                      iterations,growth_hits,traversal_steps,traversal_skipped,
-                     traversal_leaves,traversal_queries,distortion_mass,distortion_moment,distortion)
+                     traversal_leaves,traversal_queries,tree_node,tree_level,growth_node,growth_level,
+                     tree_anchor,growth_anchor,distortion_mass,distortion_moment,distortion)
     } state{active,cell,next,entry,Float(1.f),Color3f(0.f),UInt32(0),UInt32(0),
             UInt32(0),UInt32(0),UInt32(0),UInt32(0),UInt32(0),UInt32(0),
+            UInt32(m_tree.root),UInt32(m_tree.depth),UInt32(m_growth_tree.root),UInt32(m_growth_tree.depth),
+            SpatialAnchor(0),SpatialAnchor(0),
             Float(0.f),Float(0.f),Float(0.f)};
     const float diagonal=std::sqrt(dr::square(m_max[0]-m_min[0])+dr::square(m_max[1]-m_min[1])+dr::square(m_max[2]-m_min[2]));
     dr::tie(state,records)=dr::while_loop(dr::make_tuple(state,records),
         [](const State &s,const Records &) {return s.active;},
         [&](State &s,Records &r) {
             UInt32 spatial=UInt32((s.cell.z()*int(m_resolution)+s.cell.y())*int(m_resolution)+s.cell.x());
-            Int32 signed_id=dr::gather<Int32>(m_index,spatial,s.active);
+            auto [signed_id, empty_log] = m_tree.template lookup<UInt32, Int32>(
+                s.cell.x(), s.cell.y(), s.cell.z(), s.tree_node, s.tree_level, s.tree_anchor, s.active);
             Mask occupied=s.active & (signed_id>=0);
             UInt32 id=UInt32(dr::maximum(signed_id,0));
+            if (collect_growth && m_growth_count) {
+                auto [proposal_id, proposal_log] = m_growth_tree.template lookup<UInt32, Int32>(
+                    s.cell.x(), s.cell.y(), s.cell.z(), s.growth_node, s.growth_level,
+                    s.growth_anchor, s.active & !occupied);
+                signed_id = dr::select(occupied, signed_id, proposal_id);
+                // Aligned octree blocks containing the same cell are nested.
+                // Their smaller empty block is empty in the union as well.
+                empty_log = dr::minimum(empty_log, proposal_log);
+            }
             Mask visit = occupied | (collect_growth && m_growth_count ?
                          s.active & (signed_id <= -2) : Mask(false));
             if (profile_traversal) {
@@ -1554,17 +1501,18 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             }
             if (use_octree) {
                 Mask empty = s.active & !visit;
-                s = dr::if_stmt(dr::make_tuple(s, empty), empty,
-                    [this, step, step_t, origin = ray.o, inv_d, exit, collect_growth, profile_traversal](
-                        State s, const Mask &empty) {
+                s = dr::if_stmt(dr::make_tuple(s, empty, empty_log), empty,
+                    [this, step, step_t, origin = ray.o, inv_d, exit, profile_traversal](
+                        State s, const Mask &empty, const UInt32 &empty_log) {
                         UInt32 before = s.iterations;
                         skip_empty_block(s.cell, s.next, s.entry, s.iterations,
-                            step, step_t, origin, inv_d, exit, empty, collect_growth,
-                            s.traversal_queries, profile_traversal);
-                        if (profile_traversal)
+                            step, step_t, origin, inv_d, exit, empty, empty_log);
+                        if (profile_traversal) {
+                            s.traversal_queries += dr::select(empty, 1u, 0u);
                             s.traversal_skipped += s.iterations - before;
+                        }
                         return s;
-                    }, [](State s, const Mask &) { return s; },
+                    }, [](State s, const Mask &, const UInt32 &) { return s; },
                     "Voxel reconstruction octree training skip");
             }
             Float end=dr::maximum(s.entry,dr::minimum(dr::minimum(s.next.x(),dr::minimum(s.next.y(),s.next.z())),exit));
@@ -1834,7 +1782,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             Mask stored = k<state.growth_hits;
             UInt32 slot = k*ray_count+lane;
             UInt32 spatial = dr::gather<UInt32>(records.growth_ids,slot,stored);
-            Int32 head = dr::gather<Int32>(m_index,spatial,stored);
+            UInt32 node(m_growth_tree.root), level(m_growth_tree.depth);
+            SpatialAnchor anchor(0);
+            auto [head, unused_skip] = m_growth_tree.template lookup<UInt32, Int32>(
+                Int32(spatial % m_resolution), Int32((spatial / m_resolution) % m_resolution),
+                Int32(spatial / (m_resolution * m_resolution)), node, level, anchor, stored);
             UInt32 id = dr::select(stored,UInt32(-head-2),UInt32(UINT32_MAX));
             Vector3i cell;
             cell.x() = Int32(spatial%m_resolution);
