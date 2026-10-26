@@ -125,14 +125,29 @@ def _rgb_batches(context, collective, mi, dr, np):
                      distortion_loss_sum=mi.Float(.125 if active else 0))
         local_loss = value["rgb_loss_sum"] + value["distortion_loss_sum"]
         reference, loss, finite, _, _ = collective.reduce_view(value, local_loss, mi.Bool(True))
-        for mode in ("auto", "dense"):
+        for mode, compact_output in (("auto", False), ("auto", True), ("dense", True)):
             actual, actual_loss, actual_finite = collective.reduce_batch(
-                value, local_loss, mi.Bool(True), rgb_only=True, mode=mode)
-            for key in GRADIENT_KEYS:
-                np.testing.assert_allclose(np.asarray(actual["gradients"][key]),
-                                           np.asarray(reference["gradients"][key]), rtol=2e-6, atol=2e-7)
+                value, local_loss, mi.Bool(True), rgb_only=True, mode=mode, compact_output=compact_output)
+            ids = np.asarray(actual["voxel_ids"]) if "voxel_ids" in actual else None
+            if ids is not None:
+                assert compact_output and mode == "auto"
+                assert np.all(ids < count) and np.all(ids[1:] > ids[:-1])
+            for key, dimension in zip(GRADIENT_KEYS, (27, 1, 3, 3, 3)):
+                actual_values = np.asarray(actual["gradients"][key])
+                if ids is not None:
+                    # Expand only in this numerical oracle, never in training.
+                    expanded = np.zeros((count, dimension), np.float32)
+                    expanded[ids] = actual_values.reshape(len(ids), dimension)
+                    actual_values = expanded.reshape(-1)
+                np.testing.assert_allclose(actual_values, np.asarray(reference["gradients"][key]),
+                                           rtol=2e-6, atol=2e-7)
             for key in SUM_COUNTER_KEYS + MAX_COUNTER_KEYS:
-                np.testing.assert_array_equal(np.asarray(actual[key]), np.asarray(reference[key]))
+                actual_values = np.asarray(actual[key])
+                if ids is not None:
+                    expanded = np.zeros(count, np.uint32)
+                    expanded[ids] = actual_values
+                    actual_values = expanded
+                np.testing.assert_array_equal(actual_values, np.asarray(reference[key]))
             for key in ("rgb_loss_sum", "distortion_loss_sum"):
                 np.testing.assert_allclose(np.asarray(actual[key]), np.asarray(reference[key]), rtol=2e-6)
             np.testing.assert_allclose(np.asarray(actual_loss), np.asarray(loss), rtol=2e-6)
@@ -152,7 +167,7 @@ def _rgb_batches(context, collective, mi, dr, np):
                 value["background_evidence"] = dr.full(mi.UInt32, 1, width)
         for mode in ("auto", "dense"):
             reduced, loss, finite = collective.reduce_batch(value, mi.Float(2.), local_finite,
-                                                            rgb_only=True, mode=mode)
+                                                            rgb_only=True, mode=mode, compact_output=True)
             # A JIT consumer reads the external NCCL result before any host
             # conversion; one bad peer rejects the complete batch on all ranks.
             accepted = finite & dr.all(dr.isfinite(reduced["gradients"]["opacity_sh"]))
@@ -161,7 +176,7 @@ def _rgb_batches(context, collective, mi, dr, np):
             np.testing.assert_array_equal(np.asarray(marker), [-1.])
     return {"rgb_batches": "passed", "checks": ["compact_vs_dense", "dense_union_fallback",
         "tail_idle_rank", "empty_topology", "valid_zero_rows", "unexpected_nonzero_invalid_rows",
-        "loss_components", "async_consumer_ordering", "peer_nonfinite_guard", "legacy_evidence_guard"]}
+        "loss_components", "direct_compact_output", "async_consumer_ordering", "peer_nonfinite_guard", "legacy_evidence_guard"]}
 
 
 def _large_dense_batches(context, collective, mi, dr, np):
@@ -328,6 +343,13 @@ def _continuous_rgb_native(context, collective, directory, mi, dr, np):
     config.gradient.distortion_loss_weight = .1
     payload["model_metadata"]["opacity_sh_count"] = 1
     payload["model_state"]["opacity_sh"] = payload["model_state"]["opacity_sh"][:1].copy()
+    # Preserve the original visible cell and its world-space size, then add
+    # off-camera cells. A one-voxel fixture always chooses dense fallback and
+    # would never exercise direct compact NCCL output followed by native Adam.
+    payload["model_metadata"].update(resolution=8, grid_max=[8., 8., 8.])
+    cells = np.array([0] + [63 + 64 * z for z in range(8)], np.uint32)
+    for name, value in tuple(payload["model_state"].items()):
+        payload["model_state"][name] = cells if name == "cell_indices" else np.tile(value, len(cells))
     # Keep the generated geometry near its initial shape over this long test;
     # the test targets ordering/transport, not convergence or topology changes.
     for name in ("lr_radiance", "lr_opacity", "lr_center", "lr_log_scale", "lr_rotation"):
@@ -345,6 +367,7 @@ def _continuous_rgb_native(context, collective, directory, mi, dr, np):
         replay = NativeLossReplay(dr)
         sampler, rng = UniformSampler(np), np.random.default_rng(9100 + context.rank)
         checks = DeferredViewChecks(mi, dr, np)
+        direct_batches = 0
         for step in range(batch_count):
             # Repeated partial batches exercise idle ranks and both exact Adam
             # normalization factors, including switching back to full batches.
@@ -366,7 +389,8 @@ def _continuous_rgb_native(context, collective, directory, mi, dr, np):
                 reduced, loss, finite, _, _ = collective.reduce_view(accumulator, loss, finite)
             else:
                 reduced, loss, finite = collective.reduce_batch(
-                    accumulator, loss, finite, rgb_only=True, mode=mode)
+                    accumulator, loss, finite, rgb_only=True, mode=mode, compact_output=True)
+                direct_batches += int("voxel_ids" in reduced)
             finite = _finite_accumulator(reduced, loss, finite, dr)
             divisor = actual_views * ray_count
             checks.add(step, dr.concat([loss / divisor, mi.Float(finite),
@@ -386,6 +410,8 @@ def _continuous_rgb_native(context, collective, directory, mi, dr, np):
         assert optimizer.statistics()["calls"] == batch_count
         assert optimizer.statistics()["replays"] > 0
         assert replay.statistics()["replays"] > 0
+        if mode == "auto" and context.world_size > 1:
+            assert direct_batches == batch_count, "Continuous test did not exercise direct compact Adam"
         assert any(np.any(group["steps"] > 1) for group in state.values()), "No actual Adam updates occurred"
         for name, value in parameters.items():
             assert np.isfinite(value).all(), f"{mode}: nonfinite final parameter {name}"
@@ -432,6 +458,7 @@ def _continuous_rgb_native(context, collective, directory, mi, dr, np):
             "views_per_mode": expected_views, "modes": ["legacy", "dense", "auto"],
             "max_parameter_absolute_error": maximum_parameter_error,
             "checks": ["no_per_batch_numpy_readback", "native_replay_to_nccl_to_frozen_adam",
+                       "direct_compact_to_adam",
                        "repeated_idle_tail_ranks", "deferred_finite_guard", "legacy_synchronized_parity",
                        "Adam_parameters_moments_and_clocks", "replica_bit_equality"]}
 

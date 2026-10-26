@@ -177,8 +177,8 @@ def _fake_epoch(losses=(1., 3., 9.), *, gradient_nan=False, sync=False, rank=0):
         def statistics(self):
             return dict(calls=0, payload_bytes=0, seconds=0.)
 
-        def reduce_batch(self, accumulator, loss, finite, *, rgb_only=False, mode="auto"):
-            assert rgb_only and mode in ("auto", "dense")
+        def reduce_batch(self, accumulator, loss, finite, *, rgb_only=False, mode="auto", compact_output=False):
+            assert rgb_only and mode in ("auto", "dense") and compact_output
             self.indices = list(range(self.batch_index * 2, min(self.batch_index * 2 + 2, 3)))
             self.sources = {source: partial(index) for source, index in enumerate(self.indices)}
             neutral = zero_view_partial(model, mi, dr)

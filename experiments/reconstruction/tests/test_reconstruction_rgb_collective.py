@@ -161,6 +161,29 @@ def expected(peers):
 def compare(test, output, oracle):
     result, loss, finite = output
     truth, true_loss, true_finite = oracle
+    if "voxel_ids" in result:
+        # Expansion is an oracle-only operation. Production Adam must consume
+        # exactly these K rows and must never reconstruct this full table.
+        ids = np.asarray(result["voxel_ids"])
+        count = len(truth["appearance_valid"])
+        test.assertTrue(np.all(ids < count))
+        test.assertTrue(np.all(ids[1:] > ids[:-1]))
+        expanded = dict(result)
+        expanded["gradients"] = {}
+        for key in GRADIENT_KEYS:
+            dimension = len(truth["gradients"][key]) // count
+            values = np.asarray(result["gradients"][key])
+            test.assertEqual(values.size, ids.size * dimension)
+            table = np.zeros((count, dimension), np.float32)
+            table[ids] = values.reshape(len(ids), dimension)
+            expanded["gradients"][key] = table.reshape(-1)
+        for key in SUM_COUNTER_KEYS + MAX_COUNTER_KEYS:
+            values = np.asarray(result[key])
+            test.assertEqual(values.size, ids.size)
+            table = np.zeros(count, np.uint32)
+            table[ids] = values
+            expanded[key] = table
+        result = expanded
     for key in GRADIENT_KEYS:
         np.testing.assert_allclose(np.asarray(result["gradients"][key]), truth["gradients"][key],
                                    atol=0., rtol=0., equal_nan=True)
@@ -171,6 +194,50 @@ def compare(test, output, oracle):
 
 
 class CpuTests(unittest.TestCase):
+    def test_compact_output_keeps_ids_counts_and_gradient_rows(self):
+        class NoGradientExpansionDr(ArrayDr):
+            @staticmethod
+            def zeros(array_type, size):
+                assert array_type is not _float or size == 0, "Direct output allocated a zeroed gradient table"
+                return ArrayDr.zeros(array_type, size)
+
+        for count, dense, invalid, nan, empty_union in (
+                (32, False, False, False, False), (32, True, False, False, False),
+                (32, False, True, False, False), (32, False, False, True, False),
+                (32, False, False, False, True), (0, False, False, False, False)):
+            peers = inputs(count, dense=dense, invalid=invalid, nan=nan)
+            if empty_union:
+                for peer in peers:
+                    for gradient in peer["gradients"].values():
+                        gradient.fill(0)
+                    for key in SUM_COUNTER_KEYS + MAX_COUNTER_KEYS:
+                        peer[key].fill(0)
+            for mode in ("auto", "dense"):
+                stages, ids, sparse = packets(peers, mode)
+                for rank in range(len(peers)):
+                    with self.subTest(count=count, dense=dense, invalid=invalid,
+                                      nan=nan, empty_union=empty_union, mode=mode, rank=rank):
+                        collective = _fixture(len(peers))
+                        collective.rank, collective.dr = rank, NoGradientExpansionDr()
+                        collective._lib = PeerLibrary(stages, rank)
+                        local = peers[rank]
+                        result = collective.reduce_batch(local, local["loss_sum"], local["finite"],
+                            rgb_only=True, mode=mode, compact_output=True)
+                        compare(self, result, expected(peers))
+                        stats = collective.statistics()
+                        self.assertEqual("voxel_ids" in result[0], sparse)
+                        self.assertEqual(stats["rgb_last_output_layout"], "compact" if sparse else "dense")
+                        self.assertEqual(stats.get("compact_direct_batches", 0), int(sparse))
+                        avoided = sum(value.size for value in local["gradients"].values()) * 4
+                        self.assertEqual(stats.get("expanded_gradient_bytes_avoided", 0), avoided if sparse else 0)
+                        if sparse:
+                            np.testing.assert_array_equal(result[0]["voxel_ids"], ids)
+                            if not empty_union:
+                                self.assertIn(11, ids)  # Valid zero-gradient row.
+                                self.assertIn(13, ids)  # Invalid nonzero row is guarded, not discarded.
+                                if nan:
+                                    self.assertIn(2, ids)  # NaN must survive support selection.
+
     def test_dense_completes_external_writes_before_consumption(self):
         peers = inputs()
         stages, _, _ = packets(peers, "dense")
@@ -317,7 +384,7 @@ class CpuTests(unittest.TestCase):
         self.assertNotIn("rgb_count_readbacks", collective.statistics())
 
 
-def cuda_reduction(peers, mode, rank=0, *, check_inputs=True):
+def cuda_reduction(peers, mode, rank=0, *, check_inputs=True, compact_output=False):
     stages, ids, sparse = packets(peers, mode)
     collective = _fixture(len(peers))
     collective.mi, collective.dr, collective.rank = mi, dr, rank
@@ -350,7 +417,7 @@ def cuda_reduction(peers, mode, rank=0, *, check_inputs=True):
              for key, value in peers[rank].items() if key != "gradients"}
     local["gradients"] = {key: mi.Float(value) for key, value in peers[rank]["gradients"].items()}
     result = collective.reduce_batch(local, local["loss_sum"], mi.Bool(local["finite"] != 0),
-                                     rgb_only=True, mode=mode)
+                                     rgb_only=True, mode=mode, compact_output=compact_output)
     return result, collective.statistics()
 
 
@@ -364,6 +431,18 @@ class CudaTests(unittest.TestCase):
                     result, stats = cuda_reduction(peers, mode, rank)
                     compare(self, result, expected(peers))
                     self.assertEqual(stats["rgb_last_mode"], "compact" if sparse else "dense")
+
+    def test_cuda_direct_compact_output(self):
+        for count, dense in ((32, False), (32, True), (0, False)):
+            peers = inputs(count, dense=dense)
+            for mode in ("auto", "dense"):
+                stages, ids, sparse = packets(peers, mode)
+                for rank in range(3):
+                    result, stats = cuda_reduction(peers, mode, rank, compact_output=True)
+                    compare(self, result, expected(peers))
+                    self.assertEqual("voxel_ids" in result[0], sparse)
+                    if sparse:
+                        np.testing.assert_array_equal(np.asarray(result[0]["voxel_ids"]), ids)
 
     def test_compact_and_dense_consumed_by_adam_match_oracle_full_and_tail(self):
         from reconstruction_common import restore_model
@@ -397,9 +476,10 @@ class CudaTests(unittest.TestCase):
                          if key not in ("gradients", "rgb_loss_sum", "distortion_loss_sum")}
             reference["gradients"] = {key: mi.Float(value) for key, value in oracle["gradients"].items()}
             for index, mode in enumerate(("auto", "dense")):
-                (reduced, _, finite), stats = cuda_reduction(peers, mode, check_inputs=False)
+                (reduced, _, finite), stats = cuda_reduction(peers, mode, check_inputs=False, compact_output=True)
                 # Submit Adam directly, before converting any reduced output to
-                # host. This exercises lazy scatter output and replay consumers.
+                # host. Auto retains the compact representation through Adam.
+                self.assertEqual("voxel_ids" in reduced, mode == "auto")
                 optimizers[index].step(models[index], reduced, sample_count=actual_views,
                                        epoch=35, update_allowed=finite)
             optimizers[2].step(models[2], reference, sample_count=actual_views,

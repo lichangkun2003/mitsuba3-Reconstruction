@@ -575,6 +575,38 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device(
     const std::map<std::string, UIntBuffer *> &steps,
     const std::map<std::string, double> &settings, const Mask &allowed,
     bool check_moments) {
+    return optimizer_step_device_impl(gradients, appearance_valid, geometry_valid,
+        background_carve_valid, means, squared_means, steps, settings, allowed,
+        check_moments, nullptr, nullptr);
+}
+
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
+VoxelReconstruction<Float, Spectrum>::optimizer_step_compact_device(
+    const UIntBuffer &indices, const UInt32 &row_count,
+    const std::map<std::string, FloatBuffer> &gradients,
+    const UIntBuffer &appearance_valid, const UIntBuffer &geometry_valid,
+    const UIntBuffer &background_carve_valid,
+    const std::map<std::string, FloatBuffer *> &means,
+    const std::map<std::string, FloatBuffer *> &squared_means,
+    const std::map<std::string, UIntBuffer *> &steps,
+    const std::map<std::string, double> &settings, const Mask &allowed,
+    bool check_moments) {
+    return optimizer_step_device_impl(gradients, appearance_valid, geometry_valid,
+        background_carve_valid, means, squared_means, steps, settings, allowed,
+        check_moments, &indices, &row_count);
+}
+
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
+VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
+    const std::map<std::string, FloatBuffer> &gradients,
+    const UIntBuffer &appearance_valid, const UIntBuffer &geometry_valid,
+    const UIntBuffer &background_carve_valid,
+    const std::map<std::string, FloatBuffer *> &means,
+    const std::map<std::string, FloatBuffer *> &squared_means,
+    const std::map<std::string, UIntBuffer *> &steps,
+    const std::map<std::string, double> &settings, const Mask &allowed,
+    bool check_moments, const UIntBuffer *compact_indices,
+    const UInt32 *compact_count) {
     if constexpr (!dr::is_jit_v<Float>) {
         Throw("VoxelReconstruction.optimizer_step_device(): requires a JIT variant.");
     } else {
@@ -614,8 +646,10 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device(
             {"rotation_tangent", 3, true, &m_rotations,
                 setting("lr_rotation"), rotation_limit}
         }};
-        if (dr::width(allowed) != 1 || appearance_valid.size() != m_active_count ||
-            geometry_valid.size() != m_active_count || background_carve_valid.size() != m_active_count)
+        const size_t input_rows = compact_indices ? compact_indices->size() : m_active_count;
+        if (dr::width(allowed) != 1 || appearance_valid.size() != input_rows ||
+            geometry_valid.size() != input_rows || background_carve_valid.size() != input_rows ||
+            (compact_indices && (!compact_count || dr::width(*compact_count) != 1)))
             Throw("VoxelReconstruction.optimizer_step_device(): invalid mask/count sizes.");
         for (const Group &group : groups) {
             const size_t size = size_t(m_active_count) * group.size;
@@ -626,11 +660,27 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device(
                 !mean->second || !square->second || !clock->second ||
                 mean->second->size() != size || square->second->size() != size ||
                 clock->second->size() != m_active_count ||
-                (group.rate > 0.f && (gradient == gradients.end() || gradient->second.size() != size)))
+                (group.rate > 0.f && (gradient == gradients.end() ||
+                                     gradient->second.size() != input_rows * group.size)))
                 Throw("VoxelReconstruction.optimizer_step_device(): invalid group %s.", group.name);
         }
+        Mask accepted = allowed;
+        if (compact_indices) {
+            if (!input_rows)
+                return accepted & (*compact_count == 0u);
+            UIntBuffer ordinal = dr::arange<UIntBuffer>(input_rows);
+            auto in_bounds = *compact_indices < m_active_count;
+            UIntBuffer previous = dr::gather<UIntBuffer>(*compact_indices, ordinal - 1u, ordinal > 0u);
+            accepted &= (in_bounds & ((ordinal == 0u) | (*compact_indices > previous))).all_async_();
+            // Do not capture host input_rows in this comparison: frozen calls
+            // can receive a different K. This IDs-only kernel infers its width
+            // from the compact input, independently of the full model buffers.
+            UInt32 actual_rows = dr::max(dr::select(in_bounds, ordinal + 1u, UIntBuffer(0u)));
+            accepted &= *compact_count == actual_rows;
+            dr::eval(accepted);
+        }
         if (!m_active_count)
-            return allowed;
+            return accepted;
 
         // Inclusive scan gives stable IDs and the device-side list length.
         // Unlike compress(), neither list length is fetched by the CPU. The
@@ -647,9 +697,12 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device(
             dr::eval(rows, count);
             return std::make_pair(std::move(rows), std::move(count));
         };
-        auto appearance = compact(appearance_valid, groups[0].rate > 0.f || groups[1].rate > 0.f);
-        auto geometry = compact(geometry_valid, groups[2].rate > 0.f || groups[3].rate > 0.f ||
-                                              groups[4].rate > 0.f);
+        std::pair<UIntBuffer, UInt32> appearance, geometry;
+        if (!compact_indices) {
+            appearance = compact(appearance_valid, groups[0].rate > 0.f || groups[1].rate > 0.f);
+            geometry = compact(geometry_valid, groups[2].rate > 0.f || groups[3].rate > 0.f ||
+                                               groups[4].rate > 0.f);
+        }
         const uint32_t batch_size = std::min(m_active_count, uint32_t(32768));
         const UInt32 lanes = dr::arange<UInt32>(batch_size);
         const auto clean = [](const Float &value) {
@@ -662,7 +715,6 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device(
         // The transaction is validated first, then recomputed and committed.
         // This avoids both full-table rollback copies and N*SH proposal arrays.
         // All groups share the final scalar gate, including late-chunk errors.
-        Mask accepted = allowed;
         for (unsigned pass = 0; pass < 2; ++pass) {
             if (pass == 1)
                 dr::eval(accepted);
@@ -673,8 +725,9 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device(
                 const bool centers = std::string(group.name) == "centers";
                 const bool scales = std::string(group.name) == "log_scales";
                 const auto &compact_rows = group.geometry ? geometry : appearance;
-                const UIntBuffer &rows = compact_rows.first;
-                const UInt32 &count = compact_rows.second;
+                const UIntBuffer &rows = compact_indices ? *compact_indices : compact_rows.first;
+                const UInt32 &count = compact_indices ? *compact_count : compact_rows.second;
+                const UIntBuffer &validity = group.geometry ? geometry_valid : appearance_valid;
                 const FloatBuffer &gradient = gradients.at(group.name);
                 FloatBuffer &mean_target = *means.at(group.name),
                             &square_target = *squared_means.at(group.name);
@@ -687,10 +740,10 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device(
                     Float hits = Float(dr::gather<UInt32>(geometry_valid, ids, active));
                     return 1.f + carve_scale * dr::clip(carve / dr::maximum(hits, 1.f), 0.f, 1.f);
                 };
-                auto adam = [&](const UInt32 &index, const Mask &active,
+                auto adam = [&](const UInt32 &gradient_index, const UInt32 &index, const Mask &active,
                                 const FloatBuffer &mean_buffer, const FloatBuffer &square_buffer,
                                 const Float &bias1, const Float &bias2, const Float &scale) {
-                    Float original = clean(dr::gather<Float>(gradient, index, active) * gradient_factor);
+                    Float original = clean(dr::gather<Float>(gradient, gradient_index, active) * gradient_factor);
                     Float grad = dr::clip(original, -clip, clip);
                     Float mean = beta1 * dr::gather<Float>(mean_buffer, index, active) + weight1 * grad;
                     Float square = beta2 * dr::gather<Float>(square_buffer, index, active) +
@@ -753,18 +806,22 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device(
                         DRJIT_STRUCT(ValidateState, ordinal, finite)
                     } state{lanes, dr::full<Mask>(true, batch_size)};
                     dr::tie(state) = dr::while_loop(dr::make_tuple(std::move(state)),
-                        [&](const ValidateState &s) { return s.ordinal < count; },
+                        [&](const ValidateState &s) { return (s.ordinal < count) & accepted; },
                         [&](ValidateState &s) {
-                            Mask active = s.ordinal < count;
+                            Mask active = (s.ordinal < count) & accepted;
                             UInt32 ids = dr::gather<UInt32>(rows, s.ordinal, active);
+                            UInt32 input_row = compact_indices ? s.ordinal : ids;
+                            if (compact_indices)
+                                active &= dr::gather<UInt32>(validity, input_row, active) > 0u;
                             UInt32 next_clock = dr::gather<UInt32>(clock_target, ids, active) + 1u;
                             Float exponent(next_clock);
                             Float bias1 = dr::maximum(1.f - dr::pow(Float(beta1), exponent), 1e-8f);
                             Float bias2 = dr::maximum(1.f - dr::pow(Float(beta2), exponent), 1e-8f);
-                            Float scale = row_scale(ids, active);
+                            Float scale = row_scale(input_row, active);
                             std::array<Float, 3> rotation_delta;
                             for (uint32_t component = 0; component < group.size; ++component) {
-                                auto [mean, square, delta] = adam(ids * group.size + component,
+                                auto [mean, square, delta] = adam(input_row * group.size + component,
+                                    ids * group.size + component,
                                     active, mean_target, square_target, bias1, bias2, scale);
                                 if (check_moments)
                                     s.finite &= !active | (dr::isfinite(mean) & dr::isfinite(square));
@@ -812,12 +869,15 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device(
                         [&](CommitState &s) {
                             Mask active = (s.ordinal < count) & accepted;
                             UInt32 ids = dr::gather<UInt32>(rows, s.ordinal, active);
+                            UInt32 input_row = compact_indices ? s.ordinal : ids;
+                            if (compact_indices)
+                                active &= dr::gather<UInt32>(validity, input_row, active) > 0u;
                             UInt32 next_clock = dr::gather<UInt32>(scalar_clock.size() ? scalar_clock : s.clock,
                                                                  ids, active) + 1u;
                             Float exponent(next_clock);
                             Float bias1 = dr::maximum(1.f - dr::pow(Float(beta1), exponent), 1e-8f);
                             Float bias2 = dr::maximum(1.f - dr::pow(Float(beta2), exponent), 1e-8f);
-                            Float scale = row_scale(ids, active);
+                            Float scale = row_scale(input_row, active);
                             std::array<Float, 3> rotation_delta;
                             std::vector<Float> next_means, next_squares, next_parameters;
                             next_means.reserve(group.size);
@@ -825,7 +885,7 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device(
                             next_parameters.reserve(rotation ? 4 : group.size);
                             for (uint32_t component = 0; component < group.size; ++component) {
                                 UInt32 index = ids * group.size + component;
-                                auto [mean, square, delta] = adam(index, active,
+                                auto [mean, square, delta] = adam(input_row * group.size + component, index, active,
                                     scalar_mean.size() ? scalar_mean : s.mean,
                                     scalar_square.size() ? scalar_square : s.square, bias1, bias2, scale);
                                 next_means.push_back(std::move(mean));

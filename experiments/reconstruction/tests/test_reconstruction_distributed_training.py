@@ -85,7 +85,7 @@ class HostPipeCollective:
                 None if global_state["raw"] is None else mi.Float(global_state["raw"]),
                 None if global_state["alpha"] is None else mi.Float(global_state["alpha"]))
 
-    def reduce_batch(self, accumulator, loss_sum, finite, *, rgb_only=False, mode="auto"):
+    def reduce_batch(self, accumulator, loss_sum, finite, *, rgb_only=False, mode="auto", compact_output=False):
         assert mode in ("auto", "dense")
         assert not any(key.startswith(("growth_", "deletion_")) for key in accumulator)
         result, loss, finite, _, _ = self.reduce_view(accumulator, loss_sum, finite)

@@ -115,7 +115,7 @@ def run_view_batch_epoch(*, model, config, views, order, epoch, optimizer, topol
                         evidence[key] = dr.zeros(mi.Float if suffix == "gain" else mi.UInt32, count)
             reduced, loss_sum, finite = collective.reduce_batch(
                 accumulator, loss_sum, finite, rgb_only=True,
-                mode=getattr(config.training, "batch_reduction", "auto"))
+                mode=getattr(config.training, "batch_reduction", "auto"), compact_output=True)
             finite = _finite_accumulator(reduced, loss_sum, finite, dr)
             divisor = ray_count * batch_size
             loss = loss_sum / divisor

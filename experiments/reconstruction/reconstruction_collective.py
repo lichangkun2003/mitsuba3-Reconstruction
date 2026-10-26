@@ -372,7 +372,7 @@ class NcclCollective:
             self._failed = True
             raise
 
-    def _reduce_rgb_batch(self, accumulator, loss_sum, finite, mode):
+    def _reduce_rgb_batch(self, accumulator, loss_sum, finite, mode, compact_output=False):
         """Exact RGB-only reduction, optionally using a common sparse row set.
 
         Counts and nonzero-gradient support are unioned before compression.
@@ -385,6 +385,8 @@ class NcclCollective:
         dr, mi = self.dr, self.mi
         if mode not in ("auto", "dense"):
             raise ValueError("RGB batch reduction mode must be 'auto' or 'dense'")
+        if not isinstance(compact_output, bool):
+            raise ValueError("compact_output must be a boolean")
         if set(accumulator["gradients"]) != set(GRADIENT_KEYS):
             raise ValueError("Expected exactly the five reconstruction gradient groups")
         counts = {name: mi.UInt32(accumulator[name]) for name in SUM_COUNTER_KEYS + MAX_COUNTER_KEYS}
@@ -448,15 +450,21 @@ class NcclCollective:
                         compact[name] = dr.empty(mi.Float, 0)
                 communicated = self._allreduce_fields(
                     {name: (value, _NCCL_FLOAT32, _NCCL_SUM) for name, value in compact.items()}, wait=False)
-                global_gradients = {}
-                for name, value in communicated.items():
-                    output = dr.zeros(mi.Float, widths[name])
-                    if union_count:
-                        dimension = dimensions[name]
-                        lane = dr.arange(mi.UInt32, union_count * dimension)
-                        index = dr.gather(mi.UInt32, ids, lane // dimension) * dimension + lane % dimension
-                        dr.scatter(output, value, index)
-                    global_gradients[name] = output
+                if compact_output:
+                    # Keep the common union layout all the way into Adam. The
+                    # IDs include valid zero-gradient rows and unexpected
+                    # nonzero invalid rows, preserving updates and guards.
+                    global_gradients = communicated
+                else:
+                    global_gradients = {}
+                    for name, value in communicated.items():
+                        output = dr.zeros(mi.Float, widths[name])
+                        if union_count:
+                            dimension = dimensions[name]
+                            lane = dr.arange(mi.UInt32, union_count * dimension)
+                            index = dr.gather(mi.UInt32, ids, lane // dimension) * dimension + lane % dimension
+                            dr.scatter(output, value, index)
+                        global_gradients[name] = output
             else:
                 global_gradients = self._allreduce_fields(
                     {name: (value, _NCCL_FLOAT32, _NCCL_SUM) for name, value in gradients.items()}, wait=False)
@@ -471,7 +479,18 @@ class NcclCollective:
             global_gradients = {name: reduced.pop(name) for name in GRADIENT_KEYS}
         result = {"gradients": global_gradients,
                   "appearance_valid": reduced["appearance_valid"], "geometry_valid": reduced["geometry_valid"]}
-        result.update({name: dr.zeros(mi.UInt32, count)
+        direct = compact_output and selected == "compact"
+        if direct:
+            result["voxel_ids"] = ids
+            for name in ("appearance_valid", "geometry_valid"):
+                result[name] = (dr.gather(mi.UInt32, result[name], ids) if union_count
+                                else dr.empty(mi.UInt32, 0))
+            self._stats["compact_direct_batches"] = self._stats.get("compact_direct_batches", 0) + 1
+            # Bytes in the full-size gradient table that the previous output
+            # path would allocate/zero before scattering. Not wire traffic.
+            self._stats["expanded_gradient_bytes_avoided"] = (
+                self._stats.get("expanded_gradient_bytes_avoided", 0) + sum(widths.values()) * 4)
+        result.update({name: dr.zeros(mi.UInt32, union_count if direct else count)
                        for name in ("background_carve_valid", *MAX_COUNTER_KEYS)})
         losses = self._unpack(reduced["losses"], ("loss_sum", *component_names),
                               [1] * (1 + len(component_names)), mi.Float)
@@ -485,13 +504,14 @@ class NcclCollective:
             self._stats["rgb_union_rows_total"] = self._stats.get("rgb_union_rows_total", 0) + union_count
             self._stats["rgb_rows_total"] = self._stats.get("rgb_rows_total", 0) + count
         self._stats["rgb_last_mode"] = selected
+        self._stats["rgb_last_output_layout"] = "compact" if direct else "dense"
         self._stats["rgb_last_union_voxels"] = union_count if mode == "auto" and self.world_size > 1 else None
         self._stats["rgb_last_voxels"] = count
         self._stats["rgb_last_union_density"] = union_count / count if count and mode == "auto" and self.world_size > 1 else None
         self._stats["views"] += 1
         return result, global_loss, mi.Bool(reduced["finite"] != 0)
 
-    def reduce_batch(self, accumulator, loss_sum, finite, *, rgb_only=False, mode="auto"):
+    def reduce_batch(self, accumulator, loss_sum, finite, *, rgb_only=False, mode="auto", compact_output=False):
         """Reduce one full-view-per-rank batch without mixing camera votes.
 
         Gradients and validity counts are SUMs, not averages. The training
@@ -499,6 +519,10 @@ class NcclCollective:
         batches) when making its one Adam update. RGB topology evidence must be
         consumed per view through ``broadcast_arrays``; mixing its raw gains
         here would change the voting algorithm.
+
+        With ``compact_output=True``, an auto-selected compact transfer returns
+        sorted global ``voxel_ids`` and K-row gradients/counts directly. Dense
+        transfers and the default compatibility path return full-size arrays.
         """
         invalid = [key for key in accumulator
                    if any(key.startswith(f"{kind}_") for kind in ("growth", "deletion"))]
@@ -509,7 +533,7 @@ class NcclCollective:
                 raise RuntimeError("NCCL collective is closed or has failed")
             started = time.perf_counter()
             before_bytes = self._stats["payload_bytes"]
-            result, loss, finite = self._reduce_rgb_batch(accumulator, loss_sum, finite, mode)
+            result, loss, finite = self._reduce_rgb_batch(accumulator, loss_sum, finite, mode, compact_output)
             self._stats["rgb_payload_bytes"] = self._stats.get("rgb_payload_bytes", 0) + self._stats["payload_bytes"] - before_bytes
             self._stats["seconds"] += time.perf_counter() - started
         else:

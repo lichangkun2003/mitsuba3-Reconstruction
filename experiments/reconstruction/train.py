@@ -1108,9 +1108,14 @@ def run_training(distributed=None):
         update_protocol = view_batch_protocol(world_size)
         report["training_protocol"]["update_protocol"] = update_protocol
         if view_batch_mode:
+            compact_adam = config.training.batch_reduction == "auto"
+            if compact_adam and getattr(mi.VoxelReconstruction, "compact_optimizer_version", 0) < 1:
+                raise RuntimeError("Compact gradient batches require compact_optimizer_version >= 1; "
+                                   "incrementally rebuild this Mitsuba source checkout")
             report["training_protocol"]["gradient_reduction"] = (
                 "sum over pixels within each view, then mean over actual views in the batch")
             report["training_protocol"]["batch_reduction"] = config.training.batch_reduction
+            report["training_protocol"]["compact_gradients_to_adam"] = compact_adam
             completion = ("NCCL completion wait" if config.training.batch_reduction == "dense"
                           else "GPU event-managed buffers; union-length synchronization")
             report["training_protocol"]["batch_reduction_completion"] = completion
@@ -1118,6 +1123,8 @@ def run_training(distributed=None):
                  "tail batch averaged by its actual view count; learning rates unchanged", flush=True)
             emit(f"Batch gradient transport: {config.training.batch_reduction} "
                  f"(FP32; {completion})", flush=True)
+            if compact_adam:
+                emit("Compact batches: reduced voxel IDs and gradients go directly to Adam", flush=True)
         performance.metadata["traversal"] = report["traversal"]
         rgb_growth_enabled = config.topology.use_rgb_growth and config.topology.enable_growth and (
             not config.schedule.enabled or config.schedule.enable_coarse_growth)
@@ -1686,7 +1693,8 @@ def run_training(distributed=None):
                     transport = {name: communication_after.get(name, 0) - communication_before.get(name, 0)
                         for name in ("rgb_dense_equivalent_bytes", "rgb_payload_bytes",
                                      "rgb_compact_batches", "rgb_dense_batches",
-                                     "rgb_union_rows_total", "rgb_rows_total", "rgb_count_readbacks")}
+                                     "rgb_union_rows_total", "rgb_rows_total", "rgb_count_readbacks",
+                                     "compact_direct_batches", "expanded_gradient_bytes_avoided")}
                     baseline = transport["rgb_dense_equivalent_bytes"]
                     rows = transport["rgb_rows_total"]
                     transport["payload_fraction_of_legacy_dense"] = (

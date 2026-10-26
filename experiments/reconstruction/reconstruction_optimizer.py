@@ -69,10 +69,12 @@ class FalcorOptimizer:
         self.sparse_updates = sparse_updates
         self.replay_updates = replay_updates
         self._update_cache = OrderedDict()
+        self._compact_update_cache = OrderedDict()
         self._update_model = self._update_key = None
         self._update_calls = self._update_recordings = self._update_replays = 0
         self._update_bypasses = self._update_clears = 0
         self._update_evictions = 0
+        self._compact_calls = self._compact_rows = 0
         # All mutable buffers are explicit PyTree arguments. The closure must
         # not retain a model, its snapshot, or old optimizer state.
         def native_update(model, gradients, appearance, geometry, carving,
@@ -82,11 +84,19 @@ class FalcorOptimizer:
             dr.eval(accepted, *means.values(), *squares.values(), *steps.values())
             return accepted
         self._native_update = native_update
+        def compact_update(model, ids, row_count, gradients, appearance, geometry, carving,
+                           means, squares, steps, settings, allowed, check_moments):
+            accepted = model.optimizer_step_compact_device(ids, row_count, gradients,
+                appearance, geometry, carving, means, squares, steps, settings, allowed, check_moments)
+            dr.eval(accepted, *means.values(), *squares.values(), *steps.values())
+            return accepted
+        self._native_compact_update = compact_update
         self.reset(model)
 
     def clear_replay(self):
         """Release recorded buffers before replacing topology or optimizer state."""
         self._update_cache.clear()
+        self._compact_update_cache.clear()
         self._update_model = self._update_key = None
         self._update_clears += 1
 
@@ -95,8 +105,10 @@ class FalcorOptimizer:
                 "replay_enabled": self.replay_updates, "calls": self._update_calls,
                 "recordings": self._update_recordings, "replays": self._update_replays,
                 "bypasses": self._update_bypasses, "clears": self._update_clears,
-                "cached_batch_variants": len(self._update_cache),
+                "cached_batch_variants": len(self._update_cache) + len(self._compact_update_cache),
+                "cached_compact_batch_variants": len(self._compact_update_cache),
                 "batch_variant_evictions": self._update_evictions,
+                "compact_input_calls": self._compact_calls, "compact_input_rows": self._compact_rows,
                 "host_length_readbacks": 0, "capacity_rows": self.count}
 
     @property
@@ -230,6 +242,8 @@ class FalcorOptimizer:
 
     def step(self, model, out: dict, *, sample_count: int = 1, epoch: int = 0,
              coarse_to_fine: bool = True, update_allowed=None) -> dict:
+        if "voxel_ids" in out and not self.sparse_updates:
+            raise ValueError("Compact gradients require the device sparse optimizer")
         implementation = self._step_sparse if self.sparse_updates else self._step_dense
         return implementation(model, out, sample_count=sample_count, epoch=epoch,
                               coarse_to_fine=coarse_to_fine, update_allowed=update_allowed)
@@ -243,6 +257,14 @@ class FalcorOptimizer:
             raise ValueError("Topology changed: call optimizer.remap() or reset() before step")
         if sample_count < 1:
             raise ValueError("sample_count must be positive")
+        compact_input = "voxel_ids" in out
+        ids = mi.UInt32(out["voxel_ids"]) if compact_input else None
+        row_count = int(dr.width(ids)) if compact_input else self.count
+        if compact_input and not callable(getattr(model, "optimizer_step_compact_device", None)):
+            raise RuntimeError("Compact gradient Adam requires optimizer_step_compact_device; "
+                               "rebuild this source checkout")
+        if row_count > self.count:
+            raise ValueError("Compact gradient row count exceeds the model voxel count")
         if self._state_exposed:
             # Different array wrappers may share storage (the native scope
             # separates that storage). Reusing one mutable wrapper for two
@@ -257,14 +279,17 @@ class FalcorOptimizer:
         opacity_lr = self.effective_opacity_lr(epoch, coarse_to_fine)
         counts = tuple(mi.UInt32(out[name]) for name in
                        ("appearance_valid", "geometry_valid", "background_carve_valid"))
-        if any(dr.width(value) != self.count for value in counts):
-            raise ValueError("Validity counts must have one entry per voxel")
+        if any(dr.width(value) != row_count for value in counts):
+            raise ValueError("Validity counts must have one entry per gradient row")
         gradients = {name: mi.Float(out["gradients"][name]) for name in self.dimensions}
         for name, value in gradients.items():
-            if dr.width(value) != self.count * self.dimensions[name]:
+            if dr.width(value) != row_count * self.dimensions[name]:
                 raise ValueError(f"Gradient {name} has the wrong size")
         self._update_calls += 1
-        if self.count == 0:
+        if compact_input:
+            self._compact_calls += 1
+            self._compact_rows += row_count
+        if row_count == 0:
             self._update_bypasses += 1
             if guarded:
                 self.update_healthy = allowed
@@ -283,6 +308,14 @@ class FalcorOptimizer:
             self.clear_replay()
             self._update_model, self._update_key = model, key
         arguments = (model, gradients, *counts, means, squares, steps, settings, allowed, guarded)
+        native = self._native_update
+        cache = self._update_cache
+        if compact_input:
+            # K changes with the camera batch. Pass it as a GPU input rather
+            # than baking it into the frozen C++ loop or its cache key.
+            arguments = (model, ids, dr.opaque(mi.UInt32, row_count), gradients,
+                         *counts, means, squares, steps, settings, allowed, guarded)
+            native, cache = self._native_compact_update, self._compact_update_cache
         # Separate genuine external aliases before recording/replaying writes,
         # then stash the unique-owner reference counts across freeze's internal
         # temporary references. Without this scope freeze records a full-table
@@ -297,14 +330,14 @@ class FalcorOptimizer:
                 # invalidate the complete cache. The bounded LRU also avoids
                 # retaining arbitrary historical factors for external callers.
                 factor = settings["gradient_factor"]
-                frozen = self._update_cache.pop(factor, None)
+                frozen = cache.pop(factor, None)
                 if frozen is None:
-                    if len(self._update_cache) == 2:
-                        self._update_cache.popitem(last=False)
+                    if len(cache) == 2:
+                        cache.popitem(last=False)
                         self._update_evictions += 1
-                    frozen = dr.freeze(self._native_update, limit=2, warn_after=8,
+                    frozen = dr.freeze(native, limit=2, warn_after=8,
                                        auto_opaque=False)
-                self._update_cache[factor] = frozen
+                cache[factor] = frozen
                 before = frozen.n_recordings
                 try:
                     accepted = frozen(*arguments)
@@ -314,7 +347,7 @@ class FalcorOptimizer:
                 self._update_replays += int(recorded == 0)
             else:
                 self._update_bypasses += 1
-                accepted = self._native_update(*arguments)
+                accepted = native(*arguments)
         finally:
             mi._reconstruction_optimizer_update_scope_end(scope)
         if guarded:

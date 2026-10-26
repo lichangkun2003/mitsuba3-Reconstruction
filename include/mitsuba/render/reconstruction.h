@@ -39,6 +39,8 @@ public:
     static constexpr uint32_t octree_version = 1;
     /// Device-resident compact Adam, including transactional moment updates.
     static constexpr uint32_t optimizer_device_version = 1;
+    /// Pre-compacted gradient rows can feed Adam without dense reconstruction.
+    static constexpr uint32_t compact_optimizer_version = 1;
 
     VoxelReconstruction(const std::string &filename, uint32_t resolution,
                         const std::array<float, 3> &grid_min,
@@ -86,6 +88,21 @@ public:
     /// fixed-size device batches bound temporary storage independently of SH
     /// table size. Per-view/group clocks and zero-gradient updates are retained.
     Mask optimizer_step_device(
+        const std::map<std::string, FloatBuffer> &gradients,
+        const UIntBuffer &appearance_valid, const UIntBuffer &geometry_valid,
+        const UIntBuffer &background_carve_valid,
+        const std::map<std::string, FloatBuffer *> &means,
+        const std::map<std::string, FloatBuffer *> &squared_means,
+        const std::map<std::string, UIntBuffer *> &steps,
+        const std::map<std::string, double> &settings, const Mask &allowed,
+        bool check_moments = true);
+
+    /// Consume sorted global IDs with K-row gradients/counts directly. Model
+    /// and moment storage remain full-sized; only the supplied valid rows are
+    /// visited. The explicit device row_count keeps varying K replayable.
+    /// Invalid IDs or a row-count mismatch reject the complete transaction.
+    Mask optimizer_step_compact_device(
+        const UIntBuffer &indices, const UInt32 &row_count,
         const std::map<std::string, FloatBuffer> &gradients,
         const UIntBuffer &appearance_valid, const UIntBuffer &geometry_valid,
         const UIntBuffer &background_carve_valid,
@@ -180,6 +197,16 @@ public:
     MI_DECLARE_CLASS(VoxelReconstruction)
 
 private:
+    Mask optimizer_step_device_impl(
+        const std::map<std::string, FloatBuffer> &gradients,
+        const UIntBuffer &appearance_valid, const UIntBuffer &geometry_valid,
+        const UIntBuffer &background_carve_valid,
+        const std::map<std::string, FloatBuffer *> &means,
+        const std::map<std::string, FloatBuffer *> &squared_means,
+        const std::map<std::string, UIntBuffer *> &steps,
+        const std::map<std::string, double> &settings, const Mask &allowed,
+        bool check_moments, const UIntBuffer *compact_indices,
+        const UInt32 *compact_count);
     void initialize_seeds(const reconstruction::Result &loaded);
     void rebuild_octree();
     void mark_octree(const UIntBuffer &cells, uint32_t bit_offset);
