@@ -20,9 +20,17 @@ def _finite_accumulator(accumulator, loss, finite, dr):
     # another view's positive loss. This is evaluated before and after NCCL.
     finite &= dr.all(dr.isfinite(loss)) & dr.all(loss >= 0)
     for value in accumulator["gradients"].values():
-        finite &= dr.all(dr.isfinite(value))
-    for key in ("rgb_loss_sum", "distortion_loss_sum", "growth_gain", "deletion_gain"):
+        # A compact batch can have no supported rows even for a nonempty
+        # model. Empty gradients are finite by vacuity; isfinite() can compare
+        # against scalar infinity, so skip its incompatible empty-array path
+        # and keep the existing scalar guard intact.
+        if dr.width(value):
+            finite &= dr.all(dr.isfinite(value))
+    for key in ("rgb_loss_sum", "distortion_loss_sum"):
         if key in accumulator:
+            finite &= dr.all(dr.isfinite(accumulator[key]))
+    for key in ("growth_gain", "deletion_gain"):
+        if key in accumulator and dr.width(accumulator[key]):
             finite &= dr.all(dr.isfinite(accumulator[key]))
     return finite
 

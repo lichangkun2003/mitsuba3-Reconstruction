@@ -117,7 +117,7 @@ class SchedulingTests(unittest.TestCase):
             self.assertIsNone(alpha)
 
     def test_finite_guard_rejects_local_negative_and_global_overflow(self):
-        dr = SimpleNamespace(all=np.all, isfinite=np.isfinite)
+        dr = SimpleNamespace(all=np.all, isfinite=np.isfinite, width=np.size)
         baseline = {"gradients": {"radiance_sh": np.array([1.], np.float32)}}
         for loss in (-1., np.nan, np.inf):
             self.assertFalse(_finite_accumulator(baseline, np.array([loss]), np.bool_(True), dr))
@@ -134,7 +134,7 @@ def _fake_epoch(losses=(1., 3., 9.), *, gradient_nan=False, sync=False, rank=0):
         return lambda value: np.atleast_1d(np.asarray(value, dtype=dtype))
 
     mi = SimpleNamespace(Float=array(np.float32), UInt32=array(np.uint32), Bool=array(np.bool_))
-    dr = SimpleNamespace(all=np.all, isfinite=np.isfinite, concat=np.concatenate,
+    dr = SimpleNamespace(all=np.all, isfinite=np.isfinite, width=np.size, concat=np.concatenate,
         eval=lambda *args: None,
         zeros=lambda kind, count: np.zeros(count, dtype=np.float32 if kind is mi.Float else np.uint32))
     model = SimpleNamespace(active_voxel_count=1, sh_count=1, opacity_sh_count=1,

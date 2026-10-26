@@ -99,6 +99,7 @@ def _known_batches(context, collective, mi, dr, np):
 
 def _rgb_batches(context, collective, mi, dr, np):
     from reconstruction_collective import GRADIENT_KEYS, SUM_COUNTER_KEYS, MAX_COUNTER_KEYS
+    from reconstruction_batch_epoch import _finite_accumulator
     # Compare new compact/dense paths against legacy dense SUM on real NCCL,
     # including a tail, an empty topology, and an all-rows-active fallback.
     width = max(64, context.world_size * 4)
@@ -170,7 +171,9 @@ def _rgb_batches(context, collective, mi, dr, np):
                                                             rgb_only=True, mode=mode, compact_output=True)
             # A JIT consumer reads the external NCCL result before any host
             # conversion; one bad peer rejects the complete batch on all ranks.
-            accepted = finite & dr.all(dr.isfinite(reduced["gradients"]["opacity_sh"]))
+            # The rejected legacy-evidence fixture has an empty compact
+            # gradient union. Exercise the same empty-safe guard as training.
+            accepted = _finite_accumulator(reduced, loss, finite, dr)
             marker = dr.select(accepted, loss, -1.)
             dr.eval(marker)
             np.testing.assert_array_equal(np.asarray(marker), [-1.])

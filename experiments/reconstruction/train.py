@@ -680,22 +680,25 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
                 if key not in result:
                     raise RuntimeError("RGB growth evidence is unavailable; rebuild this source checkout")
                 accumulator[key] = accumulator.get(key, 0) + result[key]
-            finite &= dr.all(dr.isfinite(result["growth_gain"]))
+            if dr.width(result["growth_gain"]):
+                finite &= dr.all(dr.isfinite(result["growth_gain"]))
         if rgb_deletion_requested:
             for key in ("deletion_gain", "deletion_observed", "deletion_unknown"):
                 if key not in result:
                     raise RuntimeError("RGB deletion evidence is unavailable; rebuild this source checkout")
                 accumulator[key] = accumulator.get(key, 0) + result[key]
-            finite &= dr.all(dr.isfinite(result["deletion_gain"]))
+            if dr.width(result["deletion_gain"]):
+                finite &= dr.all(dr.isfinite(result["deletion_gain"]))
         # Materialize per-chunk sums; never retain all image path records/graphs.
         dr.eval(total_loss, finite, *[x for x in (raw_alpha, estimated_alpha) if x is not None],
                 *accumulator["gradients"].values(),
                 *[value for key, value in accumulator.items() if key != "gradients"])
     for gradient in accumulator["gradients"].values():
-        finite &= dr.all(dr.isfinite(gradient))
-    if "growth_gain" in accumulator:
+        if dr.width(gradient):
+            finite &= dr.all(dr.isfinite(gradient))
+    if "growth_gain" in accumulator and dr.width(accumulator["growth_gain"]):
         finite &= dr.all(dr.isfinite(accumulator["growth_gain"]))
-    if "deletion_gain" in accumulator:
+    if "deletion_gain" in accumulator and dr.width(accumulator["deletion_gain"]):
         finite &= dr.all(dr.isfinite(accumulator["deletion_gain"]))
     finite &= dr.isfinite(total_loss)
     if distortion_enabled:
@@ -795,10 +798,11 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
         # Finite local values can overflow when summed across ranks. Reject the
         # global result before any replica changes its optimizer or model state.
         for gradient in accumulator["gradients"].values():
-            finite &= dr.all(dr.isfinite(gradient))
-        if "growth_gain" in accumulator:
+            if dr.width(gradient):
+                finite &= dr.all(dr.isfinite(gradient))
+        if "growth_gain" in accumulator and dr.width(accumulator["growth_gain"]):
             finite &= dr.all(dr.isfinite(accumulator["growth_gain"]))
-        if "deletion_gain" in accumulator:
+        if "deletion_gain" in accumulator and dr.width(accumulator["deletion_gain"]):
             finite &= dr.all(dr.isfinite(accumulator["deletion_gain"]))
         finite &= dr.isfinite(total_loss)
         if config.gradient.distortion_loss_weight > 0:

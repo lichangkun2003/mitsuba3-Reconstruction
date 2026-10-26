@@ -422,6 +422,41 @@ def cuda_reduction(peers, mode, rank=0, *, check_inputs=True, compact_output=Fal
 
 
 class CudaTests(unittest.TestCase):
+    def test_empty_union_finite_guard_keeps_peer_rejection(self):
+        from reconstruction_batch_epoch import _finite_accumulator
+
+        for count in (0, 32):
+            for fault in ("none", "peer_rejected", "legacy_evidence", "nonfinite"):
+                if not count and fault in ("legacy_evidence", "nonfinite"):
+                    continue
+                peers = inputs(count)
+                for peer in peers:
+                    for value in peer["gradients"].values():
+                        value.fill(0)
+                    for key in SUM_COUNTER_KEYS + MAX_COUNTER_KEYS:
+                        peer[key].fill(0)
+                if fault in ("peer_rejected", "nonfinite"):
+                    peers[-1]["finite"].fill(0)
+                if fault == "legacy_evidence":
+                    peers[-1]["background_evidence"].fill(1)
+                if fault == "nonfinite":
+                    peers[-1]["gradients"]["opacity_sh"][-1] = np.nan
+                for mode in ("auto", "dense"):
+                    with self.subTest(count=count, fault=fault, mode=mode):
+                        (reduced, loss, finite), _ = cuda_reduction(peers, mode, compact_output=True)
+                        if mode == "auto" and count:
+                            ids = np.asarray(reduced["voxel_ids"])
+                            np.testing.assert_array_equal(ids, [count-1] if fault == "nonfinite" else [])
+                        accepted = _finite_accumulator(reduced, loss, finite, dr)
+                        # This consumer runs before reading the status or loss
+                        # back, including rejected K=0 compact batches.
+                        marker = dr.select(accepted, loss, -1.)
+                        dr.eval(marker)
+                        self.assertEqual(dr.width(accepted), 1)
+                        expected_loss = sum(float(peer["loss_sum"][0]) for peer in peers)
+                        np.testing.assert_array_equal(np.asarray(marker),
+                                                      [expected_loss if fault == "none" else -1.])
+
     def test_cuda_union_gather_scatter(self):
         for count, dense in ((32, False), (32, True), (0, False)):
             peers = inputs(count, dense=dense)

@@ -187,14 +187,18 @@ class CompactOptimizerTests(unittest.TestCase):
 
     def test_empty_compact_and_empty_model_are_noops(self):
         for count in (0, 29):
-            with self.subTest(count=count):
-                models, optimizers = paired(count)
-                cases = outputs(count, optimizers[0].dimensions, [])
-                for model, optimizer, out in zip(models, optimizers, cases):
-                    before = capture(model, optimizer)
-                    updated = optimizer.step(model, out, update_allowed=mi.Bool(True))
-                    self.assertTrue(bool(np.asarray(updated["accepted"])[0]))
-                    assert_equal(self, capture(model, optimizer), before, exact=True)
+            for finite in (True, False):
+                with self.subTest(count=count, finite=finite):
+                    models, optimizers = paired(count)
+                    cases = outputs(count, optimizers[0].dimensions, [])
+                    for model, optimizer, out in zip(models, optimizers, cases):
+                        out.update(growth_gain=dr.empty(mi.Float, 0), deletion_gain=dr.empty(mi.Float, 0))
+                        before = capture(model, optimizer)
+                        allowed = _finite_accumulator(out, mi.Float(0), mi.Bool(finite), dr)
+                        self.assertEqual(dr.width(allowed), 1)
+                        updated = optimizer.step(model, out, update_allowed=allowed)
+                        self.assertEqual(bool(np.asarray(updated["accepted"])[0]), finite)
+                        assert_equal(self, capture(model, optimizer), before, exact=True)
 
     def test_invalid_ids_reject_whole_update_and_latch_failure(self):
         for ids in ([2, 2], [9, 3], [1, 29], [0, 0xffffffff]):
