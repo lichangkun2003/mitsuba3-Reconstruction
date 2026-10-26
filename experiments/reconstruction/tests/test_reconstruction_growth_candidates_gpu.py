@@ -146,6 +146,63 @@ class Proposals(unittest.TestCase):
                 self.assertEqual(len(result['cells']),0)
                 self.assertTrue(all(len(value)==0 for value in result['candidate_state'].values()))
 
+    def test_bitmap_word_boundaries_duplicates_and_masked_queries(self):
+        # Concurrent writes to the same word must combine bits, including the
+        # unsigned high bit and the last partial word of a non-power-of-two grid.
+        first=np.concatenate((np.arange(32,dtype=np.uint32),[31,32,63])).astype(np.uint32)
+        second=np.array([31,32,64,69,69],dtype=np.uint32)
+        bitmap=growth_gpu._make_bitmap(70,(dr.cuda.UInt32(first),dr.cuda.UInt32(second)),dr)
+        self.assertEqual(dr.width(bitmap),3)
+        np.testing.assert_array_equal(np.array(bitmap),
+            np.array([0xffffffff,0x80000001,0x21],dtype=np.uint32))
+        queries=np.concatenate((np.arange(70,dtype=np.uint32),
+                                np.array([31,96,0xffffffff],dtype=np.uint32)))
+        active=np.arange(len(queries))<70
+        actual=growth_gpu._bitmap_contains(bitmap,dr.cuda.UInt32(queries),dr.cuda.Bool(active),dr)
+        expected=np.isin(queries,np.concatenate((first,second))) & active
+        np.testing.assert_array_equal(np.array(actual),expected)
+
+    def test_parent_batches_preserve_geometry_ids_and_order(self):
+        rng=np.random.default_rng(831903)
+        occupied=np.array([0,31,32,63,64,511,73,75,91,134,198,217,283,361,387,409,446],dtype=np.uint32)
+        rng.shuffle(occupied)
+        state=checkpoint(occupied)
+        count=len(occupied)
+        state['model_state']['centers']=rng.uniform(.05,.95,count*3).astype(np.float32)
+        state['model_state']['rotations']=rng.normal(size=count*4).astype(np.float32)
+        state['model_state']['log_scales']+=rng.uniform(-.3,.3,count*3).astype(np.float32)
+        state['model_state']['radiance_sh']=np.arange(count*12,dtype=np.float32)/100
+        state['model_state']['opacity_sh']=np.linspace(-4,4,count,dtype=np.float32)
+        for neighbors in (False,True):
+            manager=manager_for(state,use_rgb_growth=True,growth_use_26_neighbors=neighbors,
+                growth_evidence_penetration=.05,growth_min_supporting_parents=1,
+                growth_inherit_opacity=True,growth_initial_opacity=.3)
+            manager.cooldown={33:12,74:12}
+            with self.subTest(neighbors=neighbors):
+                with patch.object(growth_gpu,'geometry_gpu',wraps=growth_gpu.geometry_gpu) as geometry:
+                    result=self.compare(manager,state,parent_batch_size=7)
+                    batches=[np.array(call.args[0]['cell_indices']) for call in geometry.call_args_list]
+                self.assertEqual([len(batch) for batch in batches],[7,7,3])
+                np.testing.assert_array_equal(np.concatenate(batches),occupied)
+                self.assertGreater(len(result['cells']),0)
+
+    def test_parent_support_is_counted_across_batches(self):
+        state=checkpoint([75,73])
+        manager=manager_for(state,use_rgb_growth=True,growth_min_supporting_parents=2)
+        result=self.compare(manager,state,target_cells=[74],parent_batch_size=1)
+        np.testing.assert_array_equal(np.array(result['cells']),[74,74])
+        np.testing.assert_array_equal(np.array(result['parent_ids']),[1,0])
+        np.testing.assert_array_equal(np.array(result['geometric_support']),[2,2])
+
+    def test_empty_target_subset_skips_bitmaps_and_geometry(self):
+        state=checkpoint([73,75])
+        manager=manager_for(state,use_rgb_growth=True,growth_min_supporting_parents=2)
+        with patch.object(growth_gpu,'geometry_gpu',side_effect=AssertionError('no parent geometry')):
+            with patch.object(growth_gpu,'_make_bitmap',side_effect=AssertionError('no occupancy bitmap')):
+                result=self.compare(manager,state,target_cells=[],parent_batch_size=1)
+        self.assertEqual(len(result['cells']),0)
+        self.assertTrue(all(len(value)==0 for value in result['candidate_state'].values()))
+
 
 if __name__=='__main__':
     from reconstruction_common import initialize_runtime

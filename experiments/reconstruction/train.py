@@ -529,6 +529,21 @@ def sampling_statistics(sampler):
     return sampler.statistics() if isinstance(sampler, PrefetchedUniformSampler) else {"workers": 0}
 
 
+def release_topology_cache(model, dr):
+    """Finish topology work before releasing its inactive allocations.
+
+    The caller must first drop replacement snapshots and old replay owners.
+    WDDM can otherwise page allocations out while old allocator buckets remain
+    cached. Use this at growth/refinement boundaries, never once per view.
+    Adam's new zero state remains lazy until its normal first update.
+    """
+    started = time.perf_counter()
+    dr.eval(*model.snapshot().values())
+    dr.sync_thread()
+    dr.flush_malloc_cache()
+    return time.perf_counter() - started
+
+
 def validate_resume_supervision(config, checkpoint):
     """Never silently reinterpret a legacy checkpoint as a new RGB experiment."""
     previous = checkpoint["config"].get("training", {}).get("rgb_only", False)
@@ -693,6 +708,11 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
         dr.eval(total_loss, finite, *[x for x in (raw_alpha, estimated_alpha) if x is not None],
                 *accumulator["gradients"].values(),
                 *[value for key, value in accumulator.items() if key != "gradients"])
+        # Only the materialized accumulator must survive into the next chunk.
+        # Assignment evaluates the next native call before replacing `result`,
+        # which would otherwise keep the previous full gradient table alive.
+        del result, arguments, ray, indices, pdf, reference_rgb, reference_alpha
+        value = None  # The gradient-loop variable can independently retain a table.
     for gradient in accumulator["gradients"].values():
         if dr.width(gradient):
             finite &= dr.all(dr.isfinite(gradient))
@@ -1405,9 +1425,13 @@ def run_training(distributed=None):
                 replacement, transition = topology.finish_epoch(model, optimizer, completed)
                 if replacement is not None:
                     model = restore_model(replacement, mi)
+                replacement = None
                 if transition.get("refined", False):
                     sampler = make_sampler(config, np, sampling_workers=sampling_workers, previous=sampler)
                 topology.before_refine_checkpoint = None
+                if transition.get("refined", False):
+                    native_replay.clear()
+                    report["resume_refinement_cache_release_seconds"] = release_topology_cache(model, dr)
 
         emit("Training epochs by core resolution:", json.dumps(topology.budgets), flush=True)
 
@@ -1507,8 +1531,9 @@ def run_training(distributed=None):
                 if config.topology.use_rgb_growth:
                     if previous_growth_count or topology._growth_due(epoch + 1):
                         native_replay.clear()
+                        growth_prepare_stage_seconds["pre_cache_release"] = release_topology_cache(model, dr)
                     rgb_growth_requested = topology.prepare_rgb_growth(model, epoch)
-                    growth_prepare_stage_seconds = dict(topology.growth_prepare_stage_seconds)
+                    growth_prepare_stage_seconds.update(topology.growth_prepare_stage_seconds)
                 payload = topology.pending_growth["candidate_state"] if rgb_growth_requested else None
                 flags = (topology.needs_rendered_alpha(epoch), topology.collect_deletion(epoch),
                          rgb_growth_requested, payload)
@@ -1524,6 +1549,13 @@ def run_training(distributed=None):
                                                  for key, value in growth_payload.items()})
                 else:
                     model.clear_growth_candidates()
+            # Topology/model now own the candidates. In particular, do not keep
+            # broadcast aliases alive across finish_epoch() and the next prepare.
+            flags = growth_payload = None
+            if primary:
+                payload = None
+            if rgb_growth_requested or (primary and topology._growth_due(epoch + 1)):
+                growth_prepare_stage_seconds["cache_release"] = release_topology_cache(model, dr)
             growth_prepare_seconds = time.perf_counter() - growth_prepare_started
             growth_evidence_requested = alpha_growth_requested or rgb_growth_requested
             interval = config.training.profile_interval_epochs
@@ -1600,6 +1632,11 @@ def run_training(distributed=None):
                                 reference_alpha=gpu_reference.alpha if gpu_reference is not None else rgba[..., 3],
                                 rendered_alpha=rendered_alpha,
                                 image_shape=(config.render.height, config.render.width))
+                        # These native evidence tables have no optimizer
+                        # consumer. Release them before Adam's scratch buffers.
+                        for name in ("growth_gain", "growth_observed", "growth_unknown",
+                                     "deletion_gain", "deletion_observed", "deletion_unknown"):
+                            gradients.pop(name, None)
                         topology_done = time.perf_counter()
                         update_result = optimizer.step(model, gradients, sample_count=1, epoch=epoch,
                             coarse_to_fine=config.schedule.enabled,
@@ -1614,6 +1651,10 @@ def run_training(distributed=None):
                                 loss = measurements.pop("loss")
                                 loss_components.update(measurements)
                         optimizer_done = time.perf_counter()
+                    # Topology and Adam have consumed these buffers; deferred
+                    # checks already evaluated their scalar summaries. Release
+                    # the full gradient table before the next view (or refine).
+                    del gradients, rendered_alpha, update_result
                     stage = dict(reference=reference_done-view_started, gradients=gradients_done-reference_done,
                                  topology_observation=topology_done-gradients_done, optimizer=optimizer_done-topology_done)
                     for key, duration in stage.items():
@@ -1666,6 +1707,13 @@ def run_training(distributed=None):
                                  f"| view {len(views)}/{len(views)} (100%) | updating topology...", force=True)
             coarse_render = capture_coarse_image(epoch+1)
             topology_started = time.perf_counter()
+            topology_evidence_finished = rgb_growth_requested or (rgb_deletion_enabled and deletion_evidence_collected)
+            topology_cache_prepare_seconds = None
+            if topology_evidence_finished or topology._low_opacity_deletion_due(epoch + 1):
+                # Evidence recordings can retain candidate/tree buffers even
+                # after the model clears them. Release before commit/remapping.
+                native_replay.clear()
+                topology_cache_prepare_seconds = release_topology_cache(model, dr)
             new_state, event = topology.finish_epoch(model, optimizer, epoch+1) if primary else (None, None)
             topology.before_refine_checkpoint = None
             if distributed is not None:
@@ -1676,6 +1724,8 @@ def run_training(distributed=None):
                 if coarse_render is not None:
                     report["coarse_render"] = coarse_render
                     distributed.heartbeat("coarse_render_finished", force=True)
+            if topology_cache_prepare_seconds is not None:
+                event["topology_cache_prepare_seconds"] = topology_cache_prepare_seconds
             if new_state is not None:
                 # Drop recordings retaining the old occupancy/parameter buffers,
                 # including same-size replacements and transitions after pruning.
@@ -1692,6 +1742,9 @@ def run_training(distributed=None):
             if event.get("refined", False):
                 # Falcor resets contour proposals whenever grid resolution changes.
                 sampler = make_sampler(config, np, sampling_workers=sampling_workers, previous=sampler)
+                event["refinement_cache_release_seconds"] = release_topology_cache(model, dr)
+            elif topology_evidence_finished or event.get("deleted", 0) or event.get("grown", 0):
+                event["topology_cache_release_seconds"] = release_topology_cache(model, dr)
             entry = {"epoch": epoch+1, "global_step": global_step, "mean_loss": epoch_loss / len(views),
                      "optimizer_step": optimizer_step, "views_per_update": world_size,
                      "updates_per_epoch": (len(views) + world_size - 1) // world_size,

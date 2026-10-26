@@ -16,6 +16,35 @@ from reconstruction_deletion_rgb import RGB_DELETION_EVIDENCE_VERSION
 
 ROW_WIDTHS = {"cell_indices": 1, "cells": 1, "parent_cells": 1, "parent_ids": 1,
               "centers": 3, "log_scales": 3, "rotations": 4}
+EPOCH_FIELDS = ("growth_birth", "growth_wait_start", "deletion_eligible")
+DELETION_VIEW_FIELDS = ("support_views", "conflict_views", "observed_views", "unknown_views", "invalid_views")
+
+
+def compact_epoch_fields_safe(manager):
+    """Prove signed 32-bit storage/arithmetic safe for the configured run.
+
+    Only host state is inspected. Conservative fallback keeps unusual saved
+    states and very long schedules on the original signed 64-bit path.
+    """
+    np, limit = manager.np, (1 << 31) - 1
+    boundaries = (manager.schedule.total_epochs, manager.level_start_epoch)
+    offsets = [manager.opacity_warmup, manager.opacity_ramp,
+               manager.schedule.coarse_growth_interval]
+    offsets.extend(value for name, value in vars(manager.settings).items()
+                   if name.endswith("_epochs") or name.endswith("_interval"))
+    if any(isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
+           or value < 0 for value in (*boundaries, *offsets)):
+        return False
+    # +1 covers newborn birth timestamps and boundary - (zero wait_start - 1).
+    if max(map(int, boundaries)) + sum(map(int, offsets)) + 1 > limit:
+        return False
+    for name in EPOCH_FIELDS:
+        values = np.asarray(getattr(manager, name))
+        if not np.issubdtype(values.dtype, np.integer):
+            return False
+        if values.size and (int(values.min()) < 0 or int(values.max()) > limit):
+            return False
+    return True
 
 
 def device_checkpoint(model):
@@ -74,11 +103,13 @@ class GPUTopologyLifecycle:
         self.manager, self.dr, self.mi = manager, dr, mi
         self.Float = dr.cuda.Float32
         self.UInt = dr.cuda.UInt32
+        self.Byte = dr.cuda.UInt8
         self.Int64 = dr.int64_array_t(self.UInt)
+        self.Epoch = dr.int32_array_t(self.UInt) if compact_epoch_fields_safe(manager) else self.Int64
         self.Double = dr.float64_array_t(self.Float)
         self.Bool = dr.mask_t(self.UInt)
         self.fields = {
-            name: (self.UInt if "streak" in name else self.Int64)(getattr(manager, name))
+            name: (self.UInt if "streak" in name else self.Epoch)(getattr(manager, name))
             for name in ("growth_birth", "growth_wait_start", "deletion_eligible",
                          "rgb_deletion_streak", "low_opacity_deletion_streak")}
         self.candidates = self.Bool(manager.candidates)
@@ -102,10 +133,14 @@ class GPUTopologyLifecycle:
                        if isinstance(value, np.ndarray) else value)
                 for name, value in pending["candidate_state"].items()}
 
-    def statistics(self, pending):
+    def statistics(self, pending, *, deletion=False):
         for name in RGB_STAT_FIELDS:
+            # A deduplicated evidence window contributes at most one vote per
+            # camera. Ray counts and gain sums retain their original widths.
+            dtype = (self.Byte if deletion and self.manager.view_count <= 255 and name in DELETION_VIEW_FIELDS
+                     else self.Float if name.endswith("gain_sum") else self.UInt)
             pending[name] = self.dr.zeros(
-                self.Float if name.endswith("gain_sum") else self.UInt, len(pending["cells"]))
+                dtype, len(pending["cells"]))
 
     def eligible(self, boundary):
         start = self.fields["growth_wait_start"]
@@ -175,7 +210,8 @@ class GPUTopologyLifecycle:
         m, dr, cfg, boundary = self.manager, self.dr, self.manager.settings, int(epoch) + 1
         if not (m._rgb_deletion_due(boundary) if deletion else m._growth_due(boundary)):
             return
-        if not 0 <= view_id < m.view_count or int(model.active_voxel_count) != m.count:
+        if (not 0 <= view_id < m.view_count or view_id != int(view_id)
+                or int(model.active_voxel_count) != m.count):
             raise ValueError("Unexpected RGB topology view ID or model topology")
         if not isinstance(pixel_count, int) or pixel_count < 1:
             raise ValueError("RGB topology requires positive full-image pixel count")
@@ -187,7 +223,7 @@ class GPUTopologyLifecycle:
             pending = {"cells": dr.arange(self.UInt, m.count), "boundary": boundary,
                        "resolution": m.resolution, "seen_views": set(),
                        "evidence_version": RGB_DELETION_EVIDENCE_VERSION}
-            self.statistics(pending)
+            self.statistics(pending, deletion=True)
             m.pending_rgb_deletion = pending
         if view_id in pending["seen_views"]:
             return
@@ -211,9 +247,33 @@ class GPUTopologyLifecycle:
             "conflict_views": self.UInt(eligible & (normalized < -threshold)),
             "observed_views": self.UInt(eligible), "unknown_views": self.UInt(unknown > 0),
             "invalid_views": self.UInt(~finite), "observed_rays": observed, "unknown_rays": unknown}
-        for key in RGB_STAT_FIELDS:
-            pending[key] = pending[key] + increments[key]
-        dr.eval(*[pending[key] for key in RGB_STAT_FIELDS])
+        if deletion:
+            indices = dr.arange(self.UInt, len(pending["cells"]))
+            for key in RGB_STAT_FIELDS:
+                if type(pending[key]) == self.Byte:
+                    # CUDA has byte storage/gathers but no byte scatter-add.
+                    # Add in UInt32 before narrowing. These per-view counters
+                    # increase at most once per view, with at most 255 views.
+                    pending[key] = self.Byte(self.UInt(pending[key]) + increments[key])
+                    dr.eval(pending[key])
+                    continue
+                # Replace the Python wrapper before mutation: a caller holding
+                # the old wrapper must still see its old value. Without such an
+                # alias the old wrapper dies here, permitting native in-place
+                # writes instead of another full active-voxel allocation.
+                pending[key] = type(pending[key])(pending[key])
+                # Each index occurs once. Integer addition is non-atomic;
+                # float atomics preserve the original add.ftz.f32 semantics.
+                # NoConflicts uses add.f32, which would retain subnormal sums.
+                mode = dr.ReduceMode.Direct if key.endswith("gain_sum") else dr.ReduceMode.NoConflicts
+                dr.scatter_reduce(dr.ReduceOp.Add, pending[key], increments[key], indices, mode=mode)
+                # Finish one field's expression before proceeding, without a
+                # host synchronization or references to its previous wrapper.
+                dr.eval(pending[key])
+        else:
+            for key in RGB_STAT_FIELDS:
+                pending[key] = pending[key] + increments[key]
+            dr.eval(*[pending[key] for key in RGB_STAT_FIELDS])
         pending["seen_views"].add(int(view_id))
         m._device_statistics[f"rgb_{prefix}_device_views"] += 1
 
@@ -286,14 +346,16 @@ class GPUTopologyLifecycle:
         p = m.pending_rgb_deletion
         if p is None or p["boundary"] != boundary or p["resolution"] != m.resolution:
             p = {"cells": dr.arange(self.UInt, m.count), "seen_views": set()}
-            self.statistics(p)
+            self.statistics(p, deletion=True)
         complete = len(p["seen_views"]) == m.view_count
-        mean = (self.Double(p["gain_sum"]) / self.Double(dr.maximum(p["observed_views"], 1))
+        # Promote compact counts before arithmetic/comparisons: configuration
+        # thresholds need not fit in a byte even for a small camera set.
+        mean = (self.Double(p["gain_sum"]) / self.Double(dr.maximum(self.UInt(p["observed_views"]), 1))
                 if m.count else dr.empty(self.Double, 0))
-        observed = p["observed_views"] > 0 if m.count else dr.empty(self.Bool, 0)
-        supported = p["support_views"] >= cfg.deletion_rgb_min_support_views if m.count else observed
-        unopposed = p["conflict_views"] < cfg.deletion_rgb_max_conflict_views if m.count else observed
-        valid = (p["invalid_views"] == 0) & dr.isfinite(mean) if m.count else observed
+        observed = self.UInt(p["observed_views"]) > 0 if m.count else dr.empty(self.Bool, 0)
+        supported = self.UInt(p["support_views"]) >= cfg.deletion_rgb_min_support_views if m.count else observed
+        unopposed = self.UInt(p["conflict_views"]) < cfg.deletion_rgb_max_conflict_views if m.count else observed
+        valid = (self.UInt(p["invalid_views"]) == 0) & dr.isfinite(mean) if m.count else observed
         beneficial, mature = (mean > cfg.deletion_rgb_min_mean_gain if m.count else observed), self.mature(boundary)
         qualified = observed & supported & unopposed & valid & beneficial & mature & complete if m.count else observed
         selected, detail = self.confirmation(qualified, boundary)
@@ -304,7 +366,7 @@ class GPUTopologyLifecycle:
             support_votes=self.sum(p["support_views"]), conflict_votes=self.sum(p["conflict_views"]),
             observed_views=self.sum(p["observed_views"]), views_with_unknown=self.sum(p["unknown_views"]),
             invalid_votes=self.sum(p["invalid_views"]), voxels_with_observations=self.count(observed),
-            voxels_with_unknown_views=self.count(p["unknown_views"] > 0) if m.count else 0,
+            voxels_with_unknown_views=self.count(self.UInt(p["unknown_views"]) > 0) if m.count else 0,
             observed_rays=self.sum(p["observed_rays"]), unknown_rays=self.sum(p["unknown_rays"]),
             mean_gain_sum=self.sum(dr.select(dr.isfinite(mean), mean, 0)) if m.count else 0,
             rejected_no_observation=self.count(~observed), rejected_support=self.count(~supported),
@@ -421,6 +483,9 @@ class GPUTopologyLifecycle:
                       opacity_sh=checkpoint["model_metadata"]["opacity_sh_count"])
         selected = {name: take_rows(p[name], ids, width) for name, width in widths.items() if name in p}
         selected["parent_ids"] = parent_ids
+        # Detach the compact winners from the complete proposal tables before
+        # model concatenation and Adam remapping allocate their replacements.
+        dr.eval(*selected.values())
         return selected
 
     def remap(self, survivors, new_count, boundary):
@@ -432,10 +497,21 @@ class GPUTopologyLifecycle:
             return
         index = dr.arange(self.UInt, new_count)
         source = dr.gather(self.UInt, survivors, index, index < kept)
+        remapped = {}
         for name, old in self.fields.items():
             newborn = (boundary + 1 if name in ("growth_birth", "growth_wait_start") else
                        boundary + self.manager.settings.growth_protection_epochs if name == "deletion_eligible" else 0)
-            self.fields[name] = dr.select(index < kept, dr.gather(type(old), old, source, index < kept), newborn)
+            # Birth and wait histories often share storage and newborn values.
+            # Preserve that sharing across separate evaluations, without
+            # retaining any old arrays or comparing full device buffers.
+            key = (type(old), old.index, newborn)
+            if key in remapped:
+                self.fields[name] = type(old)(remapped[key])
+            else:
+                self.fields[name] = dr.select(index < kept, dr.gather(type(old), old, source, index < kept), newborn)
+                dr.eval(self.fields[name])
+                remapped[key] = self.fields[name]
+            old = None
         self.candidates = dr.gather(self.Bool, self.candidates, source, index < kept)
         self.manager.count = new_count
         dr.eval(*self.fields.values(), self.candidates)
@@ -515,6 +591,10 @@ class GPUTopologyLifecycle:
         masks = [mask for mask in (rgb, opacity) if mask is not None]
         checkpoint = None
         if masks:
+            # Compact decisions and scalar diagnostics must not keep the full
+            # deletion evidence window alive throughout model/Adam remapping.
+            dr.eval(*masks, *self.fields.values())
+            self.reduce_event(event)
             delete = masks[0]
             for mask in masks[1:]:
                 delete = delete | mask
@@ -541,14 +621,24 @@ class GPUTopologyLifecycle:
             if checkpoint is None:
                 checkpoint = device_checkpoint(model)
             selected = self.select_growth(checkpoint, boundary, event)
+            self.reduce_event(event)
+            m.pending_growth = None
+            m._growth_world_cache = m._growth_device = m._rgb_growth_device = None
             if selected is not None and len(selected["cells"]):
                 added = len(selected["cells"])
+                old_count, new_count = m.count, m.count + added
+                survivors = dr.arange(self.UInt, old_count)
+                # Retire the old Adam tables before allocating the appended
+                # model. Otherwise its large radiance array competes with
+                # both the old and new radiance moments during remapping.
+                optimizer.remap(survivors, new_count)
+                self.remap(survivors, new_count, boundary)
                 for name, value in checkpoint["model_state"].items():
                     addition = selected["cells" if name == "cell_indices" else name]
                     checkpoint["model_state"][name] = concat_rows(value, type(value)(addition))
-                survivors = dr.arange(self.UInt, m.count)
-                optimizer.remap(survivors, m.count + added)
-                self.remap(survivors, m.count + added, boundary)
+                # Lazy appends own only the materialized winner arrays now.
+                # Other selected fields and loop aliases have no later consumer.
+                selected = value = addition = None
                 event["grown"] = added
             elif not event["deleted"]:
                 checkpoint = None
@@ -568,7 +658,9 @@ class GPUTopologyLifecycle:
         m, np, dr = self.manager, self.manager.np, self.dr
         dr.eval(*self.fields.values(), self.candidates, self.cooldown_cells, self.cooldown_expiry)
         for name, value in self.fields.items():
-            setattr(m, name, np.array(value, copy=True))
+            # Keep the existing NumPy/checkpoint schema independent of the
+            # narrower resident representation chosen for ordinary schedules.
+            setattr(m, name, np.array(value, dtype=np.int64 if name in EPOCH_FIELDS else None, copy=True))
         m.candidates = np.array(self.candidates, copy=True)
         words = (m.view_count + 31) // 32
         m._foreground_masks = np.zeros((m.count, words), dtype=np.uint32)
@@ -581,7 +673,8 @@ class GPUTopologyLifecycle:
                 continue
             for name, value in list(p.items()):
                 if dr.is_array_v(type(value)):
-                    array = np.array(value, copy=True)
+                    dtype = np.uint32 if key == "pending_rgb_deletion" and name in DELETION_VIEW_FIELDS else None
+                    array = np.array(value, dtype=dtype, copy=True)
                     width = ROW_WIDTHS.get(name, 1)
                     if name == "radiance_sh":
                         array = array.reshape(len(p["cells"]), -1, 3) if len(p["cells"]) else array.reshape(0, p.get("sh_count", 0), 3)

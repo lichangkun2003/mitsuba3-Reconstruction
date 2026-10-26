@@ -124,6 +124,53 @@ Adam 默认按 ``appearance_valid`` / ``geometry_valid`` 分别压紧本视角�
 轮末 GPU 等待；预热、解码、拓扑变化、保存和评价不计入吞吐。
 ``--cprofile`` 和 ``--kernel-history`` 在吞吐测量后单独记录诊断，避免混入基准时间。
 
+1024 层级的显存还取决于活跃体素数量。紧凑空间索引与紧凑 Adam 更新行并不表示
+Adam 状态或原生输出梯度也按单视角命中数存储：当前两者仍覆盖全部活跃体素。
+此外，当前 Dr.Jit allocator 将每个缓冲区容量向上取整到 2 的幂，逻辑字节数会低于
+实际分配。例如约 2776 万体素、9 项颜色 SH 时，模型加 Adam 的逻辑大小约 12.2 GiB，
+分桶后约 17.6 GiB，尚未包含梯度、参考图和路径临时数据。
+
+训练循环在每个视角消费完梯度后立即释放引用，避免下个视角同时保留两份全量梯度；
+升层完成后同步一次并释放闲置 allocator 缓存，耗时记录在拓扑事件的
+``refinement_cache_release_seconds`` 中。分块也及时释放原生输出，但分块累加仍需全量
+梯度表，因此减小 ``--chunk-size`` 不保证降低峰值。显存仍紧张时，可用
+``--gpu-reference-cache-mib 0`` 释放参考图常驻缓存；CPU 图像缓存继续工作，每视角重新上传。
+
+GPU 生长查找使用每格 1 bit 的占用/目标位图，代替每格 1 byte 的 Bool 表；
+实际存储网格为 1040³ 时，每张表的 allocator 分配由 2 GiB 降至 256 MiB。
+父体素的 FP64 几何按最多 262144 行分批计算，所有批次仍统一排序并统计支持父体素，
+保持候选、几何阈值和生长规则不变。删除证据统计逐字段原位累加，有外部引用时通过
+写时复制保护旧值；Adam 迁移逐字段物化，减少整套新旧状态同时存活。提交时先迁移
+Adam，再拼接模型，避免两类完整副本的峰值叠加。
+相机数不超过 255 时，五个删除证据视角计数使用 UInt8；每个视角只计一次，比较阈值前
+提升至 UInt32。更多相机自动使用 UInt32，checkpoint 也始终保留原有 UInt32 计数格式。
+出生轮次等三个生命周期字段在可证明安全的范围内使用 signed Int32，超范围自动保留
+Int64；保存 checkpoint 时仍写入原有 Int64 格式，保护期判断和恢复兼容性保持不变。
+生长准备和证据轮提交前后均释放闲置缓存，普通视角不执行此同步；耗时分别记录在
+``epoch_growth_prepare_stage_seconds`` 和拓扑事件的 ``topology_cache_prepare_seconds`` /
+``topology_cache_release_seconds`` 中。
+
+从已有 checkpoint 检查升层后的工作集，可在独立进程运行：
+
+.. code-block:: powershell
+
+   & ..\envs\mitsuba\python.exe -B -I `
+     experiments/reconstruction/benchmarks/benchmark_reconstruction_memory.py `
+     --checkpoint outputs/bicycle-10.26-E1/training/epoch-01000.npz `
+     --refine --views 3 --rounds 2 --gpu-reference-cache-mib 0
+
+此工具只读取模型数组，细分一次后重置 Adam 和 GPU 生命周期状态，不覆盖原实验。
+每阶段同步并记录 allocator 水位、存活分配及 NVIDIA 显存采样；它不是正常吞吐基准，
+也不重现旧优化器仍存活时的完整升层峰值。``--retain-previous-gradient`` 可模拟旧视角
+引用保留方式，宜先在较小层级对照。``--max-device-gib`` 仅在阶段边界检查，无法阻止
+单次调用内部超额分配；诊断大模型时应由父进程设置超时。
+追加 ``--growth`` 可在 Adam 预热后运行一次真实生长/删除证据窗口，默认遍历全部训练相机，
+执行候选准备、证据累积、几何重验证和自然通过的拓扑提交。它使用重置的生命周期并推进
+到下一个生长边界，不能视为完整续训轨迹；是否实际新增体素以输出事件的 ``grown`` 为准。
+``--growth-views`` 可限制诊断相机数，但这会改变证据窗口，不能替代完整窗口的验证。
+``--growth-windows 2`` 可连续检查两个窗口；最后默认再执行一次普通视角更新，检查替换后的
+模型及 Adam，次数可由 ``--post-growth-views`` 调整。窗口之间推进调度轮次，不补跑中间训练。
+
 默认 ``CONFIG.render.traversal = "octree"`` 使用 GPU 八叉占用索引跳过空区域，
 预览、训练和评价均启用。正常叶子仍执行原有椭球求交、合成及 near-miss 几何梯度；
 生长候选标记单独维护，仅在收集生长证据时参与遍历，不改变真实命中数、颜色或透射率。

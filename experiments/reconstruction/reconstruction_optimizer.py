@@ -576,8 +576,15 @@ class FalcorOptimizer:
                 state["steps"] = dr.zeros(mi.UInt32, new_count)
             else:
                 state["mean"] = dr.gather(mi.Float, state["mean"], old, exists)
+                # Finish one replacement before building the next. Otherwise
+                # all lazy gathers retain the complete old Adam tables while
+                # allocating the complete new tables. Stream ordering handles
+                # lifetime safely; this does not add a host synchronization.
+                dr.eval(state["mean"])
                 state["squared_mean"] = dr.gather(mi.Float, state["squared_mean"], old, exists)
+                dr.eval(state["squared_mean"])
                 state["steps"] = dr.gather(mi.UInt32, state["steps"], source_ids, valid)
+                dr.eval(state["steps"])
         self.count = new_count
         dr.eval(*[value for state in self._state.values() for value in state.values()])
         self._remember_state()

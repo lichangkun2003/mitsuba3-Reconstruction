@@ -113,6 +113,9 @@ def execute_round(state, views, references, config, round_index, mi, dr, np, *, 
         if stages is not None:
             submission["native_stages"] = stages
         submissions.append(submission)
+        # Do not keep the previous view's dense gradient table alive while
+        # the next native call allocates its output buffers.
+        del gradients, result
     validation_started = time.perf_counter()
     measurements = checks.read(rgb_only=True, distortion_weight=config.gradient.distortion_loss_weight)
     validation_seconds = time.perf_counter() - validation_started

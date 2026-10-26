@@ -7,6 +7,9 @@ remain on the device; the NumPy generator is retained as an independent oracle.
 import math
 
 
+DEFAULT_PARENT_BATCH_SIZE = 262144
+
+
 def gather_rows(value, ids, width, dr):
     """Gather flattened rows without materializing a host index array."""
     if not dr.width(ids):
@@ -113,105 +116,59 @@ def membership_gpu(values, queries, dr):
     return (index < count) & (dr.gather(U, ordered, dr.minimum(index, count-1)) == queries)
 
 
-def generate_growth_gpu(manager, checkpoint, boundary, target_cells=None, *,
-                        eligible=None, cooldown_cells=None):
-    """Generate all parent-specific proposals, ordered by (cell,parent_cell).
-
-    `eligible` and unexpired `cooldown_cells` may be supplied by the device
-    lifecycle. A target subset restricts geometry revalidation without changing
-    supporting-parent counts for any retained target.
-    """
-    import drjit as dr
-    # Keep geometric threshold decisions in FP64 with fast math disabled,
-    # instead of silently using the renderer's float32 arithmetic.
-    with dr.scoped_set_flag(dr.JitFlag.FastMath, False):
-        return _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_cells, dr)
+def _make_bitmap(cell_count, sources, dr):
+    """One exact occupancy bit per cell; duplicate writers combine with OR."""
+    U = dr.cuda.UInt32
+    bitmap = dr.zeros(U, (cell_count + 31) // 32)
+    for source in sources:
+        if dr.width(source):
+            cells = U(source)
+            dr.scatter_reduce(dr.ReduceOp.Or, bitmap,
+                              U(1) << (cells & 31), cells >> 5)
+    dr.eval(bitmap)
+    return bitmap
 
 
-def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_cells, dr):
-    U, I, D, F, B = dr.cuda.UInt32, dr.cuda.Int32, dr.cuda.Float64, dr.cuda.Float32, dr.cuda.Bool
-    state, metadata, cfg = checkpoint['model_state'], checkpoint['model_metadata'], manager.settings
-    state = {k: U(v) if k == 'cell_indices' else F(v) for k, v in state.items()}
-    occupied, resolution = state['cell_indices'], metadata['resolution']
-    def empty_result():
-        result = {k: dr.empty(U if k in ('parent_ids','parent_cells','cells','geometric_support') else D, 0)
-                  for k in ('parent_ids','parent_cells','cells','geometric_support','centers','log_scales','rotations')}
-        result.update(boundary=boundary,resolution=resolution,seen_views=set(),foreground=U([]),background=U([]))
-        result['candidate_state'] = {k: dr.empty(U if k=='cell_indices' else F, 0) for k in state}
-        result.update(radiance_sh=F([]),opacity_sh=F([]))
-        return result
-    if not dr.width(occupied):
-        return empty_result()
-    if eligible is None:
-        wait = dr.cuda.Int64(manager.growth_wait_start)
-        eligible = ~B(manager.candidates) & ((wait == 0) |
-            ((boundary >= wait-1) & (boundary-(wait-1) >= cfg.growth_wait_epochs)))
-    if cooldown_cells is None:
-        cooldown_cells = U([cell for cell, expiry in manager.cooldown.items() if boundary < expiry])
-    cells = [I(occupied % resolution), I(occupied // resolution % resolution),
-             I(occupied // (resolution*resolution))]
-    from reconstruction_topology import _growth_core_radius_squared
-    radius_squared = _growth_core_radius_squared(metadata)
-    def region_allowed(coordinates):
-        allowed = dr.full(B, True, dr.width(coordinates[0]))
-        for c in coordinates:
-            allowed &= (c >= 0) & (c < resolution)
-        if radius_squared is not None:
-            farthest_squared = sum((dr.abs(2*c + 1 - resolution) + 1)**2
-                                   for c in coordinates)
-            allowed &= farthest_squared <= radius_squared
-        return allowed
+def _bitmap_contains(bitmap, cells, active, dr):
+    U = dr.cuda.UInt32
+    word = dr.gather(U, bitmap, cells >> 5, active)
+    return (word & (U(1) << (cells & 31))) != 0
 
-    # Parent eligibility is independent of geometry and the target direction.
-    # Compact once before FP64 ellipsoid math and all 26 neighbor passes. Keep
-    # original model IDs for inherited attributes and parent-pair matching;
-    # every occupied cell still participates in the full occupancy table below.
-    parent_ids = dr.compress(B(eligible) & region_allowed(cells))
-    if not dr.width(parent_ids):
-        return empty_result()
-    parent_cells = dr.gather(U, occupied, parent_ids)
-    cells = [dr.gather(I, value, parent_ids) for value in cells]
+
+def _reorder_fields(fields, order, dimensions, dr):
+    """Materialize one reordered field before releasing its old allocation."""
+    for name, width in dimensions.items():
+        previous = fields.pop(name)
+        fields[name] = gather_rows(previous, order, width, dr)
+        dr.eval(fields[name])
+        del previous
+
+
+def _parent_batch(state, metadata, parent_ids, blocked, selected_targets,
+                  offsets, penetration, cfg, region_allowed, dr):
+    """Keep FP64 geometry and contact temporaries bounded by this parent batch."""
+    U, I, D = dr.cuda.UInt32, dr.cuda.Int32, dr.cuda.Float64
+    resolution = metadata['resolution']
+    parent_cells = dr.gather(U, state['cell_indices'], parent_ids)
+    cells = [I(parent_cells % resolution), I(parent_cells // resolution % resolution),
+             I(parent_cells // (resolution*resolution))]
     geometry_state = {'cell_indices': parent_cells}
     for name, width in (('centers', 3), ('log_scales', 3), ('rotations', 4)):
         geometry_state[name] = gather_rows(state[name], parent_ids, width, dr)
-
-    evidence = cfg.use_growth_evidence or cfg.use_rgb_growth
-    if evidence:
-        penetration = min(max(float(cfg.growth_evidence_penetration), 0.), 4.)
-    elif manager.schedule.enabled:
-        penetration = manager.schedule.coarsest_growth_face_penetration * (1 if
-            metadata.get('core_resolution', resolution) == manager.schedule.start_resolution else
-            manager.schedule.growth_finer_level_multiplier)
-        penetration = min(max(float(penetration), 0.), 4.)
-    else:
-        penetration = min(max(float(cfg.growth_face_penetration), 0.), 4.)
-    # Avoid materializing 26 copies of each parent's geometry. Occupancy is
-    # shared, and only legal unoccupied pairs enter the expensive contact test.
-    blocked = dr.zeros(B, resolution**3)
-    dr.scatter(blocked, True, occupied)
-    if dr.width(cooldown_cells):
-        dr.scatter(blocked, True, U(cooldown_cells))
-    selected_targets = None
-    if target_cells is not None:
-        selected_targets = dr.zeros(B, resolution**3)
-        if dr.width(target_cells):
-            dr.scatter(selected_targets, True, U(target_cells))
-    dr.eval(blocked, selected_targets)
     center, axes, q, size, metric, extent = geometry_gpu(geometry_state, metadata, dr)
-    offsets = ([(x,y,z) for z in (-1,0,1) for y in (-1,0,1) for x in (-1,0,1)
-                if (x,y,z)!=(0,0,0)] if evidence and cfg.growth_use_26_neighbors else
-               [tuple(sign if j==axis else 0 for j in range(3))
-                for axis in range(3) for sign in (-1,1)])
+    del geometry_state
     pieces = []
+
     def gather(value, ids):
         return dr.gather(type(value), value, ids)
+
     for offset in offsets:
         neighbors = [cells[i]+offset[i] for i in range(3)]
         possible = region_allowed(neighbors)
         targets = U(neighbors[0]+resolution*(neighbors[1]+resolution*neighbors[2]))
-        possible &= ~dr.gather(B, blocked, targets, possible)
+        possible &= ~_bitmap_contains(blocked, targets, possible, dr)
         if selected_targets is not None:
-            possible &= dr.gather(B, selected_targets, targets, possible)
+            possible &= _bitmap_contains(selected_targets, targets, possible, dr)
         ids = dr.compress(possible)
         if not dr.width(ids):
             continue
@@ -245,15 +202,123 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
             centers=_pack([gather(v, chosen) for v in child], D, dr),
             log_scales=_pack([dr.log(gather(v*factor, chosen)) for v in a], D, dr),
             rotations=_pack([gather(v, parents) for v in q], D, dr)))
+        # Outputs own evaluated storage before this batch's geometry is dropped.
         dr.eval(*pieces[-1].values())
+    return pieces
+
+
+def generate_growth_gpu(manager, checkpoint, boundary, target_cells=None, *,
+                        eligible=None, cooldown_cells=None,
+                        parent_batch_size=DEFAULT_PARENT_BATCH_SIZE):
+    """Generate all parent-specific proposals, ordered by (cell,parent_cell).
+
+    `eligible` and unexpired `cooldown_cells` may be supplied by the device
+    lifecycle. A target subset restricts geometry revalidation without changing
+    supporting-parent counts for any retained target. `parent_batch_size` bounds
+    temporary FP64 geometry, without limiting parents or candidate counts.
+    """
+    if (isinstance(parent_batch_size, bool) or not isinstance(parent_batch_size, int)
+            or parent_batch_size < 1):
+        raise ValueError("parent_batch_size must be a positive integer")
+    import drjit as dr
+    # Keep geometric threshold decisions in FP64 with fast math disabled,
+    # instead of silently using the renderer's float32 arithmetic.
+    with dr.scoped_set_flag(dr.JitFlag.FastMath, False):
+        return _generate(manager, checkpoint, boundary, target_cells, eligible,
+                         cooldown_cells, parent_batch_size, dr)
+
+
+def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_cells,
+              parent_batch_size, dr):
+    U, I, D, F, B = dr.cuda.UInt32, dr.cuda.Int32, dr.cuda.Float64, dr.cuda.Float32, dr.cuda.Bool
+    state, metadata, cfg = checkpoint['model_state'], checkpoint['model_metadata'], manager.settings
+    state = {k: U(v) if k == 'cell_indices' else F(v) for k, v in state.items()}
+    occupied, resolution = state['cell_indices'], metadata['resolution']
+    def empty_result():
+        result = {k: dr.empty(U if k in ('parent_ids','parent_cells','cells','geometric_support') else D, 0)
+                  for k in ('parent_ids','parent_cells','cells','geometric_support','centers','log_scales','rotations')}
+        result.update(boundary=boundary,resolution=resolution,seen_views=set(),foreground=U([]),background=U([]))
+        result['candidate_state'] = {k: dr.empty(U if k=='cell_indices' else F, 0) for k in state}
+        result.update(radiance_sh=F([]),opacity_sh=F([]))
+        return result
+    if not dr.width(occupied) or (target_cells is not None and not dr.width(target_cells)):
+        return empty_result()
+    if eligible is None:
+        wait = dr.cuda.Int64(manager.growth_wait_start)
+        eligible = ~B(manager.candidates) & ((wait == 0) |
+            ((boundary >= wait-1) & (boundary-(wait-1) >= cfg.growth_wait_epochs)))
+    if cooldown_cells is None:
+        cooldown_cells = U([cell for cell, expiry in manager.cooldown.items() if boundary < expiry])
+    cells = [I(occupied % resolution), I(occupied // resolution % resolution),
+             I(occupied // (resolution*resolution))]
+    from reconstruction_topology import _growth_core_radius_squared
+    radius_squared = _growth_core_radius_squared(metadata)
+    def region_allowed(coordinates):
+        allowed = dr.full(B, True, dr.width(coordinates[0]))
+        for c in coordinates:
+            allowed &= (c >= 0) & (c < resolution)
+        if radius_squared is not None:
+            farthest_squared = sum((dr.abs(2*c + 1 - resolution) + 1)**2
+                                   for c in coordinates)
+            allowed &= farthest_squared <= radius_squared
+        return allowed
+
+    # Parent eligibility is independent of geometry and the target direction.
+    # Compact once before FP64 ellipsoid math and all 26 neighbor passes. Keep
+    # original model IDs for inherited attributes and parent-pair matching;
+    # every occupied cell still participates in the full occupancy table below.
+    parent_ids = dr.compress(B(eligible) & region_allowed(cells))
+    if not dr.width(parent_ids):
+        return empty_result()
+    del cells
+
+    evidence = cfg.use_growth_evidence or cfg.use_rgb_growth
+    if evidence:
+        penetration = min(max(float(cfg.growth_evidence_penetration), 0.), 4.)
+    elif manager.schedule.enabled:
+        penetration = manager.schedule.coarsest_growth_face_penetration * (1 if
+            metadata.get('core_resolution', resolution) == manager.schedule.start_resolution else
+            manager.schedule.growth_finer_level_multiplier)
+        penetration = min(max(float(penetration), 0.), 4.)
+    else:
+        penetration = min(max(float(cfg.growth_face_penetration), 0.), 4.)
+    # Eight times smaller than byte-per-cell Bool tables, including high-grid
+    # addresses and duplicate cooldown/target entries. Masked neighbor queries
+    # never address words outside the grid.
+    blocked = _make_bitmap(resolution**3, (occupied, cooldown_cells), dr)
+    selected_targets = (_make_bitmap(resolution**3, (target_cells,), dr)
+                        if target_cells is not None else None)
+    offsets = ([(x,y,z) for z in (-1,0,1) for y in (-1,0,1) for x in (-1,0,1)
+                if (x,y,z)!=(0,0,0)] if evidence and cfg.growth_use_26_neighbors else
+               [tuple(sign if j==axis else 0 for j in range(3))
+                for axis in range(3) for sign in (-1,1)])
+    pieces = []
+    for begin in range(0, dr.width(parent_ids), parent_batch_size):
+        count = min(parent_batch_size, dr.width(parent_ids)-begin)
+        positions = dr.arange(U, count) + dr.opaque(U, begin)
+        batch_ids = dr.gather(U, parent_ids, positions)
+        pieces.extend(_parent_batch(state, metadata, batch_ids, blocked, selected_targets,
+                                    offsets, penetration, cfg, region_allowed, dr))
+    del blocked, selected_targets, parent_ids, batch_ids, positions
     dimensions = dict(parent_ids=1, parent_cells=1, cells=1, centers=3, log_scales=3, rotations=4)
-    result = {k: dr.concat([p[k] for p in pieces]) if pieces else
-              dr.empty(U if width == 1 else D, 0) for k, width in dimensions.items()}
+    result = {}
+    for name, width in dimensions.items():
+        sources = [piece.pop(name) for piece in pieces]
+        result[name] = dr.concat(sources) if sources else dr.empty(U if width == 1 else D, 0)
+        dr.eval(result[name])
+        del sources
+    pieces.clear()
     n = dr.width(result['cells'])
     if n:
+        # Parent batches change enumeration order only. Every (cell,parent-cell)
+        # pair is unique; global sorting restores the original canonical order
+        # before support is counted across all batches.
         key = (dr.cuda.UInt64(result['cells']) << 32) | dr.cuda.UInt64(result['parent_cells'])
         order = dr.argsort(key)
-        result = {k: gather_rows(v, order, dimensions[k], dr) for k, v in result.items()}
+        dr.eval(order)
+        del key
+        _reorder_fields(result, order, dimensions, dr)
+        del order
         index = dr.arange(U, n)
         first = (index == 0) | (result['cells'] != dr.gather(U, result['cells'], dr.maximum(index, 1)-1))
         groups = dr.cumsum(U(first))-1
@@ -262,8 +327,13 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
         dr.scatter_reduce(dr.ReduceOp.Add, counts, U(1), groups)
         support = dr.gather(U, counts, groups)
         keep = dr.compress(support >= max(1, min(26, cfg.growth_min_supporting_parents))) if evidence else index
-        result = {k: gather_rows(v, keep, dimensions[k], dr) for k, v in result.items()}
-        result['geometric_support'] = dr.gather(U, support, keep) if dr.width(keep) else U([])
+        geometric_support = dr.gather(U, support, keep) if dr.width(keep) else U([])
+        dr.eval(keep, geometric_support)
+        del support, groups, starts, counts, first, index
+        if dr.width(keep) != n:
+            _reorder_fields(result, keep, dimensions, dr)
+        result['geometric_support'] = geometric_support
+        del keep, geometric_support
     else:
         result['geometric_support'] = U([])
     n = dr.width(result['cells'])
