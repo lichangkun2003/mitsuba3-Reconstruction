@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from preview import (DataConfig, ModelConfig, RenderConfig, RuntimeConfig, PreviewConfig,
                      validate_config, validate_traversal, native_traversal_settings,
-                     scene_background_protocol)
+                     scene_background_protocol, apply_saved_background_defaults)
 from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, UniformSampler, ReferenceImageCache,
     generate_ray_batch, prepare_camera, initialize_runtime, load_views, model_metadata,
     prepare_dataset, initialize_model,
@@ -97,8 +97,8 @@ class ContourSettings:
 class EvaluationSettings:
     enabled: bool = True
     spp: int = 64
-    train_max_views: int | None = 10  # First N training cameras; None or 0: all.
-    test_max_views: int | None = None  # Evaluate the complete held-out test split.
+    train_max_views: int | None = None  # All training cameras; positive values select the first N.
+    test_max_views: int | None = 10  # First N held-out cameras; None or 0: all.
     max_views: int | None = None  # Legacy explicit override of both split limits; 0: all.
     chunk_size: int = 65536
     seed: int = 42
@@ -128,7 +128,7 @@ CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
 CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再解码；渲染与损失仍在线性空间。
 CONFIG.data.scene_mode = "auto"  # 合成场景：有界白色背景；COLMAP：无界远景层、无白色背景尾项。
-CONFIG.data.background_layers = 8  # 新无界场景各层级均保留8层远景；升层时物理厚度减小。
+CONFIG.data.background_final_layers = 8  # 最终远景层数；1024 终点按 2→4→8 层细分，物理范围不变。
 CONFIG.data.background_opacity = 0.5  # 远景新生体素 opacity；允许后续优化和删除。
 
 CONFIG.render.width = 800
@@ -192,8 +192,8 @@ CONFIG.training.output = None  # 自动创建 outputs/场景-MM.DD-E编号/train
 # 需要手动指定目录时，将 None 改为路径字符串，或传 --output-dir。
 CONFIG.evaluation.enabled = True  # 最终 model.npz 保存后，自动评价训练集和测试集。
 CONFIG.evaluation.spp = 64  # 仅用于评价出图，不改变训练的 1 spp。
-CONFIG.evaluation.train_max_views = 10  # 训练集前 10 个视角。
-CONFIG.evaluation.test_max_views = None  # 测试集全部视角，适用于合成场景和 COLMAP/Mip-NeRF 360。
+CONFIG.evaluation.train_max_views = None  # 训练集全部视角，适用于合成场景和 COLMAP/Mip-NeRF 360。
+CONFIG.evaluation.test_max_views = 10  # 测试集前 10 个视角；不足 10 个时全部出图。
 # 高级参数使用 CONFIG.optimizer / gradient / topology / contour / runtime。
 # ============================ 配置区结束 ============================
 
@@ -215,6 +215,8 @@ def update(config, values):
             raise ValueError(f"Unknown or malformed configuration fields in {name}")
         for key, value in entries.items():
             setattr(group, key, value)
+        if name == "data":
+            apply_saved_background_defaults(group, entries)
 
 
 def parse_arguments():
@@ -235,7 +237,9 @@ def parse_arguments():
     parser.add_argument("--dataset")
     parser.add_argument("--scene-mode", choices=("auto", "bounded", "unbounded"),
                         help="auto: bounded synthetic / unbounded COLMAP; override for a new scene")
-    parser.add_argument("--background-layers", type=int, help="Radial shell layers retained at every level for new scenes (default: 8)")
+    parser.add_argument("--background-final-layers", type=int,
+                        help="Radial background layers at the target resolution (default: 8); independent of max_hits")
+    parser.add_argument("--background-layers", type=int, help="Legacy v2/v3 setting; use --background-final-layers for new runs")
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
     parser.add_argument("--output-dir", help="Override automatic outputs/SCENE-MM.DD-Eindex/training; on resume the default reuses the checkpoint's experiment")
     parser.add_argument("--build-dir")
@@ -262,9 +266,9 @@ def parse_arguments():
     parser.add_argument("--skip-evaluation", action="store_true", help="Save the final model without automatic train/test evaluation")
     parser.add_argument("--eval-spp", type=int, help="Samples per pixel for final evaluation (default: 64)")
     parser.add_argument("--eval-train-max-views", type=int,
-                        help="Evaluate the first N training cameras (default: 10); 0 evaluates all")
+                        help="Evaluate the first N training cameras (default: all); 0 evaluates all")
     parser.add_argument("--eval-test-max-views", type=int,
-                        help="Evaluate the first N held-out test cameras (default: all); 0 evaluates all")
+                        help="Evaluate the first N held-out test cameras (default: 10); 0 evaluates all")
     parser.add_argument("--eval-max-views", type=int,
                         help="Deprecated: override BOTH train/test limits; 0 evaluates all. Prefer the split-specific options")
     return parser.parse_args()
@@ -278,6 +282,7 @@ def apply_arguments(config, args, values):
         (args.dataset, "data", "dataset"), (args.output_dir, "training", "output"),
         (getattr(args, "scene_mode", None), "data", "scene_mode"),
         (getattr(args, "background_layers", None), "data", "background_layers"),
+        (getattr(args, "background_final_layers", None), "data", "background_final_layers"),
         (getattr(args, "background_opacity", None), "data", "background_opacity"),
         (args.build_dir, "runtime", "build_dir"), (args.gpu, "runtime", "gpu"),
         (args.chunk_size, "training", "chunk_size"),
@@ -305,8 +310,8 @@ def apply_arguments(config, args, values):
     if config.evaluation.enabled and config.evaluation.max_views is not None:
         print("Deprecated evaluation.max_views / --eval-max-views explicitly overrides BOTH "
               "train and test limits, including split-specific options. Remove it (or set "
-              "evaluation.max_views=null) to use train_max_views=10 and test_max_views=null "
-              "for full test-set evaluation.", file=sys.stderr)
+              "evaluation.max_views=null), then set train_max_views=null and test_max_views=10 "
+              "for all training views and the first 10 test views.", file=sys.stderr)
     if (not config.training.rgb_only and
             "use_rgb_growth" not in values.get("topology", {})):
         # Explicit legacy supervision must not inherit the current RGB-only
@@ -981,10 +986,17 @@ def normalized_algorithm_group(name, values):
         return {key: value for key, value in values.items() if key != "traversal"}
     if name == "data" and values is not None:
         # Omitted/None COLMAP options are identical for historical synthetic runs.
-        return {"reference_compositing": "linear", "scene_mode": "auto",
-            "background_layers": 8, "background_opacity": .5, **{
+        normalized = {"reference_compositing": "linear", "scene_mode": "auto",
+            "background_layers": 8, "background_final_layers": None, "background_opacity": .5, **{
             key: value for key, value in values.items()
             if key not in ("images", "initialization") or value is not None}}
+        # The saved initializer determines which layer parameter is meaningful.
+        # Preserve historical comparisons without silently changing its policy.
+        if (values.get("initialization") or {}).get("version") in (4, 5):
+            normalized.pop("background_layers", None)
+        elif normalized["background_final_layers"] is None:
+            normalized.pop("background_final_layers")
+        return normalized
     defaults = {"topology": TopologySettings, "gradient": GradientSettings}
     if values is not None and name in defaults:
         normalized = {**asdict(defaults[name]()), **values}
@@ -1185,7 +1197,9 @@ def run_training(distributed=None):
             runtime, training_output = config.runtime, config.training.output
             # Fields introduced after a checkpoint must use their legacy
             # dataclass defaults, not the latest experiment's CONFIG switches.
-            config.data = DataConfig(background_layers=8)  # Historical default for saves without this field.
+            saved_data = checkpoint["config"].get("data", {})
+            config.data = (DataConfig() if (saved_data.get("initialization") or {}).get("version") in (4, 5)
+                           else DataConfig(background_layers=8, background_final_layers=None))
             config.render = RenderConfig()
             config.topology = TopologySettings()
             config.gradient = GradientSettings()
@@ -1286,7 +1300,7 @@ def run_training(distributed=None):
                 "native_version": getattr(mi.VoxelReconstruction, "distortion_version", 0),
                 "formula": "2 * sum(i<j, w_i*w_j*abs(s_i-s_j)); w_i=T_i*opacity_i",
                 "depth": "hard-hit ellipsoid quadratic-minimum depth, relative to ray-grid entry, divided by grid diagonal",
-                "samples": "actual recorded hard hits only; no background sample or interval-width term",
+                "samples": "actual recorded hard hits only; no residual environment sample or interval-width term",
                 "estimator": "one inverse_pdf factor; sum gradients, mean loss over all view pixels",
                 "topology_evidence": "RGB-only insertion/removal gains remain unchanged",
                 "zero_weight": "not computed; logged distortion values are zero, not measurements",
@@ -1341,6 +1355,19 @@ def run_training(distributed=None):
         prepared = prepare_dataset(config, np, load_points=checkpoint is None)
         report["scene_background"] = scene_background_protocol(config.data, config.render)
         report["training_protocol"]["reference_background"] = list(config.render.background)
+        if (config.data.initialization or {}).get("scene_mapping") == "projective_shell":
+            report["training_protocol"]["distortion"]["depth"] = (
+                "hard-hit ellipsoid quadratic minimum mapped back to world ray distance t; "
+                "s=t/(t+core_half_extent), t measured from ray origin")
+            report["training_protocol"]["scene_mapping"] = {
+                "name": "projective_shell",
+                "native_version": getattr(mi.VoxelReconstruction, "projective_version", 0),
+                "ray_extent": "infinity",
+                "segments": "analytic world-region intervals; same color/transmittance/hit capacity across charts",
+                "background_growth": False,
+                "background_rgb_deletion": False,
+                "background_opacity_deletion": "configured finest level only; existing warmup and confirmation windows",
+            }
         views = (prepared["views"] if prepared is not None else
                  load_views(dataset, config.data.cameras, config.render, np))
         signature = dataset_signature(views, dataset, config.data.cameras, config.data.initialization)

@@ -42,7 +42,8 @@ class DataConfig:
     images: str | None = None  # COLMAP image folder; None selects the scene's downsampled images.
     initialization: dict | None = None  # Resolved COLMAP normalization/shell, persisted for resume/evaluation.
     scene_mode: str = "auto"  # auto: synthetic bounded, COLMAP unbounded; explicit override supported.
-    background_layers: int = 8  # New unbounded scenes retain this radial layer count at every level.
+    background_final_layers: int | None = 8  # Radial layers at the target core resolution; physical shell width stays fixed.
+    background_layers: int | None = None  # Legacy v2/v3 checkpoint setting; new runs use background_final_layers.
     background_opacity: float = 0.5  # Initial per-voxel opacity in the complete far-field shell.
 
 
@@ -148,6 +149,24 @@ def workspace_path(value: str | Path, workspace: Path) -> Path:
     return (path if path.is_absolute() else workspace / path).resolve()
 
 
+def apply_saved_background_defaults(data, entries: dict) -> None:
+    """Do not inherit new layer defaults when loading a saved initializer."""
+    saved = entries.get("initialization")
+    if not isinstance(saved, dict):
+        return
+    version = saved.get("version")
+    if version in (1, 2, 3):
+        if "background_final_layers" not in entries:
+            data.background_final_layers = None
+        if "background_layers" not in entries:
+            data.background_layers = saved.get("background_layers", 8)
+    elif version in (4, 5):
+        if "background_layers" not in entries:
+            data.background_layers = None
+        if "background_final_layers" not in entries:
+            data.background_final_layers = saved.get("background_final_layers", 8)
+
+
 def update_config(config: PreviewConfig, values: dict) -> None:
     allowed_groups = {item.name for item in fields(config)}
     if not isinstance(values, dict) or set(values) - allowed_groups:
@@ -159,6 +178,8 @@ def update_config(config: PreviewConfig, values: dict) -> None:
             raise ValueError(f"Unknown or malformed configuration fields in {group_name}")
         for name, value in entries.items():
             setattr(group, name, value)
+        if group_name == "data":
+            apply_saved_background_defaults(group, entries)
 
 
 def resolve_scene_background(config, dataset_type: str) -> str:
@@ -199,7 +220,13 @@ def scene_background_protocol(data, render) -> dict:
     return {"requested_scene_mode": data.scene_mode, "scene_mode": mode,
             "background_linear_rgb": list(render.background),
             "background_role": "residual ray transmittance color; no environment illumination",
-            "initial_background_layers": data.background_layers if mode == "unbounded" else None,
+            "scene_mapping": saved.get("scene_mapping", "bounded"),
+            "ray_extent": ("infinity" if saved.get("scene_mapping") == "projective_shell"
+                           else "configured far_clip"),
+            "initial_background_layers": (saved.get("initial_background_layers", saved.get("background_layers",
+                                                data.background_layers)) if mode == "unbounded" else None),
+            "final_background_layers": (saved.get("shell_layers", data.background_final_layers)
+                                        if mode == "unbounded" else None),
             "background_refinement": (saved.get("background_refinement", "preserve_physical_width")
                                       if mode == "unbounded" else None),
             "initial_background_opacity": data.background_opacity if mode == "unbounded" else None}
@@ -210,7 +237,9 @@ def parse_config(workspace: Path) -> PreviewConfig:
     parser.add_argument("--config", help="JSON config, relative to the workspace parent")
     parser.add_argument("--dataset")
     parser.add_argument("--scene-mode", choices=("auto", "bounded", "unbounded"))
-    parser.add_argument("--background-layers", type=int, help="Radial shell layers retained at every level for new scenes (default: 8)")
+    parser.add_argument("--background-final-layers", type=int,
+                        help="Background layers at the target resolution (default: 8); independent of max_hits")
+    parser.add_argument("--background-layers", type=int, help="Legacy v2/v3 setting; use --background-final-layers for new runs")
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
     parser.add_argument("--point-cloud")
     parser.add_argument("--cameras")
@@ -236,6 +265,7 @@ def parse_config(workspace: Path) -> PreviewConfig:
     mapping = {
         "dataset": ("data", "dataset"), "point_cloud": ("data", "point_cloud"),
         "scene_mode": ("data", "scene_mode"), "background_layers": ("data", "background_layers"),
+        "background_final_layers": ("data", "background_final_layers"),
         "background_opacity": ("data", "background_opacity"),
         "cameras": ("data", "cameras"), "camera_index": ("data", "camera_index"),
         "reference_compositing": ("data", "reference_compositing"),
@@ -260,8 +290,10 @@ def validate_config(config: PreviewConfig) -> None:
         raise ValueError("data.initialization must be resolved initialization metadata or null")
     if config.data.scene_mode not in ("auto", "bounded", "unbounded"):
         raise ValueError("data.scene_mode must be auto, bounded or unbounded")
-    if type(config.data.background_layers) is not int or config.data.background_layers < 1:
-        raise ValueError("data.background_layers must be a positive integer")
+    for name in ("background_final_layers", "background_layers"):
+        value = getattr(config.data, name)
+        if value is not None and (type(value) is not int or value < 1):
+            raise ValueError(f"data.{name} must be a positive integer or null")
     if (isinstance(config.data.background_opacity, bool)
             or not isinstance(config.data.background_opacity, (int, float))
             or not math.isfinite(config.data.background_opacity)
@@ -492,7 +524,8 @@ def generate_rays(config: RenderConfig, camera: dict, offset, mi, dr):
                     + vertical * mi.Vector3f(camera["up"]))
     origin = mi.Point3f(camera["position"]) + config.near_clip * unnormalized
     ray = mi.Ray3f(origin, dr.normalize(unnormalized))
-    ray.maxt = (config.far_clip - config.near_clip) * dr.norm(unnormalized)
+    ray.maxt = (float("inf") if camera.get("projective_unbounded", False) else
+                (config.far_clip - config.near_clip) * dr.norm(unnormalized))
     return ray
 
 

@@ -1,17 +1,18 @@
 体素重建实验
 ============
 
-当前单卡实验从 ``train.py`` 启动，统一参数在该文件顶部的 ``CONFIG`` 赋值区。
-切换场景修改 ``CONFIG.data.dataset``，或传入 ``--dataset datasets/lego``；
-命令行参数覆盖配置文件与默认配置。RTX 5090 Windows 主机使用这个单卡入口。
+当前单卡实验从 ``train.py`` 启动，默认参数在该文件顶部的 ``CONFIG`` 赋值区。
+完整 Bicycle 1024 实验可直接读取 ``configs/bicycle_1024.json``，不必重复输入长命令。
+参数优先级是命令行 > JSON 配置 > ``CONFIG`` 默认值。RTX 5090 Windows 主机使用这个单卡入口。
 
 新实验默认 ``data.scene_mode="auto"``：合成场景有界白底，COLMAP 场景无界黑底。
 可用 ``--scene-mode bounded`` / ``--scene-mode unbounded`` 显式指定；当前无界初始化
 要求 COLMAP 数据，合成相机 JSON 不能直接强制启用无界模式。背景只是剩余透射率的
 合成尾项，不是光照计算；普通 RGB/JPEG 参考图的实拍背景不会被替换。
 
-无界模式默认 ``data.background_layers=4``、``data.background_opacity=0.5``，
-也可用 ``--background-layers`` / ``--background-opacity`` 设置。所有静态格子 AABB
+无界模式默认 ``data.background_final_layers=8``、``data.background_opacity=0.5``，
+也可用 ``--background-final-layers`` / ``--background-opacity`` 设置。前者指定最终层数。
+所有静态格子 AABB
 与远景径向球壳相交的格子统一铺满：有点的格使用点云种子颜色，其余为黑色，
 几何为覆盖整个格子的球形椭球。内层种子保持原初始化。
 **只有初始化点继续使用原来的径向压缩；射线、前向直线遍历和梯度流程不变。**
@@ -19,16 +20,19 @@
 
 远景允许几何／颜色／opacity 优化与现有删除，禁止作为生长父体或生长目标；
 被删除的远景格不会重新长回。区域按静态格子确定，不受优化后中心移动影响。
-初始 4 层与 ``max_hits`` 解耦，256→512 时全场统一分裂，远景厚度变为 8 个体素层，
-保持物理壳层宽度；近景与远景的体素边长始终相同，不保留粗分辨率远景。
+背景层数与 ``max_hits`` 解耦：256→512 时为 4→8 层，256→512→1024 时为 2→4→8 层。
+全场统一正常分裂，保持物理壳层宽度，不再径向压缩或裁掉外层；近景与远景的体素
+边长始终相同，不保留粗分辨率远景。
 完整壳层会增加体素数与显存；删除、有限路径容量和后续优化可能留下透射率，
 黑色尾项不意味着保证射线最终不透明。
 
-新 COLMAP 初始化保存 version 2 的场景、背景和归一化元数据。旧 version 1 实验
-继续保留原初始化及背景，恢复／评价时不自动迁移。已有初始 8 层的 version 2 checkpoint
-同样保留其已保存的壳层参数，不会因新默认值变为 4 层；4 层设置应从新实验开始。
+新无界 COLMAP 初始化保存 version 4 的场景、最终背景层数和归一化元数据。
+旧 version 1／2／3 实验恢复与评价时保留原策略：version 2 按已保存的初始层数正常
+分裂，version 3 按已保存的固定层数径向重映射；不会自动迁移。新策略应从新实验开始，
+``--background-layers`` 仅保留用于旧 version 2／3 配置。
 远景初始化为模型元数据扩展了 Python 绑定，稀疏 Adam 更新另外使用新的原生参数提交接口。
-需要先在仓库根目录增量编译；前向求交与深度计算不变：
+若还未编译包含这些接口的 C++，先在仓库根目录增量编译；仅修改 JSON 或更新最终层数
+调度无需重新编译。前向求交与深度计算不变：
 
 .. code-block:: powershell
 
@@ -36,7 +40,7 @@
    if ($LASTEXITCODE -ne 0) { throw "编译失败" }
    & ..\envs\mitsuba\python.exe -u -I experiments/reconstruction/train.py `
      --dataset datasets/bicycle --scene-mode unbounded `
-     --background-layers 4 --background-opacity 0.5 --gpu 0 --epochs 1000
+     --background-final-layers 8 --background-opacity 0.5 --gpu 0 --epochs 1000
 
 venv 解释器使用 ``..\envs\mitsuba\Scripts\python.exe``。完整 Bicycle 训练质量与
 资源开销需通过新实验确认；初始化与恢复的回归不替代完整训练。
@@ -406,7 +410,7 @@ RGB 生长／删除证据按视角独立通过 NCCL 传送，再由 rank 0 投�
 
    "$HOME/envs/mitsuba/bin/python" -u -I experiments/reconstruction/train_multigpu.py \
      --dataset datasets/bicycle --scene-mode unbounded \
-     --background-layers 4 --background-opacity 0.5 \
+     --background-final-layers 8 --background-opacity 0.5 \
      --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
      --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
@@ -574,6 +578,33 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 单卡实验命令
 ------------
 
+使用仓库内的 ``configs/bicycle_1024.json`` 启动 3000 轮 Bicycle 实验：
+
+.. code-block:: powershell
+
+   Set-Location "E:\lck\reconstruction\mitsuba"
+   & "E:\lck\reconstruction\envs\mitsuba\python.exe" -u -I `
+     .\experiments\reconstruction\train.py `
+     --config "E:\lck\reconstruction\mitsuba\experiments\reconstruction\configs\bicycle_1024.json"
+
+配置采用 256 → 512 → 1024、4:3:3 的轮数比例、最终 8 层背景（2 → 4 → 8），
+Distortion 权重 0.1，启用 GPU 拓扑和原生重放，关闭性能抽样。训练为整图 1 spp，
+最终评价为 64 spp，训练集全部视角、测试集前 10 个视角。
+前景与外景的 radiance 均使用 9 个 SH 系数（0、1、2 阶），保留方向性；opacity 仍仅优化 DC。
+COLMAP 图像尺寸由数据集读取，会覆盖 JSON 中 ``render.width`` / ``render.height`` 的初始值。
+
+日常修改 JSON 中的 ``data.dataset``、``training.num_epochs``、
+``schedule.target_resolution``、``schedule.level_weights``、
+``data.background_final_layers`` 和 ``gradient.distortion_loss_weight`` 即可。
+改为 512 终点时，应同时将 ``schedule.level_weights`` 改为两个数，例如 ``[6, 4]``。
+换成 Lego / Hotdog 等合成场景时，还需将 ``data.scene_mode`` 改为 ``"bounded"`` 或 ``"auto"``。
+临时参数仍可加在命令末尾，例如 ``--epochs 1000`` 覆盖 JSON；配置修改无需重新编译。
+
+上面的绝对配置路径不依赖当前目录。若使用相对 ``--config`` 路径，仍以仓库父目录
+为基准，应写 ``mitsuba/experiments/reconstruction/configs/bicycle_1024.json``，
+而不是 ``experiments/reconstruction/configs/bicycle_1024.json``。
+JSON 内的数据集、输出等相对路径也按仓库父目录解析，不按配置文件所在目录解析。
+
 先短跑十轮，保留完整实验的 1000 轮调度预算：
 
 .. code-block:: powershell
@@ -589,7 +620,7 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 
    & '..\envs\mitsuba\Scripts\python.exe' -I .\experiments\reconstruction\train.py `
      --dataset datasets/lego --gpu 0 --epochs 1000 --chunk-size 0 `
-     --no-profile-stages --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
+     --no-profile-stages --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
 
 ``--no-profile-stages`` 关闭分段诊断，使抽样视角也能使用原生重放，适合速度比较。
 若需要定位前向与反向耗时，可重新开启 ``--profile-stages``。
@@ -630,7 +661,7 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
      --dataset datasets/lego --epochs 1000 --chunk-size 0 \
-     --no-profile-stages --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
+     --no-profile-stages --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
 
 实验启动时自动分配为 ``outputs/场景-MM.DD-E编号/``，其中 ``E`` 表示实验编号。
 训练成功并保存最终模型后，目录自动加上耗时，例如 ``hotdog-10.20-E3-20min``。
@@ -650,7 +681,7 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 启用同次训练前向中的 RGB 生长证据，以及已有反向中的 RGB 删除证据和持续低 opacity 清理，
 每个层级各 warmup 20 轮；保留 256 → 512 分裂。
 新实验在全局最后 50 轮冻结生长，删除继续按周期执行，同时以 1 spp 优化已有体素。
-最终出图为 64 spp，训练集取前 10 个视角，测试集全部出图并计入指标。
+最终出图为 64 spp，训练集全部出图，测试集取前 10 个视角并计入指标；不足 10 个时全取。
 
 出图及 COLMAP 图片读取使用 Pillow，在本项目独立环境安装：
 
@@ -667,7 +698,7 @@ HPC 使用 ``$HOME/envs/mitsuba/bin/python`` 执行同一 ``-m pip install -r`` 
 
    & '..\envs\mitsuba\Scripts\python.exe' -I .\experiments\reconstruction\evaluate.py `
      --checkpoint outputs/hotdog-10.21-E0-47min/model.npz --split both --spp 64 `
-     --train-max-views 10 --test-max-views 0 `
+     --train-max-views 0 --test-max-views 10 `
      --output-dir outputs/hotdog-10.21-E0-47min
 
 评价对多 spp 的预测先在线性空间求均值，再转换为 sRGB；预测和合成后的参考都实际保存为
@@ -695,8 +726,8 @@ HPC 使用 ``$HOME/envs/mitsuba/bin/python`` 执行同一 ``-m pip install -r`` 
 ``--skip-evaluation`` 同时跳过初始化图、升层前图片和最终评价。
 
 中途完整 checkpoint 仅在升层前保存，命名为
-``training/before-refine-0256-epoch-00600.npz`` 等；1500 轮、``4 3 3`` 权重时，
-分别保存完成第 600 和 1050 轮的旧层状态。文件包含 Adam、RNG 及生命周期，并标记待执行升层；
+``training/before-refine-0256-epoch-01200.npz`` 等；上述 3000 轮、``4 3 3`` 权重的预设，
+分别保存完成第 1200 和 2100 轮的旧层状态。文件包含 Adam、RNG 及生命周期，并标记待执行升层；
 恢复时先完成升层，再进入下一轮，不重复训练该边界轮次。旧 ``training.save_count`` 字段仅用于
 配置兼容，不再安排定期快照。训练结束仍保存最终 ``model.npz``；显式 ``--stop-after-epochs``
 仍保存可续训的停止点。已有实验文件不自动删除。
@@ -732,8 +763,9 @@ PLY 和相机来源独立判断，因此已有导出 PLY 的 360 场景仍可使
 ``R = 1.1 * max(||camera - c||)``；点云和相机先统一变换为 ``(p-c)/R``，
 再统一转换坐标轴为 ``(x,y,z) -> (x,z,-y)``。相机只做这一相似变换。
 半径 ``r <= 1`` 的点保持不变；远景点沿径向一次性映射到
-``r' = 1 + W * (1 - 1/r)``。新 version 2 初始化使用
-``W = 2 * data.background_layers / 起始核心分辨率``，默认初始 4 层。
+``r' = 1 + W * (1 - 1/r)``。新 version 4 无界初始化使用
+``W = 2 * data.background_final_layers / 最终核心分辨率``，默认最终 8 层。
+1024 终点从 2 层开始，512 终点从 4 层开始；升层保持这个物理宽度及边界。
 这是压缩几何的初始化，后续直接在该几何上求交和优化，不对射线做逆压缩。
 
 旧 version 1 初始化仍按 ``W = 2 * render.max_hits / 最终核心分辨率`` 恢复。
@@ -742,27 +774,30 @@ PLY 和相机来源独立判断，因此已有导出 PLY 的 360 场景仍可使
 外壳径向层数为 8 → 16；核心体素边长仍分别为 ``2/256``、``2/512``。
 合成场景的核心分辨率与存储分辨率相同。
 在该旧规则下，独立 ``preview.py`` 没有升层计划，最终核心分辨率等于其 ``grid_resolution``；
-因此预览 256 单层时外壳为 16 层、实际网格为 288。新 version 2 不再按 ``max_hits`` 决定壳层宽度。
-需要查看 256 → 512 训练计划的原始初始化图时，使用训练入口保存的 ``0000-initial.png``。
+因此旧 version 1 预览 256 单层时外壳为 16 层、实际网格为 288。
+version 2／3 的旧 checkpoint 继续沿用各自保存的背景层数与细分策略，
+version 4 则根据最终层数安排起始壳层；这些版本均不再按 ``max_hits`` 决定壳层宽度。
+需要查看多层训练计划的原始初始化图时，使用训练入口保存的 ``0000-initial.png``。
 中心、半径、外壳宽度和图像目录写入 ``data.initialization``，
 随 checkpoint 保存；续训、升层和评价复用它们，不重新压缩已训练体素。
 初始化后两类场景共用索引表、八叉树、Adam、生长与删除流程。
 ``max_hits`` 仍是整条射线的命中上限，外壳层数相同不代表所有射线都不会截断。
 
-自动评价和独立评价统一默认 train 前 10 张、test 全量。合成场景按各自
+自动评价和独立评价统一默认 train 全量、test 前 10 张。合成场景按各自
 ``transforms_train/test.json`` 的顺序取图；360 场景使用上述排序及每八张留一张的划分。
 评价复用 checkpoint 保存的归一化、图像目录与相机尺寸，不读取点云或重新估计场景变换。
 例如配置文件为::
 
    {
      "data": {"dataset": "datasets/garden"},
-     "evaluation": {"max_views": null, "train_max_views": 10, "test_max_views": null}
+     "evaluation": {"max_views": null, "train_max_views": null, "test_max_views": 10}
    }
 
 ``--eval-train-max-views`` / ``--eval-test-max-views`` 分别控制训练后出图范围；
 独立评价使用 ``--train-max-views`` / ``--test-max-views``，``0`` 表示该划分全部视角。
 旧 ``max_views`` / ``--eval-max-views`` / ``--max-views`` 若显式设置为非 ``None``，
-仍优先覆盖两个划分；旧配置中的 ``max_views=10`` 必须移除或改为 ``null``，才能采用新的完整测试集默认。
+仍优先覆盖两个划分；旧配置中的 ``max_views=10`` 必须移除或改为 ``null``，才能采用分划分默认。
+旧命令中的限制也会覆盖默认值，请改为 ``--eval-train-max-views 0 --eval-test-max-views 10``。
 
 源码编译及回归检查::
 

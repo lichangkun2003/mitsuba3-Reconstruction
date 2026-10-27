@@ -60,7 +60,7 @@ def run_check(args, output):
     write_scene(dataset, np)
     full, resumed = output / "full", output / "resumed"
     config = {
-        "data": {"dataset": str(dataset), "background_layers": 1},
+        "data": {"dataset": str(dataset), "background_final_layers": 4},
         "model": {"grid_resolution": 4, "opacity_sh_count": 1},
         "render": {"width": 93, "height": 97, "spp": 1, "max_hits": 2},
         "runtime": {"build_dir": args.build_dir, "gpu": args.gpu},
@@ -91,13 +91,15 @@ def run_check(args, output):
     final = load_checkpoint(full / "model.npz")
     report = json.loads((full / "training-report.json").read_text(encoding="utf-8"))
     assert report["training_status"] == report["evaluation"]["status"] == "passed"
+    assert report["training_protocol"]["scene_mapping"]["name"] == "projective_shell"
+    assert "s=t/(t+core_half_extent)" in report["training_protocol"]["distortion"]["depth"]
     assert report["initial_render"]["resolution"] == 6
     assert report["initial_render"]["view_index"] == 1  # Global index 0 belongs to the held-out split.
     assert (report["initial_render"]["width"], report["initial_render"]["height"]) == (16, 12)
     assert {path.name for path in full.glob("*.npz")} == {first_path.name, second_path.name, "model.npz"}
     assert report["checkpoint_epochs"] == [1, 2]
     assert set(report["level_renders"]) == {"4", "8"}
-    for core, storage, epoch, saved in ((4, 6, 1, first), (8, 10, 2, second)):
+    for core, storage, epoch, saved in ((4, 6, 1, first), (8, 12, 2, second)):
         rendered = report["level_renders"][str(core)]
         assert rendered["status"] == "passed"
         assert rendered["core_resolution"] == core and rendered["resolution"] == storage
@@ -109,33 +111,37 @@ def run_check(args, output):
         assert saved["training_state"]["completed_epochs"] == epoch
         assert saved["training_state"]["pending_epoch_transition"] is True
         assert saved["optimizer_state"] and saved["training_state"]["topology_state"]
-    assert final["model_metadata"]["resolution"] == 18
+    assert final["model_metadata"]["resolution"] == 24
     assert final["model_metadata"]["core_resolution"] == 16
-    assert final["model_metadata"]["scene_mapping"] == "radial_seed_shell"
-    assert final["model_metadata"]["background_refinement"] == "fixed_layers"
-    assert final["model_metadata"]["background_layers"] == 1
+    assert final["model_metadata"]["scene_mapping"] == "projective_shell"
+    assert final["model_metadata"]["background_refinement"] == "preserve_physical_width"
+    assert final["model_metadata"]["background_layers"] == 4
     assert tuple(final["config"]["render"]["background"]) == (0., 0., 0.)
     assert first["training_state"]["global_step"] == 7
     assert final["training_state"]["global_step"] == 21
     assert final["training_state"]["completed_epochs"] == 3
-    np.testing.assert_array_equal(final["model_metadata"]["grid_min"], [-1.125] * 3)
-    np.testing.assert_array_equal(final["model_metadata"]["grid_max"], [1.125] * 3)
+    np.testing.assert_array_equal(final["model_metadata"]["grid_min"], [-1.5] * 3)
+    np.testing.assert_array_equal(final["model_metadata"]["grid_max"], [1.5] * 3)
     initialization = final["config"]["data"]["initialization"]
     assert first["config"]["data"]["initialization"] == initialization
     np.testing.assert_allclose(initialization["center"], [0., 0., -2.], atol=1e-15)
     np.testing.assert_allclose(initialization["radius"], .66, atol=1e-15)
     assert initialization["shell_width"] == .5
-    assert initialization["shell_layers"] == 1
-    assert initialization["version"] == 3
-    assert initialization["background_refinement"] == "fixed_layers"
-    assert initialization["background_layers"] == 1
+    assert initialization["shell_layers"] == 4
+    assert initialization["version"] == 5
+    assert initialization["background_refinement"] == "preserve_physical_width"
+    assert initialization["background_final_layers"] == 4
+    assert initialization["initial_background_layers"] == 1
     assert initialization["background_opacity"] == .5
     assert not (dataset / "init_points.ply").exists()
     history = [json.loads(line) for line in (full / "training.jsonl").read_text().splitlines()]
-    assert [row["training_resolution"] for row in history] == [6, 10, 18]
+    assert [row["training_resolution"] for row in history] == [6, 12, 24]
     assert history[0]["topology"]["refined"] is True
     assert history[1]["topology"]["refined"] is True
     assert final["model_state"]["radiance_sh"].size > 0
+    for saved in (first, second, final):
+        metadata, state = saved["model_metadata"], saved["model_state"]
+        assert state["radiance_sh"].size == len(state["cell_indices"]) * metadata["sh_count"] * 3
     assert not np.array_equal(first["model_state"]["radiance_sh"], final["model_state"]["radiance_sh"])
 
     evaluation = json.loads((full / "evaluation-report.json").read_text(encoding="utf-8"))
@@ -183,7 +189,8 @@ def run_check(args, output):
         assert resume_evaluation["splits"][split]["aggregate"]["view_count"] == count
     return {"status": "passed", "output": str(output), "checks": [
         "COLMAP binary initialization without PLY", "fixed camera normalization and thin shell",
-        "fixed shell storage 6 -> 10 -> 18 with core 4 -> 8 -> 16", "sorted filename split: 7 train / 2 test",
+        "fixed physical shell: layers 1 -> 2 -> 4 and grid 6 -> 12 -> 24",
+        "sorted filename split: 7 train / 2 test",
         "full scaled fx/fy/cx/cy and 16x12 reference alignment", "all-view train/test evaluation",
         "resume preserves model, Adam, RNG and initialization metadata"]}
 

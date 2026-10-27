@@ -1,8 +1,8 @@
 """Read COLMAP cameras and prepare explicit bounded/unbounded initializations.
 
-Files and straight rendering rays remain untouched. In the unbounded proxy,
-only initial point positions outside the unit sphere receive radial contraction.
-Version-1 metadata retains the original point-only contraction and grid layout.
+Files and camera poses remain untouched. New unbounded scenes use the same
+piecewise-projective contraction for point seeds and native ray queries.
+Versions 1--4 retain their original point-only radial contraction and layout.
 """
 
 from __future__ import annotations
@@ -324,7 +324,7 @@ def _image_directory(dataset, images_dir):
     raise FileNotFoundError(f"No reference image directory in {dataset}")
 
 
-def _grid_layout(start_core_resolution, target_core_resolution, shell_layers):
+def _grid_layout(start_core_resolution, target_core_resolution, shell_layers, *, max_grid_resolution=1024):
     for name, value in (("start_core_resolution", start_core_resolution),
                         ("target_core_resolution", target_core_resolution), ("shell_layers", shell_layers)):
         if isinstance(value, bool) or int(value) != value or value < 1:
@@ -336,21 +336,22 @@ def _grid_layout(start_core_resolution, target_core_resolution, shell_layers):
         raise ValueError("Final shell layers must give an integer number of layers at the starting core resolution")
     width = layers * 2. / target
     resolution = start + 2 * (start * layers // target)
-    if target + 2 * layers > 1024:
-        raise ValueError("Core plus shell storage resolution exceeds the supported maximum of 1024")
+    if target + 2 * layers > max_grid_resolution:
+        raise ValueError(f"Core plus shell storage resolution exceeds the supported maximum of {max_grid_resolution}")
     return resolution, width
 
 
 def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_points.ply",
                    initialization=None, start_core_resolution=256, target_core_resolution=512,
                    shell_layers=16, load_points=True, *, scene_mode=None,
-                   background_layers=None, background_opacity=None):
+                   background_layers=None, background_opacity=None, background_final_layers=None):
     """Prepare views and point seeds without writing dataset files.
 
-    New explicit ``unbounded`` mode keeps ``background_layers`` (eight by
-    default) at every level, independent of the ray hit capacity. Its version-3
-    metadata fixes the layer count while the physical shell becomes thinner.
-    Saved version-2 initializations retain their original physical width.
+    New explicit ``unbounded`` mode uses ``background_final_layers`` (eight by
+    default) at the target resolution, independent of the ray hit capacity.
+    Version-5 metadata keeps the physical shell width constant, so a 256 to
+    1024 schedule starts with two layers and refines through four to eight.
+    Saved version-2 and version-3 initializations retain their original policies.
     ``bounded`` mode fits cameras
     and points into one cube by a similarity transform, without contraction.
     This function does not initialize shell ellipsoids or transform any rays.
@@ -368,7 +369,7 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
         raise ValueError("COLMAP scene_mode must be bounded, unbounded, or legacy")
     saved = None if initialization is None else dict(initialization)
     version = 1 if saved is None else saved.get("version")
-    if saved is not None and version not in (1, 2, 3):
+    if saved is not None and version not in (1, 2, 3, 4, 5):
         raise ValueError("Unsupported saved COLMAP initialization version")
     if saved is not None:
         mode = "legacy" if version == 1 else saved.get("scene_mode")
@@ -376,13 +377,22 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
             raise ValueError("Saved COLMAP initialization has an invalid scene_mode")
         if version == 3 and (mode != "unbounded" or saved.get("background_refinement") != "fixed_layers"):
             raise ValueError("Version-3 initialization requires fixed_layers unbounded refinement")
+        if version >= 4 and (mode != "unbounded" or saved.get("background_refinement") != "preserve_physical_width"):
+            raise ValueError("Version-4/5 initialization requires preserve_physical_width unbounded refinement")
+        if version < 4 and any(key in saved for key in ("background_final_layers", "initial_background_layers")):
+            raise ValueError("Legacy initialization cannot silently change to final background layers")
         if version < 3 and "background_refinement" in saved:
             raise ValueError("Legacy initialization cannot silently change its background refinement policy")
         if scene_mode is not None and scene_mode != mode:
             raise ValueError("Saved COLMAP initialization scene_mode disagrees with the configuration")
     else:
         mode = scene_mode or "legacy"
-        version = 1 if mode == "legacy" else (3 if mode == "unbounded" else 2)
+        version = 1 if mode == "legacy" else (5 if mode == "unbounded" else 2)
+
+    if version < 4 and background_final_layers is not None:
+        raise ValueError("background_final_layers requires a new unbounded reconstruction or saved version-4 initialization")
+    if version >= 4 and background_layers is not None:
+        raise ValueError("Use background_final_layers for new unbounded reconstructions; background_layers is reserved for legacy saves")
 
     if mode == "legacy":
         if background_layers is not None or background_opacity is not None:
@@ -390,16 +400,24 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
         resolution, shell_width = _grid_layout(start_core_resolution, target_core_resolution, shell_layers)
         final_layers = int(shell_layers)
     else:
-        if background_layers is None:
-            background_layers = saved.get("background_layers", 8) if saved else 8
+        if version >= 4:
+            if "background_layers" in (saved or {}):
+                raise ValueError("Version-4 initialization uses background_final_layers, not background_layers")
+            if background_final_layers is None:
+                background_final_layers = saved.get("background_final_layers") if saved else 8
+            layer_name, layer_value = "background_final_layers", background_final_layers
+        else:
+            if background_layers is None:
+                background_layers = saved.get("background_layers", 8) if saved else 8
+            layer_name, layer_value = "background_layers", background_layers
         if background_opacity is None:
             background_opacity = saved.get("background_opacity", .5) if saved else .5
         for name, value in (("start_core_resolution", start_core_resolution),
                             ("target_core_resolution", target_core_resolution),
-                            ("background_layers", background_layers)):
+                            (layer_name, layer_value)):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or int(value) != value or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        start, target, initial_layers = map(int, (start_core_resolution, target_core_resolution, background_layers))
+        start, target, requested_layers = map(int, (start_core_resolution, target_core_resolution, layer_value))
         if start & (start - 1) or target & (target - 1) or target < start:
             raise ValueError("Core resolutions must be powers of two and target must be >= start")
         if target > 1024:
@@ -407,12 +425,18 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
         if isinstance(background_opacity, bool) or not isinstance(background_opacity, (int, float)) or not math.isfinite(background_opacity) or not 0 < background_opacity < 1:
             raise ValueError("background_opacity must lie strictly between zero and one")
         if mode == "unbounded":
-            if version == 3:
+            if version >= 4:
+                final_layers = requested_layers
+                resolution, shell_width = _grid_layout(start, target, final_layers, max_grid_resolution=1040)
+                initial_layers = (resolution - start) // 2
+            elif version == 3:
+                initial_layers = requested_layers
                 final_layers = initial_layers
                 if target + 2 * final_layers > 1040:
                     raise ValueError("Core plus shell storage resolution exceeds the supported maximum of 1040")
                 resolution, shell_width = start + 2 * initial_layers, 2. * initial_layers / start
             else:
+                initial_layers = requested_layers
                 final_layers = initial_layers * (target // start)
                 resolution, shell_width = _grid_layout(start, target, final_layers)
         else:
@@ -462,8 +486,14 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
         }
         if version >= 2:
             initialization.update(scene_mode=mode,
-                scene_mapping="radial_seed_shell" if mode == "unbounded" else "bounded",
-                background_layers=int(background_layers), background_opacity=float(background_opacity))
+                scene_mapping=("projective_shell" if version == 5 else "radial_seed_shell") if mode == "unbounded" else "bounded",
+                background_opacity=float(background_opacity))
+            if version >= 4:
+                initialization.update(background_final_layers=final_layers,
+                                      initial_background_layers=initial_layers,
+                                      background_refinement="preserve_physical_width")
+            else:
+                initialization["background_layers"] = int(background_layers)
         if version == 3:
             initialization["background_refinement"] = "fixed_layers"
     else:
@@ -474,8 +504,14 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
                     "source_model": model.relative_to(dataset).as_posix(), "camera_count": len(images)}
         if version >= 2:
             expected.update(scene_mode=mode,
-                scene_mapping="radial_seed_shell" if mode == "unbounded" else "bounded",
-                background_layers=int(background_layers), background_opacity=float(background_opacity))
+                scene_mapping=("projective_shell" if version == 5 else "radial_seed_shell") if mode == "unbounded" else "bounded",
+                background_opacity=float(background_opacity))
+            if version >= 4:
+                expected.update(background_final_layers=final_layers,
+                                initial_background_layers=initial_layers,
+                                background_refinement="preserve_physical_width")
+            else:
+                expected["background_layers"] = int(background_layers)
         if version == 3:
             expected["background_refinement"] = "fixed_layers"
         for name, value in expected.items():
@@ -538,6 +574,10 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
             positions = np.ascontiguousarray(((source_positions - center) / radius) @ _AXES.T, dtype=np.float32)
             if not np.isfinite(positions).all():
                 raise ValueError("Point normalization produced nonfinite coordinates")
+        elif version == 5:
+            from reconstruction_projective import projective_points
+            normalized = ((source_positions - center) / radius) @ _AXES.T
+            positions = projective_points(normalized, shell_width, np)
         else:
             positions = contract_points(source_positions, center, radius, shell_width)
         colors = np.ascontiguousarray(source_colors, dtype=np.float32)

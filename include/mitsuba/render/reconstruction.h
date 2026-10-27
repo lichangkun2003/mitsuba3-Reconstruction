@@ -50,6 +50,7 @@ public:
     static constexpr uint32_t optimizer_device_version = 1;
     /// Pre-compacted gradient rows can feed Adam without dense reconstruction.
     static constexpr uint32_t compact_optimizer_version = 1;
+    static constexpr uint32_t projective_version = 1;
 
     VoxelReconstruction(const std::string &filename, uint32_t resolution,
                         const std::array<float, 3> &grid_min,
@@ -138,6 +139,10 @@ public:
     void clear_growth_candidates();
     uint32_t growth_candidate_count() const { return m_growth_count; }
     uint64_t topology_revision() const { return m_topology_revision; }
+    /// Mapping is model metadata, never a trainable parameter. Changing it
+    /// invalidates frozen recordings through topology_revision().
+    void set_scene_mapping(const std::string &mapping);
+    std::string native_scene_mapping() const { return m_scene_mapping; }
 
     struct TrainingResult {
         Color3f rgb, raw_rgb;
@@ -168,8 +173,10 @@ public:
     /// Internal opacity, transmittance, and returned rendered alpha remain active.
     /// distortion_loss_weight optionally adds pairwise L1 separation of the
     /// recorded hard-hit contributions. Depth is the clipped ellipsoid-metric
-    /// closest point, normalized by the fixed grid diagonal. No background,
-    /// unrecorded suffix, near-miss surrogate, or extra tracing is included.
+    /// closest point, normalized by the fixed grid diagonal for legacy models.
+    /// Projective models use world distance t/(t+core_half_extent), including
+    /// its exact local-distance derivative. Environment color, unrecorded
+    /// suffixes, near-miss surrogates, and extra tracing are not included.
     TrainingResult loss_and_grad(const Ray3f &ray, const Color3f &reference_rgb,
                                  const Float &reference_alpha,
                                  const Color3f &background,
@@ -179,7 +186,8 @@ public:
     /// Trace independent rays, returning linear RGB (including background),
     /// accumulated alpha, and contributing hit count. maxt bounds the ray.
     /// entry_offset_fraction reproduces Falcor's near/far segment entry nudge
-    /// when set to 1e-6; zero gives ordinary segment intersection semantics.
+    /// when set to 1e-6 for legacy models. Projective segments use local voxel
+    /// units instead of an infinite far plane; zero disables the entry nudge.
     std::tuple<Color3f, Float, UInt32> trace(
         const Ray3f &ray, const Color3f &background,
         float transmittance_threshold = .01f, uint32_t max_hits = 16,
@@ -206,6 +214,26 @@ public:
     MI_DECLARE_CLASS(VoxelReconstruction)
 
 private:
+    struct ProjectiveSegment {
+        Mask valid;
+        Point3f origin;
+        Vector3f direction;
+        Float entry, exit, world_entry, h_start, h_rate, speed;
+        UInt32 visited, chart;
+        DRJIT_STRUCT(ProjectiveSegment, valid, origin, direction, entry, exit,
+                     world_entry, h_start, h_rate, speed, visited, chart)
+    };
+    ProjectiveSegment next_projective_segment(const Point3f &origin,
+        const Vector3f &direction, const Float &maxt, const UInt32 &visited) const;
+    void initialize_projective_segment(const ProjectiveSegment &segment,
+        Vector3i &cell, Vector3f &next, Float &entry, float entry_offset_fraction,
+        bool use_octree) const;
+    Vector3f projective_hit_direction(const Point3f &origin,
+        const Vector3f &direction, const UInt32 &id, const Mask &active) const;
+    Mask projective_core_ids(const UInt32 &id, const Mask &active) const;
+    Mask projective_cell_inside(const Vector3i &cell, const UInt32 &chart) const;
+    std::pair<Float,Float> projective_depth(const ProjectiveSegment &segment,
+                                           const Float &distance) const;
     Mask optimizer_step_device_impl(
         const std::map<std::string, FloatBuffer> &gradients,
         const UIntBuffer &appearance_valid, const UIntBuffer &geometry_valid,
@@ -233,6 +261,7 @@ private:
                           Mask active, const UInt32 &log_size) const;
 
     uint32_t m_resolution, m_core_resolution, m_active_count, m_sh_count, m_opacity_sh_count;
+    std::string m_scene_mapping = "bounded";
     std::array<float, 3> m_min, m_max, m_size;
     std::map<std::string, uint64_t> m_statistics;
     UIntBuffer m_cells;

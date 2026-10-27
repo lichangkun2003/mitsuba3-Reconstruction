@@ -90,6 +90,9 @@ def refine_state_gpu(checkpoint, config, max_active_voxels=67108864):
 
 def _refine(checkpoint, config, max_active_voxels, dr):
     U, D, F, B = dr.cuda.UInt32, dr.cuda.Float64, dr.cuda.Float32, dr.cuda.Bool
+    if checkpoint["model_metadata"].get("scene_mapping") == "projective_shell":
+        from reconstruction_projective import refine_projective_device
+        return refine_projective_device(checkpoint, config, max_active_voxels, _refine, dr)
     metadata = dict(checkpoint["model_metadata"])
     state = {name: (U if name == "cell_indices" else F)(value)
              for name, value in checkpoint["model_state"].items()}

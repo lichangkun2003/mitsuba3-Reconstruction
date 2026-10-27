@@ -36,8 +36,8 @@ class EvaluationConfig:
         "train": None, "test": "transforms_test.json"})
     spp: int = 64  # Independent evaluation sampling; training remains 1 spp.
     max_views: int | None = None  # Legacy global override; 0 means all, None uses split limits.
-    train_max_views: int | None = 10
-    test_max_views: int | None = None  # All held-out cameras, for synthetic and COLMAP datasets.
+    train_max_views: int | None = None  # All training cameras, for synthetic and COLMAP datasets.
+    test_max_views: int | None = 10  # First N held-out cameras; None or 0: all.
     seed: int = 42
     chunk_size: int = 65536
     traversal: str | None = None  # None: saved mode; legacy checkpoints default to octree.
@@ -77,8 +77,8 @@ def parse_config(workspace):
     parser.add_argument("--spp", type=int)
     parser.add_argument("--max-views", type=int,
                         help="Legacy override for BOTH splits (0: all); prefer separate train/test limits")
-    parser.add_argument("--train-max-views", type=int, help="First N train views (default: 10; 0: all)")
-    parser.add_argument("--test-max-views", type=int, help="First N test views (default: all; 0: all)")
+    parser.add_argument("--train-max-views", type=int, help="First N train views (default: all; 0: all)")
+    parser.add_argument("--test-max-views", type=int, help="First N test views (default: 10; 0: all)")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--chunk-size", type=int)
     parser.add_argument("--traversal", choices=("octree", "dda"),
@@ -162,8 +162,8 @@ def evaluation_view_limits(config):
 def warn_legacy_view_limit(config):
     if config.max_views is not None:
         print("Legacy max_views overrides BOTH train/test limits. "
-              "For train-first-10 and all test views, omit --max-views and set "
-              "--train-max-views 10 --test-max-views 0.", file=sys.stderr, flush=True)
+              "For all training views and the first 10 test views, omit --max-views and set "
+              "--train-max-views 0 --test-max-views 10.", file=sys.stderr, flush=True)
 
 
 def primary_metric_name(config):
@@ -260,7 +260,9 @@ def resolve_reference_compositing(config, checkpoint_config):
 
 def checkpoint_data_config(saved):
     """Reuse the exact initialization transform for every evaluation split."""
-    data = preview.DataConfig(background_layers=8)  # Historical default for saves without this field.
+    saved_data = saved.get("data", {})
+    data = (preview.DataConfig() if (saved_data.get("initialization") or {}).get("version") in (4, 5)
+            else preview.DataConfig(background_layers=8, background_final_layers=None))
     allowed = {item.name for item in fields(data)}
     for key, value in saved.get("data", {}).items():
         if key not in allowed:

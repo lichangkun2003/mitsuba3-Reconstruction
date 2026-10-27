@@ -1,4 +1,4 @@
-"""CPU checks for train-subset/full-test evaluation and explicit legacy limits."""
+"""CPU checks for full-train/test-subset evaluation and explicit legacy limits."""
 
 from copy import deepcopy
 from dataclasses import asdict
@@ -29,10 +29,10 @@ class TrainingEvaluationLimitsTests(unittest.TestCase):
         evaluate.validate_config(result)
         return result
 
-    def test_defaults_keep_ten_training_views_and_complete_test_split(self):
+    def test_defaults_keep_complete_training_split_and_ten_test_views(self):
         config, warning = self.configure()
         evaluation = self.evaluation(config)
-        self.assertEqual(evaluate.evaluation_view_limits(evaluation), {"train": 10, "test": None})
+        self.assertEqual(evaluate.evaluation_view_limits(evaluation), {"train": None, "test": 10})
         self.assertEqual(evaluation.spp, 64)
         self.assertEqual(config.render.spp, 1)
         self.assertEqual(evaluation.dataset, config.data.dataset)
@@ -43,10 +43,19 @@ class TrainingEvaluationLimitsTests(unittest.TestCase):
         self.assertEqual(evaluate.evaluation_view_limits(self.evaluation(config)), {"train": 4, "test": 23})
         self.assertEqual(warning, "")
 
+    def test_old_explicit_split_limits_survive_resume_and_can_be_overridden(self):
+        resumed = train.TrainConfig()
+        train.update(resumed, {"evaluation": {"train_max_views": 10, "test_max_views": None}})
+        resumed, _ = self.configure(("--resume", "checkpoint.npz"), config=resumed)
+        self.assertEqual(evaluate.evaluation_view_limits(self.evaluation(resumed)), {"train": 10, "test": None})
+        resumed, _ = self.configure(("--resume", "checkpoint.npz", "--eval-train-max-views", "0",
+                                     "--eval-test-max-views", "10"), config=resumed)
+        self.assertEqual(evaluate.evaluation_view_limits(self.evaluation(resumed)), {"train": None, "test": 10})
+
     def test_zero_cli_limit_selects_all_without_affecting_other_split(self):
         for arguments, expected in (
-                (("--eval-train-max-views", "0"), {"train": None, "test": None}),
-                (("--eval-test-max-views", "0"), {"train": 10, "test": None})):
+                (("--eval-train-max-views", "0"), {"train": None, "test": 10}),
+                (("--eval-test-max-views", "0"), {"train": None, "test": None})):
             with self.subTest(arguments=arguments):
                 config, _ = self.configure(arguments)
                 self.assertEqual(evaluate.evaluation_view_limits(self.evaluation(config)), expected)
@@ -64,6 +73,7 @@ class TrainingEvaluationLimitsTests(unittest.TestCase):
         self.assertEqual(evaluate.evaluation_view_limits(self.evaluation(config)), {"train": 6, "test": 6})
         self.assertIn("Deprecated", warning)
         self.assertIn("BOTH", warning)
+        self.assertIn("train_max_views=null and test_max_views=10", warning)
         self.assertEqual(config.evaluation.max_views, 6)
 
     def test_legacy_zero_explicitly_selects_all_splits(self):
@@ -84,7 +94,7 @@ class TrainingEvaluationLimitsTests(unittest.TestCase):
         config = deepcopy(train.CONFIG)
         config.evaluation.max_views = 10
         config, warning = self.configure(values={"evaluation": {"max_views": None}}, config=config)
-        self.assertEqual(evaluate.evaluation_view_limits(self.evaluation(config)), {"train": 10, "test": None})
+        self.assertEqual(evaluate.evaluation_view_limits(self.evaluation(config)), {"train": None, "test": 10})
         self.assertEqual(warning, "")
 
     def test_disabled_evaluation_does_not_emit_legacy_warning(self):
@@ -109,6 +119,25 @@ class TrainingEvaluationLimitsTests(unittest.TestCase):
         for name in before:
             if name not in ("evaluation", "schedule"):
                 self.assertEqual(before[name], after[name], name)
+
+    def test_standalone_evaluation_defaults_match_training_and_cli_overrides(self):
+        for arguments, expected in (
+                ((), {"train": None, "test": 10}),
+                (("--train-max-views", "4"), {"train": 4, "test": 10}),
+                (("--test-max-views", "0"), {"train": None, "test": None}),
+                (("--train-max-views", "4", "--test-max-views", "2"), {"train": 4, "test": 2}),
+                (("--train-max-views", "4", "--max-views", "3"), {"train": 3, "test": 3}),
+                (("--test-max-views", "2", "--max-views", "0"), {"train": None, "test": None})):
+            with self.subTest(arguments=arguments), patch.object(sys, "argv", ["evaluate.py", *arguments]):
+                config = evaluate.parse_config(Path("."))
+                evaluate.validate_config(config)
+                self.assertEqual(evaluate.evaluation_view_limits(config), expected)
+
+    def test_standalone_legacy_warning_describes_current_default_selection(self):
+        stderr = io.StringIO()
+        with patch.object(sys, "stderr", stderr):
+            evaluate.warn_legacy_view_limit(evaluate.EvaluationConfig(max_views=3))
+        self.assertIn("--train-max-views 0 --test-max-views 10", stderr.getvalue())
 
 
 if __name__ == "__main__":

@@ -98,7 +98,7 @@ class CommitRemapTests(unittest.TestCase):
         settings = TopologySettings(growth_protection_epochs=5, deletion_cooldown_epochs=5)
         manager = SimpleNamespace(settings=settings,
             schedule=CoarseToFineConfig(enabled=False, total_epochs=30),
-            resolution=8, core_resolution=8, level_start_epoch=0,
+            resolution=8, core_resolution=8, scene_mapping="bounded", level_start_epoch=0,
             level_budget=30, growth_warmup=0, count=count, completed_windows=3,
             growth_frozen=lambda boundary: False, deletion_frozen=lambda boundary: False,
             _growth_due=lambda boundary: growth_due,
@@ -127,7 +127,8 @@ class CommitRemapTests(unittest.TestCase):
         survivors = np.array([i for i in range(count) if i not in removed], dtype=np.uint32)
         phase = {"selected": False, "model_concats": 0}
 
-        def evaluate(boundary, event):
+        def evaluate(boundary, event, *, region_eligible=None):
+            self.assertIsNone(region_eligible)
             if not removed:
                 return None
             event["deletion_rgb"] = {}

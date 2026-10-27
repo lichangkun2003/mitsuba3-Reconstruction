@@ -71,11 +71,11 @@ class EvaluationDatasetTests(unittest.TestCase):
         limit = evaluate.evaluation_view_limit(config, split)
         return views[:limit] if limit is not None else views
 
-    def test_synthetic_uses_all_test_json_frames_and_first_ten_train_frames(self):
+    def test_synthetic_uses_all_train_json_frames_and_first_ten_test_frames(self):
         root = self.root / "synthetic"
         synthetic_fixture(root)
         config = evaluate.EvaluationConfig()
-        for split, total, selected in (("train", 17, 10), ("test", 23, 23)):
+        for split, total, selected in (("train", 17, 17), ("test", 23, 10)):
             views = common.load_views(root, f"transforms_{split}.json", self.render, np,
                                       data=preview.DataConfig(), split=split)
             self.assertEqual(len(views), total)
@@ -100,8 +100,8 @@ class EvaluationDatasetTests(unittest.TestCase):
         self.assertEqual(train_ids, [i for i in range(97) if i % 8])
         self.assertFalse(set(train_ids) & set(test_ids))
         self.assertEqual(sorted(train_ids + test_ids), list(range(97)))
-        self.assertEqual(len(self.selected(train, config, "train")), 10)
-        self.assertEqual(len(self.selected(test, config, "test")), 13)
+        self.assertEqual(len(self.selected(train, config, "train")), 84)
+        self.assertEqual([view["index"] for view in self.selected(test, config, "test")], list(range(0, 80, 8)))
         self.assertEqual(Path(test[1]["reference_path"]).name, "image_008.jpg")
         self.assertTrue(all(Path(v["reference_path"]).parent.name == "images_2" for v in train + test))
 
@@ -113,6 +113,7 @@ class EvaluationDatasetTests(unittest.TestCase):
         initialization.update(center=[1., 2., 3.], radius=9.)
         data = preview.DataConfig(images="images_2", initialization=initialization)
         views = common.load_views(root, "test", self.render, np, data=data, split="test")
+        self.assertEqual(len(self.selected(views, evaluate.EvaluationConfig(), "test")), 2)
         camera = views[0]["camera"]
         np.testing.assert_allclose(camera["position"], [-1/9, -3/9, 2/9])
         np.testing.assert_allclose([camera[k] for k in ("fx", "fy", "cx", "cy")],

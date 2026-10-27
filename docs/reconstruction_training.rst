@@ -89,7 +89,7 @@ checkpoint 缺字段时的兼容值。该项从第一轮开始生效，升层时
    & "..\envs\mitsuba\python.exe" -u -I .\experiments\reconstruction\train.py `
      --dataset datasets/hotdog --gpu 0 --epochs 1000 --chunk-size 0 `
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages `
-     --distortion-weight 0.1 --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
+     --distortion-weight 0.1 --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
 
 若本机是 venv 布局，解释器改为 ``..\envs\mitsuba\Scripts\python.exe``。
 多卡入口 ``train_multigpu.py`` 同样透传此选项。当前 N 卡协议每卡计算一个完整视角，
@@ -110,13 +110,21 @@ checkpoint 缺字段时的兼容值。该项从第一轮开始生效，升层时
    L_{\mathrm{dist}}=2\sum_{i<j}w_iw_j|s_i-s_j|.
 
 ``D_grid`` 是当前层级网格 AABB 的世界空间对角线长度，同一层级内固定。
-有界场景及旧版固定物理壳宽模型在升层时保持该值；新的固定层数远景在升层时压薄壳层、
-缩小 AABB，因此该归一化尺度随新层级的网格边界更新。
+有界场景与旧无界固定物理壳宽模型在升层时保持该值；旧 version 3 的固定层数远景
+在升层时压薄壳层、缩小 AABB，因此该旧策略的归一化尺度随新层级的网格边界更新。
 ``t_entry`` 是当前射线进入网格的固定深度。``t_i`` 取当前体素裁剪段内、
 椭球二次型取得最小值的位置，即现有 ``xStar`` 对应的深度，既不是体素中心，
 也不是新的椭球表面交点。深度按归一化射线方向的世界距离计算；
 由于每个点位于自己的网格段内，命中顺序同时是非递减深度顺序。
 网格整体等比例缩放时，归一化深度差保持不变；它不是无界场景的深度收缩方案。
+
+新 ``projective_shell`` 无界模式使用世界射线深度的有界参数
+``s_i = t_i / (t_i + core_half_extent)``，其中 ``t_i`` 从当前世界射线原点起算，
+``core_half_extent`` 是核心立方体的半边长。这里的 ``t_i`` 仍对应当前映射体素段内
+二次型最小点，须从存储段位置逆算回世界深度；它不是各段重新从零开始的局部长度。
+跨区域的坐标跳转不增加深度，反向包含该参数对存储段长度的链式因子。
+这一深度单位与旧 ``D_grid`` 归一化不同；相同 lambda 的正则强度不能直接视为等价，
+旧 checkpoint 保持旧定义，新模式应新开实验。
 
 RGB-only 的每像素目标为：
 
@@ -486,7 +494,7 @@ checkpoint 保存内部证据版本，使用版本 2 或更早 RGB 生长证据�
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
      --rgb-only --dataset datasets/lego --epochs 1000 --chunk-size 0 \
-     --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
+     --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
 
 在已经分配同节点两张 GPU 的 Linux Slurm 作业内启动新的双卡实验：
 
@@ -495,7 +503,7 @@ checkpoint 保存内部证据版本，使用版本 2 或更早 RGB 生长证据�
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --workers 2 --worker-timeout 600 \
      --rgb-only --dataset datasets/lego --epochs 1000 --chunk-size 0 \
-     --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
+     --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
 
 两条命令都自动创建新的实验目录。需要短跑时添加 ``--stop-after-epochs 10``，保持
 ``--epochs 1000``，避免改变完整调度。训练后的 64 spp 只用于评价出图，不改变训练 spp。
@@ -623,47 +631,85 @@ COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理�
 .. code-block:: python
 
    CONFIG.data.scene_mode = "auto"
-   CONFIG.data.background_layers = 8
+   CONFIG.data.background_final_layers = 8
    CONFIG.data.background_opacity = 0.5
 
-``background_layers`` 表示各层级保留的远景径向层数（以当前体素宽度计），默认 8，不与
-``render.max_hits`` 关联。无界初始化保持原有径向点压缩：单位球内仅作坐标归一化，
-单位球外的初始点压缩到半径 ``1 + shell_width`` 以内，其中
-``shell_width = 2 * background_layers / start_resolution``。
-**压缩仅用于初始化点；相机光线仍按当前直线前向、DDA／八叉树和椭球求交执行。**
-没有引入曲线射线、运行时坐标收缩或新的深度定义，不能将该初始化描述为完整的无界射线映射。
+``background_final_layers`` 表示最终分辨率下的远景径向层数，默认 8；当前层数按
+``background_final_layers * core_resolution / target_resolution`` 计算，必须为整数。
+它不与 ``render.max_hits`` 关联；后者默认 16，限制整条射线的椭球命中数，包含近景与背景。
+新无界初始化使用 ``scene_mapping="projective_shell"``，点云与查询射线使用同一分区投影。
+归一化核心为立方体 ``[-1,1]^3``，核心内坐标不变。外部按绝对值最大的坐标轴 ``a``
+及符号 ``sigma`` 划为六个凸区域，边界采用固定优先级唯一归属。令
+``h = sigma * p[a] >= 1``，且 ``h >= abs(p[j])`` 对另外两轴均成立，则：
 
-所有静态格子 AABB 与径向球壳相交的远景格统一初始化：有点云种子的格保留种子颜色，
-其余为黑色；opacity 均设为 ``0.5``。使用能覆盖格子立方体的球形椭球，防止仅填满
-格子编号却在初始椭球之间留下缝隙。内层点云体素保留原有几何与初始化规则。
-这些远景体素可以继续优化几何、颜色和 opacity，也参与现有 RGB／低 opacity 删除。
-生长的父体与目标都限制在核心区域；远景格删除后不通过生长重新填回。
-区域按静态格子与单位球的关系确定，不随优化后的椭球中心移动。
+.. math::
 
-新无界实验从核心分辨率 256 开始，可选择终点 512 或 1024。默认远景始终为 8 层：
-实际网格分辨率依次为 272、528、1040，边界半径为 ``(core_resolution + 16) / core_resolution``。
-内场按原规则细分；远景先沿用原来的八子格拟合，再将单位球外子体素的径向距离压缩到一半壳宽，
-因此物理厚度逐层减半。映射到同一目标格的子体素会合并，而非直接保留八倍子体素。
-近景与远景仍使用同一层级的体素边长，未保留粗体素远景，也不在升层时重新初始化完整壳层。
-该几何映射与合并是下一层优化的近似初始化，不保证升层前后渲染等价；每次升层后继续执行原有 warmup。
-只使用已有子体素作为支持，不从空壳回填，已删除的远景区域不会因升层而自动重新铺满。
-完整壳层仍会增加体素数、参数、Adam 状态与细分后的显存占用，不能沿用稀疏远景初始化时的显存估计。
+   q_a = \sigma\left(1+W-\frac{W}{h}\right),\qquad
+   q_j = \frac{p_j}{h}\quad(j\ne a),\qquad
+   W=\frac{2L_{\mathrm{final}}}{R_{\mathrm{final}}}.
+
+六个无限外景区域分别映入核心六个面外侧厚度为 ``W`` 的薄板。
+仅六块面薄板有效，两个或三个坐标同时处于核心范围外的边角格不初始化、不追踪。
+直接枚举 ``6 * core_resolution**2 * background_layers`` 个背景格，不枚举全 ``R³`` 网格。
+有点云种子的格保留种子颜色，其余为黑色；opacity 均设为 ``0.5``。
+初始椭球覆盖各自格子，防止仅填满格子编号却在初始椭球之间留下缝隙。
+核心点云体素保留原有几何初始化规则。
+
+相机射线始终是世界直线 ``p(t)=o+t*d``。先用区域的线性不等式求出世界深度区间，
+按世界 ``t`` 排序；映射后每个区间是一条精确直线段，使用八叉树／DDA 遍历及叶子椭球求交。
+不通过固定小步长近似曲线，不在每个体素重新选取区域。
+同一段内存储方向固定，但存储距离与世界深度并非线性关系。
+可视为同一世界点的两侧在不同外景薄板中采用不同坐标；跨区域时直接切换到下一段起点，
+不追踪两个存储端点间的连接线，不在无效边角空隙累积颜色。
+有限远裁剪面按世界深度裁剪；无穷远末段使用解析的有限存储终点，避免无穷坐标运算。
+
+所有段共享累计颜色、透射率、命中计数和反向记录。离开一个区域不等于路径完成，
+到达所有有效区间的末尾才是正常完成；透射率或命中容量提前终止保持原有语义。
+各段使用自己的存储方向计算硬命中、near-miss 和几何反向，SH 外观继续使用原世界观察方向。
+体素、椭球半轴和旋转定义在存储空间；外景存储椭球映回世界一般不再是普通椭球。
+该映射参考 `MERF 的分区投影收缩 <https://creiser.github.io/merf/>`_，
+薄板宽度、离散 opacity 和截断椭球属于当前模型的适配。
+
+外景所有层级都不生长；生长的父体与目标均限制在核心格中。
+外景仅在达到目标核心分辨率后按低 opacity 分支删除，默认阈值 ``0.1``，
+并保留 warmup、保护期及连续确认规则；不参与 RGB 删除投票，粗层和中间层不删除外景。
+核心保持现有 RGB／低 opacity 删除规则。区域身份按静态格子及核心索引范围确定，
+不随椭球中心的连续优化移动。内景 RGB 拓扑证据仍使用包含外景颜色的完整实际后缀。
+
+新无界实验从核心分辨率 256 开始，可选择终点 512 或 1024。最终远景 8 层时：
+
+* 终点 1024：背景层数为 2 → 4 → 8，实际网格为 260 → 520 → 1040；
+  网格各轴边界始终为 ``[-65/64, 65/64]``，物理壳宽始终为 ``1/64``。
+* 终点 512：背景层数为 4 → 8，实际网格为 264 → 528；
+  网格各轴边界始终为 ``[-33/32, 33/32]``，物理壳宽始终为 ``1/32``。
+
+核心继续八子格拟合；新投影模式的远景保留已有父格的八个子格，
+不因核心拟合器的几何失败筛选提前删除背景。体素边长相同；不径向重压缩，也不裁掉外层。
+背景继承可产生相对子格越界的中心，以子格裁剪贡献；不能在首次 Adam 更新时立即按核心
+中心边界重新夹紧。参数和 opacity 继承仍是离散近似，不保证升层前后渲染完全一致。
+每次升层后继续执行原有 warmup，不重新初始化完整壳层。
+仅已有父格提供子格，不从空壳回填。
+这会减少早期背景层数，但最终 1024／8 层的显存规模与旧固定 8 层方案相近；
+模型参数、Adam 状态及升层临时数组仍需计入，不能据此认定 40 GB 足够或消除了升层峰值。
 初始每层 opacity 为 0.5 不等于强制不透明边界：删除、连续优化、有限 ``max_hits``、
 有限远裁剪面及后续几何变化都可能留下透射率，剩余部分以黑色尾项结束。
 
-新无界 COLMAP 初始化保存 ``data.initialization.version=3``、
-``background_refinement="fixed_layers"`` 和 ``background_layers=8``；模型 metadata 同步保存
-这两个策略字段。``shell_layers`` 记录固定层数，``shell_width`` 记录初始化层级的物理壳宽，
-用于恢复相同的点云压缩和相机归一化。各升层模型的当前边界保存在模型 metadata 中。
+新无界 COLMAP 初始化保存 ``data.initialization.version=5``、``scene_mapping="projective_shell"``、
+``background_refinement="preserve_physical_width"``、``background_final_layers`` 和
+``initial_background_layers``。``shell_layers`` 记录最终层数，``shell_width`` 记录固定物理壳宽，
+用于恢复相同的点云压缩和相机归一化。模型 metadata 中的网格及核心分辨率随正常细分翻倍，边界不变。
 checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设置会报错。
-有界 COLMAP 保持 version 2。旧无界 version 2 checkpoint 不增加 ``fixed_layers`` 标记，
-继续按原有固定物理厚度策略升层，其径向层数随分辨率翻倍。旧 checkpoint 不会自动升级为固定 8 层；
-比较固定 8 层方案必须新开实验。
+有界 COLMAP 保持 version 2。旧无界 version 4 保持只映射初始化点的径向语义、
+固定物理壳宽及原直线查询，不在恢复时切换成分区投影。
+旧无界 version 3 checkpoint 继续使用 ``fixed_layers``：
+各级层数固定，升层时压缩并合并背景。旧 version 2 保持原始物理壳宽，其 ``background_layers``
+表示初始层数，之后随分辨率翻倍。这些旧字段不会被重新解释为最终层数；
+新的实验使用 ``--background-final-layers``，比较新策略应新开实验。
 旧 version 1 checkpoint 保留原来的相机、点云压缩、网格和已保存背景，不会自动铺满远景、
 改为黑底或应用新的远景生长限制。比较新初始化应从新实验开始。
 
-本次需要增量编译 Python 绑定，使模型可携带持久化的场景元数据；
-``reconstruction.cpp`` 中的前向追踪与梯度没有因此更改。在 Windows 仓库根目录执行：
+分区投影涉及原生遍历、梯度和模型状态，必须增量编译 C++ 后新开实验。
+可在 Windows 仓库根目录执行：
 
 .. code-block:: powershell
 
@@ -671,12 +717,17 @@ checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设
    if ($LASTEXITCODE -ne 0) { throw "编译失败" }
    & ..\envs\mitsuba\python.exe -u -I experiments/reconstruction/train.py `
      --dataset datasets/bicycle --scene-mode unbounded `
-     --background-layers 8 --background-opacity 0.5 --gpu 0 --epochs 1500 `
+     --background-final-layers 8 --background-opacity 0.5 --gpu 0 --epochs 1500 `
      --target-resolution 1024 --level-weights 4 3 3
 
 若使用 venv，将解释器路径换为 ``..\envs\mitsuba\Scripts\python.exe``。
-该功能的初始化／恢复回归不能替代完整 Bicycle 重建；新远景方案的最终质量、删除行为和
-完整实验资源开销仍需要实际训练验证。
+本次实现已通过 Windows Release 编译、独立世界空间参考的 28 条射线对照、40 项有限差分，
+以及世界方向 SH、跨区域核心生长／删除收益、外景 RGB 删除屏蔽、整条射线命中容量和重放检查。
+初始化／拓扑回归覆盖空点云种子、真实原生模型、CPU／CUDA 升层及区域删除，
+Adam 回归覆盖密集、设备稀疏、紧凑与参考实现。旧 Distortion／八叉树回归以及小型 COLMAP
+三层训练、恢复和 train/test PNG 评价也已通过。
+这些小型检查不能替代完整 Bicycle 1024 重建；最终质量、区域接缝表现、运行时间和
+显存峰值尚需完整实验验证。
 
 统一配置
 --------
@@ -690,7 +741,7 @@ checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设
    CONFIG.data.dataset = "datasets/lego"  # 切换场景就在这里改，例如 datasets/ficus
    CONFIG.data.point_cloud = "init_points.ply"
    CONFIG.data.scene_mode = "auto"  # 合成场景有界白底；COLMAP 无界黑底
-   CONFIG.data.background_layers = 8  # 新无界实验各层级均保留8层远景
+   CONFIG.data.background_final_layers = 8  # 最终层数；1024终点为2→4→8，512终点为4→8
    CONFIG.data.background_opacity = 0.5
    CONFIG.data.cameras = "transforms_train.json"
    CONFIG.render.width = 800
@@ -713,8 +764,8 @@ checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设
    CONFIG.evaluation.enabled = True  # 保存初始化、每次升层前对照图，并在训练完成后自动出图
    CONFIG.evaluation.spp = 64
    CONFIG.evaluation.max_views = None  # 兼容旧全局上限；None 使用下面的分划分配置
-   CONFIG.evaluation.train_max_views = 10
-   CONFIG.evaluation.test_max_views = None  # 全部测试视角
+   CONFIG.evaluation.train_max_views = None  # 全部训练视角
+   CONFIG.evaluation.test_max_views = 10
 
 ``datasets/lego`` 相对于源码仓库的父目录，即 ``reconstruction/datasets/lego``。
 点云和相机文件名相对于该场景目录；训练会遍历相机 JSON 中的全部视角。
@@ -738,7 +789,7 @@ checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设
 命令行 ``--target-resolution 1024`` 在新实验未显式配置权重时选用 ``(4, 3, 3)``，
 ``--epochs 1500 --target-resolution 1024 --level-weights 4 3 3`` 的分配如下：
 
-.. list-table:: 1500 轮、固定 8 层远景的三层调度
+.. list-table:: 1500 轮、最终 8 层远景的三层调度
    :header-rows: 1
    :widths: 20 25 25 30
 
@@ -747,11 +798,11 @@ checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设
      - 训练轮数
      - 全局 epoch
    * - 256
-     - 272
+     - 260
      - 600
      - 1–600
    * - 512
-     - 528
+     - 520
      - 450
      - 601–1050
    * - 1024
@@ -770,7 +821,7 @@ JSON 的 ``schedule.level_weights`` 若已显式给定，则不会被自动替�
 512 层级仍保留生长，升层后重新 warmup 20 轮；最后第 951–1000 轮冻结生长，
 删除继续按周期执行。这 50 轮包含在细层的 400 轮内，不是额外增加的训练轮数。
 
-训练完成后默认以 64 spp 评价训练集前十个视角和全部测试视角；训练集不足十个时全取。
+训练完成后默认以 64 spp 评价训练集全部视角和测试集前十个视角；测试集不足十个时全取。
 合成场景采用对应相机 JSON 的顺序，COLMAP 360 使用文件名排序后分划分的顺序；
 均不使用训练打乱后的访问顺序。
 出图数量不限制训练：每个 epoch 仍遍历全部训练相机，始终为 1 spp。
@@ -792,7 +843,7 @@ JSON 的 ``schedule.level_weights`` 若已显式给定，则不会被自动替�
 * ``contour``：训练时可选的 contour 重要性采样。
 * ``runtime``：源码构建目录和本地 GPU 编号。
 * ``evaluation``：初始化、每次升层前对照图及训练结束后出图设置，默认 ``enabled=True``、``spp=64``、
-  ``max_views=None``、``train_max_views=10``、``test_max_views=None``、
+  ``max_views=None``、``train_max_views=None``、``test_max_views=10``、
   ``chunk_size=65536``、``seed=42``。合成场景测试相机文件由
   ``test_cameras="transforms_test.json"`` 指定；分划分的 ``None`` 或 ``0`` 表示全部视角。
 
@@ -801,7 +852,7 @@ JSON 的 ``schedule.level_weights`` 若已显式给定，则不会被自动替�
 ``--eval-spp`` 覆盖自动评价的采样数；``--eval-train-max-views`` /
 ``--eval-test-max-views`` 分别覆盖两个划分的上限，``0`` 表示全部。
 旧 ``--eval-max-views`` 及配置中的非空 ``max_views`` 仍优先同时覆盖两个划分；
-沿用旧 JSON 时应去掉旧上限或将其改为 ``null``，避免测试集继续只取十张。
+沿用旧 JSON 时应去掉旧全局上限或将其改为 ``null``，避免训练集仍只取十张。
 训练后评价使用当前实验最终保存的 ``model.npz``，不再初始化体素、不更新参数；
 评价设置保存在实验根目录的 ``evaluation-config.json``，训练自己的 ``training/config.json``
 及 checkpoint 内的训练配置保持独立。
@@ -1177,7 +1228,7 @@ RGB 删除对应 ``rgb_deletion_device_views``、``rgb_deletion_cpu_views`` 和
 正常命中、near-miss 几何记录或训练更新规则。
 
 索引显存随实际叶子与非空内部节点数量变化，不再仅由网格分辨率决定。
-这不代表整条训练流程都没有密集临时数组：Python 的候选生成和远景初始化仍有按 ``R³``
+这不代表整条训练流程都没有密集临时数组：旧径向远景初始化仍有按 ``R³``
 分配或扫描的临时工作；参数、Adam 历史矩、候选证据及反向记录也仍占用显存。
 核心分辨率上限为 1024，带远景的实际网格上限为 1040，支持核心 1024 加两侧各 8 层。
 稀疏空间索引不会消除高分辨率密集远景本身的参数与临时工作开销。
@@ -1563,7 +1614,7 @@ Adam 状态的数值误差。可调整 ``--cameras``、``--warmup``、``--repeat
 脚本自动在其父目录（实验根目录）保存 ``model.npz``。如果显式输出目录的最后一级不是 ``training``，
 则直接保存到该输出目录下的 ``model.npz``，兼容已有的平铺输出方式。
 随后自动评价，在同一实验根目录创建 ``train/``、``test/`` 及评价配置和报告；默认
-以 64 spp 渲染训练集前十个视角及全部测试集视角。独立评价时指向实验根目录，
+以 64 spp 渲染训练集全部视角及测试集前十个视角。独立评价时指向实验根目录，
 并用 ``--checkpoint`` 加载这个模型。
 训练轮数记录在配置、日志和
 checkpoint 中，不通过 ``E编号`` 表示。下文恢复和评价命令中的 ``E1`` 仅为示例，
@@ -1619,7 +1670,7 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
 上述命令保留 1000 轮分辨率调度，仅执行前 10 轮，即每个视角被访问 10 次，
 保存可续训 checkpoint，不生成最终评价。省略 ``--output-dir`` 时自动分配新实验目录。
 完整实验去掉 ``--stop-after-epochs 10``，结束并保存模型后会自动生成 train/test
-训练集前十个及测试集全部视角的 64 spp 图片和 PSNR。
+训练集全部及测试集前十个视角的 64 spp 图片和 PSNR。
 要使用前面的固定小网格例子，应将 JSON 保存到工作区，例如 ``train-config.json``，
 再以 ``--config train-config.json`` 运行。
 
@@ -1652,7 +1703,7 @@ HPC Slurm
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
      --dataset datasets/lego --epochs 1000 --chunk-size 0 --profile-views 3 \
      --profile-interval-epochs 10 \
-     --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
+     --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
 
 这里显式选择整图提交，并诊断最先处理的三个视角及每第 10 轮的首个视角，
 便于区分前向与两类反向开销。省略这两个 profile 参数时，恢复默认的分辨率/每 50 轮抽样。
@@ -1778,7 +1829,7 @@ NCCL 和重放 Adam，最后统一回读验证，避免逐批读回掩盖连续�
 ``tests/test_reconstruction_compact_optimizer.py`` 检查紧凑 Adam 与整表参考的参数、历史矩、
 时钟、变化行数和非法输入保护；它在本地单卡 CUDA 上运行，不能替代 HPC 的真实 NCCL 检查。
 
-完整训练结束后，N 个进程继续执行最终 train/test 评价，默认训练集前十个、测试集全部视角，
+完整训练结束后，N 个进程继续执行最终 train/test 评价，默认训练集全部、测试集前十个视角，
 每视角 64 spp。评价把已选中的 train/test 视角合并为任务列表，再交错分给 N 个 rank；
 每张卡加载完整模型，独立渲染分到的整个视角。这里不拆分同一视角的 samples、不计算梯度，
 也不使用 NCCL。每个视角的 seed、64 spp 累积顺序、文件名和 PSNR 协议保持原样。
@@ -1842,14 +1893,14 @@ Python 环境中的 NVIDIA NCCL 包也会被搜索。启动器不会自动安装
 CUDA 设备，N>1 时需要上述 NCCL 库。通信检查通过后再运行短训练，检查真实场景的行为与吞吐。
 
 先保持 Bicycle 总计 1500 轮的完整分辨率调度，执行前 10 轮并保存恢复点。
-省略 ``--workers`` 即使用本次分配的全部 GPU；以下选项与最近单卡速度测试一致：
+省略 ``--workers`` 即使用本次分配的全部 GPU；以下单卡与多卡命令使用相同的新背景层数策略：
 
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --worker-timeout 600 \
      --dataset datasets/bicycle --scene-mode unbounded \
-     --background-layers 4 --background-opacity 0.5 \
+     --background-final-layers 8 --background-opacity 0.5 \
      --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
      --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
@@ -1867,7 +1918,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
      --dataset datasets/bicycle --scene-mode unbounded \
-     --background-layers 4 --background-opacity 0.5 \
+     --background-final-layers 8 --background-opacity 0.5 \
      --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
      --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
@@ -1884,10 +1935,10 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --worker-timeout 600 \
      --dataset datasets/bicycle --scene-mode unbounded \
-     --background-layers 4 --background-opacity 0.5 --epochs 1500 --chunk-size 0 \
+     --background-final-layers 8 --background-opacity 0.5 --epochs 1500 --chunk-size 0 \
      --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages \
-     --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
+     --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
 
 若要继续前面的短实验，可给同一启动器传 ``--resume`` 和实际保存的中间 checkpoint
 相对路径，省略 ``--stop-after-epochs``，保留相同 GPU 工作进程数和其余算法设置。
@@ -1900,7 +1951,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --evaluate --worker-timeout 600 \
      --checkpoint outputs/lego-10.15-E1/model.npz \
-     --split both --spp 64 --train-max-views 10 --test-max-views 0 \
+     --split both --spp 64 --train-max-views 0 --test-max-views 10 \
      --output-dir outputs/lego-10.15-E1
 
 把示例实验目录替换为实际目录。``--evaluate`` 将其余评价参数转交给
@@ -1934,10 +1985,17 @@ GPU 升层
 默认 RGB GPU topology 的升层通过 ``reconstruction_refinement_gpu.refine_state_gpu``
 直接处理父模型设备缓冲。它保持 NumPy ``refine_state`` 的 FP64 几何、归一四元数、
 父 opacity 筛选、有限盒内拟合、18 轮二分及 preferred center。
-有界与旧版无界模型仍按子格编号优先、父体素原顺序压紧，core／shell 分辨率元数据同步翻倍；
-它们的 DC 颜色继承及光学厚度衰减规则保持不变。
+有界、旧 version 4 无界及旧固定物理壳宽模型按子格编号优先、父体素原顺序压紧，
+核心／实际网格分辨率元数据同步翻倍，物理边界不变；DC 颜色继承及光学厚度衰减规则保持不变。
+新无界实验的最终层数在初始化时决定起始壳宽，因此普通细分自然得到 2 → 4 → 8
+或 4 → 8 层；不运行径向映射、同格合并或外层裁剪。
 
-标有 ``background_refinement="fixed_layers"`` 的新无界模型先使用同一个八子格拟合器。
+新 version 5 ``projective_shell`` 核心沿用上述拟合，外景保留每个已有父格的八个子格，
+不通过拟合失败删除背景；继承其存储空间椭球几何及外观，子格裁剪各自贡献。
+CPU 与 GPU 使用相同的核心／六面薄板分类及继承规则，元数据中的映射模式随替换保留。
+
+旧 version 3、标有 ``background_refinement="fixed_layers"`` 的无界模型仍使用原恢复策略。
+它先使用同一个八子格拟合器。
 对拟合后中心半径 ``r > 1`` 的子体素，保持径向方向 ``n``，将中心映射为
 ``F(x) = n * (1 + (r - 1) / 2)``，并用该映射的局部 Jacobian 变换椭球几何支持范围。
 同一目标格中的子体素按映射后体积加权合并中心，沿代表坐标的三个轴估计合并后的支持范围；
@@ -1945,7 +2003,7 @@ GPU 升层
 内部子体素保留原细分继承行为。核心分辨率翻倍、远景层数保持不变，实际网格边界随壳层变薄更新，
 保存的初始化相机归一化不改变。
 
-这一步是下一层的近似几何及外观初始化，不保证合并椭球包含各输入椭球的完整并集，
+该旧策略的径向映射是下一层的近似几何及外观初始化，不保证合并椭球包含各输入椭球的完整并集，
 也不保证升层前后图像或透射率一致。它不会重新初始化远景。
 只有已有拟合子体素提供支持，空壳不回填；每个新层级仍按原配置 warmup，再继续生长和删除。
 不生成完整八倍父 SH 临时表，最终子体素数量确定后才分配颜色与 opacity 缓冲。
@@ -2104,8 +2162,8 @@ COLMAP 数据集中的相机全局索引不一定为 0。
 但已进入细层的 checkpoint 无法还原此前粗层的图。``--skip-evaluation`` 关闭这些对照图，
 不影响升层前 checkpoint 的保存。
 
-训练入口默认在保存最终模型后调用评价流程，使用 64 spp 渲染训练集前十个视角和
-测试集全部视角，并保存每个视角的图片和 PSNR。训练集不足十个时全取。
+训练入口默认在保存最终模型后调用评价流程，使用 64 spp 渲染训练集全部视角和
+测试集前十个视角，并保存每个视角的图片和 PSNR。测试集不足十个时全取。
 这不限制训练视角或改变训练 1 spp。评价只读取 checkpoint，不更新模型或使用测试视角训练。
 默认主指标为实际保存并读回 PNG 的 ``psnr_srgb_png``，同时报告量化前的
 ``psnr_srgb_float`` 和线性 RGB PSNR；这不改变线性训练损失。
@@ -2125,14 +2183,14 @@ COLMAP 数据集中的相机全局索引不一定为 0。
 
    & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\evaluate.py `
      --checkpoint outputs/lego-10.15-E1/model.npz `
-     --split both --spp 64 --train-max-views 10 --test-max-views 0 `
+     --split both --spp 64 --train-max-views 0 --test-max-views 10 `
      --output-dir outputs/lego-10.15-E1
 
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I mitsuba/experiments/reconstruction/evaluate.py \
      --checkpoint outputs/lego-10.15-E1/model.npz \
-     --split both --spp 64 --train-max-views 10 --test-max-views 0 \
+     --split both --spp 64 --train-max-views 0 --test-max-views 10 \
      --output-dir outputs/lego-10.15-E1
 
 ``--split train`` 或 ``--split test`` 只评价一个划分。训练相机默认继承 checkpoint
@@ -2145,11 +2203,11 @@ COLMAP 数据集中的相机全局索引不一定为 0。
 用于对照时请写入新的输出目录；它会改变真值和指标，不能与原协议分数直接混用。
 ``evaluation-report.json`` 的 ``metric_protocol`` 记录实际协议及其来源
 （checkpoint、旧 checkpoint 默认或显式覆盖），训练后的自动评价不作此覆盖。
-独立评价与训练后自动评价统一默认 train 前十张、test 全量。分划分参数
+独立评价与训练后自动评价统一默认 train 全量、test 前十张。分划分参数
 ``--train-max-views`` / ``--test-max-views`` 接受正整数或 ``0``（全部），配置中的
 ``None`` / JSON ``null`` 也表示该划分全量。旧 ``--max-views`` 或非空 ``max_views``
 继续优先同时覆盖两个划分；旧文件中显式的 ``max_views=10`` 应删去或改为 ``null``。
-报告同时记录每个划分可用的总视角数、实际选中数量及有效上限；训练集十张的均值是子集指标，
+报告同时记录每个划分可用的总视角数、实际选中数量及有效上限；测试集十张的均值是子集指标，
 只有实际选中数量等于该划分总数时才是完整划分评价。
 
 合成场景使用各自 ``transforms_train.json``、``transforms_test.json`` 定义的划分和顺序。
