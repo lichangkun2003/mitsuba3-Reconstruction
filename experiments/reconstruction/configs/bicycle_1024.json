@@ -45,7 +45,7 @@
   },
   "training": {
     "rgb_only": true,
-    "num_epochs": 3000,
+    "num_epochs": 1500,
     "chunk_size": 0,
     "sampling_workers": 2,
     "profile_views": 0,
@@ -176,7 +176,7 @@
     "enabled": true,
     "spp": 64,
     "train_max_views": 0,
-    "test_max_views": 10,
+    "test_max_views": 0,
     "max_views": null,
     "chunk_size": 65536,
     "seed": 42,

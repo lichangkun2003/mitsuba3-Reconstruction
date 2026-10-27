@@ -37,7 +37,7 @@ class EvaluationConfig:
     spp: int = 64  # Independent evaluation sampling; training remains 1 spp.
     max_views: int | None = None  # Legacy global override; 0 means all, None uses split limits.
     train_max_views: int | None = None  # All training cameras, for synthetic and COLMAP datasets.
-    test_max_views: int | None = 10  # First N held-out cameras; None or 0: all.
+    test_max_views: int | None = None  # All held-out cameras; positive values select the first N.
     seed: int = 42
     chunk_size: int = 65536
     traversal: str | None = None  # None: saved mode; legacy checkpoints default to octree.
@@ -78,7 +78,7 @@ def parse_config(workspace):
     parser.add_argument("--max-views", type=int,
                         help="Legacy override for BOTH splits (0: all); prefer separate train/test limits")
     parser.add_argument("--train-max-views", type=int, help="First N train views (default: all; 0: all)")
-    parser.add_argument("--test-max-views", type=int, help="First N test views (default: 10; 0: all)")
+    parser.add_argument("--test-max-views", type=int, help="First N test views (default: all; 0: all)")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--chunk-size", type=int)
     parser.add_argument("--traversal", choices=("octree", "dda"),
@@ -162,8 +162,8 @@ def evaluation_view_limits(config):
 def warn_legacy_view_limit(config):
     if config.max_views is not None:
         print("Legacy max_views overrides BOTH train/test limits. "
-              "For all training views and the first 10 test views, omit --max-views and set "
-              "--train-max-views 0 --test-max-views 10.", file=sys.stderr, flush=True)
+              "For all training and test views, omit --max-views and set "
+              "--train-max-views 0 --test-max-views 0.", file=sys.stderr, flush=True)
 
 
 def primary_metric_name(config):
@@ -581,7 +581,7 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
                         score = result["aggregate"][primary_metric_space(config)]["mean_psnr_db"]
                         text = "+inf" if score is None else f"{score:.4f}"
                         print(f"Eval {split} {result['evaluated_view_count']}/{result['selected_view_count']} "
-                              f"| {config.spp} spp | {primary_metric_name(config)}={text} dB", flush=True)
+                              f"| {config.spp} spp | mean_{primary_metric_name(config)}={text} dB", flush=True)
             else:
                 report.update(status=readiness["status"], error=readiness["error"])
             errors = [f"rank {worker['rank']}: {worker['error']}" for worker in workers if worker["error"]]
@@ -755,7 +755,7 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
             mean_text = "+inf" if mean_score is None else f"{mean_score:.4f}"
             progress.finish(
                 f"Eval {split} {len(records)}/{len(views)} (100%) | {config.spp} spp | "
-                f"{primary_metric_name(config)}={mean_text} dB | "
+                f"mean_{primary_metric_name(config)}={mean_text} dB | "
                 f"{time.perf_counter() - split_started:.1f}s")
         report["status"] = "passed"
     except KeyboardInterrupt:

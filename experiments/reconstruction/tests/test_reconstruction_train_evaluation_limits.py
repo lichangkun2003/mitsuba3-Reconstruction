@@ -1,4 +1,4 @@
-"""CPU checks for full-train/test-subset evaluation and explicit legacy limits."""
+"""CPU checks for complete train/test evaluation and explicit legacy limits."""
 
 from copy import deepcopy
 from dataclasses import asdict
@@ -29,10 +29,10 @@ class TrainingEvaluationLimitsTests(unittest.TestCase):
         evaluate.validate_config(result)
         return result
 
-    def test_defaults_keep_complete_training_split_and_ten_test_views(self):
+    def test_defaults_keep_complete_training_and_test_splits(self):
         config, warning = self.configure()
         evaluation = self.evaluation(config)
-        self.assertEqual(evaluate.evaluation_view_limits(evaluation), {"train": None, "test": 10})
+        self.assertEqual(evaluate.evaluation_view_limits(evaluation), {"train": None, "test": None})
         self.assertEqual(evaluation.spp, 64)
         self.assertEqual(config.render.spp, 1)
         self.assertEqual(evaluation.dataset, config.data.dataset)
@@ -54,10 +54,11 @@ class TrainingEvaluationLimitsTests(unittest.TestCase):
 
     def test_zero_cli_limit_selects_all_without_affecting_other_split(self):
         for arguments, expected in (
-                (("--eval-train-max-views", "0"), {"train": None, "test": 10}),
-                (("--eval-test-max-views", "0"), {"train": None, "test": None})):
+                (("--eval-train-max-views", "0"), {"train": None, "test": 7}),
+                (("--eval-test-max-views", "0"), {"train": 2, "test": None})):
             with self.subTest(arguments=arguments):
-                config, _ = self.configure(arguments)
+                config, _ = self.configure(arguments, {
+                    "evaluation": {"train_max_views": 2, "test_max_views": 7}})
                 self.assertEqual(evaluate.evaluation_view_limits(self.evaluation(config)), expected)
 
     def test_json_limits_accept_null_and_cli_overrides_one_split(self):
@@ -73,7 +74,7 @@ class TrainingEvaluationLimitsTests(unittest.TestCase):
         self.assertEqual(evaluate.evaluation_view_limits(self.evaluation(config)), {"train": 6, "test": 6})
         self.assertIn("Deprecated", warning)
         self.assertIn("BOTH", warning)
-        self.assertIn("train_max_views=null and test_max_views=10", warning)
+        self.assertIn("train_max_views=null and test_max_views=null", warning)
         self.assertEqual(config.evaluation.max_views, 6)
 
     def test_legacy_zero_explicitly_selects_all_splits(self):
@@ -94,7 +95,7 @@ class TrainingEvaluationLimitsTests(unittest.TestCase):
         config = deepcopy(train.CONFIG)
         config.evaluation.max_views = 10
         config, warning = self.configure(values={"evaluation": {"max_views": None}}, config=config)
-        self.assertEqual(evaluate.evaluation_view_limits(self.evaluation(config)), {"train": None, "test": 10})
+        self.assertEqual(evaluate.evaluation_view_limits(self.evaluation(config)), {"train": None, "test": None})
         self.assertEqual(warning, "")
 
     def test_disabled_evaluation_does_not_emit_legacy_warning(self):
@@ -122,8 +123,8 @@ class TrainingEvaluationLimitsTests(unittest.TestCase):
 
     def test_standalone_evaluation_defaults_match_training_and_cli_overrides(self):
         for arguments, expected in (
-                ((), {"train": None, "test": 10}),
-                (("--train-max-views", "4"), {"train": 4, "test": 10}),
+                ((), {"train": None, "test": None}),
+                (("--train-max-views", "4"), {"train": 4, "test": None}),
                 (("--test-max-views", "0"), {"train": None, "test": None}),
                 (("--train-max-views", "4", "--test-max-views", "2"), {"train": 4, "test": 2}),
                 (("--train-max-views", "4", "--max-views", "3"), {"train": 3, "test": 3}),
@@ -137,7 +138,7 @@ class TrainingEvaluationLimitsTests(unittest.TestCase):
         stderr = io.StringIO()
         with patch.object(sys, "stderr", stderr):
             evaluate.warn_legacy_view_limit(evaluate.EvaluationConfig(max_views=3))
-        self.assertIn("--train-max-views 0 --test-max-views 10", stderr.getvalue())
+        self.assertIn("--train-max-views 0 --test-max-views 0", stderr.getvalue())
 
 
 if __name__ == "__main__":

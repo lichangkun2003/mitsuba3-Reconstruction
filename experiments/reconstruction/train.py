@@ -98,7 +98,7 @@ class EvaluationSettings:
     enabled: bool = True
     spp: int = 64
     train_max_views: int | None = None  # All training cameras; positive values select the first N.
-    test_max_views: int | None = 10  # First N held-out cameras; None or 0: all.
+    test_max_views: int | None = None  # All held-out cameras; positive values select the first N.
     max_views: int | None = None  # Legacy explicit override of both split limits; 0: all.
     chunk_size: int = 65536
     seed: int = 42
@@ -193,7 +193,7 @@ CONFIG.training.output = None  # 自动创建 outputs/场景-MM.DD-E编号/train
 CONFIG.evaluation.enabled = True  # 最终 model.npz 保存后，自动评价训练集和测试集。
 CONFIG.evaluation.spp = 64  # 仅用于评价出图，不改变训练的 1 spp。
 CONFIG.evaluation.train_max_views = None  # 训练集全部视角，适用于合成场景和 COLMAP/Mip-NeRF 360。
-CONFIG.evaluation.test_max_views = 10  # 测试集前 10 个视角；不足 10 个时全部出图。
+CONFIG.evaluation.test_max_views = None  # 测试集全部视角，分别汇总训练集与测试集的平均 PSNR。
 # 高级参数使用 CONFIG.optimizer / gradient / topology / contour / runtime。
 # ============================ 配置区结束 ============================
 
@@ -268,7 +268,7 @@ def parse_arguments():
     parser.add_argument("--eval-train-max-views", type=int,
                         help="Evaluate the first N training cameras (default: all); 0 evaluates all")
     parser.add_argument("--eval-test-max-views", type=int,
-                        help="Evaluate the first N held-out test cameras (default: 10); 0 evaluates all")
+                        help="Evaluate the first N held-out test cameras (default: all); 0 evaluates all")
     parser.add_argument("--eval-max-views", type=int,
                         help="Deprecated: override BOTH train/test limits; 0 evaluates all. Prefer the split-specific options")
     return parser.parse_args()
@@ -310,8 +310,8 @@ def apply_arguments(config, args, values):
     if config.evaluation.enabled and config.evaluation.max_views is not None:
         print("Deprecated evaluation.max_views / --eval-max-views explicitly overrides BOTH "
               "train and test limits, including split-specific options. Remove it (or set "
-              "evaluation.max_views=null), then set train_max_views=null and test_max_views=10 "
-              "for all training views and the first 10 test views.", file=sys.stderr)
+              "evaluation.max_views=null), then set train_max_views=null and test_max_views=null "
+              "for all training and test views.", file=sys.stderr)
     if (not config.training.rgb_only and
             "use_rgb_growth" not in values.get("topology", {})):
         # Explicit legacy supervision must not inherit the current RGB-only

@@ -71,11 +71,11 @@ class EvaluationDatasetTests(unittest.TestCase):
         limit = evaluate.evaluation_view_limit(config, split)
         return views[:limit] if limit is not None else views
 
-    def test_synthetic_uses_all_train_json_frames_and_first_ten_test_frames(self):
+    def test_synthetic_uses_all_train_and_test_json_frames(self):
         root = self.root / "synthetic"
         synthetic_fixture(root)
         config = evaluate.EvaluationConfig()
-        for split, total, selected in (("train", 17, 17), ("test", 23, 10)):
+        for split, total, selected in (("train", 17, 17), ("test", 23, 23)):
             views = common.load_views(root, f"transforms_{split}.json", self.render, np,
                                       data=preview.DataConfig(), split=split)
             self.assertEqual(len(views), total)
@@ -101,7 +101,7 @@ class EvaluationDatasetTests(unittest.TestCase):
         self.assertFalse(set(train_ids) & set(test_ids))
         self.assertEqual(sorted(train_ids + test_ids), list(range(97)))
         self.assertEqual(len(self.selected(train, config, "train")), 84)
-        self.assertEqual([view["index"] for view in self.selected(test, config, "test")], list(range(0, 80, 8)))
+        self.assertEqual([view["index"] for view in self.selected(test, config, "test")], test_ids)
         self.assertEqual(Path(test[1]["reference_path"]).name, "image_008.jpg")
         self.assertTrue(all(Path(v["reference_path"]).parent.name == "images_2" for v in train + test))
 

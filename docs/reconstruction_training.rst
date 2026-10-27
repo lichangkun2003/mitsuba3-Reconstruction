@@ -89,7 +89,7 @@ checkpoint 缺字段时的兼容值。该项从第一轮开始生效，升层时
    & "..\envs\mitsuba\python.exe" -u -I .\experiments\reconstruction\train.py `
      --dataset datasets/hotdog --gpu 0 --epochs 1000 --chunk-size 0 `
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages `
-     --distortion-weight 0.1 --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
+     --distortion-weight 0.1 --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 0
 
 若本机是 venv 布局，解释器改为 ``..\envs\mitsuba\Scripts\python.exe``。
 多卡入口 ``train_multigpu.py`` 同样透传此选项。当前 N 卡协议每卡计算一个完整视角，
@@ -494,7 +494,7 @@ checkpoint 保存内部证据版本，使用版本 2 或更早 RGB 生长证据�
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
      --rgb-only --dataset datasets/lego --epochs 1000 --chunk-size 0 \
-     --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
+     --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 0
 
 在已经分配同节点两张 GPU 的 Linux Slurm 作业内启动新的双卡实验：
 
@@ -503,7 +503,7 @@ checkpoint 保存内部证据版本，使用版本 2 或更早 RGB 生长证据�
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --workers 2 --worker-timeout 600 \
      --rgb-only --dataset datasets/lego --epochs 1000 --chunk-size 0 \
-     --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
+     --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 0
 
 两条命令都自动创建新的实验目录。需要短跑时添加 ``--stop-after-epochs 10``，保持
 ``--epochs 1000``，避免改变完整调度。训练后的 64 spp 只用于评价出图，不改变训练 spp。
@@ -765,7 +765,7 @@ Adam 回归覆盖密集、设备稀疏、紧凑与参考实现。旧 Distortion�
    CONFIG.evaluation.spp = 64
    CONFIG.evaluation.max_views = None  # 兼容旧全局上限；None 使用下面的分划分配置
    CONFIG.evaluation.train_max_views = None  # 全部训练视角
-   CONFIG.evaluation.test_max_views = 10
+   CONFIG.evaluation.test_max_views = None  # 全部测试视角
 
 ``datasets/lego`` 相对于源码仓库的父目录，即 ``reconstruction/datasets/lego``。
 点云和相机文件名相对于该场景目录；训练会遍历相机 JSON 中的全部视角。
@@ -821,7 +821,7 @@ JSON 的 ``schedule.level_weights`` 若已显式给定，则不会被自动替�
 512 层级仍保留生长，升层后重新 warmup 20 轮；最后第 951–1000 轮冻结生长，
 删除继续按周期执行。这 50 轮包含在细层的 400 轮内，不是额外增加的训练轮数。
 
-训练完成后默认以 64 spp 评价训练集全部视角和测试集前十个视角；测试集不足十个时全取。
+训练完成后默认以 64 spp 评价训练集和测试集的全部视角。
 合成场景采用对应相机 JSON 的顺序，COLMAP 360 使用文件名排序后分划分的顺序；
 均不使用训练打乱后的访问顺序。
 出图数量不限制训练：每个 epoch 仍遍历全部训练相机，始终为 1 spp。
@@ -843,7 +843,7 @@ JSON 的 ``schedule.level_weights`` 若已显式给定，则不会被自动替�
 * ``contour``：训练时可选的 contour 重要性采样。
 * ``runtime``：源码构建目录和本地 GPU 编号。
 * ``evaluation``：初始化、每次升层前对照图及训练结束后出图设置，默认 ``enabled=True``、``spp=64``、
-  ``max_views=None``、``train_max_views=None``、``test_max_views=10``、
+  ``max_views=None``、``train_max_views=None``、``test_max_views=None``、
   ``chunk_size=65536``、``seed=42``。合成场景测试相机文件由
   ``test_cameras="transforms_test.json"`` 指定；分划分的 ``None`` 或 ``0`` 表示全部视角。
 
@@ -1614,7 +1614,7 @@ Adam 状态的数值误差。可调整 ``--cameras``、``--warmup``、``--repeat
 脚本自动在其父目录（实验根目录）保存 ``model.npz``。如果显式输出目录的最后一级不是 ``training``，
 则直接保存到该输出目录下的 ``model.npz``，兼容已有的平铺输出方式。
 随后自动评价，在同一实验根目录创建 ``train/``、``test/`` 及评价配置和报告；默认
-以 64 spp 渲染训练集全部视角及测试集前十个视角。独立评价时指向实验根目录，
+以 64 spp 渲染训练集和测试集的全部视角。独立评价时指向实验根目录，
 并用 ``--checkpoint`` 加载这个模型。
 训练轮数记录在配置、日志和
 checkpoint 中，不通过 ``E编号`` 表示。下文恢复和评价命令中的 ``E1`` 仅为示例，
@@ -1670,7 +1670,7 @@ Dr.Jit、CUDA 和 OptiX 缓存写入源码仓库父目录（``reconstruction`` �
 上述命令保留 1000 轮分辨率调度，仅执行前 10 轮，即每个视角被访问 10 次，
 保存可续训 checkpoint，不生成最终评价。省略 ``--output-dir`` 时自动分配新实验目录。
 完整实验去掉 ``--stop-after-epochs 10``，结束并保存模型后会自动生成 train/test
-训练集全部及测试集前十个视角的 64 spp 图片和 PSNR。
+训练集和测试集全部视角的 64 spp 图片和 PSNR。
 要使用前面的固定小网格例子，应将 JSON 保存到工作区，例如 ``train-config.json``，
 再以 ``--config train-config.json`` 运行。
 
@@ -1703,7 +1703,7 @@ HPC Slurm
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
      --dataset datasets/lego --epochs 1000 --chunk-size 0 --profile-views 3 \
      --profile-interval-epochs 10 \
-     --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
+     --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 0
 
 这里显式选择整图提交，并诊断最先处理的三个视角及每第 10 轮的首个视角，
 便于区分前向与两类反向开销。省略这两个 profile 参数时，恢复默认的分辨率/每 50 轮抽样。
@@ -1829,7 +1829,7 @@ NCCL 和重放 Adam，最后统一回读验证，避免逐批读回掩盖连续�
 ``tests/test_reconstruction_compact_optimizer.py`` 检查紧凑 Adam 与整表参考的参数、历史矩、
 时钟、变化行数和非法输入保护；它在本地单卡 CUDA 上运行，不能替代 HPC 的真实 NCCL 检查。
 
-完整训练结束后，N 个进程继续执行最终 train/test 评价，默认训练集全部、测试集前十个视角，
+完整训练结束后，N 个进程继续执行最终 train/test 评价，默认训练集和测试集全部视角，
 每视角 64 spp。评价把已选中的 train/test 视角合并为任务列表，再交错分给 N 个 rank；
 每张卡加载完整模型，独立渲染分到的整个视角。这里不拆分同一视角的 samples、不计算梯度，
 也不使用 NCCL。每个视角的 seed、64 spp 累积顺序、文件名和 PSNR 协议保持原样。
@@ -1938,7 +1938,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
      --background-final-layers 8 --background-opacity 0.5 --epochs 1500 --chunk-size 0 \
      --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages \
-     --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
+     --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 0
 
 若要继续前面的短实验，可给同一启动器传 ``--resume`` 和实际保存的中间 checkpoint
 相对路径，省略 ``--stop-after-epochs``，保留相同 GPU 工作进程数和其余算法设置。
@@ -1951,7 +1951,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --evaluate --worker-timeout 600 \
      --checkpoint outputs/lego-10.15-E1/model.npz \
-     --split both --spp 64 --train-max-views 0 --test-max-views 10 \
+     --split both --spp 64 --train-max-views 0 --test-max-views 0 \
      --output-dir outputs/lego-10.15-E1
 
 把示例实验目录替换为实际目录。``--evaluate`` 将其余评价参数转交给
@@ -2162,8 +2162,8 @@ COLMAP 数据集中的相机全局索引不一定为 0。
 但已进入细层的 checkpoint 无法还原此前粗层的图。``--skip-evaluation`` 关闭这些对照图，
 不影响升层前 checkpoint 的保存。
 
-训练入口默认在保存最终模型后调用评价流程，使用 64 spp 渲染训练集全部视角和
-测试集前十个视角，并保存每个视角的图片和 PSNR。测试集不足十个时全取。
+训练入口默认在保存最终模型后调用评价流程，使用 64 spp 渲染训练集和测试集的
+全部视角，并保存每个视角的图片和 PSNR，分别汇总两个划分的平均 PSNR。
 这不限制训练视角或改变训练 1 spp。评价只读取 checkpoint，不更新模型或使用测试视角训练。
 默认主指标为实际保存并读回 PNG 的 ``psnr_srgb_png``，同时报告量化前的
 ``psnr_srgb_float`` 和线性 RGB PSNR；这不改变线性训练损失。
@@ -2183,14 +2183,14 @@ COLMAP 数据集中的相机全局索引不一定为 0。
 
    & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\evaluate.py `
      --checkpoint outputs/lego-10.15-E1/model.npz `
-     --split both --spp 64 --train-max-views 0 --test-max-views 10 `
+     --split both --spp 64 --train-max-views 0 --test-max-views 0 `
      --output-dir outputs/lego-10.15-E1
 
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I mitsuba/experiments/reconstruction/evaluate.py \
      --checkpoint outputs/lego-10.15-E1/model.npz \
-     --split both --spp 64 --train-max-views 0 --test-max-views 10 \
+     --split both --spp 64 --train-max-views 0 --test-max-views 0 \
      --output-dir outputs/lego-10.15-E1
 
 ``--split train`` 或 ``--split test`` 只评价一个划分。训练相机默认继承 checkpoint
@@ -2203,11 +2203,11 @@ COLMAP 数据集中的相机全局索引不一定为 0。
 用于对照时请写入新的输出目录；它会改变真值和指标，不能与原协议分数直接混用。
 ``evaluation-report.json`` 的 ``metric_protocol`` 记录实际协议及其来源
 （checkpoint、旧 checkpoint 默认或显式覆盖），训练后的自动评价不作此覆盖。
-独立评价与训练后自动评价统一默认 train 全量、test 前十张。分划分参数
+独立评价与训练后自动评价统一默认 train、test 全量。分划分参数
 ``--train-max-views`` / ``--test-max-views`` 接受正整数或 ``0``（全部），配置中的
 ``None`` / JSON ``null`` 也表示该划分全量。旧 ``--max-views`` 或非空 ``max_views``
 继续优先同时覆盖两个划分；旧文件中显式的 ``max_views=10`` 应删去或改为 ``null``。
-报告同时记录每个划分可用的总视角数、实际选中数量及有效上限；测试集十张的均值是子集指标，
+报告同时记录每个划分可用的总视角数、实际选中数量及有效上限；显式限量时的均值是子集指标，
 只有实际选中数量等于该划分总数时才是完整划分评价。
 
 合成场景使用各自 ``transforms_train.json``、``transforms_test.json`` 定义的划分和顺序。
@@ -2269,6 +2269,9 @@ PSNR 的具体约定：
 ``metrics.json`` 的 ``aggregate.psnr_srgb_png`` 是逐图 PNG PSNR 的算术平均，
 ``aggregate.srgb_png.mean_psnr_db`` 提供同一均值及相关 MSE 汇总；
 ``aggregate.psnr_srgb_float`` / ``aggregate.srgb.mean_psnr_db`` 保留旧浮点评价。
+实验目录的 ``evaluation-report.json`` 分别在
+``splits.train.aggregate.psnr_srgb_png`` 和 ``splits.test.aggregate.psnr_srgb_png``
+记录两个划分的逐视角平均 PSNR；终端汇总以 ``mean_psnr_srgb_png`` 标识该均值。
 PNG 同时用于显示与可复算的正式指标。进行论文或其他实现对比时，应统一颜色空间、
 量化、背景、数据划分、分辨率和 spp；不能因为使用 PNG 就声称全部评价协议已经一致。
 

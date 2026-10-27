@@ -377,7 +377,7 @@ checkpoint 不能直接接入 N>1 新协议，可继续单卡恢复或独立评�
 
 RGB 生长／删除证据按视角独立通过 NCCL 传送，再由 rank 0 投票，不将不同相机混成一票。
 候选、模型与 Adam 缓冲也通过 GPU 广播，控制通道只传元数据；没有为此增加证据前向。
-训练结束后 N 个 rank 分配不同评价视角，默认训练前 10 张、测试全部、每视角 64 spp。
+训练结束后 N 个 rank 分配不同评价视角，默认训练集和测试集全部视角、每视角 64 spp。
 选择的视角总数不会乘 N；seed、PNG 与 PSNR 评价规则保持不变。
 
 先申请同节点一项任务，例如两卡、16 CPU：
@@ -578,7 +578,7 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 单卡实验命令
 ------------
 
-使用仓库内的 ``configs/bicycle_1024.json`` 启动 3000 轮 Bicycle 实验：
+使用仓库内的 ``configs/bicycle_1024.json`` 启动 1500 轮 Bicycle 实验：
 
 .. code-block:: powershell
 
@@ -587,9 +587,9 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
      .\experiments\reconstruction\train.py `
      --config "E:\lck\reconstruction\mitsuba\experiments\reconstruction\configs\bicycle_1024.json"
 
-配置采用 256 → 512 → 1024、4:3:3 的轮数比例、最终 8 层背景（2 → 4 → 8），
+配置采用 256 → 512 → 1024、4:3:3 的轮数比例（600 / 450 / 450 轮）、最终 8 层背景（2 → 4 → 8），
 Distortion 权重 0.1，启用 GPU 拓扑和原生重放，关闭性能抽样。训练为整图 1 spp，
-最终评价为 64 spp，训练集全部视角、测试集前 10 个视角。
+最终评价为 64 spp，训练集和测试集均评价全部视角。
 前景与外景的 radiance 均使用 9 个 SH 系数（0、1、2 阶），保留方向性；opacity 仍仅优化 DC。
 COLMAP 图像尺寸由数据集读取，会覆盖 JSON 中 ``render.width`` / ``render.height`` 的初始值。
 
@@ -620,7 +620,7 @@ JSON 内的数据集、输出等相对路径也按仓库父目录解析，不按
 
    & '..\envs\mitsuba\Scripts\python.exe' -I .\experiments\reconstruction\train.py `
      --dataset datasets/lego --gpu 0 --epochs 1000 --chunk-size 0 `
-     --no-profile-stages --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
+     --no-profile-stages --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 0
 
 ``--no-profile-stages`` 关闭分段诊断，使抽样视角也能使用原生重放，适合速度比较。
 若需要定位前向与反向耗时，可重新开启 ``--profile-stages``。
@@ -661,7 +661,7 @@ JSON 内的数据集、输出等相对路径也按仓库父目录解析，不按
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
      --dataset datasets/lego --epochs 1000 --chunk-size 0 \
-     --no-profile-stages --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 10
+     --no-profile-stages --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 0
 
 实验启动时自动分配为 ``outputs/场景-MM.DD-E编号/``，其中 ``E`` 表示实验编号。
 训练成功并保存最终模型后，目录自动加上耗时，例如 ``hotdog-10.20-E3-20min``。
@@ -681,7 +681,7 @@ JSON 内的数据集、输出等相对路径也按仓库父目录解析，不按
 启用同次训练前向中的 RGB 生长证据，以及已有反向中的 RGB 删除证据和持续低 opacity 清理，
 每个层级各 warmup 20 轮；保留 256 → 512 分裂。
 新实验在全局最后 50 轮冻结生长，删除继续按周期执行，同时以 1 spp 优化已有体素。
-最终出图为 64 spp，训练集全部出图，测试集取前 10 个视角并计入指标；不足 10 个时全取。
+最终出图为 64 spp，训练集和测试集均全部出图并计入各自划分的指标。
 
 出图及 COLMAP 图片读取使用 Pillow，在本项目独立环境安装：
 
@@ -698,15 +698,18 @@ HPC 使用 ``$HOME/envs/mitsuba/bin/python`` 执行同一 ``-m pip install -r`` 
 
    & '..\envs\mitsuba\Scripts\python.exe' -I .\experiments\reconstruction\evaluate.py `
      --checkpoint outputs/hotdog-10.21-E0-47min/model.npz --split both --spp 64 `
-     --train-max-views 0 --test-max-views 10 `
+     --train-max-views 0 --test-max-views 0 `
      --output-dir outputs/hotdog-10.21-E0-47min
 
 评价对多 spp 的预测先在线性空间求均值，再转换为 sRGB；预测和合成后的参考都实际保存为
 8 位 RGB PNG，再读回整数 RGB / 255 计算全图 MSE 与 PSNR。参考 PNG 位于
 ``train/reference/``、``test/reference/``，与对应预测图同名，便于独立复算。
-``metrics.json`` 的 ``aggregate.psnr_srgb_png`` 是逐视角 PSNR 的算术平均；
+各划分 ``metrics.json`` 的 ``aggregate.psnr_srgb_png`` 是逐视角 PSNR 的算术平均；
 ``aggregate.srgb_png.mean_psnr_db`` 提供同一结果及 MSE 汇总，
 ``aggregate.psnr_srgb_float``／``aggregate.srgb.mean_psnr_db`` 保留量化前结果。
+实验目录的 ``evaluation-report.json`` 分别在
+``splits.train.aggregate.psnr_srgb_png`` 和 ``splits.test.aggregate.psnr_srgb_png``
+记录训练集、测试集的平均 PSNR，不混合两个划分。
 不使用前景 mask；JPEG/RGB 参考没有 alpha 时保留整张原图，不用白色替换背景。
 与其他方法比较仍须统一数据划分、图像分辨率和背景合成协议。
 这里更新的是评价流程；训练参数、梯度和生长删除规则不变，未据此宣称真实场景已完成全量 GPU 评价。
@@ -726,8 +729,8 @@ HPC 使用 ``$HOME/envs/mitsuba/bin/python`` 执行同一 ``-m pip install -r`` 
 ``--skip-evaluation`` 同时跳过初始化图、升层前图片和最终评价。
 
 中途完整 checkpoint 仅在升层前保存，命名为
-``training/before-refine-0256-epoch-01200.npz`` 等；上述 3000 轮、``4 3 3`` 权重的预设，
-分别保存完成第 1200 和 2100 轮的旧层状态。文件包含 Adam、RNG 及生命周期，并标记待执行升层；
+``training/before-refine-0256-epoch-00600.npz`` 等；上述 1500 轮、``4 3 3`` 权重的预设，
+分别保存完成第 600 和 1050 轮的旧层状态。文件包含 Adam、RNG 及生命周期，并标记待执行升层；
 恢复时先完成升层，再进入下一轮，不重复训练该边界轮次。旧 ``training.save_count`` 字段仅用于
 配置兼容，不再安排定期快照。训练结束仍保存最终 ``model.npz``；显式 ``--stop-after-epochs``
 仍保存可续训的停止点。已有实验文件不自动删除。
@@ -783,21 +786,21 @@ version 4 则根据最终层数安排起始壳层；这些版本均不再按 ``m
 初始化后两类场景共用索引表、八叉树、Adam、生长与删除流程。
 ``max_hits`` 仍是整条射线的命中上限，外壳层数相同不代表所有射线都不会截断。
 
-自动评价和独立评价统一默认 train 全量、test 前 10 张。合成场景按各自
+自动评价和独立评价统一默认 train、test 全量，每视角 64 spp。合成场景按各自
 ``transforms_train/test.json`` 的顺序取图；360 场景使用上述排序及每八张留一张的划分。
 评价复用 checkpoint 保存的归一化、图像目录与相机尺寸，不读取点云或重新估计场景变换。
 例如配置文件为::
 
    {
      "data": {"dataset": "datasets/garden"},
-     "evaluation": {"max_views": null, "train_max_views": null, "test_max_views": 10}
+     "evaluation": {"max_views": null, "train_max_views": 0, "test_max_views": 0}
    }
 
 ``--eval-train-max-views`` / ``--eval-test-max-views`` 分别控制训练后出图范围；
 独立评价使用 ``--train-max-views`` / ``--test-max-views``，``0`` 表示该划分全部视角。
 旧 ``max_views`` / ``--eval-max-views`` / ``--max-views`` 若显式设置为非 ``None``，
 仍优先覆盖两个划分；旧配置中的 ``max_views=10`` 必须移除或改为 ``null``，才能采用分划分默认。
-旧命令中的限制也会覆盖默认值，请改为 ``--eval-train-max-views 0 --eval-test-max-views 10``。
+旧命令中的限制也会覆盖默认值，请改为 ``--eval-train-max-views 0 --eval-test-max-views 0``。
 
 源码编译及回归检查::
 
