@@ -160,7 +160,7 @@ def apply_saved_background_defaults(data, entries: dict) -> None:
             data.background_final_layers = None
         if "background_layers" not in entries:
             data.background_layers = saved.get("background_layers", 8)
-    elif version == 4:
+    elif version in (4, 5):
         if "background_layers" not in entries:
             data.background_layers = None
         if "background_final_layers" not in entries:
@@ -220,6 +220,9 @@ def scene_background_protocol(data, render) -> dict:
     return {"requested_scene_mode": data.scene_mode, "scene_mode": mode,
             "background_linear_rgb": list(render.background),
             "background_role": "residual ray transmittance color; no environment illumination",
+            "scene_mapping": saved.get("scene_mapping", "bounded"),
+            "ray_extent": ("infinity" if saved.get("scene_mapping") == "projective_shell"
+                           else "configured far_clip"),
             "initial_background_layers": (saved.get("initial_background_layers", saved.get("background_layers",
                                                 data.background_layers)) if mode == "unbounded" else None),
             "final_background_layers": (saved.get("shell_layers", data.background_final_layers)
@@ -235,7 +238,7 @@ def parse_config(workspace: Path) -> PreviewConfig:
     parser.add_argument("--dataset")
     parser.add_argument("--scene-mode", choices=("auto", "bounded", "unbounded"))
     parser.add_argument("--background-final-layers", type=int,
-                        help="Radial background layers at the target resolution (default: 8); independent of max_hits")
+                        help="Background layers at the target resolution (default: 8); independent of max_hits")
     parser.add_argument("--background-layers", type=int, help="Legacy v2/v3 setting; use --background-final-layers for new runs")
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
     parser.add_argument("--point-cloud")
@@ -521,7 +524,8 @@ def generate_rays(config: RenderConfig, camera: dict, offset, mi, dr):
                     + vertical * mi.Vector3f(camera["up"]))
     origin = mi.Point3f(camera["position"]) + config.near_clip * unnormalized
     ray = mi.Ray3f(origin, dr.normalize(unnormalized))
-    ray.maxt = (config.far_clip - config.near_clip) * dr.norm(unnormalized)
+    ray.maxt = (float("inf") if camera.get("projective_unbounded", False) else
+                (config.far_clip - config.near_clip) * dr.norm(unnormalized))
     return ray
 
 

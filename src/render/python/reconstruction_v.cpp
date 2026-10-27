@@ -211,6 +211,8 @@ MI_PY_EXPORT(VoxelReconstruction) {
         }, "state"_a,
            "Install frozen empty-cell candidates for online RGB evidence; does not grow the model.")
         .def("clear_growth_candidates", &Model::clear_growth_candidates)
+        .def("set_scene_mapping", &Model::set_scene_mapping, "mapping"_a)
+        .def("native_scene_mapping", &Model::native_scene_mapping)
         .def_prop_ro("growth_candidate_count", &Model::growth_candidate_count)
         .def_prop_ro("topology_revision", &Model::topology_revision)
         .def("loss_and_grad", [](const Model &model, const Ray3f &ray,
@@ -276,6 +278,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("rgb_growth_version") = nb::int_(Model::rgb_growth_version);
     cls.attr("rgb_deletion_version") = nb::int_(Model::rgb_deletion_version);
     cls.attr("distortion_version") = nb::int_(Model::distortion_version);
+    cls.attr("projective_version") = nb::int_(Model::projective_version);
     cls.attr("octree_version") = nb::int_(Model::octree_version);
     cls.attr("optimizer_device_version") = nb::int_(Model::optimizer_device_version);
     cls.attr("compact_optimizer_version") = nb::int_(Model::compact_optimizer_version);

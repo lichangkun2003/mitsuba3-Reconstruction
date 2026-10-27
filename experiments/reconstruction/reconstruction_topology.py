@@ -194,8 +194,11 @@ def model_checkpoint(model, fields=None) -> dict:
     core_resolution = int(getattr(model, "core_resolution", model.resolution))
     if core_resolution != metadata["resolution"]:
         metadata["core_resolution"] = core_resolution
-    if getattr(model, "scene_mapping", "") == "radial_seed_shell":
-        metadata["scene_mapping"] = "radial_seed_shell"
+    if getattr(model, "scene_mapping", "") in ("radial_seed_shell", "projective_shell"):
+        metadata["scene_mapping"] = model.scene_mapping
+    if getattr(model, "scene_mapping", "") == "projective_shell":
+        metadata["background_refinement"] = "preserve_physical_width"
+        metadata["background_layers"] = (metadata["resolution"] - core_resolution)//2
     if getattr(model, "background_refinement", "") == "fixed_layers":
         metadata.update(background_refinement="fixed_layers",
                         background_layers=int(model.background_layers))
@@ -278,6 +281,10 @@ def _growth_core_radius_squared(metadata):
 def _growth_coordinates_allowed(coordinates, metadata, np):
     resolution = int(metadata["resolution"])
     allowed = np.all((coordinates >= 0) & (coordinates < resolution), axis=1)
+    if metadata.get("scene_mapping") == "projective_shell":
+        core = int(metadata["core_resolution"])
+        pad = (resolution - core) // 2
+        return allowed & np.all((coordinates >= pad) & (coordinates < pad + core), axis=1)
     radius_squared = _growth_core_radius_squared(metadata)
     if radius_squared is not None:
         farthest = np.abs(2 * coordinates + 1 - resolution) + 1
@@ -406,6 +413,9 @@ def _closest_box(metric, lower, upper, np, inverse=None):
 def refine_state(checkpoint: dict, config: CoarseToFineConfig, max_active_voxels=67108864) -> dict:
     """Port of Shader/RefineGrid.cs.slang, retaining only fitted child volumes."""
     import numpy as np
+    if checkpoint["model_metadata"].get("scene_mapping") == "projective_shell":
+        from reconstruction_projective import refine_projective_numpy
+        return refine_projective_numpy(checkpoint, config, max_active_voxels, refine_state, np)
     state, metadata = checkpoint["model_state"], dict(checkpoint["model_metadata"])
     fixed_shell = metadata.get("background_refinement") == "fixed_layers"
     if fixed_shell:
@@ -599,6 +609,7 @@ class TopologyManager:
         # continues to use the actual enclosing grid resolution.
         self.core_resolution = int(getattr(model, "core_resolution", model.resolution))
         self.background_refinement = getattr(model, "background_refinement", "")
+        self.scene_mapping = getattr(model, "scene_mapping", "bounded")
         self.background_layers = int(getattr(model, "background_layers", 0))
         self._model_opacity_sh_count = getattr(model, "opacity_sh_count", None)
         self.level_start_epoch = 0
@@ -1107,7 +1118,7 @@ class TopologyManager:
                 self._device_statistics["rgb_deletion_cpu_views"] += 1
         pending["seen_views"].add(int(view_id))
 
-    def _evaluate_rgb_deletion(self, boundary, event):
+    def _evaluate_rgb_deletion(self, boundary, event, *, region_eligible=None):
         """Confirm removals using consecutive complete, reliable view windows."""
         np, cfg, pending = self.np, self.settings, self.pending_rgb_deletion
         if not self._rgb_deletion_due(boundary):
@@ -1132,6 +1143,8 @@ class TopologyManager:
         # b+1 .. b+protection; it becomes eligible at b+protection+1.
         mature = ((self.growth_birth == 0) |
                   (boundary - self.growth_birth >= cfg.deletion_protection_epochs))
+        if region_eligible is not None:
+            mature &= region_eligible
         qualified = observed & supported & unopposed & valid & beneficial & mature
         if not complete:
             qualified.fill(False)
@@ -1214,6 +1227,8 @@ class TopologyManager:
         low = coefficients.astype(np.float64) < coefficient_threshold
         mature = ((self.growth_birth == 0) |
                   (boundary - self.growth_birth >= cfg.deletion_protection_epochs))
+        if self.scene_mapping == "projective_shell" and not self._background_deletion_allowed():
+            mature &= self._core_region_numpy(model)
         qualified = low & mature
         previous = self.low_opacity_deletion_streak.copy()
         consecutive = self.low_opacity_deletion_last_boundary == boundary - cfg.deletion_interval
@@ -1239,6 +1254,15 @@ class TopologyManager:
             "max_streak": int(self.low_opacity_deletion_streak.max()) if self.count else 0,
         }
         return selected
+
+    def _background_deletion_allowed(self):
+        """Only low-opacity cleanup at the configured finest core level."""
+        return not self.schedule.enabled or self.core_resolution >= self.schedule.target_resolution
+
+    def _core_region_numpy(self, model):
+        from reconstruction_projective import core_mask_numpy
+        return core_mask_numpy(model.snapshot()["cell_indices"], self.resolution,
+                               self.core_resolution, self.np)
 
     def _growth_world_points(self, pending, metadata):
         """Reuse the seven frozen proposal samples across views, never evidence.
@@ -1557,7 +1581,10 @@ class TopologyManager:
             if self.core_resolution != self.resolution:
                 event["core_resolution"] = self.core_resolution
             return replacement, event
-        rgb_delete = self._evaluate_rgb_deletion(boundary, event) if cfg.use_rgb_deletion else None
+        region_eligible = (self._core_region_numpy(model)
+                           if self.scene_mapping == "projective_shell" and self._rgb_deletion_due(boundary) else None)
+        rgb_delete = (self._evaluate_rgb_deletion(boundary, event, region_eligible=region_eligible)
+                      if cfg.use_rgb_deletion else None)
         opacity_delete = self._evaluate_low_opacity_deletion(model, boundary, event)
         event["evidence_window_evaluated"] = (
             rgb_delete is not None if cfg.use_rgb_deletion else self._evaluate_deletion(boundary))
@@ -1566,6 +1593,8 @@ class TopologyManager:
         periodic = boundary >= first and (boundary - first) % cfg.deletion_interval == 0
         legacy_delete = (self.candidates if not cfg.use_rgb_deletion and
                          (periodic or final) and self.collect_deletion(boundary) else None)
+        if legacy_delete is not None and self.scene_mapping == "projective_shell":
+            legacy_delete = legacy_delete & self._core_region_numpy(model)
         masks = [mask for mask in (rgb_delete, legacy_delete, opacity_delete) if mask is not None]
         delete = np.logical_or.reduce(masks) if masks else None
         if delete is not None and np.any(delete):

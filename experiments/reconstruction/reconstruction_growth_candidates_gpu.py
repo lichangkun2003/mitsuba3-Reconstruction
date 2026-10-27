@@ -257,6 +257,11 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
         allowed = dr.full(B, True, dr.width(coordinates[0]))
         for c in coordinates:
             allowed &= (c >= 0) & (c < resolution)
+        if metadata.get("scene_mapping") == "projective_shell":
+            core = int(metadata["core_resolution"])
+            pad = (resolution - core) // 2
+            for c in coordinates:
+                allowed &= (c >= pad) & (c < pad + core)
         if radius_squared is not None:
             farthest_squared = sum((dr.abs(2*c + 1 - resolution) + 1)**2
                                    for c in coordinates)

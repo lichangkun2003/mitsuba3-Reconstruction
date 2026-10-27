@@ -261,7 +261,7 @@ def resolve_reference_compositing(config, checkpoint_config):
 def checkpoint_data_config(saved):
     """Reuse the exact initialization transform for every evaluation split."""
     saved_data = saved.get("data", {})
-    data = (preview.DataConfig() if (saved_data.get("initialization") or {}).get("version") == 4
+    data = (preview.DataConfig() if (saved_data.get("initialization") or {}).get("version") in (4, 5)
             else preview.DataConfig(background_layers=8, background_final_layers=None))
     allowed = {item.name for item in fields(data)}
     for key, value in saved.get("data", {}).items():

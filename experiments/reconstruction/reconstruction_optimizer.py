@@ -185,6 +185,21 @@ class FalcorOptimizer:
         index = self.dr.arange(self.mi.UInt32, self.dr.width(value) * size) // size
         return self.dr.gather(type(value), value, index)
 
+    def _background_components(self, model, cells, ids=None):
+        """Background geometry may extend beyond its child leaf after subdivision."""
+        if getattr(model, "scene_mapping", "bounded") != "projective_shell":
+            return False
+        dr, mi = self.dr, self.mi
+        if ids is not None:
+            cells = dr.gather(mi.UInt32, cells, ids)
+        resolution, core = int(model.resolution), int(model.core_resolution)
+        padding = (resolution - core) // 2
+        exterior = mi.Bool(False)
+        for stride in (1, resolution, resolution * resolution):
+            coordinate = cells // stride % resolution
+            exterior |= (coordinate < padding) | (coordinate >= padding + core)
+        return self._expand(exterior, 3)
+
     def _adam(self, name, gradient, valid, lr, lr_scale=1., *, state=None, count=None):
         dr, mi, cfg = self.dr, self.mi, self.config
         size = self.dimensions[name]
@@ -302,6 +317,8 @@ class FalcorOptimizer:
         squares = {name: state["squared_mean"] for name, state in self._state.items()}
         steps = {name: state["steps"] for name, state in self._state.items()}
         key = (self.count, tuple(self.dimensions.items()), tuple(float(v) for v in model.voxel_size),
+               getattr(model, "scene_mapping", "bounded"),
+               int(getattr(model, "core_resolution", model.resolution)),
                tuple(sorted((name, value) for name, value in settings.items()
                             if name != "gradient_factor")), guarded)
         if self._update_model is not model or self._update_key != key:
@@ -433,12 +450,16 @@ class FalcorOptimizer:
             if name in ("radiance_sh", "opacity_sh"):
                 updated = self._finite(updated)
             elif name == "centers":
-                updated = dr.clip(updated, .01, .99)
+                exterior = self._background_components(model, snapshot["cell_indices"], ids)
+                updated = dr.clip(updated, dr.select(exterior, dr.minimum(old, .01), .01),
+                                  dr.select(exterior, dr.maximum(old, .99), .99))
             elif name == "log_scales":
                 voxel_size = dr.gather(mi.Float, mi.Float(list(model.voxel_size)), lane % 3)
                 lower = dr.maximum(voxel_size * 1e-4, 1e-8)
                 upper = dr.maximum(voxel_size * cfg.max_scale_voxels, lower)
-                updated = dr.clip(self._finite(updated), dr.log(lower), dr.log(upper))
+                exterior = self._background_components(model, snapshot["cell_indices"], ids)
+                upper_log = dr.select(exterior, dr.maximum(old, dr.log(upper)), dr.log(upper))
+                updated = dr.clip(self._finite(updated), dr.log(lower), upper_log)
             parameters[name] = updated
         if guarded:
             for state in proposals.values():
@@ -517,14 +538,18 @@ class FalcorOptimizer:
             if name in ("radiance_sh", "opacity_sh"):
                 updated = self._finite(updated)
             elif name == "centers":
-                updated = dr.clip(updated, .01, .99)
+                exterior = self._background_components(model, snapshot["cell_indices"])
+                updated = dr.clip(updated, dr.select(exterior, dr.minimum(old, .01), .01),
+                                  dr.select(exterior, dr.maximum(old, .99), .99))
             elif name == "log_scales":
                 size = mi.Float(list(model.voxel_size))
                 axis = dr.arange(mi.UInt32, self.count * 3) % 3
                 voxel_size = dr.gather(mi.Float, size, axis)
                 lower = dr.maximum(voxel_size * 1e-4, 1e-8)
                 upper = dr.maximum(voxel_size * cfg.max_scale_voxels, lower)
-                updated = dr.clip(self._finite(updated), dr.log(lower), dr.log(upper))
+                exterior = self._background_components(model, snapshot["cell_indices"])
+                upper_log = dr.select(exterior, dr.maximum(old, dr.log(upper)), dr.log(upper))
+                updated = dr.clip(self._finite(updated), dr.log(lower), upper_log)
             parameters[name] = dr.select(mask, updated, old)
         if parameters:
             if guarded:

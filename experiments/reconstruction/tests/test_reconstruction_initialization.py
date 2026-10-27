@@ -89,7 +89,8 @@ class InitializationIntegrationTests(unittest.TestCase):
                 "reconstruction_background.initialize_background_model", return_value=sentinel.colmap_model) as shell:
             result = common.initialize_model(self.config, self.scene, mi, np, prepared=prepared)
         self.assertEqual(shell.call_args.kwargs,
-                         {"opacity": .5, "refinement": "preserve_physical_width", "layers": 4})
+                         {"opacity": .5, "refinement": "preserve_physical_width", "layers": 4,
+                          "mapping": "projective_shell"})
         self.assertIs(result, sentinel.colmap_model)
         mi.VoxelReconstruction.assert_not_called()
         args = mi.VoxelReconstruction.from_points.call_args.args

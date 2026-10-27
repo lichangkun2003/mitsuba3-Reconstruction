@@ -689,12 +689,18 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                     Float result = old - dr::clip(delta, -group.limit, group.limit);
                     if (!group.geometry)
                         result = clean(result);
-                    else if (centers)
-                        result = dr::clip(result, .01f, .99f);
+                    else if (centers) {
+                        Mask inherited=(m_scene_mapping=="projective_shell") && !projective_core_ids(ids,active);
+                        result = dr::clip(result,dr::select(inherited,dr::minimum(old,.01f),.01f),
+                            dr::select(inherited,dr::maximum(old,.99f),.99f));
+                    }
                     else if (scales) {
                         const float lower = std::max(m_size[component] * 1e-4f, 1e-8f);
                         const float upper = std::max(m_size[component] * max_scale, lower);
-                        result = dr::clip(clean(result), dr::log(Float(lower)), dr::log(Float(upper)));
+                        Float limit=dr::log(Float(upper));
+                        if (m_scene_mapping=="projective_shell")
+                            limit=dr::select(!projective_core_ids(ids,active),dr::maximum(limit,old),limit);
+                        result = dr::clip(clean(result), dr::log(Float(lower)), limit);
                     }
                     return result;
                 };
@@ -1046,6 +1052,186 @@ template <typename T> static T reconstruction_sh(uint32_t i, const Vector<T, 3> 
     }
 }
 
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_scene_mapping(const std::string &mapping) {
+    if (mapping != "bounded" && mapping != "radial_seed_shell" && mapping != "projective_shell")
+        Throw("VoxelReconstruction: unknown scene mapping '%s'.", mapping.c_str());
+    if (mapping == "projective_shell") {
+        if (m_resolution <= m_core_resolution || (m_resolution-m_core_resolution)%2)
+            Throw("VoxelReconstruction: projective mapping requires a symmetric exterior shell.");
+        for (uint32_t j=1;j<3;++j)
+            if (std::abs(m_size[j]-m_size[0]) > 1e-5f*m_size[0])
+                Throw("VoxelReconstruction: projective mapping requires cubic cells.");
+    }
+    if (m_scene_mapping != mapping) {
+        m_scene_mapping = mapping;
+        ++m_topology_revision;
+    }
+}
+
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::ProjectiveSegment
+VoxelReconstruction<Float, Spectrum>::next_projective_segment(const Point3f &origin,
+    const Vector3f &direction, const Float &maxt, const UInt32 &visited) const {
+    const float half = .5f*m_size[0]*m_core_resolution;
+    const float width = float(m_resolution-m_core_resolution)/m_core_resolution;
+    Point3f center(.5f*(m_min[0]+m_max[0]),.5f*(m_min[1]+m_max[1]),.5f*(m_min[2]+m_max[2]));
+    Vector3f o=(origin-center)/half, d=direction/half;
+    ProjectiveSegment best{Mask(false),origin,direction,Float(0.f),Float(0.f),
+        Float(0.f),Float(1.f),Float(0.f),Float(1.f),visited,UInt32(0)};
+    Float best_start=dr::Infinity<Float>;
+    // Each region is convex. Clip seven fixed sets of linear inequalities;
+    // select the next interval in world-distance order, without ray marching.
+    for (uint32_t region=0;region<7;++region) {
+        Float lo(0.f), hi=maxt;
+        Mask valid=(visited & (1u<<region))==0u;
+        auto clip=[&](const Float &a,const Float &b,bool strict_parallel=false) {
+            Mask parallel=b==0.f;
+            valid &= !parallel | (strict_parallel ? a>0.f : a>=0.f);
+            Float crossing=-a/dr::select(parallel,1.f,b);
+            lo=dr::maximum(lo,dr::select(b>0.f,crossing,-dr::Infinity<Float>));
+            hi=dr::minimum(hi,dr::select(b<0.f,crossing, dr::Infinity<Float>));
+        };
+        uint32_t axis=region ? (region-1)/2 : 0;
+        float sign=region && ((region-1)%2) ? -1.f : 1.f;
+        if (!region) {
+            for (uint32_t j=0;j<3;++j) { clip(1.f-o[j],-d[j]);clip(1.f+o[j],d[j]); }
+        } else {
+            clip(sign*o[axis]-1.f,sign*d[axis],true);
+            for (uint32_t j=0;j<3;++j) if (j!=axis) {
+                // Coplanar ties belong to the lower-numbered dominant axis.
+                clip(sign*o[axis]-o[j],sign*d[axis]-d[j],j<axis);
+                clip(sign*o[axis]+o[j],sign*d[axis]+d[j],j<axis);
+            }
+        }
+        valid &= hi>lo;
+        Mask choose=valid & (lo<best_start);
+        Float start=dr::select(valid,lo,0.f), finish=dr::select(valid,hi,0.f);
+        Point3f mapped_origin=origin;
+        Vector3f mapped_direction=direction;
+        Float mapped_entry=start,mapped_exit=finish,h_start(1.f),h_rate(0.f),speed(1.f);
+        if (region) {
+            Vector3f p=o+start*d;
+            h_start=sign*p[axis];h_rate=sign*d[axis];
+            Float safe_h=dr::select(valid,h_start,1.f);
+            Vector3f q=p/safe_h;
+            q[axis]=sign*(1.f+width-width/safe_h);
+            mapped_origin=center+half*q;
+            Vector3f v=(sign*o[axis])*d-o*h_rate;
+            v[axis]=width*d[axis];
+            speed=half*dr::norm(v);
+            mapped_direction=v/dr::maximum(dr::norm(v),1e-30f);
+            Float delta=dr::select(dr::isfinite(finish),finish-start,0.f);
+            Float h_end=h_start+delta*h_rate;
+            mapped_exit=dr::select(dr::isfinite(finish),
+                speed*delta/(safe_h*dr::maximum(h_end,1e-30f)),
+                speed/(safe_h*dr::maximum(h_rate,1e-30f)));
+            mapped_entry=0.f;
+        }
+        best.valid |= choose;
+        best.origin=dr::select(choose,mapped_origin,best.origin);
+        best.direction=dr::select(choose,mapped_direction,best.direction);
+        best.entry=dr::select(choose,mapped_entry,best.entry);
+        best.exit=dr::select(choose,mapped_exit,best.exit);
+        best.world_entry=dr::select(choose,start,best.world_entry);
+        best.h_start=dr::select(choose,h_start,best.h_start);
+        best.h_rate=dr::select(choose,h_rate,best.h_rate);
+        best.speed=dr::select(choose,speed,best.speed);
+        best.chart=dr::select(choose,region,best.chart);
+        best_start=dr::select(choose,lo,best_start);
+    }
+    best.visited=visited | dr::select(best.valid,UInt32(1)<<best.chart,UInt32(0));
+    return best;
+}
+
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::initialize_projective_segment(
+    const ProjectiveSegment &segment, Vector3i &cell, Vector3f &next, Float &entry,
+    float entry_offset_fraction, bool use_octree) const {
+    // Nudge in local cell units, never by an infinite world far-plane distance.
+    entry=dr::minimum(segment.exit,segment.entry+entry_offset_fraction*m_size[0]);
+    Point3f point=segment.origin+segment.direction*entry;
+    Vector3i step;
+    Vector3f inv=dr::rcp(dr::select(segment.direction!=0.f,segment.direction,Vector3f(1.f)));
+    for (uint32_t j=0;j<3;++j) {
+        Float position=(point[j]-m_min[j])/m_size[j];
+        position=dr::select(dr::isfinite(position),position,0.f);
+        Float floor=dr::floor(position);
+        // A segment starts on its outgoing side of an exact grid boundary.
+        floor-=dr::select((segment.direction[j]<0.f)&(position==floor),1.f,0.f);
+        const uint32_t layer=(m_resolution-m_core_resolution)/2;
+        Mask normal=(segment.chart>0u)&((segment.chart-1u)/2u==j);
+        Mask positive=(segment.chart&1u)!=0u;
+        Float lower=dr::select(normal,dr::select(positive,float(layer+m_core_resolution),0.f),float(layer));
+        Float upper=dr::select(normal,dr::select(positive,float(m_resolution-1),float(layer-1)),float(layer+m_core_resolution-1));
+        cell[j]=Int32(dr::clip(floor,lower,upper));
+        step[j]=dr::select(segment.direction[j]>0.f,1,dr::select(segment.direction[j]<0.f,-1,0));
+        Float boundary=m_min[j]+(Float(cell[j])+dr::select(step[j]>0,1.f,0.f))*m_size[j];
+        next[j]=dr::maximum(entry,dr::select(step[j]==0,dr::Infinity<Float>,
+            (boundary-segment.origin[j])*inv[j]));
+    }
+    if (use_octree)
+        next=dr::maximum(entry,octree_boundary_times(cell,step,segment.origin,inv));
+}
+
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
+VoxelReconstruction<Float, Spectrum>::projective_cell_inside(const Vector3i &cell,const UInt32 &chart) const {
+    const int layer=int((m_resolution-m_core_resolution)/2);
+    Mask inside(true);
+    for (uint32_t j=0;j<3;++j) {
+        Mask normal=(chart>0u)&((chart-1u)/2u==j),positive=(chart&1u)!=0u;
+        Int32 lower=dr::select(normal,dr::select(positive,layer+int(m_core_resolution),0),layer);
+        Int32 upper=dr::select(normal,dr::select(positive,int(m_resolution),layer),layer+int(m_core_resolution));
+        inside &= (cell[j]>=lower)&(cell[j]<upper);
+    }
+    return inside;
+}
+
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
+VoxelReconstruction<Float, Spectrum>::projective_core_ids(const UInt32 &id,const Mask &active) const {
+    if (m_scene_mapping!="projective_shell") return active;
+    UInt32 cell=dr::gather<UInt32>(m_cells,id,active);
+    const uint32_t layer=(m_resolution-m_core_resolution)/2;
+    Mask core=active;
+    for (uint32_t j=0;j<3;++j) {
+        UInt32 coordinate=cell%m_resolution;
+        core &= (coordinate>=layer)&(coordinate<layer+m_core_resolution);
+        cell/=m_resolution;
+    }
+    return core;
+}
+
+MI_VARIANT std::pair<Float,Float> VoxelReconstruction<Float,Spectrum>::projective_depth(
+    const ProjectiveSegment &segment,const Float &distance) const {
+    const float half=.5f*m_size[0]*m_core_resolution;
+    // s=t/(t+half). Combined inverse/chain formula remains finite at infinity.
+    Float denominator=segment.speed-distance*segment.h_start*segment.h_rate;
+    Float numerator=segment.world_entry*denominator+distance*dr::square(segment.h_start);
+    Float sum=numerator+half*denominator;
+    Float depth=numerator/dr::maximum(sum,1e-30f);
+    Float chain=half*segment.speed*dr::square(segment.h_start)/dr::maximum(dr::square(sum),1e-30f);
+    Mask core=segment.chart==0u;
+    return {dr::select(core,distance/(distance+half),depth),
+            dr::select(core,half/dr::square(distance+half),chain)};
+}
+
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Vector3f
+VoxelReconstruction<Float, Spectrum>::projective_hit_direction(const Point3f &origin,
+    const Vector3f &direction,const UInt32 &id,const Mask &active) const {
+    if (m_scene_mapping!="projective_shell") return direction;
+    const float half=.5f*m_size[0]*m_core_resolution;
+    const float width=float(m_resolution-m_core_resolution)/m_core_resolution;
+    const uint32_t layer=(m_resolution-m_core_resolution)/2;
+    Point3f center(.5f*(m_min[0]+m_max[0]),.5f*(m_min[1]+m_max[1]),.5f*(m_min[2]+m_max[2]));
+    Vector3f o=(origin-center)/half,d=direction/half,result=direction;
+    UInt32 cell=dr::gather<UInt32>(m_cells,id,active);
+    for (uint32_t j=0;j<3;++j) {
+        UInt32 coordinate=cell%m_resolution;cell/=m_resolution;
+        Mask outside=(coordinate<layer)|(coordinate>=layer+m_core_resolution);
+        Float sign=dr::select(coordinate<layer,-1.f,1.f);
+        Vector3f v=(sign*o[j])*d-o*(sign*d[j]);v[j]=width*d[j];
+        result=dr::select(outside,v/dr::maximum(dr::norm(v),1e-30f),result);
+    }
+    return result;
+}
+
 MI_VARIANT std::tuple<typename VoxelReconstruction<Float, Spectrum>::Color3f,
                      Float, typename VoxelReconstruction<Float, Spectrum>::UInt32>
 VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &background,
@@ -1101,6 +1287,16 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
     }
     if (use_octree)
         next = dr::maximum(entry, octree_boundary_times(cell, step, ray.o, inv_d));
+    const bool projective=m_scene_mapping=="projective_shell";
+    const Vector3f world_d=d;
+    ProjectiveSegment first{active,ray.o,d,entry,exit,Float(0.f),Float(1.f),
+        Float(0.f),Float(1.f),UInt32(0),UInt32(0)};
+    if (projective) {
+        first=next_projective_segment(ray.o,d,ray.maxt*length,UInt32(0));
+        active=first.valid & dr::all(dr::isfinite(ray.o)) & dr::all(dr::isfinite(ray.d)) &
+               (length>0.f) & (ray.maxt>0.f);
+        initialize_projective_segment(first,cell,next,entry,entry_offset_fraction,use_octree);
+    }
     struct LoopState {
         Mask active;
         Vector3i cell;
@@ -1109,14 +1305,21 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
         Color3f color;
         UInt32 hits, iterations, tree_node, tree_level;
         SpatialAnchor tree_anchor;
+        ProjectiveSegment segment;
         DRJIT_STRUCT(LoopState, active, cell, next, entry, transmittance, color, hits, iterations,
-                     tree_node, tree_level, tree_anchor)
+                     tree_node, tree_level, tree_anchor, segment)
     } ls{active, cell, next, entry, Float(1.f), Color3f(0.f), UInt32(0), UInt32(0),
-         UInt32(m_tree.root), UInt32(m_tree.depth), SpatialAnchor(0)};
+         UInt32(m_tree.root), UInt32(m_tree.depth), SpatialAnchor(0), first};
 
     dr::tie(ls) = dr::while_loop(dr::make_tuple(ls),
         [](const LoopState &s) { return s.active; },
         [&](LoopState &s) {
+            const Vector3f d=s.segment.direction;
+            const Vector3f inv_d=dr::rcp(dr::select(d!=0.f,d,Vector3f(1.f)));
+            const Vector3i step=dr::select(d>0.f,Vector3i(1),dr::select(d<0.f,Vector3i(-1),Vector3i(0)));
+            const Vector3f step_t=dr::select(d==0.f,Vector3f(dr::Infinity<Float>),
+                dr::abs(Vector3f(m_size[0],m_size[1],m_size[2])*inv_d));
+            const Float exit=s.segment.exit;
             auto [id_signed, empty_log] = m_tree.template lookup<UInt32, Int32>(
                 s.cell.x(), s.cell.y(), s.cell.z(), s.tree_node, s.tree_level, s.tree_anchor, s.active);
             Mask occupied = s.active & (id_signed >= 0);
@@ -1124,7 +1327,7 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
             if (use_octree) {
                 Mask empty = s.active & !occupied;
                 s = dr::if_stmt(dr::make_tuple(s, empty, empty_log), empty,
-                    [this, step, step_t, origin = ray.o, inv_d, exit](
+                    [this, step, step_t, origin = s.segment.origin, inv_d, exit](
                         LoopState s, const Mask &empty, const UInt32 &empty_log) {
                         skip_empty_block(s.cell, s.next, s.entry, s.iterations,
                                          step, step_t, origin, inv_d, exit, empty, empty_log);
@@ -1139,7 +1342,7 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
                 Float c = dr::gather<Float>(m_centers, id * 3 + uint32_t(a), occupied);
                 Float log_scale = dr::gather<Float>(m_log_scales, id * 3 + uint32_t(a), occupied);
                 // Subtract the cell origin first to retain precision for small ellipsoids.
-                local[a] = ray.o[a] + s.entry*d[a] -
+                local[a] = s.segment.origin[a] + s.entry*d[a] -
                            (m_min[a] + (Float(s.cell[a]) + c) * m_size[a]);
                 scale[a] = dr::exp(dr::clip(log_scale, -30.f, 30.f));
             }
@@ -1166,7 +1369,7 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
             Color3f emission(0.f);
             Float logit = 0.f;
             for (uint32_t k = 0; k < std::max(m_sh_count, m_opacity_sh_count); ++k) {
-                Float sh = reconstruction_sh(k, Vector3f(-d));
+                Float sh = reconstruction_sh(k, Vector3f(-world_d));
                 if (k < m_sh_count)
                     for (uint32_t channel = 0; channel < 3; ++channel)
                         emission[channel] += sh * dr::gather<Float>(m_radiance,
@@ -1187,7 +1390,7 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
             s.cell.y() += dr::select(cross_y, step.y(), 0);
             s.cell.z() += dr::select(cross_z, step.z(), 0);
             if (use_octree)
-                s.next = dr::maximum(end, octree_boundary_times(s.cell, step, ray.o, inv_d));
+                s.next = dr::maximum(end, octree_boundary_times(s.cell, step, s.segment.origin, inv_d));
             else {
                 s.next.x() = dr::select(cross_x, s.next.x() + step_t.x(), s.next.x());
                 s.next.y() = dr::select(cross_y, s.next.y() + step_t.y(), s.next.y());
@@ -1195,9 +1398,21 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
             }
             s.entry = end;
             s.iterations += 1;
-            s.active &= dr::all(s.cell >= 0) & dr::all(s.cell < int(m_resolution)) &
-                        (s.entry < exit) & (s.transmittance > transmittance_threshold) &
-                        (s.hits < max_hits) & (s.iterations <= 3*m_resolution+3);
+            Mask in_segment=dr::all(s.cell>=0)&dr::all(s.cell<int(m_resolution))&(s.entry<exit);
+            if (projective) in_segment &= projective_cell_inside(s.cell,s.segment.chart);
+            Mask budget=s.iterations<=3*m_resolution+3;
+            if (projective) {
+                s=dr::if_stmt(dr::make_tuple(s),Mask(!in_segment & budget),
+                    [this,&ray,world_d,length,entry_offset_fraction,use_octree](LoopState s) {
+                        s.segment=next_projective_segment(ray.o,world_d,ray.maxt*length,s.segment.visited);
+                        initialize_projective_segment(s.segment,s.cell,s.next,s.entry,entry_offset_fraction,use_octree);
+                        s.tree_node=UInt32(m_tree.root);s.tree_level=UInt32(m_tree.depth);
+                        s.tree_anchor=SpatialAnchor(0);s.iterations=UInt32(0);
+                        return s;
+                    },[](LoopState s){return s;},"Voxel reconstruction next projective trace segment");
+                s.active &= s.segment.valid & budget;
+            } else s.active &= in_segment & budget;
+            s.active &= (s.transmittance>transmittance_threshold)&(s.hits<max_hits);
         }, "Voxel reconstruction DDA");
     return {ls.color + ls.transmittance*background, 1.f-ls.transmittance, ls.hits};
 }
@@ -1458,6 +1673,16 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     }
     if (use_octree)
         next = dr::maximum(entry, octree_boundary_times(cell, step, ray.o, inv_d));
+    const bool projective=m_scene_mapping=="projective_shell";
+    const Vector3f world_d=d;
+    ProjectiveSegment first{active,ray.o,d,entry,exit,Float(0.f),Float(1.f),
+        Float(0.f),Float(1.f),UInt32(0),UInt32(0)};
+    if (projective) {
+        first=next_projective_segment(ray.o,d,ray.maxt*direction_length,UInt32(0));
+        active=first.valid & dr::all(dr::isfinite(ray.o)) & dr::all(dr::isfinite(ray.d)) &
+               (direction_length>0.f) & (ray.maxt>0.f);
+        initialize_projective_segment(first,cell,next,entry,cfg["entry_offset_fraction"],use_octree);
+    }
     struct State {
         Mask active;
         Vector3i cell;
@@ -1469,19 +1694,26 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         UInt32 tree_node, tree_level, growth_node, growth_level;
         SpatialAnchor tree_anchor, growth_anchor;
         Float distortion_mass, distortion_moment, distortion;
+        ProjectiveSegment segment;
         DRJIT_STRUCT(State,active,cell,next,entry,transmittance,color,hits,candidates,
                      iterations,growth_hits,traversal_steps,traversal_skipped,
                      traversal_leaves,traversal_queries,tree_node,tree_level,growth_node,growth_level,
-                     tree_anchor,growth_anchor,distortion_mass,distortion_moment,distortion)
+                     tree_anchor,growth_anchor,distortion_mass,distortion_moment,distortion,segment)
     } state{active,cell,next,entry,Float(1.f),Color3f(0.f),UInt32(0),UInt32(0),
             UInt32(0),UInt32(0),UInt32(0),UInt32(0),UInt32(0),UInt32(0),
             UInt32(m_tree.root),UInt32(m_tree.depth),UInt32(m_growth_tree.root),UInt32(m_growth_tree.depth),
             SpatialAnchor(0),SpatialAnchor(0),
-            Float(0.f),Float(0.f),Float(0.f)};
+            Float(0.f),Float(0.f),Float(0.f),first};
     const float diagonal=std::sqrt(dr::square(m_max[0]-m_min[0])+dr::square(m_max[1]-m_min[1])+dr::square(m_max[2]-m_min[2]));
     dr::tie(state,records)=dr::while_loop(dr::make_tuple(state,records),
         [](const State &s,const Records &) {return s.active;},
         [&](State &s,Records &r) {
+            const Vector3f d=s.segment.direction;
+            const Vector3f inv_d=dr::rcp(dr::select(d!=0.f,d,Vector3f(1.f)));
+            const Vector3i step=dr::select(d>0.f,Vector3i(1),dr::select(d<0.f,Vector3i(-1),Vector3i(0)));
+            const Vector3f step_t=dr::select(d==0.f,Vector3f(dr::Infinity<Float>),
+                dr::abs(Vector3f(m_size[0],m_size[1],m_size[2])*inv_d));
+            const Float exit=s.segment.exit;
             UInt32 spatial=UInt32((s.cell.z()*int(m_resolution)+s.cell.y())*int(m_resolution)+s.cell.x());
             auto [signed_id, empty_log] = m_tree.template lookup<UInt32, Int32>(
                 s.cell.x(), s.cell.y(), s.cell.z(), s.tree_node, s.tree_level, s.tree_anchor, s.active);
@@ -1505,7 +1737,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             if (use_octree) {
                 Mask empty = s.active & !visit;
                 s = dr::if_stmt(dr::make_tuple(s, empty, empty_log), empty,
-                    [this, step, step_t, origin = ray.o, inv_d, exit, profile_traversal](
+                    [this, step, step_t, origin = s.segment.origin, inv_d, exit, profile_traversal](
                         State s, const Mask &empty, const UInt32 &empty_log) {
                         UInt32 before = s.iterations;
                         skip_empty_block(s.cell, s.next, s.entry, s.iterations,
@@ -1521,10 +1753,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             Float end=dr::maximum(s.entry,dr::minimum(dr::minimum(s.next.x(),dr::minimum(s.next.y(),s.next.z())),exit));
             if (collect_growth) {
                 Mask proposal = s.active & (signed_id <= -2);
+                if (projective) proposal &= s.segment.chart==0u;
                 UInt32 growth_id = UInt32(-dr::minimum(signed_id, Int32(-2)) - 2);
                 auto buffers = std::make_shared<GrowthBuffers>(
                     GrowthBuffers{r.growth_values, r.growth_ids, r.growth_unknown});
-                s = dr::if_stmt(dr::make_tuple(s, growth_id, spatial, end, proposal, ray.o, d), proposal,
+                s = dr::if_stmt(dr::make_tuple(s, growth_id, spatial, end, proposal, s.segment.origin, d), proposal,
                     [this, growth_intersects, buffers, lane, ray_count, growth_stride, max_growth_hits](
                         State s, const UInt32 &head, const UInt32 &spatial,
                         const Float &end, const Mask &proposal,
@@ -1571,9 +1804,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             // Shared ownership also keeps the targets alive for callback replay.
             auto hit_buffers=std::make_shared<HitBuffers>(HitBuffers{r.hit,r.hit_id});
             if (m_active_count) dr::tie(s,r.candidates)=dr::if_stmt(
-                dr::make_tuple(s,r.candidates,id,end,occupied,ray.o,d),occupied,
+                dr::make_tuple(s,r.candidates,id,end,occupied,s.segment.origin,d),occupied,
                 [this,rotate,quaternion,appearance,ray_count,hit_stride,lane,
-                 max_candidates,diagonal,hit_buffers,distortion_enabled,
+                 max_candidates,diagonal,hit_buffers,distortion_enabled,world_d,projective,
                  grid_entry=entry](State s,Candidates candidates,const UInt32 &id,
                     const Float &end,const Mask &occupied,const Point3f &origin,
                     const Vector3f &direction) {
@@ -1596,20 +1829,27 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     Vector3f relative_star=relative+star*segment, unit_star=u+star*v;
                     Float gmin=dr::squared_norm(unit_star)-1.f;
                     Float depth(0.f);
-                    Mask depth_free(false);
+                    Float depth_chain(0.f);
                     if (distortion_enabled) {
-                        depth = (s.entry+star*(end-s.entry)-grid_entry)/diagonal;
-                        depth_free = (a>1e-20f)&(star>0.f)&(star<1.f);
+                        Float distance=s.entry+star*(end-s.entry);
+                        Mask free=(a>1e-20f)&(star>0.f)&(star<1.f);
+                        depth=(distance-grid_entry)/diagonal;
+                        depth_chain=Float(free);
+                        if (projective) {
+                            auto mapped=projective_depth(s.segment,distance);
+                            depth=mapped.first;
+                            depth_chain=dr::select(free,mapped.second,0.f);
+                        }
                     }
                     s=dr::if_stmt(
-                        dr::make_tuple(s,id,relative_star,gmin,hit,direction,depth,depth_free),hit,
-                        [appearance,ray_count,hit_stride,lane,hit_buffers,distortion_enabled](State s,
+                        dr::make_tuple(s,id,relative_star,gmin,hit,direction,depth,depth_chain),hit,
+                        [appearance,ray_count,hit_stride,lane,hit_buffers,distortion_enabled,world_d](State s,
                             const UInt32 &id,const Vector3f &relative_star,
                             const Float &gmin,const Mask &hit,const Vector3f &direction,
-                            const Float &depth,const Mask &depth_free) {
+                            const Float &depth,const Float &depth_chain) {
                             Color3f emission;
                             Float opacity;
-                            appearance(id,Vector3f(-direction),hit,emission,opacity);
+                            appearance(id,Vector3f(-world_d),hit,emission,opacity);
                             UInt32 slot=s.hits*ray_count+lane;
                             dr::scatter(hit_buffers->hit_id,id,slot,hit);
                             for(uint32_t j=0;j<3;++j) {
@@ -1622,7 +1862,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                             Float hit_alpha=dr::select(hit,opacity,0.f);
                             if (distortion_enabled) {
                                 dr::scatter(hit_buffers->hit,depth,9*hit_stride+slot,hit);
-                                dr::scatter(hit_buffers->hit,Float(depth_free),10*hit_stride+slot,hit);
+                                dr::scatter(hit_buffers->hit,depth_chain,10*hit_stride+slot,hit);
                                 Float contribution = s.transmittance*hit_alpha;
                                 s.distortion += 2.f*contribution*
                                     (depth*s.distortion_mass-s.distortion_moment);
@@ -1636,7 +1876,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                         },
                         [](State s,const UInt32 &,const Vector3f &,
                            const Float &,const Mask &,const Vector3f &,
-                           const Float &,const Mask &) {
+                           const Float &,const Float &) {
                             return s;
                         },"Voxel reconstruction training hit");
                     if(max_candidates) {
@@ -1644,7 +1884,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                         dr::tie(s,candidates)=dr::if_stmt(
                             dr::make_tuple(s,candidates,id,relative_star,unit_star,scale,gmin,
                                            star,end,miss),miss,
-                            [this,max_candidates,diagonal](State s,Candidates candidates,
+                            [this,max_candidates,diagonal,projective](State s,Candidates candidates,
                                 const UInt32 &id,const Vector3f &relative_star,
                                 const Vector3f &unit_star,const Vector3f &scale,
                                 const Float &gmin,const Float &star,const Float &end,
@@ -1654,8 +1894,10 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                                 Mask valid_distance=dr::isfinite(metric)&(metric>0.f)&(radius2>1e-12f);
                                 Float distance=gmin/dr::select(valid_distance,metric,1.f);
                                 Float depth=s.entry+star*(end-s.entry);
+                                Float depth_score=projective ? projective_depth(s.segment,depth).first :
+                                    dr::abs(depth)/std::max(diagonal,1e-6f);
                                 Float score=dr::select(valid_distance,dr::maximum(distance,0.f)/std::max(m_size[0],1e-6f)+
-                                                      .05f*dr::abs(depth)/std::max(diagonal,1e-6f),1e30f);
+                                                      .05f*depth_score,1e30f);
                                 Candidate incoming{relative_star,gmin,s.transmittance,score,id,s.hits};
                                 // A full list keeps earlier candidates on equal scores.
                                 Mask insert=(s.candidates<max_candidates) |
@@ -1701,15 +1943,29 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             Mask cross_y=!cross_x&(s.next.y()<=s.next.z()),cross_z=!cross_x&!cross_y;
             s.cell.x()+=dr::select(cross_x,step.x(),0);s.cell.y()+=dr::select(cross_y,step.y(),0);s.cell.z()+=dr::select(cross_z,step.z(),0);
             if (use_octree)
-                s.next=dr::maximum(end,octree_boundary_times(s.cell,step,ray.o,inv_d));
+                s.next=dr::maximum(end,octree_boundary_times(s.cell,step,s.segment.origin,inv_d));
             else {
                 s.next.x()=dr::select(cross_x,s.next.x()+step_t.x(),s.next.x());
                 s.next.y()=dr::select(cross_y,s.next.y()+step_t.y(),s.next.y());
                 s.next.z()=dr::select(cross_z,s.next.z()+step_t.z(),s.next.z());
             }
             s.entry=end;s.iterations+=1;
-            s.active &= dr::all(s.cell>=0)&dr::all(s.cell<int(m_resolution))&(s.entry<exit)&
-                        (s.transmittance>cfg["transmittance_threshold"])&(s.hits<max_hits)&(s.iterations<=3*m_resolution+3);
+            Mask in_segment=dr::all(s.cell>=0)&dr::all(s.cell<int(m_resolution))&(s.entry<exit);
+            if (projective) in_segment &= projective_cell_inside(s.cell,s.segment.chart);
+            Mask budget=s.iterations<=3*m_resolution+3;
+            if (projective) {
+                s=dr::if_stmt(dr::make_tuple(s),Mask(!in_segment & budget),
+                    [this,&ray,world_d,direction_length,&cfg,use_octree](State s) {
+                        s.segment=next_projective_segment(ray.o,world_d,ray.maxt*direction_length,s.segment.visited);
+                        initialize_projective_segment(s.segment,s.cell,s.next,s.entry,cfg.at("entry_offset_fraction"),use_octree);
+                        s.tree_node=UInt32(m_tree.root);s.tree_level=UInt32(m_tree.depth);s.tree_anchor=SpatialAnchor(0);
+                        s.growth_node=UInt32(m_growth_tree.root);s.growth_level=UInt32(m_growth_tree.depth);s.growth_anchor=SpatialAnchor(0);
+                        s.iterations=UInt32(0);
+                        return s;
+                    },[](State s){return s;},"Voxel reconstruction next projective training segment");
+                s.active &= s.segment.valid & budget;
+            } else s.active &= in_segment & budget;
+            s.active &= (s.transmittance>cfg["transmittance_threshold"])&(s.hits<max_hits);
         },"Voxel reconstruction training paths");
     if (profiler.enabled()) {
         if constexpr (dr::is_jit_v<Float>) {
@@ -1775,8 +2031,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         // A stopped path has no reliable full suffix, and inserting a hit can
         // itself trigger the cap/early exit. Be conservative and report unknown
         // for both cases instead of extending traversal or inventing evidence.
-        Mask exited = !dr::all(state.cell>=0) | !dr::all(state.cell<int(m_resolution)) |
-                      (state.entry>=exit);
+        Mask exited = projective ? !state.segment.valid :
+            (!dr::all(state.cell>=0) | !dr::all(state.cell<int(m_resolution)) | (state.entry>=exit));
         Mask complete = exited & (state.iterations<=3*m_resolution+3) &
                         (state.hits+1u<max_hits) &
                         (weight==1.f) & dr::all(dr::isfinite(result.raw_rgb)) &
@@ -1933,8 +2189,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         // that the recorded suffix is complete; no extra traversal is done.
         // Removal reduces hit count and increases T, so insertion's spare-hit
         // capacity and reduced-final-T checks do not apply.
-        Mask exited = !dr::all(state.cell>=0) | !dr::all(state.cell<int(m_resolution)) |
-                      (state.entry>=exit);
+        Mask exited = projective ? !state.segment.valid :
+            (!dr::all(state.cell>=0) | !dr::all(state.cell<int(m_resolution)) | (state.entry>=exit));
         deletion_complete = exited & (state.iterations<=3*m_resolution+3) &
                             (weight==1.f) & dr::isfinite(inverse_pdf) &
                             dr::all(dr::isfinite(result.raw_rgb)) &
@@ -1965,7 +2221,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
          ray_count,hit_stride,lane,clean,dcolor,dalpha,d,weight,is_background,
          is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry,rgb_only,
          collect_rgb_deletion,deletion_complete,deletion_residual,distortion_enabled,
-         distortion_weight,diagonal,quaternion,rotate,
+         distortion_weight,diagonal,quaternion,rotate,projective,ray_origin=ray.o,
          total_mass=state.distortion_mass,total_moment=state.distortion_moment](ReverseState &s) {
             Mask valid=UInt32(s.hit)<hit_count;
             UInt32 slot=UInt32(s.hit)*ray_count+lane,id=dr::gather<UInt32>(hit_ids,slot,valid);
@@ -1986,7 +2242,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             Mask distortion_geometry_valid(false);
             if (distortion_enabled) {
                 Float depth=dr::gather<Float>(hit_records,9*hit_stride+slot,valid);
-                Mask depth_free=dr::gather<Float>(hit_records,10*hit_stride+slot,valid)>0.f;
+                Float depth_chain=dr::gather<Float>(hit_records,10*hit_stride+slot,valid);
+                Mask depth_free=depth_chain>0.f;
                 Float contribution=dr::select(valid,before*opacity,0.f);
                 Float left_mass=total_mass-contribution-s.distortion_mass;
                 Float left_moment=total_moment-contribution*depth-s.distortion_moment;
@@ -2004,6 +2261,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     opacity*s.distortion_weight_derivative);
                 Float depth_derivative=distortion_weight*weight*
                     (2.f*contribution*(left_mass-s.distortion_mass))/diagonal;
+                if (projective)
+                    depth_derivative=distortion_weight*weight*
+                        (2.f*contribution*(left_mass-s.distortion_mass))*depth_chain;
                 depth_derivative=dr::select(hit_count>1u,depth_derivative,0.f);
 
                 // Interior closest point minimizes p^T diag(scale^-2) p.
@@ -2016,7 +2276,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     log_scale[j]=dr::gather<Float>(m_log_scales,id*3+j,valid);
                     scale[j]=dr::exp(dr::clip(log_scale[j],-30.f,30.f));
                 }
-                Vector3f principal=rotate(offset,qw,-qv), direction=rotate(d,qw,-qv);
+                Vector3f local_direction=projective_hit_direction(ray_origin,d,id,valid);
+                Vector3f principal=rotate(offset,qw,-qv), direction=rotate(local_direction,qw,-qv);
                 Vector3f weighted_point=principal/(scale*scale);
                 Vector3f weighted_direction=direction/(scale*scale);
                 Float denominator=dr::dot(direction,weighted_direction);
@@ -2072,7 +2333,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 // alpha approaches one; never divide by (1-alpha).
                 Color3f dc = before*opacity*(s.behind-radiance);
                 Float gain = -2.f*dr::dot(deletion_residual,dc)-dr::squared_norm(dc);
-                Mask known = valid & deletion_complete & dr::isfinite(before) &
+                Mask eligible=projective_core_ids(id,valid);
+                Mask known = eligible & deletion_complete & dr::isfinite(before) &
                              dr::isfinite(opacity) & dr::all(dr::isfinite(radiance)) &
                              dr::all(dr::isfinite(s.behind)) &
                              dr::all(dr::isfinite(dc)) & dr::isfinite(gain);
@@ -2081,7 +2343,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 dr::scatter_reduce(ReduceOp::Add,s.deletion_counts["deletion_observed"],
                     UInt32(1),id,known);
                 dr::scatter_reduce(ReduceOp::Add,s.deletion_counts["deletion_unknown"],
-                    UInt32(1),id,valid&!known);
+                    UInt32(1),id,eligible&!known);
             }
             Mask proxy_geometry_valid=add_geometry(s.gradients,s.counters,id,offset,gmin,
                 before,opacity,radiance,s.behind,s.after,valid,true);

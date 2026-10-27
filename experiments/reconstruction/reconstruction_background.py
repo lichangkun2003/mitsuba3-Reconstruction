@@ -1,8 +1,8 @@
-"""Dense initial far-field shell; subsequent rendering remains straight-ray.
+"""Dense initial background for projective charts or saved radial proxies.
 
-Only cells intersecting the radial contraction shell are populated. The static
-cell footprint also defines the topology region, independently of the optimized
-ellipsoid center. This module does not alter ray generation or intersection.
+New projective scenes populate six face slabs and select native segmented ray
+queries. Legacy radial scenes preserve their spherical shell and straight-ray
+behavior. Region membership always follows the immutable cell address.
 """
 
 from __future__ import annotations
@@ -10,7 +10,8 @@ from __future__ import annotations
 import math
 
 
-def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=None, layers=None):
+def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=None, layers=None,
+                                mapping="radial_seed_shell"):
     """Keep core seeds and fill the far shell with covering, black ellipsoids.
 
     Existing far-cell radiance is retained, but its initial geometry and opacity
@@ -27,6 +28,10 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
         raise ValueError("A background shell requires a positive, symmetric grid padding")
     if refinement not in (None, "fixed_layers", "preserve_physical_width"):
         raise ValueError("Unknown background refinement policy")
+    if mapping not in ("radial_seed_shell", "projective_shell"):
+        raise ValueError("Unknown background mapping")
+    if mapping == "projective_shell" and refinement != "preserve_physical_width":
+        raise ValueError("Projective charts require fixed physical shell width")
     if refinement is not None and (type(layers) is not int or layers < 1
                                   or resolution != core + 2 * layers):
         raise ValueError("Background layer metadata must match initial grid padding")
@@ -37,19 +42,38 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
 
     UInt, Int, Float = mi.UInt32, mi.Int32, mi.Float
     seed = model.snapshot()
-    index = dr.arange(UInt, resolution**3)
-    q = (index % resolution, (index // resolution) % resolution,
-         index // (resolution * resolution))
-    d = [dr.abs(2*Int(axis) + 1 - resolution) for axis in q]
-    # Exact integer bounds in half-cell units; matches the growth exclusion.
-    far = (sum(dr.square(axis + 1) for axis in d) > core*core) & (
-        sum(dr.square(dr.maximum(axis - 1, 0)) for axis in d) < resolution*resolution)
     missing = 0xffffffff
-    seed_row = dr.full(UInt, missing, resolution**3)
-    dr.scatter(seed_row, dr.arange(UInt, int(model.active_voxel_count)), seed["cell_indices"])
-    selected = dr.compress(far | (seed_row != missing))
-    is_far = dr.gather(type(far), far, selected)
-    rows = dr.gather(UInt, seed_row, selected)
+    if mapping == "projective_shell":
+        from reconstruction_projective import core_mask_device, face_cells_device
+        # Enumerate the six slabs directly. The sparse sorted lookup has one
+        # entry per seed; neither occupancy nor selection allocates G^3 rows.
+        core_seed = dr.compress(core_mask_device(seed["cell_indices"], resolution, core, dr))
+        selected = face_cells_device(core, (resolution-core)//2, UInt, dr)
+        if len(core_seed):
+            selected = dr.concat([dr.gather(UInt, seed["cell_indices"], core_seed), selected])
+        selected = dr.gather(UInt, selected, dr.argsort(selected))
+        is_far = ~core_mask_device(selected, resolution, core, dr)
+        seed_count = int(model.active_voxel_count)
+        if seed_count:
+            order = dr.argsort(seed["cell_indices"])
+            ordered = dr.gather(UInt, seed["cell_indices"], order)
+            found = dr.binary_search(0, seed_count, lambda i: dr.gather(UInt, ordered, i) < selected)
+            valid = (found < seed_count) & (dr.gather(UInt, ordered, dr.minimum(found, seed_count-1)) == selected)
+            rows = dr.select(valid, dr.gather(UInt, order, dr.minimum(found, seed_count-1)), missing)
+        else:
+            rows = dr.full(UInt, missing, len(selected))
+    else:
+        index = dr.arange(UInt, resolution**3)
+        q = (index % resolution, (index // resolution) % resolution,
+             index // (resolution * resolution))
+        d = [dr.abs(2*Int(axis) + 1 - resolution) for axis in q]
+        far = (sum(dr.square(axis + 1) for axis in d) > core*core) & (
+            sum(dr.square(dr.maximum(axis - 1, 0)) for axis in d) < resolution*resolution)
+        seed_row = dr.full(UInt, missing, resolution**3)
+        dr.scatter(seed_row, dr.arange(UInt, int(model.active_voxel_count)), seed["cell_indices"])
+        selected = dr.compress(far | (seed_row != missing))
+        is_far = dr.gather(type(far), far, selected)
+        rows = dr.gather(UInt, seed_row, selected)
     has_seed = rows != missing
     count = len(selected)
     sh, opacity_sh = int(model.sh_count), int(model.opacity_sh_count)
@@ -63,7 +87,8 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
         flat = dr.arange(UInt, count*width)
         parent = dr.gather(UInt, rows, flat // width)
         present = dr.gather(type(has_seed), has_seed, flat // width)
-        value = dr.gather(Float, seed[key], parent*width + flat % width, present)
+        value = (dr.gather(Float, seed[key], parent*width + flat % width, present)
+                 if len(seed[key]) else dr.zeros(Float, count*width))
         if key != "radiance_sh":
             if key == "centers":
                 initial = Float(.5)
@@ -79,14 +104,18 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
     result = mi.VoxelReconstruction.from_state(
         resolution, model.grid_min, model.grid_max, state, sh, opacity_sh,
         core_resolution=core)
-    result.scene_mapping = "radial_seed_shell"
-    if refinement == "fixed_layers":
+    result.scene_mapping = mapping
+    if mapping == "projective_shell":
+        result.set_scene_mapping(mapping)
+        result.background_refinement = "preserve_physical_width"
+        result.background_layers = (resolution-core)//2
+    elif refinement == "fixed_layers":
         result.background_refinement = refinement
         result.background_layers = layers
     result.background_initialization = dict(
-        region="cell_AABB_intersects_radial_shell", opacity=opacity,
+        region="six_projective_face_slabs" if mapping == "projective_shell" else "cell_AABB_intersects_radial_shell", opacity=opacity,
         initial_background_layers=(resolution-core)//2,
         background_refinement=refinement or "preserve_physical_width",
         color="point_seed_radiance_else_black", seed_voxels=int(model.active_voxel_count),
-        initialized_voxels=count, straight_ray_forward=True)
+        initialized_voxels=count, straight_ray_forward=mapping != "projective_shell")
     return result

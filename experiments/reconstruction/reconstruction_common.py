@@ -91,6 +91,8 @@ def _colmap_views(prepared, render):
             near_clip=render.near_clip, far_clip=render.far_clip,
             entry_offset_fraction=render.entry_offset_fraction,
             ray_origin="near plane; camera_position + near_clip * unnormalized_direction")
+        view["camera"]["projective_unbounded"] = (
+            prepared["initialization"].get("scene_mapping") == "projective_shell")
     return prepared["views"]
 
 
@@ -120,7 +122,7 @@ def prepare_dataset(config, np, *, load_points=True):
     else:
         options.update(scene_mode=mode, background_opacity=config.data.background_opacity)
         saved = config.data.initialization
-        if mode == "unbounded" and (saved is None or saved.get("version") == 4):
+        if mode == "unbounded" and (saved is None or saved.get("version") in (4, 5)):
             if config.data.background_layers is not None:
                 raise ValueError("New unbounded runs use data.background_final_layers / --background-final-layers; "
                                  "background_layers is only for legacy v2/v3 initializations")
@@ -144,19 +146,24 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
     if prepared is not None:
         if not hasattr(mi.VoxelReconstruction, "from_points"):
             raise RuntimeError("Rebuild this checkout: in-memory point-cloud initialization is missing")
+        mapping = prepared["initialization"].get("scene_mapping")
+        if mapping == "projective_shell" and not hasattr(mi.VoxelReconstruction, "set_scene_mapping"):
+            raise RuntimeError("Rebuild this checkout: projective scene traversal is missing")
         model = mi.VoxelReconstruction.from_points(
             np.ascontiguousarray(prepared["positions"], dtype=np.float32).reshape(-1),
             np.ascontiguousarray(prepared["colors"], dtype=np.float32).reshape(-1),
             prepared["resolution"], prepared["grid_min"], prepared["grid_max"],
             config.model.sh_count, config.model.opacity_sh_count, prepared["core_resolution"])
-        if prepared["initialization"].get("scene_mapping") == "radial_seed_shell":
+        if mapping in ("radial_seed_shell", "projective_shell"):
             import drjit as dr
             from reconstruction_background import initialize_background_model
+            options = {"mapping": mapping} if mapping == "projective_shell" else {}
             return initialize_background_model(model, mi, dr, np,
                 opacity=prepared["initialization"]["background_opacity"],
                 refinement=prepared["initialization"].get("background_refinement"),
                 layers=prepared["initialization"].get("initial_background_layers",
-                                                    prepared["initialization"].get("background_layers")))
+                                                    prepared["initialization"].get("background_layers")),
+                **options)
         return model
     lo, hi = np.asarray(config.model.bounds_min), np.asarray(config.model.bounds_max)
     center, half = (lo + hi) / 2, (hi - lo) / 2 * config.model.bounds_padding
@@ -294,7 +301,8 @@ def generate_ray_batch(render, camera, indices, offsets, mi, dr, *, prepared_cam
     direction = values["forward"] + horizontal * values["right"] + vertical * values["up"]
     ray = mi.Ray3f(values["position"] + render.near_clip * direction,
                   dr.normalize(direction))
-    ray.maxt = (render.far_clip - render.near_clip) * dr.norm(direction)
+    ray.maxt = (float("inf") if camera.get("projective_unbounded", False) else
+                (render.far_clip - render.near_clip) * dr.norm(direction))
     return ray
 
 
@@ -356,8 +364,9 @@ def model_metadata(model) -> dict:
     core = int(getattr(model, "core_resolution", model.resolution))
     if core != metadata["resolution"]:
         metadata["core_resolution"] = core
-    if getattr(model, "scene_mapping", "bounded") == "radial_seed_shell":
-        metadata["scene_mapping"] = "radial_seed_shell"
+    mapping = getattr(model, "scene_mapping", "bounded")
+    if mapping in ("radial_seed_shell", "projective_shell"):
+        metadata["scene_mapping"] = mapping
         if hasattr(model, "background_refinement"):
             metadata["background_refinement"] = model.background_refinement
             metadata["background_layers"] = int(model.background_layers)
@@ -371,8 +380,13 @@ def restore_model(checkpoint, mi):
     options = ({"core_resolution": metadata["core_resolution"]} if "core_resolution" in metadata else {})
     model = mi.VoxelReconstruction.from_state(metadata["resolution"], metadata["grid_min"],
         metadata["grid_max"], state, metadata["sh_count"], metadata["opacity_sh_count"], **options)
-    if metadata.get("scene_mapping") == "radial_seed_shell":
-        model.scene_mapping = "radial_seed_shell"
+    mapping = metadata.get("scene_mapping", "bounded")
+    if mapping in ("radial_seed_shell", "projective_shell"):
+        model.scene_mapping = mapping
+        if mapping == "projective_shell":
+            if not hasattr(model, "set_scene_mapping"):
+                raise RuntimeError("Rebuild this checkout: projective scene traversal is missing")
+            model.set_scene_mapping(mapping)
         if "background_refinement" in metadata:
             model.background_refinement = metadata["background_refinement"]
             model.background_layers = metadata["background_layers"]

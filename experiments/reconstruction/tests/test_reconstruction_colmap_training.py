@@ -88,14 +88,16 @@ def run_check(args, output):
     final = load_checkpoint(full / "model.npz")
     report = json.loads((full / "training-report.json").read_text(encoding="utf-8"))
     assert report["training_status"] == report["evaluation"]["status"] == "passed"
+    assert report["training_protocol"]["scene_mapping"]["name"] == "projective_shell"
+    assert "s=t/(t+core_half_extent)" in report["training_protocol"]["distortion"]["depth"]
     assert report["initial_render"]["resolution"] == 6
     assert report["initial_render"]["view_index"] == 1  # Global index 0 belongs to the held-out split.
     assert (report["initial_render"]["width"], report["initial_render"]["height"]) == (16, 12)
     assert final["model_metadata"]["resolution"] == 24
     assert final["model_metadata"]["core_resolution"] == 16
-    assert final["model_metadata"]["scene_mapping"] == "radial_seed_shell"
-    assert "background_refinement" not in final["model_metadata"]
-    assert "background_layers" not in final["model_metadata"]
+    assert final["model_metadata"]["scene_mapping"] == "projective_shell"
+    assert final["model_metadata"]["background_refinement"] == "preserve_physical_width"
+    assert final["model_metadata"]["background_layers"] == 4
     assert tuple(final["config"]["render"]["background"]) == (0., 0., 0.)
     assert first["training_state"]["global_step"] == 7
     assert final["training_state"]["global_step"] == 21
@@ -108,7 +110,7 @@ def run_check(args, output):
     np.testing.assert_allclose(initialization["radius"], .66, atol=1e-15)
     assert initialization["shell_width"] == .5
     assert initialization["shell_layers"] == 4
-    assert initialization["version"] == 4
+    assert initialization["version"] == 5
     assert initialization["background_refinement"] == "preserve_physical_width"
     assert initialization["background_final_layers"] == 4
     assert initialization["initial_background_layers"] == 1

@@ -45,18 +45,21 @@ def validate_model_state(state: dict, metadata: dict) -> None:
     resolution = _integer(metadata["resolution"], "resolution", 1, 1040)
     core = _integer(metadata.get("core_resolution", resolution), "core_resolution", 1, min(resolution, 1024))
     mapping = metadata.get("scene_mapping", "bounded")
-    if mapping not in ("bounded", "radial_seed_shell"):
+    if mapping not in ("bounded", "radial_seed_shell", "projective_shell"):
         raise ValueError("Unknown initialization scene_mapping")
-    if mapping == "radial_seed_shell":
+    if mapping in ("radial_seed_shell", "projective_shell"):
         if core >= resolution or (resolution-core) % 2:
-            raise ValueError("Radial shell metadata requires positive symmetric padding")
+            raise ValueError("Shell metadata requires positive symmetric padding")
     policy = metadata.get("background_refinement")
     if policy is not None or "background_layers" in metadata:
-        if mapping != "radial_seed_shell" or policy != "fixed_layers":
-            raise ValueError("Background refinement metadata requires a fixed_layers radial shell")
+        if not ((mapping == "radial_seed_shell" and policy == "fixed_layers") or
+                (mapping == "projective_shell" and policy == "preserve_physical_width")):
+            raise ValueError("Background refinement metadata disagrees with the scene mapping")
         layers = _integer(metadata.get("background_layers"), "background_layers", 1)
         if resolution != core + 2 * layers:
-            raise ValueError("Fixed-layer background metadata must match grid padding")
+            raise ValueError("Background layer metadata must match grid padding")
+    if mapping == "projective_shell" and policy != "preserve_physical_width":
+        raise ValueError("Projective mapping requires preserve_physical_width refinement metadata")
     sh = _integer(metadata["sh_count"], "sh_count", 1, 16)
     opacity_sh = _integer(metadata["opacity_sh_count"], "opacity_sh_count", 1, 16)
     lo, hi = np.asarray(metadata["grid_min"]), np.asarray(metadata["grid_max"])
@@ -64,11 +67,11 @@ def validate_model_state(state: dict, metadata: dict) -> None:
             or hi.dtype.kind not in "iuf" or not np.isfinite(lo).all()
             or not np.isfinite(hi).all() or not (lo < hi).all()):
         raise ValueError("grid_min/grid_max must contain three finite, increasing bounds")
-    if mapping == "radial_seed_shell":
+    if mapping in ("radial_seed_shell", "projective_shell"):
         extent = resolution / metadata["core_resolution"]
         if (not np.allclose(lo, [-extent]*3, rtol=0, atol=1e-7)
                 or not np.allclose(hi, [extent]*3, rtol=0, atol=1e-7)):
-            raise ValueError("Radial shell grid bounds must preserve the unit-radius core")
+            raise ValueError("Shell grid bounds must preserve the normalized core")
     if not isinstance(state, dict) or set(state) != set(MODEL_FIELDS):
         raise ValueError(f"model_state must contain exactly {MODEL_FIELDS}")
     arrays = {key: np.asarray(value) for key, value in state.items()}
@@ -79,6 +82,14 @@ def validate_model_state(state: dict, metadata: dict) -> None:
         raise ValueError("cell_indices contains an index outside the grid")
     if np.unique(cells).size != cells.size:
         raise ValueError("cell_indices must be unique")
+    if mapping == "projective_shell":
+        padding = (resolution - core) // 2
+        outside = np.zeros(cells.size, dtype=np.uint8)
+        for stride in (1, resolution, resolution * resolution):
+            coordinate = cells // stride % resolution
+            outside += ((coordinate < padding) | (coordinate >= padding + core))
+        if np.any(outside > 1):
+            raise ValueError("Projective voxels must belong to the core or one face slab, not atlas corners")
     count = cells.size
     widths = {"centers": 3, "log_scales": 3, "rotations": 4,
               "radiance_sh": 3 * sh, "opacity_sh": opacity_sh}

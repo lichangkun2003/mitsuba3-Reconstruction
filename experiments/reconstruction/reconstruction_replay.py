@@ -95,6 +95,8 @@ class NativeLossReplay:
         # widths matter: native code embeds ray_count in hit/candidate offsets.
         key = (
             revision,
+            getattr(model, "scene_mapping", "bounded"),
+            int(getattr(model, "core_resolution", model.resolution)),
             int(model.resolution), int(model.active_voxel_count),
             int(getattr(model, "growth_candidate_count", 0)),
             int(model.sh_count), int(model.opacity_sh_count),

@@ -923,7 +923,7 @@ def normalized_algorithm_group(name, values):
             if key not in ("images", "initialization") or value is not None}}
         # The saved initializer determines which layer parameter is meaningful.
         # Preserve historical comparisons without silently changing its policy.
-        if (values.get("initialization") or {}).get("version") == 4:
+        if (values.get("initialization") or {}).get("version") in (4, 5):
             normalized.pop("background_layers", None)
         elif normalized["background_final_layers"] is None:
             normalized.pop("background_final_layers")
@@ -1129,7 +1129,7 @@ def run_training(distributed=None):
             # Fields introduced after a checkpoint must use their legacy
             # dataclass defaults, not the latest experiment's CONFIG switches.
             saved_data = checkpoint["config"].get("data", {})
-            config.data = (DataConfig() if (saved_data.get("initialization") or {}).get("version") == 4
+            config.data = (DataConfig() if (saved_data.get("initialization") or {}).get("version") in (4, 5)
                            else DataConfig(background_layers=8, background_final_layers=None))
             config.render = RenderConfig()
             config.topology = TopologySettings()
@@ -1231,7 +1231,7 @@ def run_training(distributed=None):
                 "native_version": getattr(mi.VoxelReconstruction, "distortion_version", 0),
                 "formula": "2 * sum(i<j, w_i*w_j*abs(s_i-s_j)); w_i=T_i*opacity_i",
                 "depth": "hard-hit ellipsoid quadratic-minimum depth, relative to ray-grid entry, divided by grid diagonal",
-                "samples": "actual recorded hard hits only; no background sample or interval-width term",
+                "samples": "actual recorded hard hits only; no residual environment sample or interval-width term",
                 "estimator": "one inverse_pdf factor; sum gradients, mean loss over all view pixels",
                 "topology_evidence": "RGB-only insertion/removal gains remain unchanged",
                 "zero_weight": "not computed; logged distortion values are zero, not measurements",
@@ -1286,6 +1286,19 @@ def run_training(distributed=None):
         prepared = prepare_dataset(config, np, load_points=checkpoint is None)
         report["scene_background"] = scene_background_protocol(config.data, config.render)
         report["training_protocol"]["reference_background"] = list(config.render.background)
+        if (config.data.initialization or {}).get("scene_mapping") == "projective_shell":
+            report["training_protocol"]["distortion"]["depth"] = (
+                "hard-hit ellipsoid quadratic minimum mapped back to world ray distance t; "
+                "s=t/(t+core_half_extent), t measured from ray origin")
+            report["training_protocol"]["scene_mapping"] = {
+                "name": "projective_shell",
+                "native_version": getattr(mi.VoxelReconstruction, "projective_version", 0),
+                "ray_extent": "infinity",
+                "segments": "analytic world-region intervals; same color/transmittance/hit capacity across charts",
+                "background_growth": False,
+                "background_rgb_deletion": False,
+                "background_opacity_deletion": "configured finest level only; existing warmup and confirmation windows",
+            }
         views = (prepared["views"] if prepared is not None else
                  load_views(dataset, config.data.cameras, config.render, np))
         signature = dataset_signature(views, dataset, config.data.cameras, config.data.initialization)

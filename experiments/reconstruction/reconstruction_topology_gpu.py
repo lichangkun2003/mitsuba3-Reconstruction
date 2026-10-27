@@ -56,8 +56,11 @@ def device_checkpoint(model):
     core = int(getattr(model, "core_resolution", model.resolution))
     if core != metadata["resolution"]:
         metadata["core_resolution"] = core
-    if getattr(model, "scene_mapping", "") == "radial_seed_shell":
-        metadata["scene_mapping"] = "radial_seed_shell"
+    if getattr(model, "scene_mapping", "") in ("radial_seed_shell", "projective_shell"):
+        metadata["scene_mapping"] = model.scene_mapping
+    if getattr(model, "scene_mapping", "") == "projective_shell":
+        metadata["background_refinement"] = "preserve_physical_width"
+        metadata["background_layers"] = (metadata["resolution"] - core)//2
     if getattr(model, "background_refinement", "") == "fixed_layers":
         metadata.update(background_refinement="fixed_layers",
                         background_layers=int(model.background_layers))
@@ -339,7 +342,7 @@ class GPUTopologyLifecycle:
             "confirmed": self.count(selected), "deleted": 0,
             "max_streak": dr.max(streak) if m.count else 0}
 
-    def evaluate_rgb_deletion(self, boundary, event):
+    def evaluate_rgb_deletion(self, boundary, event, *, region_eligible=None):
         m, dr, cfg = self.manager, self.dr, self.manager.settings
         if not m._rgb_deletion_due(boundary):
             return None
@@ -357,6 +360,8 @@ class GPUTopologyLifecycle:
         unopposed = self.UInt(p["conflict_views"]) < cfg.deletion_rgb_max_conflict_views if m.count else observed
         valid = (self.UInt(p["invalid_views"]) == 0) & dr.isfinite(mean) if m.count else observed
         beneficial, mature = (mean > cfg.deletion_rgb_min_mean_gain if m.count else observed), self.mature(boundary)
+        if region_eligible is not None:
+            mature &= region_eligible
         qualified = observed & supported & unopposed & valid & beneficial & mature & complete if m.count else observed
         selected, detail = self.confirmation(qualified, boundary)
         detail.update(status="complete" if complete else "incomplete_views",
@@ -389,6 +394,10 @@ class GPUTopologyLifecycle:
         coefficient_threshold = math.log(threshold / (1. - threshold)) * (2. * math.sqrt(math.pi))
         low = self.Double(coefficients) < coefficient_threshold if m.count else dr.empty(self.Bool, 0)
         mature = self.mature(boundary)
+        if m.scene_mapping == "projective_shell" and not m._background_deletion_allowed():
+            from reconstruction_projective import core_mask_device
+            mature &= core_mask_device(self.UInt(model.snapshot()["cell_indices"]),
+                                       m.resolution, m.core_resolution, dr)
         qualified = low & mature
         selected, detail = self.confirmation(qualified, boundary, opacity=True)
         detail.update(status="complete", threshold=threshold, tested_voxels=m.count,
@@ -585,7 +594,12 @@ class GPUTopologyLifecycle:
         if (m.schedule.enabled and m.core_resolution < m.schedule.target_resolution and
                 boundary - m.level_start_epoch >= m.level_budget):
             return self.refine(model, optimizer, boundary, event)
-        rgb = self.evaluate_rgb_deletion(boundary, event)
+        region_eligible = None
+        if m.scene_mapping == "projective_shell" and m._rgb_deletion_due(boundary):
+            from reconstruction_projective import core_mask_device
+            region_eligible = core_mask_device(self.UInt(model.snapshot()["cell_indices"]),
+                                               m.resolution, m.core_resolution, dr)
+        rgb = self.evaluate_rgb_deletion(boundary, event, region_eligible=region_eligible)
         opacity = self.evaluate_opacity(model, boundary, event)
         event["evidence_window_evaluated"] = rgb is not None
         masks = [mask for mask in (rgb, opacity) if mask is not None]
