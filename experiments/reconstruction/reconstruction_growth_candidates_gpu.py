@@ -1,13 +1,18 @@
 """Exact RGB growth proposals using device-resident double precision geometry.
 
-Only compaction sizes cross the host boundary. Proposal arrays and model fields
-remain on the device; the NumPy generator is retained as an independent oracle.
+Only compaction sizes and small per-direction counts cross the host boundary.
+Proposal arrays and model fields remain on the device; the NumPy generator is
+retained as an independent oracle.
 """
 
 import math
 
 
-DEFAULT_PARENT_BATCH_SIZE = 262144
+DEFAULT_PARENT_BATCH_SIZE = 65536
+# Bound pre-contact proposal storage even if a caller requests larger batches.
+# At most 26 directions * 65536 parents: 149.5 MiB of logical proposal fields,
+# about 216 MiB after this Dr.Jit allocator's per-field power-of-two rounding.
+MAX_BATCH_PAIRS = 26 * DEFAULT_PARENT_BATCH_SIZE
 
 
 def gather_rows(value, ids, width, dr):
@@ -144,67 +149,172 @@ def _reorder_fields(fields, order, dimensions, dr):
         del previous
 
 
+def _concatenate_fields(pieces, dimensions, dr):
+    """Merge one field at a time, with data-dependent offsets kept out of PTX."""
+    U, D = dr.cuda.UInt32, dr.cuda.Float64
+    count = sum(dr.width(piece['cells']) for piece in pieces)
+    result = {}
+    for name, width in dimensions.items():
+        merged = dr.empty(U if width == 1 else D, count * width)
+        begin = 0
+        for piece in pieces:
+            source = piece.pop(name)
+            positions = dr.arange(U, dr.width(source)) + dr.opaque(U, begin)
+            # Ranges are disjoint and cover the complete result. Unlike
+            # dr.concat's literal offsets, these reuse code when counts change.
+            dr.scatter(merged, source, positions, mode=dr.ReduceMode.Permute)
+            begin += dr.width(source)
+        dr.eval(merged)
+        result[name] = merged
+        if pieces:
+            del source, positions
+    pieces.clear()
+    return result
+
+
+def _neighbor_mask(cells, offset, resolution, blocked, selected_targets,
+                   region_allowed, active, dr):
+    """Cheap eligibility shared by the parent prefilter and pair generation."""
+    U = dr.cuda.UInt32
+    neighbors = [cells[i] + offset[i] for i in range(3)]
+    possible = active & region_allowed(neighbors)
+    targets = U(neighbors[0] + resolution * (neighbors[1] + resolution * neighbors[2]))
+    possible &= ~_bitmap_contains(blocked, targets, possible, dr)
+    if selected_targets is not None:
+        possible &= _bitmap_contains(selected_targets, targets, possible, dr)
+    return possible
+
+
+def _exposed_parent_ids(occupied, eligible, resolution, blocked, selected_targets,
+                        offsets, region_allowed, dr):
+    """Discard only parents that cannot propose any legal requested empty cell."""
+    I, B = dr.cuda.Int32, dr.cuda.Bool
+    cells = [I(occupied % resolution), I(occupied // resolution % resolution),
+             I(occupied // (resolution * resolution))]
+    allowed = B(eligible) & region_allowed(cells)
+    exposed = dr.zeros(B, dr.width(occupied))
+    for offset in offsets:
+        # A single accumulated mask, not a direction-by-full-model table.
+        # Once a parent has a legal target, further bitmap reads are masked.
+        exposed |= _neighbor_mask(cells, offset, resolution, blocked, selected_targets,
+                                  region_allowed, allowed & ~exposed, dr)
+    return dr.compress(exposed)
+
+
+def _batch_pairs(parent_cells, resolution, blocked, selected_targets,
+                 offset_fields, region_allowed, divisor, dr):
+    """Compact all directions together; returned indices remain direction-major."""
+    import numpy as np
+    U, I = dr.cuda.UInt32, dr.cuda.Int32
+    count, directions = dr.width(parent_cells), dr.width(offset_fields[0])
+    lanes = dr.arange(U, count * directions)
+    addresses = dr.gather(U, parent_cells, lanes % divisor)
+    cells = [I(addresses % resolution), I(addresses // resolution % resolution),
+             I(addresses // (resolution * resolution))]
+    offsets = [dr.gather(I, value, lanes // divisor) for value in offset_fields]
+    possible = _neighbor_mask(cells, offsets, resolution, blocked, selected_targets,
+                              region_allowed, dr.cuda.Bool(True), dr)
+    pairs = dr.compress(possible)
+    # Stable compaction groups each direction contiguously. Read one small
+    # histogram (6/26 uint32 values), never one length per neighbor direction.
+    counts = dr.zeros(U, directions)
+    if dr.width(pairs):
+        dr.scatter_reduce(dr.ReduceOp.Add, counts, U(1), pairs // divisor)
+    dr.eval(counts)
+    return pairs, np.array(counts).tolist()
+
+
+def _write_direction(fields, accepted, pairs, begin, count, parent_ids, parent_cells,
+                     geometry, offset, resolution, penetration, cfg, divisor, dr):
+    """Write a direction's unfiltered proposals; compact acceptance once per batch."""
+    U, D = dr.cuda.UInt32, dr.cuda.Float64
+    center, axes, q, size, metric, extent = geometry
+    positions = dr.arange(U, count) + dr.opaque(U, begin)
+    ids = dr.gather(U, pairs, positions) % divisor
+
+    def gather(value):
+        return dr.gather(type(value), value, ids)
+
+    c = [gather(v) for v in center]
+    m = [[gather(v) for v in row] for row in metric]
+    a = [gather(v) for v in axes]
+    e = [gather(v) for v in extent]
+    touched, contact = contact_gpu(c, m, offset, 0., dr)
+    if penetration > 0:
+        deep, _ = contact_gpu(c, m, offset, penetration, dr)
+        touched &= deep
+    child = [dr.clip(v, .05, .95) for v in contact]
+    margin = [dr.minimum(v, 1-v) for v in child]
+    for axis in range(3):
+        if offset[axis]:
+            v = min(max(cfg.growth_contact_offset, .01), .49)
+            child[axis] = dr.full(D, v if offset[axis] > 0 else 1-v, count)
+            margin[axis] = 1-child[axis] if offset[axis] > 0 else child[axis]
+    factor = dr.full(D, min(max(cfg.growth_shrink, .01), .99), count)
+    for axis in range(3):
+        factor = dr.minimum(factor, dr.maximum(margin[axis]-.005, 0.)/dr.maximum(e[axis], 1e-20))
+    touched &= factor > 0
+    for axis in range(3):
+        touched &= a[axis]*factor >= size[axis]*1e-4
+    source_cells = gather(parent_cells)
+    target_delta = offset[0] + resolution * (offset[1] + resolution * offset[2])
+    # Pair construction already proved each target is inside the allowed grid.
+    targets = source_cells + U(target_delta & 0xffffffff)
+    for name, value in (('parent_ids', gather(parent_ids)), ('parent_cells', source_cells),
+                        ('cells', targets)):
+        dr.scatter(fields[name], value, positions, mode=dr.ReduceMode.Permute)
+    for name, values in (('centers', child),
+                         ('log_scales', [dr.log(dr.select(touched, v*factor, 1.)) for v in a]),
+                         ('rotations', [gather(v) for v in q])):
+        for lane, value in enumerate(values):
+            dr.scatter(fields[name], value, positions * len(values) + lane,
+                       mode=dr.ReduceMode.Permute)
+    dr.scatter(accepted, touched, positions, mode=dr.ReduceMode.Permute)
+    # Every row in this contiguous range is written. Unwritten later ranges are
+    # not read until all directions have completed; rejected log inputs use 1.
+    # Component and direction ranges never overlap. Permute avoids flushing a
+    # dirty field before each component write, so they share the evaluation.
+    dr.eval(accepted, *fields.values())
+
+
 def _parent_batch(state, metadata, parent_ids, blocked, selected_targets,
-                  offsets, penetration, cfg, region_allowed, dr):
-    """Keep FP64 geometry and contact temporaries bounded by this parent batch."""
-    U, I, D = dr.cuda.UInt32, dr.cuda.Int32, dr.cuda.Float64
+                  offsets, offset_fields, penetration, cfg, region_allowed, batch_size, dr):
+    """Two compactions per bounded parent batch, with unchanged FP64 contact math."""
+    U, D = dr.cuda.UInt32, dr.cuda.Float64
     resolution = metadata['resolution']
     parent_cells = dr.gather(U, state['cell_indices'], parent_ids)
-    cells = [I(parent_cells % resolution), I(parent_cells // resolution % resolution),
-             I(parent_cells // (resolution*resolution))]
+    parent_count = dr.width(parent_ids)
+    # Full batches retain constant (usually power-of-two) division. A changing
+    # tail size must not become a new divisor literal in every contact kernel.
+    divisor = parent_count if parent_count == batch_size else dr.opaque(U, parent_count)
+    pairs, direction_counts = _batch_pairs(parent_cells, resolution, blocked, selected_targets,
+                                          offset_fields, region_allowed, divisor, dr)
+    count = dr.width(pairs)
+    if not count:
+        return None
     geometry_state = {'cell_indices': parent_cells}
     for name, width in (('centers', 3), ('log_scales', 3), ('rotations', 4)):
         geometry_state[name] = gather_rows(state[name], parent_ids, width, dr)
-    center, axes, q, size, metric, extent = geometry_gpu(geometry_state, metadata, dr)
+    geometry = geometry_gpu(geometry_state, metadata, dr)
     del geometry_state
-    pieces = []
-
-    def gather(value, ids):
-        return dr.gather(type(value), value, ids)
-
-    for offset in offsets:
-        neighbors = [cells[i]+offset[i] for i in range(3)]
-        possible = region_allowed(neighbors)
-        targets = U(neighbors[0]+resolution*(neighbors[1]+resolution*neighbors[2]))
-        possible &= ~_bitmap_contains(blocked, targets, possible, dr)
-        if selected_targets is not None:
-            possible &= _bitmap_contains(selected_targets, targets, possible, dr)
-        ids = dr.compress(possible)
-        if not dr.width(ids):
-            continue
-        c = [gather(v, ids) for v in center]
-        m = [[gather(v, ids) for v in row] for row in metric]
-        a = [gather(v, ids) for v in axes]
-        e = [gather(v, ids) for v in extent]
-        touched, contact = contact_gpu(c, m, offset, 0., dr)
-        if penetration > 0:
-            deep, _ = contact_gpu(c, m, offset, penetration, dr)
-            touched &= deep
-        child = [dr.clip(v, .05, .95) for v in contact]
-        margin = [dr.minimum(v, 1-v) for v in child]
-        for axis in range(3):
-            if offset[axis]:
-                v = min(max(cfg.growth_contact_offset, .01), .49)
-                child[axis] = dr.full(D, v if offset[axis] > 0 else 1-v, dr.width(ids))
-                margin[axis] = 1-child[axis] if offset[axis] > 0 else child[axis]
-        factor = dr.full(D, min(max(cfg.growth_shrink, .01), .99), dr.width(ids))
-        for axis in range(3):
-            factor = dr.minimum(factor, dr.maximum(margin[axis]-.005, 0.)/dr.maximum(e[axis], 1e-20))
-        touched &= factor > 0
-        for axis in range(3):
-            touched &= a[axis]*factor >= size[axis]*1e-4
-        chosen = dr.compress(touched)
-        if not dr.width(chosen):
-            continue
-        parents = gather(ids, chosen)
-        pieces.append(dict(parent_ids=gather(parent_ids, parents), parent_cells=gather(parent_cells, parents),
-            cells=gather(targets, parents),
-            centers=_pack([gather(v, chosen) for v in child], D, dr),
-            log_scales=_pack([dr.log(gather(v*factor, chosen)) for v in a], D, dr),
-            rotations=_pack([gather(v, parents) for v in q], D, dr)))
-        # Outputs own evaluated storage before this batch's geometry is dropped.
-        dr.eval(*pieces[-1].values())
-    return pieces
+    dimensions = dict(parent_ids=1, parent_cells=1, cells=1, centers=3, log_scales=3, rotations=4)
+    fields = {name: dr.empty(U if width == 1 else D, count * width)
+              for name, width in dimensions.items()}
+    accepted = dr.empty(dr.cuda.Bool, count)
+    begin = 0
+    for offset, size in zip(offsets, direction_counts):
+        if size:
+            _write_direction(fields, accepted, pairs, begin, size, parent_ids, parent_cells,
+                             geometry, offset, resolution, penetration, cfg, divisor, dr)
+        begin += size
+    del geometry, pairs
+    keep = dr.compress(accepted)
+    del accepted
+    if not dr.width(keep):
+        return None
+    if dr.width(keep) != count:
+        _reorder_fields(fields, keep, dimensions, dr)
+    return fields
 
 
 def generate_growth_gpu(manager, checkpoint, boundary, target_cells=None, *,
@@ -215,7 +325,8 @@ def generate_growth_gpu(manager, checkpoint, boundary, target_cells=None, *,
     `eligible` and unexpired `cooldown_cells` may be supplied by the device
     lifecycle. A target subset restricts geometry revalidation without changing
     supporting-parent counts for any retained target. `parent_batch_size` bounds
-    temporary FP64 geometry, without limiting parents or candidate counts.
+    temporary FP64 geometry; batches are also capped by `MAX_BATCH_PAIRS` before
+    contact filtering. Neither bound limits parents or final candidate counts.
     """
     if (isinstance(parent_batch_size, bool) or not isinstance(parent_batch_size, int)
             or parent_batch_size < 1):
@@ -249,8 +360,6 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
             ((boundary >= wait-1) & (boundary-(wait-1) >= cfg.growth_wait_epochs)))
     if cooldown_cells is None:
         cooldown_cells = U([cell for cell, expiry in manager.cooldown.items() if boundary < expiry])
-    cells = [I(occupied % resolution), I(occupied // resolution % resolution),
-             I(occupied // (resolution*resolution))]
     from reconstruction_topology import _growth_core_radius_squared
     radius_squared = _growth_core_radius_squared(metadata)
     def region_allowed(coordinates):
@@ -262,15 +371,6 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
                                    for c in coordinates)
             allowed &= farthest_squared <= radius_squared
         return allowed
-
-    # Parent eligibility is independent of geometry and the target direction.
-    # Compact once before FP64 ellipsoid math and all 26 neighbor passes. Keep
-    # original model IDs for inherited attributes and parent-pair matching;
-    # every occupied cell still participates in the full occupancy table below.
-    parent_ids = dr.compress(B(eligible) & region_allowed(cells))
-    if not dr.width(parent_ids):
-        return empty_result()
-    del cells
 
     evidence = cfg.use_growth_evidence or cfg.use_rgb_growth
     if evidence:
@@ -292,22 +392,27 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
                 if (x,y,z)!=(0,0,0)] if evidence and cfg.growth_use_26_neighbors else
                [tuple(sign if j==axis else 0 for j in range(3))
                 for axis in range(3) for sign in (-1,1)])
+    # Interior parents and parents outside a requested target neighborhood
+    # cannot contribute a proposal. Cull them before any FP64 geometry, keeping
+    # every eligible supporting parent and its original model row ID.
+    parent_ids = _exposed_parent_ids(occupied, eligible, resolution, blocked, selected_targets,
+                                     offsets, region_allowed, dr)
+    if not dr.width(parent_ids):
+        return empty_result()
+    offset_fields = [I([offset[axis] for offset in offsets]) for axis in range(3)]
+    batch_size = min(parent_batch_size, max(1, MAX_BATCH_PAIRS // len(offsets)))
     pieces = []
-    for begin in range(0, dr.width(parent_ids), parent_batch_size):
-        count = min(parent_batch_size, dr.width(parent_ids)-begin)
+    for begin in range(0, dr.width(parent_ids), batch_size):
+        count = min(batch_size, dr.width(parent_ids)-begin)
         positions = dr.arange(U, count) + dr.opaque(U, begin)
         batch_ids = dr.gather(U, parent_ids, positions)
-        pieces.extend(_parent_batch(state, metadata, batch_ids, blocked, selected_targets,
-                                    offsets, penetration, cfg, region_allowed, dr))
-    del blocked, selected_targets, parent_ids, batch_ids, positions
+        piece = _parent_batch(state, metadata, batch_ids, blocked, selected_targets,
+                              offsets, offset_fields, penetration, cfg, region_allowed, batch_size, dr)
+        if piece is not None:
+            pieces.append(piece)
+    del blocked, selected_targets, parent_ids, batch_ids, positions, offset_fields, piece
     dimensions = dict(parent_ids=1, parent_cells=1, cells=1, centers=3, log_scales=3, rotations=4)
-    result = {}
-    for name, width in dimensions.items():
-        sources = [piece.pop(name) for piece in pieces]
-        result[name] = dr.concat(sources) if sources else dr.empty(U if width == 1 else D, 0)
-        dr.eval(result[name])
-        del sources
-    pieces.clear()
+    result = _concatenate_fields(pieces, dimensions, dr)
     n = dr.width(result['cells'])
     if n:
         # Parent batches change enumeration order only. Every (cell,parent-cell)

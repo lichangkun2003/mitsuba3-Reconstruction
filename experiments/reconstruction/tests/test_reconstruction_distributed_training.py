@@ -268,16 +268,23 @@ def run_regression(root, build_dir, gpu):
 
     for workers in (2, 3):
         full_path, full = run_case(f"simulated-{workers}", workers)
-        first = load_checkpoint(full_path / "epoch-00001.npz")
-        assert first["model_metadata"]["resolution"] == full["model_metadata"]["resolution"] == 8
+        first_path = full_path / "before-refine-0004-epoch-00001.npz"
+        first = load_checkpoint(first_path)
+        assert first["model_metadata"]["resolution"] == 4
+        assert full["model_metadata"]["resolution"] == 8
+        assert first["training_state"]["pending_epoch_transition"]
         assert first["training_state"]["contour_state"] == {}
+        _, pending_resumed = run_case(f"simulated-{workers}-pending", workers, first_path)
+        compare_checkpoint(full, pending_resumed, np)
         stopped_name = f"simulated-{workers}-stopped"
         stopped_path, stopped = run_case(stopped_name, workers, stop_after=1)
         assert stopped["model_metadata"]["resolution"] == 8
-        assert {path.name for path in stopped_path.glob("*.npz")} == {"epoch-00001.npz"}
+        assert {path.name for path in stopped_path.glob("*.npz")} == {
+            "before-refine-0004-epoch-00001.npz", "epoch-00001.npz"}
         _, completed = run_case(stopped_name, workers, stopped_path / "epoch-00001.npz")
         compare_checkpoint(full, completed, np)
-    run_case("reject-changed-world-size", 3, root / "simulated-2" / "epoch-00001.npz", expect_success=False)
+    run_case("reject-changed-world-size", 3,
+             root / "simulated-2" / "before-refine-0004-epoch-00001.npz", expect_success=False)
     legacy = json.loads(json.dumps(config))
     legacy["training"]["rgb_only"] = False
     legacy["topology"].update(enable_deletion=False, use_rgb_deletion=False, use_rgb_growth=False)

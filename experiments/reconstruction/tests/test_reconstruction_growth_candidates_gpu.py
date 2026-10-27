@@ -185,6 +185,17 @@ class Proposals(unittest.TestCase):
                 self.assertEqual([len(batch) for batch in batches],[7,7,3])
                 np.testing.assert_array_equal(np.concatenate(batches),occupied)
                 self.assertGreater(len(result['cells']),0)
+                # Compare a literal full-batch divisor with a runtime tail
+                # divisor and disjoint component writes across several batches.
+                single=generate_growth_gpu(manager,state,10,parent_batch_size=count)
+                for key in ('cells','parent_cells','parent_ids','geometric_support'):
+                    np.testing.assert_array_equal(np.array(result[key]),np.array(single[key]),err_msg=key)
+                for key in ('centers','log_scales','rotations'):
+                    np.testing.assert_allclose(np.array(result[key]),np.array(single[key]),
+                                               atol=3e-12,rtol=3e-12,err_msg=key)
+                for key in single['candidate_state']:
+                    np.testing.assert_array_equal(np.array(result['candidate_state'][key]),
+                        np.array(single['candidate_state'][key]),err_msg=key)
 
     def test_parent_support_is_counted_across_batches(self):
         state=checkpoint([75,73])
@@ -202,6 +213,81 @@ class Proposals(unittest.TestCase):
                 result=self.compare(manager,state,target_cells=[],parent_batch_size=1)
         self.assertEqual(len(result['cells']),0)
         self.assertTrue(all(len(value)==0 for value in result['candidate_state'].values()))
+
+    def test_only_exposed_parents_reach_fp64_geometry(self):
+        hole=219
+        occupied=np.delete(np.arange(512,dtype=np.uint32),hole)
+        state=checkpoint(occupied)
+        coordinates=np.stack((occupied%8,occupied//8%8,occupied//64),axis=1).astype(np.int64)
+        delta=np.abs(coordinates-np.array([hole%8,hole//8%8,hole//64]))
+        for neighbors in (False,True):
+            manager=manager_for(state,use_rgb_growth=True,growth_use_26_neighbors=neighbors,
+                growth_min_supporting_parents=2,growth_evidence_penetration=0.)
+            exposed=np.max(delta,axis=1)==1 if neighbors else np.sum(delta,axis=1)==1
+            with self.subTest(neighbors=neighbors):
+                with patch.object(growth_gpu,'geometry_gpu',wraps=growth_gpu.geometry_gpu) as geometry:
+                    self.compare(manager,state,parent_batch_size=5)
+                    batches=[np.array(call.args[0]['cell_indices']) for call in geometry.call_args_list]
+                np.testing.assert_array_equal(np.concatenate(batches),occupied[exposed])
+                self.assertTrue(all(len(batch)<=5 for batch in batches))
+
+    def test_target_neighborhood_keeps_all_supporting_parents(self):
+        # Requested targets occur more than once, and distant eligible parents
+        # must not enter FP64 geometry. Both local supporting parents survive.
+        state=checkpoint([0,7,73,217,75,511])
+        manager=manager_for(state,use_rgb_growth=True,growth_use_26_neighbors=True,
+            growth_min_supporting_parents=2,growth_evidence_penetration=0.)
+        with patch.object(growth_gpu,'geometry_gpu',wraps=growth_gpu.geometry_gpu) as geometry:
+            result=self.compare(manager,state,target_cells=[74,74],parent_batch_size=1)
+            parents=np.concatenate([np.array(call.args[0]['cell_indices']) for call in geometry.call_args_list])
+        np.testing.assert_array_equal(parents,[73,75])
+        np.testing.assert_array_equal(np.array(result['parent_ids']),[2,4])
+        np.testing.assert_array_equal(np.array(result['geometric_support']),[2,2])
+
+    def test_fully_blocked_or_unreachable_targets_skip_geometry(self):
+        cases=[(checkpoint(np.arange(512,dtype=np.uint32)),None,{}),
+               (checkpoint([73,75]),[511],{}),
+               (checkpoint([73,75]),[74],{74:12})]
+        for state,targets,cooldown in cases:
+            manager=manager_for(state,use_rgb_growth=True,growth_use_26_neighbors=True,
+                growth_min_supporting_parents=1)
+            manager.cooldown=cooldown
+            with self.subTest(targets=targets,cooldown=cooldown):
+                with patch.object(growth_gpu,'geometry_gpu',side_effect=AssertionError('no exposed parent')):
+                    result=self.compare(manager,state,target_cells=targets)
+                self.assertEqual(len(result['cells']),0)
+
+    def test_pair_capacity_and_compaction_count_are_bounded(self):
+        state=checkpoint([73,75,217,219,361])
+        manager=manager_for(state,use_rgb_growth=True,growth_use_26_neighbors=True,
+            growth_min_supporting_parents=1,growth_evidence_penetration=.05)
+        # An oversized requested parent batch must still respect pair capacity.
+        with patch.object(growth_gpu,'MAX_BATCH_PAIRS',26*2):
+            with patch.object(growth_gpu,'geometry_gpu',wraps=growth_gpu.geometry_gpu) as geometry:
+                with patch.object(dr,'compress',wraps=dr.compress) as compress:
+                    result=self.compare(manager,state,parent_batch_size=1000)
+            sizes=[len(call.args[0]['cell_indices']) for call in geometry.call_args_list]
+        self.assertEqual(sizes,[2,2,1])
+        self.assertGreater(len(result['cells']),0)
+        # Parent filtering plus global group/support filtering, and only two
+        # compressions per batch regardless of the 26 neighbor directions.
+        self.assertLessEqual(compress.call_count,3+2*len(sizes))
+
+    def test_ragged_field_concatenation_preserves_rows(self):
+        dimensions=dict(parent_ids=1,parent_cells=1,cells=1,centers=3,log_scales=3,rotations=4)
+        pieces,expected=[],{name:[] for name in dimensions}
+        for ordinal,count in enumerate((3,7,1)):
+            piece={}
+            for name,width in dimensions.items():
+                values=np.arange(count*width)+(ordinal+1)*100
+                dtype=dr.cuda.UInt32 if width==1 else dr.cuda.Float64
+                piece[name]=dtype(values)
+                expected[name].append(values)
+            pieces.append(piece)
+        result=growth_gpu._concatenate_fields(pieces,dimensions,dr)
+        self.assertEqual(pieces,[])
+        for name in dimensions:
+            np.testing.assert_array_equal(np.array(result[name]),np.concatenate(expected[name]),err_msg=name)
 
 
 if __name__=='__main__':

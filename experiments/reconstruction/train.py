@@ -16,6 +16,7 @@ import io
 import json
 import math
 from pathlib import Path
+import shutil
 import sys
 import time
 import traceback
@@ -63,7 +64,7 @@ class TrainingSettings:
     batch_reduction: str = "auto"  # Multi-GPU RGB batches: exact sparse union, or dense diagnostic transport.
     seed: int = 42
     shuffle: bool = True
-    save_count: int = 3  # Total snapshots, including the final model.npz.
+    save_count: int = 3  # Legacy config field; saves now occur only before refinement and at completion.
     output: str | None = None  # None: automatically allocate a daily experiment.
 
 
@@ -186,7 +187,7 @@ CONFIG.schedule.start_resolution = 256
 CONFIG.schedule.target_resolution = 512
 CONFIG.schedule.level_weights = (6, 4)  # 512终点默认6:4；1024终点默认(4,3,3)。
 CONFIG.training.num_epochs = 1500  # 整个实验总轮数，每轮遍历全部训练视角。
-CONFIG.training.save_count = 3  # 包含最终 model.npz，共保存三次。
+CONFIG.training.save_count = 3  # 兼容旧配置；只在升层前保存续训 checkpoint，训练结束保留 model.npz。
 CONFIG.training.output = None  # 自动创建 outputs/场景-MM.DD-E编号/training。
 # 需要手动指定目录时，将 None 改为路径字符串，或传 --output-dir。
 CONFIG.evaluation.enabled = True  # 最终 model.npz 保存后，自动评价训练集和测试集。
@@ -469,8 +470,13 @@ def save_initial_training_view(config, model, views, model_path, mi, dr, np, *, 
 def is_coarse_training_end(topology, completed_epochs):
     """Capture the original coarse level only, before its refinement."""
     core = getattr(topology, "core_resolution", topology.resolution)
+    return core == topology.schedule.start_resolution and is_refinement_boundary(topology, completed_epochs)
+
+
+def is_refinement_boundary(topology, completed_epochs):
+    """Use the same old-level boundary as CPU and GPU topology finish_epoch."""
+    core = getattr(topology, "core_resolution", topology.resolution)
     return (topology.schedule.enabled
-            and core == topology.schedule.start_resolution
             and core < topology.schedule.target_resolution
             and completed_epochs >= topology.level_start_epoch + topology.level_budget)
 
@@ -490,6 +496,62 @@ def save_coarse_training_view(config, model, views, model_path, mi, dr, np, *,
                                     completed_epochs=completed_epochs, global_step=global_step)
 
 
+def save_refinement_boundary(config, topology, model, views, model_path, output, mi, dr, np, save, *,
+                             completed_epochs, global_step, primary=True):
+    """Persist the completed old level before finish_epoch mutates it.
+
+    A pending checkpoint resumes by applying that transition once, without
+    replaying its completed training epoch. Existing boundary files belong to
+    the original run and must not be overwritten when resuming in place.
+    """
+    if not primary or not is_refinement_boundary(topology, completed_epochs):
+        return None
+    core = int(getattr(topology, "core_resolution", topology.resolution))
+    path = output / f"before-refine-{core:04d}-epoch-{completed_epochs:05d}.npz"
+    saved = dict(path=str(path), completed_epochs=completed_epochs, core_resolution=core,
+                 resolution=int(model.resolution), pending_epoch_transition=True)
+    if path.exists():
+        saved.update(status="skipped", reason="existing_checkpoint")
+    else:
+        save(path, completed_epochs, pending_epoch_transition=True)
+        saved["status"] = "passed"
+    image = model_path.parent / "train" / f"0000-level-{core:04d}.png"
+    coarse = model_path.parent / "train" / "0000-coarse.png"
+    first_level = core == topology.schedule.start_resolution
+    if not config.evaluation.enabled:
+        rendered = dict(status="skipped", reason="evaluation_disabled")
+    elif image.exists():
+        rendered = dict(status="skipped", reason="existing_image", image=str(image), existing_image=True)
+    elif first_level and coarse.is_file():
+        # Retain the legacy image when revisiting an old pending checkpoint.
+        shutil.copyfile(coarse, image)
+        rendered = dict(status="skipped", reason="existing_coarse_image", image=str(image), existing_image=True)
+    else:
+        rendered = _save_training_view_zero(config, model, views, image, mi, dr, np,
+            completed_epochs=completed_epochs, global_step=global_step)
+    rendered.update(core_resolution=core, completed_epochs=completed_epochs, global_step=global_step)
+    coarse_render = None
+    if first_level:
+        if image.is_file() and not coarse.exists():
+            shutil.copyfile(image, coarse)
+        coarse_render = dict(rendered)
+        if "image" in rendered:
+            coarse_render["image"] = str(coarse)
+    return dict(checkpoint=saved, render=rendered, coarse_render=coarse_render)
+
+
+def record_refinement_boundary(report, boundary):
+    """Publish small metadata only; never keep a model/Adam snapshot alive."""
+    if boundary is None:
+        return
+    checkpoint = boundary["checkpoint"]
+    core = str(checkpoint["core_resolution"])
+    report.setdefault("pre_refine_checkpoints", {})[core] = checkpoint
+    report.setdefault("level_renders", {})[core] = boundary["render"]
+    if boundary["coarse_render"] is not None:
+        report["coarse_render"] = boundary["coarse_render"]
+
+
 def _save_training_view_zero(config, model, views, path, mi, dr, np, *,
                              completed_epochs, global_step):
     """Use evaluation camera/seed settings without consuming training RNG."""
@@ -507,6 +569,7 @@ def _save_training_view_zero(config, model, views, path, mi, dr, np, *,
                 completed_epochs=completed_epochs, global_step=global_step,
                 spp=config.evaluation.spp, seed=seed,
                 width=config.render.width, height=config.render.height,
+                core_resolution=int(getattr(model, "core_resolution", model.resolution)),
                 resolution=int(model.resolution), active_voxels=int(model.active_voxel_count),
                 seconds=time.perf_counter()-started)
 
@@ -859,13 +922,19 @@ def dataset_signature(views, dataset, camera_file, initialization=None):
     return signature
 
 
-def checkpoint_epochs(num_epochs: int, save_count: int) -> tuple[int, ...]:
-    """Evenly space completed-epoch saves; the final model counts as one save."""
-    for value in (num_epochs, save_count):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError("Epoch and checkpoint counts must be positive integers")
-    count = min(num_epochs, save_count)
-    return tuple((index * num_epochs + count - 1) // count for index in range(1, count + 1))
+def refinement_checkpoint_epochs(config) -> tuple[int, ...]:
+    """Planned pre-refinement boundaries; final and explicit stops save separately."""
+    if not config.schedule.enabled:
+        return ()
+    budgets = level_budgets(config.schedule.start_resolution, config.schedule.target_resolution,
+                           config.training.num_epochs, config.schedule.level_weights)
+    completed = 0
+    boundaries = []
+    for core, budget in budgets.items():
+        completed += budget
+        if core < config.schedule.target_resolution:
+            boundaries.append(completed)
+    return tuple(boundaries)
 
 
 def final_model_path(output: Path) -> Path:
@@ -1138,8 +1207,8 @@ def run_training(distributed=None):
                 previous_group = normalized_algorithm_group(group, previous[group])
                 if normalized_algorithm_group(group, current[group]) != previous_group:
                     raise ValueError(f"Cannot change {group} while resuming; start a new run for a different algorithm")
-            for key in ("seed", "shuffle", "save_count"):
-                previous_value = previous["training"].get(key, 3) if key == "save_count" else previous["training"][key]
+            for key in ("seed", "shuffle"):
+                previous_value = previous["training"][key]
                 if current["training"][key] != previous_value:
                     raise ValueError(f"Cannot change training.{key} while resuming")
             # Changing the total budget changes the coarse-to-fine schedule retroactively.
@@ -1308,8 +1377,10 @@ def run_training(distributed=None):
             gpu_reference_cache_mib=config.training.gpu_reference_cache_mib)
         emit(f"Training rays: {ray_count} per view, {batch_size} per batch, "
               f"{report['training_protocol']['batches_per_view']} ray batch(es) per view", flush=True)
-        save_epochs = checkpoint_epochs(config.training.num_epochs, config.training.save_count)
-        report["checkpoint_epochs"] = list(save_epochs)
+        report["checkpoint_policy"] = "before_refinement_and_final; explicit_stop_saves_resume_checkpoint"
+        report["checkpoint_epochs"] = list(refinement_checkpoint_epochs(config))
+        report["level_renders"] = {}
+        report["pre_refine_checkpoints"] = {}
         if primary:
             (output / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")
         reference_cache = ReferenceImageCache(config.render.width, config.render.height, mi, np,
@@ -1399,20 +1470,50 @@ def run_training(distributed=None):
         else:
             report["coarse_render"] = dict(status="pending", image=str(coarse_path))
 
-        def capture_coarse_image(completed_epochs):
-            if not primary or not is_coarse_training_end(topology, completed_epochs):
+        def save(path, epochs, *, pending_epoch_transition=False):
+            if not primary:
+                return
+            save_started = time.perf_counter()
+            dr.eval(*model.snapshot().values())
+            dr.sync_thread()
+            arrays = {key: np.array(value, copy=True) for key, value in model.snapshot().items()}
+            metadata = model_metadata(model)
+            optimizer_state, topology_state = optimizer.state_dict(), topology.state_dict()
+            save_checkpoint(path, arrays, metadata,
+                training_state={"completed_epochs": epochs, "global_step": global_step,
+                    "optimizer_step": optimizer_step, "update_protocol": update_protocol,
+                    "rng_state": rng.bit_generator.state, "contour_state": sampler.state_dict(),
+                    "topology_state": topology_state, "dataset_signature": signature,
+                    # Sample before serialization; a resumed checkpoint cannot
+                    # recover the time spent writing that same checkpoint.
+                    "reconstruction_seconds": prior_seconds + time.perf_counter() - run_started,
+                    "reconstruction_time_complete": time_complete,
+                    "pending_epoch_transition": pending_epoch_transition},
+                optimizer_state=optimizer_state, config=asdict(config), provenance=report["provenance"])
+            # These potentially multi-GiB CPU exports must die before refinement.
+            del arrays, metadata, optimizer_state, topology_state
+            report["checkpoint"] = str(path)
+            performance.record_checkpoint(path, time.perf_counter()-save_started)
+
+        def capture_refinement_boundary(completed_epochs):
+            if not primary or not is_refinement_boundary(topology, completed_epochs):
                 return None
-            if config.evaluation.enabled:
-                progress_line.finish()
-                emit(f"Rendering coarse voxel model before refinement: train view 0, "
-                     f"{config.evaluation.spp} spp", flush=True)
-            record = save_coarse_training_view(
-                config, model, views, model_path, mi, dr, np,
-                completed_epochs=completed_epochs, global_step=global_step)
-            report["coarse_render"] = record
-            if record["status"] == "passed":
-                emit("Coarse voxel image:", record["image"], flush=True)
-            return record
+            progress_line.finish()
+            core = int(getattr(topology, "core_resolution", topology.resolution))
+            emit(f"Saving completed core {core} before refinement", flush=True)
+            # Frozen ordinary-view work can retain the old gradient/path
+            # buffers. Release them before the snapshot, preview and split.
+            native_replay.clear()
+            cache_prepare_seconds = release_topology_cache(model, dr)
+            boundary = save_refinement_boundary(config, topology, model, views, model_path, output,
+                mi, dr, np, save, completed_epochs=completed_epochs, global_step=global_step)
+            boundary["cache_prepare_seconds"] = cache_prepare_seconds
+            boundary["checkpoint"]["cache_prepare_seconds"] = cache_prepare_seconds
+            record_refinement_boundary(report, boundary)
+            emit("Pre-refinement checkpoint:", boundary["checkpoint"]["path"], flush=True)
+            if boundary["render"]["status"] == "passed":
+                emit("Level voxel image:", boundary["render"]["image"], flush=True)
+            return boundary
 
         if checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state"])
@@ -1420,8 +1521,15 @@ def run_training(distributed=None):
             # Loading legacy lifecycle state restores its schedule too. Avoid
             # making additional pre-refinement snapshots under the new policy.
             topology.schedule.save_each_level = False
-            if primary and checkpoint["training_state"].get("pending_epoch_transition", False):
-                capture_coarse_image(completed)
+            pending_transition = checkpoint["training_state"].get("pending_epoch_transition", False)
+            # Restored model, optimizer and lifecycle now own their state. Do not
+            # retain the portable CPU archive through a potentially large split.
+            checkpoint.pop("model_state", None)
+            checkpoint.pop("optimizer_state", None)
+            checkpoint.pop("training_state", None)
+            del state
+            if primary and pending_transition:
+                capture_refinement_boundary(completed)
                 replacement, transition = topology.finish_epoch(model, optimizer, completed)
                 if replacement is not None:
                     model = restore_model(replacement, mi)
@@ -1443,12 +1551,15 @@ def run_training(distributed=None):
                 initial = dict(model_state=dict(model.snapshot()),
                     model_metadata=model_metadata(model), optimizer_state=optimizer.device_state_dict(),
                     rng_state=rng.bit_generator.state, contour_state=sampler.state_dict(),
-                    dataset_signature=signature, config=asdict(config), global_step=global_step)
+                    dataset_signature=signature, config=asdict(config), global_step=global_step,
+                    refinement_artifacts={key: report[key] for key in
+                        ("pre_refine_checkpoints", "level_renders", "coarse_render")})
             initial = broadcast_device_state(initial, distributed, collective, mi, dr)
             if initial["dataset_signature"] != signature or initial["config"] != asdict(config):
                 raise ValueError("GPU workers have different datasets or training configurations")
             if initial["global_step"] != global_step:
                 raise ValueError("GPU workers restored different training steps")
+            report.update(initial["refinement_artifacts"])
             if not primary:
                 model = restore_model(initial, mi)
                 optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native)
@@ -1477,29 +1588,6 @@ def run_training(distributed=None):
             # Only rank 0 renders this one image; peers wait before any update.
             report["initial_render"] = distributed.broadcast(report.get("initial_render"))
             distributed.heartbeat("initial_render_finished", force=True)
-
-        def save(path, epochs):
-            if not primary:
-                return
-            save_started = time.perf_counter()
-            dr.eval(*model.snapshot().values())
-            dr.sync_thread()
-            arrays = {key: np.array(value, copy=True) for key, value in model.snapshot().items()}
-            metadata = model_metadata(model)
-            optimizer_state, topology_state = optimizer.state_dict(), topology.state_dict()
-            save_checkpoint(path, arrays, metadata,
-                training_state={"completed_epochs": epochs, "global_step": global_step,
-                    "optimizer_step": optimizer_step, "update_protocol": update_protocol,
-                    "rng_state": rng.bit_generator.state, "contour_state": sampler.state_dict(),
-                    "topology_state": topology_state, "dataset_signature": signature,
-                    # Sample before serialization; a resumed checkpoint cannot
-                    # recover the time spent writing that same checkpoint.
-                    "reconstruction_seconds": prior_seconds + time.perf_counter() - run_started,
-                    "reconstruction_time_complete": time_complete,
-                    "pending_epoch_transition": False},
-                optimizer_state=optimizer_state, config=asdict(config), provenance=report["provenance"])
-            report["checkpoint"] = str(path)
-            performance.record_checkpoint(path, time.perf_counter()-save_started)
 
         report.update(view_count=len(views), resumed=checkpoint is not None)
         # A restart writes a new history segment, preserving any later entries
@@ -1705,7 +1793,7 @@ def run_training(distributed=None):
                 validation_seconds = time.perf_counter() - validation_started
             progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} "
                                  f"| view {len(views)}/{len(views)} (100%) | updating topology...", force=True)
-            coarse_render = capture_coarse_image(epoch+1)
+            refinement_boundary = capture_refinement_boundary(epoch+1)
             topology_started = time.perf_counter()
             topology_evidence_finished = rgb_growth_requested or (rgb_deletion_enabled and deletion_evidence_collected)
             topology_cache_prepare_seconds = None
@@ -1719,11 +1807,11 @@ def run_training(distributed=None):
             if distributed is not None:
                 transition = broadcast_device_state((new_state, event,
                     optimizer.device_state_dict() if new_state is not None else None,
-                    coarse_render) if primary else None, distributed, collective, mi, dr)
-                new_state, event, new_optimizer, coarse_render = transition
-                if coarse_render is not None:
-                    report["coarse_render"] = coarse_render
-                    distributed.heartbeat("coarse_render_finished", force=True)
+                    refinement_boundary) if primary else None, distributed, collective, mi, dr)
+                new_state, event, new_optimizer, refinement_boundary = transition
+                record_refinement_boundary(report, refinement_boundary)
+                if refinement_boundary is not None:
+                    distributed.heartbeat("level_render_finished", force=True)
             if topology_cache_prepare_seconds is not None:
                 event["topology_cache_prepare_seconds"] = topology_cache_prepare_seconds
             if new_state is not None:
@@ -1774,9 +1862,14 @@ def run_training(distributed=None):
                      "epoch_growth_prepare_seconds": growth_prepare_seconds,
                      "epoch_growth_prepare_stage_seconds": growth_prepare_stage_seconds,
                      "epoch_topology_seconds": time.perf_counter()-topology_started}
-            if coarse_render is not None:
-                entry["coarse_render"] = coarse_render
-                entry["epoch_coarse_render_seconds"] = coarse_render.get("seconds", 0.)
+            if refinement_boundary is not None:
+                entry["pre_refine_checkpoint"] = refinement_boundary["checkpoint"]
+                entry["level_render"] = refinement_boundary["render"]
+                entry["epoch_refinement_cache_prepare_seconds"] = refinement_boundary["cache_prepare_seconds"]
+                entry["epoch_level_render_seconds"] = refinement_boundary["render"].get("seconds", 0.)
+                if refinement_boundary["coarse_render"] is not None:
+                    entry["coarse_render"] = refinement_boundary["coarse_render"]
+                    entry["epoch_coarse_render_seconds"] = entry["epoch_level_render_seconds"]
             if collective is not None:
                 communication_after = collective.statistics()
                 entry["collective"] = communication_after
@@ -1805,9 +1898,6 @@ def run_training(distributed=None):
             progress_line.finish(f"Epoch {epoch+1}/{config.training.num_epochs} done "
                 f"| loss={entry['mean_loss']:.6f} | {entry['seconds']:.2f}s "
                 f"| grid={entry['resolution']} | voxels={entry['active_voxels']}")
-            if epoch+1 in save_epochs and epoch+1 < config.training.num_epochs:
-                save(output / f"epoch-{epoch+1:05d}.npz", epoch+1)
-                emit("Saved checkpoint:", output / f"epoch-{epoch+1:05d}.npz", flush=True)
             performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
             publish_performance("running", training_status="running",
                               gpu_reference_cache=entry["gpu_reference_cache"], native_replay=entry["native_replay"],
@@ -1818,8 +1908,7 @@ def run_training(distributed=None):
         training_loop_started = None
         if end_epoch < config.training.num_epochs:
             stopped_checkpoint = output / f"epoch-{end_epoch:05d}.npz"
-            if end_epoch not in save_epochs:
-                save(stopped_checkpoint, end_epoch)
+            save(stopped_checkpoint, end_epoch)
             if distributed is not None:
                 distributed.barrier()
             report.update(status="stopped", training_status="stopped", completed_epochs=end_epoch,

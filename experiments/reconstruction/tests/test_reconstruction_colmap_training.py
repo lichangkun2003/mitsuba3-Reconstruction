@@ -84,13 +84,31 @@ def run_check(args, output):
                                f"{result.stdout}\n{result.stderr}")
 
     run([sys.executable, "-u", "-I", str(entry), "--config", str(config_path)], "full")
-    first = load_checkpoint(full / "epoch-00001.npz")
+    first_path = full / "before-refine-0004-epoch-00001.npz"
+    second_path = full / "before-refine-0008-epoch-00002.npz"
+    first = load_checkpoint(first_path)
+    second = load_checkpoint(second_path)
     final = load_checkpoint(full / "model.npz")
     report = json.loads((full / "training-report.json").read_text(encoding="utf-8"))
     assert report["training_status"] == report["evaluation"]["status"] == "passed"
     assert report["initial_render"]["resolution"] == 6
     assert report["initial_render"]["view_index"] == 1  # Global index 0 belongs to the held-out split.
     assert (report["initial_render"]["width"], report["initial_render"]["height"]) == (16, 12)
+    assert {path.name for path in full.glob("*.npz")} == {first_path.name, second_path.name, "model.npz"}
+    assert report["checkpoint_epochs"] == [1, 2]
+    assert set(report["level_renders"]) == {"4", "8"}
+    for core, storage, epoch, saved in ((4, 6, 1, first), (8, 10, 2, second)):
+        rendered = report["level_renders"][str(core)]
+        assert rendered["status"] == "passed"
+        assert rendered["core_resolution"] == core and rendered["resolution"] == storage
+        assert rendered["view_index"] == 1 and rendered["completed_epochs"] == epoch
+        assert Path(rendered["image"]).name == f"0000-level-{core:04d}.png"
+        assert Path(rendered["image"]).is_file()
+        assert saved["model_metadata"]["core_resolution"] == core
+        assert saved["model_metadata"]["resolution"] == storage
+        assert saved["training_state"]["completed_epochs"] == epoch
+        assert saved["training_state"]["pending_epoch_transition"] is True
+        assert saved["optimizer_state"] and saved["training_state"]["topology_state"]
     assert final["model_metadata"]["resolution"] == 18
     assert final["model_metadata"]["core_resolution"] == 16
     assert final["model_metadata"]["scene_mapping"] == "radial_seed_shell"
@@ -141,13 +159,17 @@ def run_check(args, output):
                                    [7., 8.5, 8.75, 5.25], atol=0, rtol=0)
         assert (camera["width"], camera["height"]) == (16, 12)
 
-    run([sys.executable, "-u", "-I", str(entry), "--resume", str(full / "epoch-00001.npz"),
+    run([sys.executable, "-u", "-I", str(entry), "--resume", str(first_path),
          "--output-dir", str(resumed), "--build-dir", args.build_dir, "--gpu", str(args.gpu)], "resume")
     recovered = load_checkpoint(resumed / "model.npz")
     assert recovered["model_metadata"] == final["model_metadata"]
     assert recovered["config"]["data"]["initialization"] == initialization
     assert recovered["training_state"]["rng_state"] == final["training_state"]["rng_state"]
     assert recovered["training_state"]["global_step"] == 21
+    resume_report = json.loads((resumed / "training-report.json").read_text(encoding="utf-8"))
+    assert resume_report["trained_epochs_this_run"] == 2
+    resumed_history = [json.loads(line) for line in Path(resume_report["history_file"]).read_text().splitlines()]
+    assert [row["epoch"] for row in resumed_history] == [2, 3]
     for key, value in final["model_state"].items():
         np.testing.assert_allclose(recovered["model_state"][key], value, atol=2e-6, rtol=2e-6,
                                    err_msg=f"resumed model {key}")

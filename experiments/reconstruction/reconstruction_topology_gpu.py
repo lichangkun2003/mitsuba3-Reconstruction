@@ -590,6 +590,7 @@ class GPUTopologyLifecycle:
         event["evidence_window_evaluated"] = rgb is not None
         masks = [mask for mask in (rgb, opacity) if mask is not None]
         checkpoint = None
+        adam_survivors = None
         if masks:
             # Compact decisions and scalar diagnostics must not keep the full
             # deletion evidence window alive throughout model/Adam remapping.
@@ -613,7 +614,12 @@ class GPUTopologyLifecycle:
                     event["deletion_rgb"]["deleted"] = self.count(rgb)
                 if opacity is not None:
                     event["deletion_opacity"]["deleted"] = self.count(opacity)
-                optimizer.remap(survivors, len(survivors))
+                # Revalidation needs compact model/lifecycle row IDs, but it
+                # never reads Adam. Keep this map in the original Adam layout
+                # so a subsequent append does not migrate every moment twice.
+                # Release replay owners before revalidation's temporary buffers.
+                optimizer.clear_replay()
+                adam_survivors = survivors
                 self.remap(survivors, len(survivors), boundary)
                 self.candidates = dr.zeros(self.Bool, m.count)
                 m.completed_windows = 0
@@ -631,7 +637,8 @@ class GPUTopologyLifecycle:
                 # Retire the old Adam tables before allocating the appended
                 # model. Otherwise its large radiance array competes with
                 # both the old and new radiance moments during remapping.
-                optimizer.remap(survivors, new_count)
+                optimizer.remap(adam_survivors if adam_survivors is not None else survivors, new_count)
+                adam_survivors = None
                 self.remap(survivors, new_count, boundary)
                 for name, value in checkpoint["model_state"].items():
                     addition = selected["cells" if name == "cell_indices" else name]
@@ -642,6 +649,12 @@ class GPUTopologyLifecycle:
                 event["grown"] = added
             elif not event["deleted"]:
                 checkpoint = None
+        if adam_survivors is not None:
+            # Deletion-only commits include an empty survivor map. If growth
+            # selection raises, let the existing failed-epoch path abort before
+            # starting a migration or trying to save a partial transaction.
+            optimizer.remap(adam_survivors, m.count)
+            adam_survivors = None
         m.pending_growth, m.pending_rgb_deletion = None, None
         m._growth_world_cache = m._growth_device = m._rgb_growth_device = m._rgb_deletion_device = None
         if len(self.cooldown_cells):

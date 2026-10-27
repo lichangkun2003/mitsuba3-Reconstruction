@@ -173,13 +173,20 @@ def main():
             assert saved_evaluation["max_views"] == max_views
 
         run_process([sys.executable, "-I", str(entry), "--config", str(config_path)], "full")
-        first = load_checkpoint(run / "full" / "epoch-00001.npz")
+        # Explicit bounded runs supply resume/oracle fixtures; ordinary full
+        # training no longer writes periodic snapshots.
+        for stop in (1, 2):
+            run_process([sys.executable, "-I", str(entry), "--config", str(config_path),
+                "--output-dir", str(run / f"full-stop-{stop}"),
+                "--stop-after-epochs", str(stop), "--skip-evaluation"], f"full-stop-{stop}")
+        first_path = run / "full-stop-1" / "epoch-00001.npz"
+        first = load_checkpoint(first_path)
         final = load_checkpoint(run / "full" / "model.npz")
         assert first["training_state"]["global_step"] == 2
         assert final["training_state"]["global_step"] == 6
         assert final["training_state"]["completed_epochs"] == 3
         assert final["model_metadata"]["resolution"] == 4
-        assert {path.name for path in (run / "full").glob("*.npz")} == {"epoch-00001.npz", "epoch-00002.npz", "model.npz"}
+        assert {path.name for path in (run / "full").glob("*.npz")} == {"model.npz"}
         full_report = json.loads((run / "full" / "training-report.json").read_text(encoding="utf-8"))
         assert full_report["reconstructed_model"]["completed_epochs"] == 3
         assert full_report["reconstructed_model"]["global_step"] == 6
@@ -225,12 +232,12 @@ def main():
             assert native_summary[name]["sampled_views"] == len(profiles)
             assert native_summary[name]["wall_seconds"]["total"] == math.fsum(
                 item["native_stages"][name]["wall_seconds"] for item in profiles)
-        assert len(performance["checkpoints"]) == 3
+        assert len(performance["checkpoints"]) == 1
         assert performance["phase_seconds"]["evaluation"] > 0
         assert performance["details"]["evaluation"]["status"] == "passed"
         assert performance["details"]["gpu_reference_cache"] == gpu_cache
         assert performance["details"]["native_replay"] == replay
-        report["checks"].append("three epochs save two intermediate checkpoints and final model without duplicate archives")
+        report["checks"].append("fixed-resolution training saves only final model; explicit bounded runs remain resumable")
         check_automatic_evaluation(run / "full", initial=True)
         saved_config = json.loads((run / "full" / "config.json").read_text(encoding="utf-8"))
         assert saved_config["render"]["spp"] == final["config"]["render"]["spp"] == 1
@@ -279,14 +286,14 @@ def main():
         report["checks"].append("train view 0 initial PNG matches untouched point-cloud initialization and is preserved on resume")
         if np.array_equal(first["model_state"]["radiance_sh"], final["model_state"]["radiance_sh"]):
             raise AssertionError("Full-epoch training did not change radiance parameters")
-        run_process([sys.executable, "-I", str(entry), "--resume", str(run / "full" / "epoch-00001.npz"),
+        run_process([sys.executable, "-I", str(entry), "--resume", str(first_path),
                      "--no-rgb-only",
                      "--output-dir", str(run / "resumed"), "--build-dir", args.build_dir, "--gpu", str(args.gpu),
                      "--reference-cache-mib", "0", "--profile-views", "0", "--profile-interval-epochs", "0",
                      "--gpu-reference-cache-mib", "0", "--no-freeze-native",
                      "--skip-evaluation"], "resume")
         resumed = load_checkpoint(run / "resumed" / "model.npz")
-        assert {path.name for path in (run / "resumed").glob("*.npz")} == {"epoch-00002.npz", "model.npz"}
+        assert {path.name for path in (run / "resumed").glob("*.npz")} == {"model.npz"}
         for key in final["model_state"]:
             np.testing.assert_allclose(resumed["model_state"][key], final["model_state"][key], atol=2e-6, rtol=2e-6)
         for name, group in final["optimizer_state"]["groups"].items():
@@ -362,9 +369,9 @@ def main():
         run_process([sys.executable, "-I", str(entry), "--config", str(config_path)], "coarse")
         coarse = load_checkpoint(run / "coarse" / "model.npz")
         assert coarse["model_metadata"]["resolution"] == 8
-        assert {path.name for path in (run / "coarse").glob("*.npz")} == {"epoch-00001.npz", "epoch-00002.npz", "model.npz"}
-        after_refine = load_checkpoint(run / "coarse" / "epoch-00001.npz")
-        assert after_refine["model_metadata"]["resolution"] == 8
+        assert {path.name for path in (run / "coarse").glob("*.npz")} == {"before-refine-0004-epoch-00001.npz", "model.npz"}
+        before_refine = load_checkpoint(run / "coarse" / "before-refine-0004-epoch-00001.npz")
+        assert before_refine["model_metadata"]["resolution"] == 4
         coarse_report = json.loads((run / "coarse" / "training-report.json").read_text(encoding="utf-8"))
         assert coarse_report["initial_render"]["status"] == "skipped"
         assert coarse_report["initial_render"]["reason"] == "evaluation_disabled"
@@ -377,17 +384,17 @@ def main():
         assert coarse_performance["by_resolution"]["8"]["completed_epochs"] == 2
         coarse_profiles = [json.loads(line) for line in Path(coarse_report["profile_file"]).read_text(encoding="utf-8").splitlines()]
         assert any(row["training_resolution"] == 8 and "enter_resolution" in row["sample_reasons"] for row in coarse_profiles)
-        assert after_refine["training_state"]["contour_state"] == {}
-        assert not after_refine["training_state"]["pending_epoch_transition"]
-        # New saves follow the epoch's topology transition. The training loader
-        # separately retains compatibility with legacy pending-transition files.
-        run_process([sys.executable, "-I", str(entry), "--resume", str(run / "coarse" / "epoch-00001.npz"),
+        assert before_refine["training_state"]["contour_state"]
+        assert before_refine["training_state"]["pending_epoch_transition"]
+        # New saves precede the transition and preserve the completed old
+        # level, including contour history, for a resumable split boundary.
+        run_process([sys.executable, "-I", str(entry), "--resume", str(run / "coarse" / "before-refine-0004-epoch-00001.npz"),
                      "--no-rgb-only",
                      "--output-dir", str(run / "coarse-resumed"), "--build-dir", args.build_dir,
                      "--gpu", str(args.gpu), "--reference-cache-mib", "0",
                      "--gpu-reference-cache-mib", "0", "--no-freeze-native"], "coarse-resume")
         coarse_resumed = load_checkpoint(run / "coarse-resumed" / "model.npz")
-        assert {path.name for path in (run / "coarse-resumed").glob("*.npz")} == {"epoch-00002.npz", "model.npz"}
+        assert {path.name for path in (run / "coarse-resumed").glob("*.npz")} == {"before-refine-0004-epoch-00001.npz", "model.npz"}
         for key in coarse["model_state"]:
             np.testing.assert_allclose(coarse_resumed["model_state"][key], coarse["model_state"][key], atol=2e-6, rtol=2e-6)
         assert coarse_resumed["training_state"]["global_step"] == 6
@@ -395,7 +402,7 @@ def main():
         for view_id, history in coarse["training_state"]["contour_state"].items():
             np.testing.assert_allclose(coarse_resumed["training_state"]["contour_state"][view_id]["mean_alpha"],
                                        history["mean_alpha"], atol=2e-6)
-        report["checks"].append("cached coarse-to-fine training and uncached post-refinement resume preserve contour and RNG without extra archives")
+        report["checks"].append("cached coarse-to-fine training and uncached pending-refinement resume preserve contour and RNG without extra archives")
 
         # With the current 6:4 budget, three epochs spend two epochs at the
         # coarse resolution. The independent single-resolution run above has
@@ -419,7 +426,7 @@ def main():
                 coarse_record["resolution"]) == (16, 16, 4)
         assert (coarse_record["spp"], coarse_record["seed"]) == (2, initial_seed)
         assert coarse_record["seconds"] > 0
-        coarse_oracle = load_checkpoint(run / "full" / "epoch-00002.npz")
+        coarse_oracle = load_checkpoint(run / "full-stop-2" / "epoch-00002.npz")
         optimized_coarse_model = restore_model(coarse_oracle, mi)
         assert coarse_record["active_voxels"] == int(optimized_coarse_model.active_voxel_count)
         expected_coarse_rgb, _ = render_view(optimized_coarse_model, initial_render,
@@ -430,14 +437,13 @@ def main():
                 mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.UInt8, True)
         np.testing.assert_array_equal(np.asarray(mi.Bitmap(str(coarse_image_path))),
                                       np.asarray(expected_coarse_png))
-        coarse_image_first = load_checkpoint(run / "coarse-image" / "epoch-00001.npz")
-        for key in first["model_state"]:
-            np.testing.assert_allclose(coarse_image_first["model_state"][key],
-                                       first["model_state"][key], atol=2e-6, rtol=2e-6)
-        assert coarse_image_first["training_state"]["rng_state"] == first["training_state"]["rng_state"]
-        coarse_image_refined = load_checkpoint(run / "coarse-image" / "epoch-00002.npz")
-        assert coarse_image_refined["model_metadata"]["resolution"] == 8
-        assert coarse_image_refined["training_state"]["rng_state"] == coarse_oracle["training_state"]["rng_state"]
+        coarse_image_saved = load_checkpoint(run / "coarse-image" / "before-refine-0004-epoch-00002.npz")
+        assert coarse_image_saved["model_metadata"]["resolution"] == 4
+        assert coarse_image_saved["training_state"]["pending_epoch_transition"]
+        for key in coarse_oracle["model_state"]:
+            np.testing.assert_allclose(coarse_image_saved["model_state"][key],
+                                       coarse_oracle["model_state"][key], atol=2e-6, rtol=2e-6)
+        assert coarse_image_saved["training_state"]["rng_state"] == coarse_oracle["training_state"]["rng_state"]
         coarse_image_history = [json.loads(line) for line in
             (run / "coarse-image" / "training.jsonl").read_text(encoding="utf-8").splitlines()]
         assert coarse_image_history[1]["coarse_render"] == coarse_record
@@ -446,7 +452,7 @@ def main():
         assert coarse_image_history[1]["resolution"] == 8
         assert coarse_image_history[1]["topology"]["refined"] is True
         assert {path.name for path in (run / "coarse-image" / "train").glob("*.png")} == {
-            "0000-initial.png", "0000-coarse.png", "0000.png"}
+            "0000-initial.png", "0000-coarse.png", "0000-level-0004.png", "0000.png"}
         # A repeat call must retain the historical coarse image, even if the
         # currently available model is already refined and further optimized.
         coarse_bytes = coarse_image_path.read_bytes()
@@ -494,8 +500,11 @@ def main():
         assert paths["deletion_cpu_views"] == paths["growth_cpu_views"] == 0, paths
         topology_summary = json.loads(Path(topology_report["performance_file"]).read_text(encoding="utf-8"))
         assert topology_summary["details"]["topology_execution"] == paths
+        run_process([sys.executable, "-I", str(entry), "--config", str(config_path),
+            "--output-dir", str(run / "device-topology-stopped"), "--stop-after-epochs", "1"],
+            "device-topology-stop")
         run_process([sys.executable, "-I", str(entry),
-            "--resume", str(run / "device-topology" / "epoch-00001.npz"), "--no-rgb-only",
+            "--resume", str(run / "device-topology-stopped" / "epoch-00001.npz"), "--no-rgb-only",
             "--output-dir", str(run / "device-topology-resume"), "--build-dir", args.build_dir,
             "--gpu", str(args.gpu), "--gpu-reference-cache-mib", "0"], "device-topology-resume")
         expected = load_checkpoint(run / "device-topology" / "model.npz")

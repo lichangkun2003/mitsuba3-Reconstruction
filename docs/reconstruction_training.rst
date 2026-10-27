@@ -708,9 +708,9 @@ checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设
    CONFIG.schedule.target_resolution = 512
    CONFIG.schedule.level_weights = (6, 4)  # 512终点；1024终点使用(4,3,3)
    CONFIG.training.num_epochs = 1000
-   CONFIG.training.save_count = 3
+   CONFIG.training.save_count = 3  # 旧配置兼容字段；不控制当前保存计划
    CONFIG.training.output = None  # 自动创建 outputs/场景-月.日-E编号/training
-   CONFIG.evaluation.enabled = True  # 保存初始化、粗层结束对照图，并在训练完成后自动出图
+   CONFIG.evaluation.enabled = True  # 保存初始化、每次升层前对照图，并在训练完成后自动出图
    CONFIG.evaluation.spp = 64
    CONFIG.evaluation.max_views = None  # 兼容旧全局上限；None 使用下面的分划分配置
    CONFIG.evaluation.train_max_views = 10
@@ -728,7 +728,8 @@ checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设
 配置还支持 JSON 分组覆盖及少量命令行覆盖，优先级为：代码中的 ``CONFIG``，然后
 ``--config`` JSON，最后命令行参数。例如 ``--dataset datasets/ficus`` 会覆盖配置块中的数据集。
 当前配置块默认是 bicycle、1 spp、1500 个 epoch；合成场景默认出图 800 × 800，COLMAP 使用所选参考图分辨率。
-随机种子 42、整个实验保存三次（含最终模型）。修改 ``--epochs`` 同时设置分辨率调度的
+随机种子 42，在每次升分辨率前保存完整 checkpoint，训练完成后保存最终模型。
+修改 ``--epochs`` 同时设置分辨率调度的
 总训练预算，因此不能把不同预算的早期阶段当成相同调度。
 两层默认按 ``schedule.level_weights = (6, 4)`` 分配：
 1000 轮为 256 层级 600 轮、512 层级 400 轮；700 轮为 420／280 轮。
@@ -782,21 +783,21 @@ JSON 的 ``schedule.level_weights`` 若已显式给定，则不会被自动替�
 * ``training``：``num_epochs``、``chunk_size``、``profile_views``、``profile_interval_epochs``、
   ``profile_stages``、``reference_cache_mib``、``gpu_reference_cache_mib``、
   ``freeze_native``、``seed``、``shuffle``、
-  ``save_count``（默认 3，包含最后一次）和输出路径 ``output``；``None`` / JSON ``null``
-  表示自动分配实验目录，字符串表示使用显式路径。
+  ``save_count``（保留旧配置兼容性，不控制保存计划）和输出路径 ``output``；
+  ``None`` / JSON ``null`` 表示自动分配实验目录，字符串表示使用显式路径。
 * ``gradient``：alpha 损失、几何代理宽度/截断、边界和删除证据等参数。
 * ``optimizer``：各类参数学习率、Adam、裁剪、步长限制和不透明度调度。
 * ``topology``：体素增删及证据条件。
 * ``schedule``：coarse-to-fine 开关和分辨率计划；启用时由此组决定起始分辨率。
 * ``contour``：训练时可选的 contour 重要性采样。
 * ``runtime``：源码构建目录和本地 GPU 编号。
-* ``evaluation``：初始化、粗层结束对照图及训练结束后出图设置，默认 ``enabled=True``、``spp=64``、
+* ``evaluation``：初始化、每次升层前对照图及训练结束后出图设置，默认 ``enabled=True``、``spp=64``、
   ``max_views=None``、``train_max_views=10``、``test_max_views=None``、
   ``chunk_size=65536``、``seed=42``。合成场景测试相机文件由
   ``test_cameras="transforms_test.json"`` 指定；分划分的 ``None`` 或 ``0`` 表示全部视角。
 
 仅想训练时可传 ``--skip-evaluation``，或设置 ``CONFIG.evaluation.enabled=False``，
-同时跳过初始化、粗层结束对照图与最终评价。
+同时跳过初始化、每次升层前对照图与最终评价；checkpoint 仍按原边界保存。
 ``--eval-spp`` 覆盖自动评价的采样数；``--eval-train-max-views`` /
 ``--eval-test-max-views`` 分别覆盖两个划分的上限，``0`` 表示全部。
 旧 ``--eval-max-views`` 及配置中的非空 ``max_views`` 仍优先同时覆盖两个划分；
@@ -851,7 +852,6 @@ JSON 的 ``schedule.level_weights`` 若已显式给定，则不会被自动替�
      "render": {"width": 800, "height": 800, "spp": 1},
      "training": {
        "num_epochs": 2,
-       "save_count": 3,
        "output": null
      },
      "schedule": {"enabled": false}
@@ -1332,7 +1332,7 @@ legacy 生长证据期间，每批冻结候选的中心和六个轴向采样点�
 
 性能汇总在每个完整 epoch 结束时原子刷新，训练和自动评价结束时再次更新；
 正常处理 ``Ctrl+C`` 或运行异常时也尝试保存当前已记录的信息。它不是模型 checkpoint，
-不会改变原来的三次模型保存计划，也不能用来恢复未保存的训练进度。
+不会改变模型 checkpoint 的保存边界，也不能用来恢复未保存的训练进度。
 进程被强制结束、Slurm 超时终止或节点故障时，最后一次成功写入的完整记录仍可用于分析，
 但不能保证取得正在执行的视角或轮次的完整耗时。
 
@@ -1513,7 +1513,7 @@ Adam 状态的数值误差。可调整 ``--cameras``、``--warmup``、``--repeat
 完整训练成功、最终 ``model.npz`` 保存并关闭训练文件后，实验目录自动追加重建分钟数：
 例如 ``lego-10.15-E3`` 改为 ``lego-10.15-E3-20min``，然后在新目录内进行最终评价。
 分钟数向上取整，不足一分钟显示 ``1min``。计时使用活动进程的墙钟时长，
-包含初始化、训练、训练期间 checkpoint 和初始化／粗层对照图，以及最终模型保存；
+包含初始化、训练、训练期间 checkpoint 和初始化／升层前对照图，以及最终模型保存；
 不包含后续训练集、测试集评价出图。即使指定 ``--skip-evaluation``，训练成功后也会改名。
 ``training-report.json`` 的 ``reconstruction_seconds`` 保留秒数，
 ``experiment_directory`` 记录改名状态及分钟数。
@@ -1544,13 +1544,15 @@ Adam 状态的数值误差。可调整 ``--cameras``、``--warmup``、``--repeat
 
    outputs/lego-10.15-E1-20min/
      model.npz          # 训练完成后自动导出的完整体素重建模型
-     training/          # 训练配置、日志及最多两份中间 checkpoint（默认）
+     training/          # 训练配置、日志、升层前及显式停止时的 checkpoint
+       before-refine-0256-epoch-00600.npz  # 1000 轮、256→512、6:4 调度示例
        performance-summary.json  # 自动更新的本次进程耗时汇总
        training.jsonl            # 逐轮耗时、损失和拓扑事件
        profile-training.jsonl    # 稀疏抽样的内核性能记录
-     train/             # 初始化、粗层结束对照图、最终模型训练集视角 PNG 和 metrics.json
-       0000-initial.png  # 第一次参数更新前，训练相机索引 0 的初始化体素图
-       0000-coarse.png   # 粗层全部视角优化结束后、第一次升层前，同一相机的图
+     train/             # 初始化、每次升层前对照图、最终训练集视角 PNG 和 metrics.json
+       0000-initial.png  # 第一次参数更新前，第一个训练相机的初始化体素图
+       0000-level-0256.png  # 256 层全部视角优化结束后、升层前，同一相机的图
+       0000-coarse.png   # 第一层对照图的兼容副本
        0000.png         # 同一相机下的最终重建图
      test/              # 最终模型的测试集视角 PNG 和 metrics.json
      evaluation-config.json
@@ -1953,11 +1955,12 @@ GPU 升层
 跳过其结果会被覆盖的二分；其判定与最终模型规则没有改变。边界子格仍完整执行原拟合。
 没有可表示子体素或超过 ``max_active_voxels`` 时拒绝替换并保留旧模型。
 空模型同样按保存的升层策略更新元数据并保留空数组。新生命周期与 Adam 按旧规则清零，原生占据索引和
-八叉树在 GPU 重建。数量压紧及错误标量允许少量同步，普通升层不整表回读父模型。
+八叉树在 GPU 重建。数量压紧及错误标量允许少量同步，GPU 升层拟合本身不整表回读父模型。
 
-``--no-gpu-topology`` 保留 NumPy 对照。训练按既定保存计划关闭额外的
-``schedule.save_each_level``；其他调用若显式开启它，仍生成可序列化的旧层 checkpoint，
-该显式存档会回读模型、优化器和生命周期，不能把此情况称为完全没有主机传输。
+``--no-gpu-topology`` 保留 NumPy 对照。训练入口在升层前保存完整 checkpoint，
+这一步会回读模型、优化器和生命周期；训练入口关闭底层 ``schedule.save_each_level``，
+避免重复保存同一旧层。其他调用若显式开启该兼容选项，仍生成可序列化的旧层 checkpoint。
+因此，包含存档的整个升层边界并非完全没有主机传输。
 日志 ``topology.refinement_backend="cuda"`` 及 ``refinement_stage_seconds`` 分别报告
 拟合、可选旧层存档和重置阶段；外层 ``epoch_topology_seconds`` 还包含后续模型替换等工作。
 
@@ -1977,38 +1980,44 @@ RTX 4060 Laptop 的 8192 父体素→60320 子体素合成拟合，CPU 1.535 秒
 Checkpoint 与恢复
 -----------------
 
-``training.save_count=3`` 表示整个实验保存三次完整状态，包含最后的 ``model.npz``。
-保存轮次按总 epoch 数均匀分配并向上取整：1000 轮在第 334、667、1000 轮保存，
-30 轮在第 10、20、30 轮保存；不足三轮时每轮保存一次，不重复保存同一轮。
-例如前面的本地 10 轮命令会生成 ``training/epoch-00004.npz``、
-``training/epoch-00007.npz`` 和实验根目录 ``model.npz``。
-不再额外生成 ``latest.npz``、最终轮次的 ``epoch-XXXXX.npz`` 或升分辨率前的分层副本。
+自动 checkpoint 在每次升分辨率之前和全部训练完成时保存，不再按 epoch 等间隔保存。
+升层前文件名为 ``training/before-refine-{core:04d}-epoch-{completed:05d}.npz``，
+其中 ``core`` 是当前核心分辨率，``completed`` 是已完成的总 epoch 数。
+1000 轮、256 → 512、权重 6:4 时保存 ``before-refine-0256-epoch-00600.npz``；
+1500 轮、256 → 512 → 1024、权重 4:3:3 时，分别在第 600、1050 轮保存
+``before-refine-0256-epoch-00600.npz`` 和 ``before-refine-0512-epoch-01050.npz``。
+完成全部预算后保存实验根目录的 ``model.npz``。固定分辨率训练没有自动中间 checkpoint，
+也不额外生成 ``latest.npz`` 或最终轮次的 ``epoch-XXXXX.npz``。
 显式使用 ``--stop-after-epochs`` 做有界短测试时，会在本次结束的完整轮次额外保存
-``epoch-XXXXX.npz`` 作为恢复点；这个主动停止点不改变总训练预算和原定三次保存计划。
+``epoch-XXXXX.npz`` 作为恢复点；这个主动停止点不改变总训练预算和分辨率调度。
 尚未完成全部预算时，不生成最终的 ``model.npz``，也不运行最终评价。
 
 训练输出还包括 ``config.json``、``training.jsonl``、``training-report.json`` 和
 ``performance-summary.json``。
-日志仍记录每轮的平均训练损失、分辨率、体素数与拓扑事件，保存次数不改变日志频率、
-参数更新或分辨率调度。Checkpoint 在完整 epoch 及该轮拓扑处理结束后保存；它不是任意
-视角中途的恢复点。中断后需从最近保存的 checkpoint 重算尚未保存的 epoch；
-第一次保存前中断则需要重新开始。中间 checkpoint 保存不触发出图；全部 epoch 完成并保存
-``model.npz`` 后，默认自动调用评价流程一次。
+日志仍记录每轮的平均训练损失、分辨率、体素数与拓扑事件，保存策略不改变日志频率、
+参数更新或分辨率调度。升层前 checkpoint 在该层最后一个 epoch 的全部视角更新后、
+拓扑转换前保存，并标记 ``pending_epoch_transition=true``；显式停止和最终 checkpoint
+在该轮拓扑处理结束后保存。它们都不是任意视角中途的恢复点。
+中断后需从最近保存的 checkpoint 重算尚未保存的 epoch；第一次保存前中断则需要重新开始。
+启用评价时，每次升层前另保存该层的第一个训练视角对照图；全部 epoch 完成并保存
+``model.npz`` 后，默认自动调用最终评价流程一次。
 
 最终的 ``model.npz`` 使用同一套原子写入和校验格式，包含完整体素状态、网格元数据、
 配置和训练恢复状态。它在全部训练成功完成后、自动评价开始前导出；训练中断时，可从最近保存的
-``training/epoch-XXXXX.npz`` 恢复或评价中间结果。恢复一个已经完成的 checkpoint 到新目录时，
+升层前 checkpoint 或显式停止的 ``training/epoch-XXXXX.npz`` 恢复或评价中间结果。
+恢复一个已经完成的 checkpoint 到新目录时，
 也会自动导出 ``model.npz``。训练报告的 ``reconstructed_model`` 记录导出路径、SHA-256、
 完成轮数及更新次数。新实验拒绝覆盖已有的最终模型；恢复时也会校验既有模型的配置、
 随机种子和训练数据签名，防止把其他实验的结果替换掉。
 
-旧配置中的 ``training.save_every_epochs`` 仍可读取，但该字段不再控制保存间隔；
-未显式指定 ``save_count`` 时使用默认三次。``schedule.save_each_level`` 保留旧配置兼容性，
-训练入口不再据此额外保存分层副本；分辨率调度与体素更新流程保持不变。
-已有的 ``latest.npz`` 和 ``level-R-epoch-XXXXX.npz`` 仍可通过 ``--resume`` 加载，
-不会自动删除或改写这些旧结果。旧分层文件中的 ``pending_epoch_transition=true``
-表示该轮所有视角已更新完，但尚需执行升层；训练恢复时仍会先完成一次待执行的升层，
-再进入下一个 epoch。评价加载旧分层文件时保留保存的本层模型，不自动升层。
+旧配置中的 ``training.save_count`` 和 ``training.save_every_epochs`` 仍可读取，
+但都不再控制保存计划，恢复时也不要求 ``save_count`` 一致。
+``schedule.save_each_level`` 保留底层调用的旧配置兼容性，训练入口统一保存上述完整
+升层前 checkpoint，关闭底层的重复存档。已有的 ``latest.npz``、``epoch-XXXXX.npz``
+和 ``level-R-epoch-XXXXX.npz`` 仍可通过 ``--resume`` 加载，不会自动删除或改写这些旧结果。
+新旧 checkpoint 中的 ``pending_epoch_transition=true`` 都表示该轮所有视角已更新完，
+但尚需执行拓扑转换；训练恢复时先完成一次待执行转换，再进入下一个 epoch，
+不会重复已完成的视角更新。评价加载此类文件时保留保存的本层模型，不自动升层。
 
 Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pickle。保存过程先在
 目标目录写临时文件、刷新，再原子替换目标，避免覆盖过程中留下半个 checkpoint。
@@ -2039,19 +2048,19 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 这些模块位于 ``experiments/reconstruction``，独立脚本需要将该目录加入 Python 导入路径。
 模型文件包含渲染所需的全部体素参数；计算 PSNR 仍需数据集的相机 JSON 和真值图片。
 
-例如前面的本地 10 轮实验在第二次保存后中断，可从第 7 轮恢复：
+例如 1000 轮、256 → 512、权重 6:4 的本地实验，可从第 600 轮的升层前状态恢复：
 
 .. code-block:: powershell
 
    & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\train.py `
-     --resume outputs/lego-10.15-E1/training/epoch-00007.npz
+     --resume outputs/lego-10.15-E1/training/before-refine-0256-epoch-00600.npz
 
-前面的服务器 1000 轮实验对应从第二次保存的第 667 轮恢复：
+1500 轮、256 → 512 → 1024、权重 4:3:3 的服务器实验，可从第 1050 轮的升层前状态恢复：
 
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I mitsuba/experiments/reconstruction/train.py \
-     --resume outputs/lego-10.15-E1/training/epoch-00667.npz
+     --resume outputs/lego-10.15-E1/training/before-refine-0512-epoch-01050.npz
 
 恢复时默认复用 checkpoint 所在实验，不递增 ``E编号``：中间 checkpoint 使用所在的
 训练目录，标准布局根目录的 ``model.npz`` 使用同一实验下的 ``training/``，旧平铺布局
@@ -2061,8 +2070,7 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 恢复会校验训练数据签名，并保持原算法设置和总 epoch 预算。运行环境和输出目录可以
 换到当前机器；更换算法参数或重新制定分辨率调度应开启新的实验。跨机器恢复保留完整
 优化状态，但 GPU 累加次序等差异仍可能改变后续低位数值，不保证逐位确定性。
-恢复也固定 ``training.seed``、``training.shuffle`` 和 ``training.save_count``，保持同一
-实验的保存计划不变，并检查完整 epoch 数与视角更新
+恢复也固定 ``training.seed`` 和 ``training.shuffle``，并检查完整 epoch 数与视角更新
 次数是否一致；不会从不完整的视角计数继续。每次恢复写入单独的
 ``training-resume-TIMESTAMP.jsonl`` 日志，保留此前日志，避免同一文件中重复混入恢复前
 已运行但未保存的 epoch。比较曲线时应按本次运行的日志段与恢复点选取数据。
@@ -2074,21 +2082,27 @@ Checkpoint 是单个 NPZ，包含 JSON 元数据和数值数组，不使用 pick
 -----------------
 
 新实验默认在点云初始化完成、第一次参数更新前，额外保存
-``train/0000-initial.png``。视角 0 指训练相机 JSON 中的第一个相机，与训练打乱顺序无关。
+``train/0000-initial.png``。视角 0 指训练划分中的第一个相机，与训练打乱顺序无关；
+COLMAP 数据集中的相机全局索引不一定为 0。
 该图使用 ``evaluation.spp``（默认 64，可由 ``--eval-spp`` 覆盖），
-分辨率、背景及随机种子约定与最终 ``train/0000.png`` 一致，便于前后对照；
+分辨率、背景及随机种子约定与最终评价中同一相机的图一致，便于前后对照；
+合成场景通常对应 ``train/0000.png``，COLMAP 最终图文件名使用相机的全局索引。
 独立的出图采样不会改变训练随机序列，训练仍为 1 spp。
 双卡训练只由 rank 0 保存这一张图。恢复 checkpoint 时保留已有初始化图，
 若缺失也不把恢复后的模型当作初始化模型重新出图。``--skip-evaluation`` 同时关闭此功能。
 
-启用多层调度时，粗层最后一个 epoch 的全部训练视角更新完、执行升层之前，
-还会保存 ``train/0000-coarse.png``。默认 256 → 512 时，这张图展示优化完成的 256 层模型，
-尚未分裂为 512 层体素。它与初始化图和最终图使用相同的训练视角 0、分辨率、
+启用多层调度时，每层最后一个 epoch 的全部训练视角更新完、执行升层之前，
+还会保存 ``train/0000-level-{core:04d}.png``。256 → 512 → 1024 时分别保存
+``0000-level-0256.png`` 和 ``0000-level-0512.png``，展示该层完成优化、尚未分裂的模型；
+文件名使用核心分辨率，而非含背景的存储网格分辨率。第一层另保留 ``0000-coarse.png``
+作为兼容副本。对照图与初始化图和最终图使用相同的第一个训练相机、分辨率、
 背景、评价随机种子约定及 ``evaluation.spp``（默认 64），不会改变训练随机序列。
-``training-report.json`` 的 ``coarse_render`` 记录该次出图信息。
-双卡只由 rank 0 出图，其他工作进程等待完成后继续升层；固定单层训练不生成此图。
-恢复训练时保留已有文件；若 checkpoint 已进入细层且此前未保存，
-无法从细层模型还原粗层图，也不会用细层模型冒充。``--skip-evaluation`` 同样关闭粗层出图。
+``training-report.json`` 的 ``level_renders`` 记录各层出图信息，
+``pre_refine_checkpoints`` 记录对应 checkpoint；第一层同时保留 ``coarse_render``。
+双卡只由 rank 0 出图，其他工作进程等待完成后继续升层；固定单层训练不生成此类对照图。
+恢复训练时保留已有文件；恢复升层前 checkpoint 时可以补存该层缺失的对照图，
+但已进入细层的 checkpoint 无法还原此前粗层的图。``--skip-evaluation`` 关闭这些对照图，
+不影响升层前 checkpoint 的保存。
 
 训练入口默认在保存最终模型后调用评价流程，使用 64 spp 渲染训练集前十个视角和
 测试集全部视角，并保存每个视角的图片和 PSNR。训练集不足十个时全取。
@@ -2228,7 +2242,8 @@ PNG 同时用于显示与可复算的正式指标。进行论文或其他实现�
 上使用 ``cuda_ad_rgb`` 完成以下检查；CPU 与模拟环境检查单独列出：
 
 下表保留已有验证记录。本次整图提交与按需回读修改后，另行完成了生成小场景的 CUDA 性能回归，
-并重跑训练集成检查：两视角三轮、三次模型保存、普通及升层后恢复、独立评价均通过。
+并重跑训练集成检查：两视角三轮、旧保存策略下的 checkpoint 往返、普通及升层后恢复、
+独立评价均通过；其中历史保存次数不代表当前保存策略。
 未重新运行真实 Lego 实验，也未在 A100 或真实 Slurm 作业中测量吞吐量。
 
 本次自动评价改动另在同一 RTX 4060 的 ``cuda_ad_rgb`` 下通过生成的 16 × 16 场景检查：
