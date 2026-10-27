@@ -142,7 +142,7 @@ def main(argv=None):
     config.data.dataset = args.dataset
     config.data.scene_mode = "auto"  # bicycle resolves to the current unbounded initializer.
     config.data.initialization = None
-    config.data.background_layers = 8
+    config.data.background_final_layers = 8
     config.data.background_opacity = .5
     config.model.grid_resolution = config.schedule.start_resolution = 256
     # Match the requested training schedule's initialization/LR conventions;

@@ -25,11 +25,11 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
     resolution, core = int(model.resolution), int(model.core_resolution)
     if not 0 < core < resolution or (resolution - core) % 2:
         raise ValueError("A background shell requires a positive, symmetric grid padding")
-    if refinement not in (None, "fixed_layers"):
+    if refinement not in (None, "fixed_layers", "preserve_physical_width"):
         raise ValueError("Unknown background refinement policy")
-    if refinement == "fixed_layers" and (type(layers) is not int or layers < 1
-                                         or resolution != core + 2 * layers):
-        raise ValueError("Fixed-layer background metadata must match grid padding")
+    if refinement is not None and (type(layers) is not int or layers < 1
+                                  or resolution != core + 2 * layers):
+        raise ValueError("Background layer metadata must match initial grid padding")
     extent = resolution / core
     if (not np.allclose(model.grid_min, [-extent]*3, rtol=0, atol=1e-7)
             or not np.allclose(model.grid_max, [extent]*3, rtol=0, atol=1e-7)):
@@ -85,6 +85,8 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
         result.background_layers = layers
     result.background_initialization = dict(
         region="cell_AABB_intersects_radial_shell", opacity=opacity,
+        initial_background_layers=(resolution-core)//2,
+        background_refinement=refinement or "preserve_physical_width",
         color="point_seed_radiance_else_black", seed_voxels=int(model.active_voxel_count),
         initialized_voxels=count, straight_ray_forward=True)
     return result

@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from preview import (DataConfig, ModelConfig, RenderConfig, RuntimeConfig, PreviewConfig,
                      validate_config, validate_traversal, native_traversal_settings,
-                     scene_background_protocol)
+                     scene_background_protocol, apply_saved_background_defaults)
 from reconstruction_common import (REPOSITORY, WORKSPACE, ContourSampler, UniformSampler, ReferenceImageCache,
     generate_ray_batch, prepare_camera, initialize_runtime, load_views, model_metadata,
     prepare_dataset, initialize_model,
@@ -127,7 +127,7 @@ CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
 CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再解码；渲染与损失仍在线性空间。
 CONFIG.data.scene_mode = "auto"  # 合成场景：有界白色背景；COLMAP：无界远景层、无白色背景尾项。
-CONFIG.data.background_layers = 8  # 新无界场景各层级均保留8层远景；升层时物理厚度减小。
+CONFIG.data.background_final_layers = 8  # 最终远景层数；1024 终点按 2→4→8 层细分，物理范围不变。
 CONFIG.data.background_opacity = 0.5  # 远景新生体素 opacity；允许后续优化和删除。
 
 CONFIG.render.width = 800
@@ -214,6 +214,8 @@ def update(config, values):
             raise ValueError(f"Unknown or malformed configuration fields in {name}")
         for key, value in entries.items():
             setattr(group, key, value)
+        if name == "data":
+            apply_saved_background_defaults(group, entries)
 
 
 def parse_arguments():
@@ -234,7 +236,9 @@ def parse_arguments():
     parser.add_argument("--dataset")
     parser.add_argument("--scene-mode", choices=("auto", "bounded", "unbounded"),
                         help="auto: bounded synthetic / unbounded COLMAP; override for a new scene")
-    parser.add_argument("--background-layers", type=int, help="Radial shell layers retained at every level for new scenes (default: 8)")
+    parser.add_argument("--background-final-layers", type=int,
+                        help="Radial background layers at the target resolution (default: 8); independent of max_hits")
+    parser.add_argument("--background-layers", type=int, help="Legacy v2/v3 setting; use --background-final-layers for new runs")
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
     parser.add_argument("--output-dir", help="Override automatic outputs/SCENE-MM.DD-Eindex/training; on resume the default reuses the checkpoint's experiment")
     parser.add_argument("--build-dir")
@@ -277,6 +281,7 @@ def apply_arguments(config, args, values):
         (args.dataset, "data", "dataset"), (args.output_dir, "training", "output"),
         (getattr(args, "scene_mode", None), "data", "scene_mode"),
         (getattr(args, "background_layers", None), "data", "background_layers"),
+        (getattr(args, "background_final_layers", None), "data", "background_final_layers"),
         (getattr(args, "background_opacity", None), "data", "background_opacity"),
         (args.build_dir, "runtime", "build_dir"), (args.gpu, "runtime", "gpu"),
         (args.chunk_size, "training", "chunk_size"),
@@ -912,10 +917,17 @@ def normalized_algorithm_group(name, values):
         return {key: value for key, value in values.items() if key != "traversal"}
     if name == "data" and values is not None:
         # Omitted/None COLMAP options are identical for historical synthetic runs.
-        return {"reference_compositing": "linear", "scene_mode": "auto",
-            "background_layers": 8, "background_opacity": .5, **{
+        normalized = {"reference_compositing": "linear", "scene_mode": "auto",
+            "background_layers": 8, "background_final_layers": None, "background_opacity": .5, **{
             key: value for key, value in values.items()
             if key not in ("images", "initialization") or value is not None}}
+        # The saved initializer determines which layer parameter is meaningful.
+        # Preserve historical comparisons without silently changing its policy.
+        if (values.get("initialization") or {}).get("version") == 4:
+            normalized.pop("background_layers", None)
+        elif normalized["background_final_layers"] is None:
+            normalized.pop("background_final_layers")
+        return normalized
     defaults = {"topology": TopologySettings, "gradient": GradientSettings}
     if values is not None and name in defaults:
         normalized = {**asdict(defaults[name]()), **values}
@@ -1116,7 +1128,9 @@ def run_training(distributed=None):
             runtime, training_output = config.runtime, config.training.output
             # Fields introduced after a checkpoint must use their legacy
             # dataclass defaults, not the latest experiment's CONFIG switches.
-            config.data = DataConfig(background_layers=8)  # Historical default for saves without this field.
+            saved_data = checkpoint["config"].get("data", {})
+            config.data = (DataConfig() if (saved_data.get("initialization") or {}).get("version") == 4
+                           else DataConfig(background_layers=8, background_final_layers=None))
             config.render = RenderConfig()
             config.topology = TopologySettings()
             config.gradient = GradientSettings()

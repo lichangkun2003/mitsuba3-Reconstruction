@@ -110,8 +110,8 @@ checkpoint 缺字段时的兼容值。该项从第一轮开始生效，升层时
    L_{\mathrm{dist}}=2\sum_{i<j}w_iw_j|s_i-s_j|.
 
 ``D_grid`` 是当前层级网格 AABB 的世界空间对角线长度，同一层级内固定。
-有界场景及旧版固定物理壳宽模型在升层时保持该值；新的固定层数远景在升层时压薄壳层、
-缩小 AABB，因此该归一化尺度随新层级的网格边界更新。
+有界场景与新无界实验的固定物理壳宽模型在升层时保持该值；旧 version 3 的固定层数远景
+在升层时压薄壳层、缩小 AABB，因此该旧策略的归一化尺度随新层级的网格边界更新。
 ``t_entry`` 是当前射线进入网格的固定深度。``t_i`` 取当前体素裁剪段内、
 椭球二次型取得最小值的位置，即现有 ``xStar`` 对应的深度，既不是体素中心，
 也不是新的椭球表面交点。深度按归一化射线方向的世界距离计算；
@@ -623,15 +623,18 @@ COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理�
 .. code-block:: python
 
    CONFIG.data.scene_mode = "auto"
-   CONFIG.data.background_layers = 8
+   CONFIG.data.background_final_layers = 8
    CONFIG.data.background_opacity = 0.5
 
-``background_layers`` 表示各层级保留的远景径向层数（以当前体素宽度计），默认 8，不与
-``render.max_hits`` 关联。无界初始化保持原有径向点压缩：单位球内仅作坐标归一化，
+``background_final_layers`` 表示最终分辨率下的远景径向层数，默认 8；当前层数按
+``background_final_layers * core_resolution / target_resolution`` 计算，必须为整数。
+它不与 ``render.max_hits`` 关联；后者默认 16，限制整条射线的椭球命中数，包含近景与背景。
+无界初始化保持原有径向点压缩：单位球内仅作坐标归一化，
 单位球外的初始点压缩到半径 ``1 + shell_width`` 以内，其中
-``shell_width = 2 * background_layers / start_resolution``。
+``shell_width = 2 * background_final_layers / target_resolution``，整个升层过程保持此物理壳宽。
 **压缩仅用于初始化点；相机光线仍按当前直线前向、DDA／八叉树和椭球求交执行。**
-没有引入曲线射线、运行时坐标收缩或新的深度定义，不能将该初始化描述为完整的无界射线映射。
+没有引入曲线射线、运行时坐标收缩或新的深度定义。初始化只移动背景点仍可能改变多视角投影关系；
+本次升层策略不修复这一限制，不能将该初始化描述为完整的无界射线映射。
 
 所有静态格子 AABB 与径向球壳相交的远景格统一初始化：有点云种子的格保留种子颜色，
 其余为黑色；opacity 均设为 ``0.5``。使用能覆盖格子立方体的球形椭球，防止仅填满
@@ -640,30 +643,36 @@ COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理�
 生长的父体与目标都限制在核心区域；远景格删除后不通过生长重新填回。
 区域按静态格子与单位球的关系确定，不随优化后的椭球中心移动。
 
-新无界实验从核心分辨率 256 开始，可选择终点 512 或 1024。默认远景始终为 8 层：
-实际网格分辨率依次为 272、528、1040，边界半径为 ``(core_resolution + 16) / core_resolution``。
-内场按原规则细分；远景先沿用原来的八子格拟合，再将单位球外子体素的径向距离压缩到一半壳宽，
-因此物理厚度逐层减半。映射到同一目标格的子体素会合并，而非直接保留八倍子体素。
-近景与远景仍使用同一层级的体素边长，未保留粗体素远景，也不在升层时重新初始化完整壳层。
-该几何映射与合并是下一层优化的近似初始化，不保证升层前后渲染等价；每次升层后继续执行原有 warmup。
+新无界实验从核心分辨率 256 开始，可选择终点 512 或 1024。最终远景 8 层时：
+
+* 终点 1024：背景层数为 2 → 4 → 8，实际网格为 260 → 520 → 1040；
+  网格各轴边界始终为 ``[-65/64, 65/64]``，物理壳宽始终为 ``1/64``。
+* 终点 512：背景层数为 4 → 8，实际网格为 264 → 528；
+  网格各轴边界始终为 ``[-33/32, 33/32]``，物理壳宽始终为 ``1/32``。
+
+近景与远景均按原来的八子格拟合正常细分，体素边长相同；升层不再径向压缩背景，也不裁掉外层。
+正常细分的几何拟合及 opacity 继承仍是离散近似，不保证升层前后渲染完全一致。
+每次升层后继续执行原有 warmup，不重新初始化完整壳层。
 只使用已有子体素作为支持，不从空壳回填，已删除的远景区域不会因升层而自动重新铺满。
-完整壳层仍会增加体素数、参数、Adam 状态与细分后的显存占用，不能沿用稀疏远景初始化时的显存估计。
+这会减少早期背景层数，但最终 1024／8 层的显存规模与旧固定 8 层方案相近；
+模型参数、Adam 状态及升层临时数组仍需计入，不能据此认定 40 GB 足够或消除了升层峰值。
 初始每层 opacity 为 0.5 不等于强制不透明边界：删除、连续优化、有限 ``max_hits``、
 有限远裁剪面及后续几何变化都可能留下透射率，剩余部分以黑色尾项结束。
 
-新无界 COLMAP 初始化保存 ``data.initialization.version=3``、
-``background_refinement="fixed_layers"`` 和 ``background_layers=8``；模型 metadata 同步保存
-这两个策略字段。``shell_layers`` 记录固定层数，``shell_width`` 记录初始化层级的物理壳宽，
-用于恢复相同的点云压缩和相机归一化。各升层模型的当前边界保存在模型 metadata 中。
+新无界 COLMAP 初始化保存 ``data.initialization.version=4``、
+``background_refinement="preserve_physical_width"``、``background_final_layers`` 和
+``initial_background_layers``。``shell_layers`` 记录最终层数，``shell_width`` 记录固定物理壳宽，
+用于恢复相同的点云压缩和相机归一化。模型 metadata 中的网格及核心分辨率随正常细分翻倍，边界不变。
 checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设置会报错。
-有界 COLMAP 保持 version 2。旧无界 version 2 checkpoint 不增加 ``fixed_layers`` 标记，
-继续按原有固定物理厚度策略升层，其径向层数随分辨率翻倍。旧 checkpoint 不会自动升级为固定 8 层；
-比较固定 8 层方案必须新开实验。
+有界 COLMAP 保持 version 2。旧无界 version 3 checkpoint 继续使用 ``fixed_layers``：
+各级层数固定，升层时压缩并合并背景。旧 version 2 保持原始物理壳宽，其 ``background_layers``
+表示初始层数，之后随分辨率翻倍。这些旧字段不会被重新解释为最终层数；
+新的实验使用 ``--background-final-layers``，比较新策略应新开实验。
 旧 version 1 checkpoint 保留原来的相机、点云压缩、网格和已保存背景，不会自动铺满远景、
 改为黑底或应用新的远景生长限制。比较新初始化应从新实验开始。
 
-本次需要增量编译 Python 绑定，使模型可携带持久化的场景元数据；
-``reconstruction.cpp`` 中的前向追踪与梯度没有因此更改。在 Windows 仓库根目录执行：
+最终层数策略复用现有正常升层与原生前向，无需为本次 Python 修改重新编译。
+若本地还未编译此前的 C++ 更新，可先执行下面的增量编译，然后在 Windows 仓库根目录运行：
 
 .. code-block:: powershell
 
@@ -671,7 +680,7 @@ checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设
    if ($LASTEXITCODE -ne 0) { throw "编译失败" }
    & ..\envs\mitsuba\python.exe -u -I experiments/reconstruction/train.py `
      --dataset datasets/bicycle --scene-mode unbounded `
-     --background-layers 8 --background-opacity 0.5 --gpu 0 --epochs 1500 `
+     --background-final-layers 8 --background-opacity 0.5 --gpu 0 --epochs 1500 `
      --target-resolution 1024 --level-weights 4 3 3
 
 若使用 venv，将解释器路径换为 ``..\envs\mitsuba\Scripts\python.exe``。
@@ -690,7 +699,7 @@ checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设
    CONFIG.data.dataset = "datasets/lego"  # 切换场景就在这里改，例如 datasets/ficus
    CONFIG.data.point_cloud = "init_points.ply"
    CONFIG.data.scene_mode = "auto"  # 合成场景有界白底；COLMAP 无界黑底
-   CONFIG.data.background_layers = 8  # 新无界实验各层级均保留8层远景
+   CONFIG.data.background_final_layers = 8  # 最终层数；1024终点为2→4→8，512终点为4→8
    CONFIG.data.background_opacity = 0.5
    CONFIG.data.cameras = "transforms_train.json"
    CONFIG.render.width = 800
@@ -737,7 +746,7 @@ checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设
 命令行 ``--target-resolution 1024`` 在新实验未显式配置权重时选用 ``(4, 3, 3)``，
 ``--epochs 1500 --target-resolution 1024 --level-weights 4 3 3`` 的分配如下：
 
-.. list-table:: 1500 轮、固定 8 层远景的三层调度
+.. list-table:: 1500 轮、最终 8 层远景的三层调度
    :header-rows: 1
    :widths: 20 25 25 30
 
@@ -746,11 +755,11 @@ checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设
      - 训练轮数
      - 全局 epoch
    * - 256
-     - 272
+     - 260
      - 600
      - 1–600
    * - 512
-     - 528
+     - 520
      - 450
      - 601–1050
    * - 1024
@@ -1840,14 +1849,14 @@ Python 环境中的 NVIDIA NCCL 包也会被搜索。启动器不会自动安装
 CUDA 设备，N>1 时需要上述 NCCL 库。通信检查通过后再运行短训练，检查真实场景的行为与吞吐。
 
 先保持 Bicycle 总计 1500 轮的完整分辨率调度，执行前 10 轮并保存恢复点。
-省略 ``--workers`` 即使用本次分配的全部 GPU；以下选项与最近单卡速度测试一致：
+省略 ``--workers`` 即使用本次分配的全部 GPU；以下单卡与多卡命令使用相同的新背景层数策略：
 
 .. code-block:: bash
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --worker-timeout 600 \
      --dataset datasets/bicycle --scene-mode unbounded \
-     --background-layers 4 --background-opacity 0.5 \
+     --background-final-layers 8 --background-opacity 0.5 \
      --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
      --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
@@ -1865,7 +1874,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
      --dataset datasets/bicycle --scene-mode unbounded \
-     --background-layers 4 --background-opacity 0.5 \
+     --background-final-layers 8 --background-opacity 0.5 \
      --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
      --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
@@ -1882,7 +1891,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --worker-timeout 600 \
      --dataset datasets/bicycle --scene-mode unbounded \
-     --background-layers 4 --background-opacity 0.5 --epochs 1500 --chunk-size 0 \
+     --background-final-layers 8 --background-opacity 0.5 --epochs 1500 --chunk-size 0 \
      --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages \
      --eval-spp 64 --eval-train-max-views 10 --eval-test-max-views 0
@@ -1932,10 +1941,13 @@ GPU 升层
 默认 RGB GPU topology 的升层通过 ``reconstruction_refinement_gpu.refine_state_gpu``
 直接处理父模型设备缓冲。它保持 NumPy ``refine_state`` 的 FP64 几何、归一四元数、
 父 opacity 筛选、有限盒内拟合、18 轮二分及 preferred center。
-有界与旧版无界模型仍按子格编号优先、父体素原顺序压紧，core／shell 分辨率元数据同步翻倍；
-它们的 DC 颜色继承及光学厚度衰减规则保持不变。
+有界、新 version 4 无界及旧固定物理壳宽模型按子格编号优先、父体素原顺序压紧，
+核心／实际网格分辨率元数据同步翻倍，物理边界不变；DC 颜色继承及光学厚度衰减规则保持不变。
+新无界实验的最终层数在初始化时决定起始壳宽，因此普通细分自然得到 2 → 4 → 8
+或 4 → 8 层；不运行径向映射、同格合并或外层裁剪。
 
-标有 ``background_refinement="fixed_layers"`` 的新无界模型先使用同一个八子格拟合器。
+旧 version 3、标有 ``background_refinement="fixed_layers"`` 的无界模型仍使用原恢复策略。
+它先使用同一个八子格拟合器。
 对拟合后中心半径 ``r > 1`` 的子体素，保持径向方向 ``n``，将中心映射为
 ``F(x) = n * (1 + (r - 1) / 2)``，并用该映射的局部 Jacobian 变换椭球几何支持范围。
 同一目标格中的子体素按映射后体积加权合并中心，沿代表坐标的三个轴估计合并后的支持范围；
@@ -1943,7 +1955,7 @@ GPU 升层
 内部子体素保留原细分继承行为。核心分辨率翻倍、远景层数保持不变，实际网格边界随壳层变薄更新，
 保存的初始化相机归一化不改变。
 
-这一步是下一层的近似几何及外观初始化，不保证合并椭球包含各输入椭球的完整并集，
+该旧策略的径向映射是下一层的近似几何及外观初始化，不保证合并椭球包含各输入椭球的完整并集，
 也不保证升层前后图像或透射率一致。它不会重新初始化远景。
 只有已有拟合子体素提供支持，空壳不回填；每个新层级仍按原配置 warmup，再继续生长和删除。
 不生成完整八倍父 SH 临时表，最终子体素数量确定后才分配颜色与 opacity 缓冲。

@@ -64,6 +64,7 @@ class BackgroundConfigTests(unittest.TestCase):
         for name, values in {
                 "scene_mode": [None, "outside"],
                 "background_layers": [0, -1, True, 1.5],
+                "background_final_layers": [0, -1, True, 1.5],
                 "background_opacity": [0., 1., -1., True, float("inf"), float("nan")],
         }.items():
             for value in values:
@@ -76,10 +77,11 @@ class BackgroundConfigTests(unittest.TestCase):
     def test_shell_layers_independent_of_hit_capacity(self):
         config = preview.PreviewConfig()
         config.render.max_hits = 1
-        self.assertEqual(config.data.background_layers, 8)
+        self.assertEqual(config.data.background_final_layers, 8)
+        self.assertIsNone(config.data.background_layers)
         preview.validate_config(config)
         config.render.max_hits = 32
-        self.assertEqual(config.data.background_layers, 8)
+        self.assertEqual(config.data.background_final_layers, 8)
         preview.validate_config(config)
 
     def test_old_resume_configuration_gets_equivalent_defaults(self):
@@ -95,13 +97,37 @@ class BackgroundConfigTests(unittest.TestCase):
     def test_training_cli_keeps_requested_initialization_settings(self):
         import train
         with patch.object(sys, "argv", ["train.py", "--scene-mode", "unbounded",
-                         "--background-layers", "8", "--background-opacity", "0.5"]):
+                         "--background-final-layers", "8", "--background-opacity", "0.5"]):
             args = train.parse_arguments()
         config = train.TrainConfig()
         train.apply_arguments(config, args, asdict(train.CONFIG))
         self.assertEqual(config.data.scene_mode, "unbounded")
-        self.assertEqual(config.data.background_layers, 8)
+        self.assertEqual(config.data.background_final_layers, 8)
+        self.assertIsNone(config.data.background_layers)
         self.assertEqual(config.data.background_opacity, .5)
+
+    def test_saved_final_layer_protocol_and_evaluation(self):
+        import evaluate
+        import train
+        for target, initial in ((512, 4), (1024, 2)):
+            with self.subTest(target=target):
+                saved = {"data": {"scene_mode": "unbounded", "background_final_layers": 8,
+                         "background_layers": None, "background_opacity": .5,
+                         "initialization": {"version": 4, "scene_mode": "unbounded",
+                             "background_refinement": "preserve_physical_width",
+                             "initial_background_layers": initial, "background_final_layers": 8,
+                             "shell_layers": 8, "start_core_resolution": 256,
+                             "target_core_resolution": target}}}
+                data = evaluate.checkpoint_data_config(saved)
+                report = preview.scene_background_protocol(data, preview.RenderConfig())
+                self.assertEqual(report["initial_background_layers"], initial)
+                self.assertEqual(report["final_background_layers"], 8)
+                self.assertEqual(report["background_refinement"], "preserve_physical_width")
+                self.assertEqual(data.background_final_layers, 8)
+                self.assertIsNone(data.background_layers)
+                normalized = train.normalized_algorithm_group("data", asdict(data))
+                self.assertEqual(normalized["background_final_layers"], 8)
+                self.assertNotIn("background_layers", normalized)
 
     def test_target_resolution_cli_defaults_and_explicit_level_weights(self):
         import train

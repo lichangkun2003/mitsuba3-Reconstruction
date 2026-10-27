@@ -114,12 +114,25 @@ def prepare_dataset(config, np, *, load_points=True):
     schedule = getattr(config, "schedule", None)
     start = schedule.start_resolution if schedule and schedule.enabled else config.model.grid_resolution
     target = schedule.target_resolution if schedule and schedule.enabled else start
-    options = {} if mode == "legacy" else dict(scene_mode=mode,
-        background_layers=config.data.background_layers, background_opacity=config.data.background_opacity)
+    options = {}
+    if mode == "legacy":
+        options["shell_layers"] = config.data.initialization["shell_layers"]
+    else:
+        options.update(scene_mode=mode, background_opacity=config.data.background_opacity)
+        saved = config.data.initialization
+        if mode == "unbounded" and (saved is None or saved.get("version") == 4):
+            if config.data.background_layers is not None:
+                raise ValueError("New unbounded runs use data.background_final_layers / --background-final-layers; "
+                                 "background_layers is only for legacy v2/v3 initializations")
+            options["background_final_layers"] = config.data.background_final_layers
+        else:
+            if mode == "unbounded" and config.data.background_final_layers is not None:
+                raise ValueError("Saved v2/v3 initialization must keep its original background_layers; "
+                                 "start a new run to use background_final_layers")
+            options["background_layers"] = config.data.background_layers
     prepared = prepare_colmap(dataset, split=_colmap_split(config.data.cameras), images_dir=config.data.images,
         point_cloud=config.data.point_cloud, initialization=config.data.initialization,
         start_core_resolution=start, target_core_resolution=target,
-        shell_layers=(config.data.initialization["shell_layers"] if mode == "legacy" else config.render.max_hits),
         load_points=load_points, **options)
     config.data.initialization = prepared["initialization"]
     config.render.width, config.render.height = prepared["width"], prepared["height"]
@@ -142,7 +155,8 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
             return initialize_background_model(model, mi, dr, np,
                 opacity=prepared["initialization"]["background_opacity"],
                 refinement=prepared["initialization"].get("background_refinement"),
-                layers=prepared["initialization"].get("background_layers"))
+                layers=prepared["initialization"].get("initial_background_layers",
+                                                    prepared["initialization"].get("background_layers")))
         return model
     lo, hi = np.asarray(config.model.bounds_min), np.asarray(config.model.bounds_max)
     center, half = (lo + hi) / 2, (hi - lo) / 2 * config.model.bounds_padding

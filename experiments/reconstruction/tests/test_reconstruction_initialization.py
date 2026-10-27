@@ -82,25 +82,60 @@ class InitializationIntegrationTests(unittest.TestCase):
         prepared = common.prepare_dataset(self.config, np)
         self.assertEqual((self.config.render.width, self.config.render.height), (16, 12))
         self.assertEqual(self.config.data.initialization, prepared["initialization"])
-        self.assertEqual(prepared["initialization"]["shell_layers"], self.config.data.background_layers)
-        self.assertEqual((prepared["resolution"], prepared["core_resolution"]), (272, 256))
+        self.assertEqual(prepared["initialization"]["shell_layers"], self.config.data.background_final_layers)
+        self.assertEqual((prepared["resolution"], prepared["core_resolution"]), (264, 256))
         mi = self.native()
         with patch.dict(sys.modules, {"drjit": SimpleNamespace()}), patch(
                 "reconstruction_background.initialize_background_model", return_value=sentinel.colmap_model) as shell:
             result = common.initialize_model(self.config, self.scene, mi, np, prepared=prepared)
         self.assertEqual(shell.call_args.kwargs,
-                         {"opacity": .5, "refinement": "fixed_layers", "layers": 8})
+                         {"opacity": .5, "refinement": "preserve_physical_width", "layers": 4})
         self.assertIs(result, sentinel.colmap_model)
         mi.VoxelReconstruction.assert_not_called()
         args = mi.VoxelReconstruction.from_points.call_args.args
-        self.assertEqual(args[2:], (272, [-1.0625] * 3, [1.0625] * 3,
+        self.assertEqual(args[2:], (264, [-1.03125] * 3, [1.03125] * 3,
                                     self.config.model.sh_count, self.config.model.opacity_sh_count, 256))
         for actual, expected in zip(args[:2], (prepared["positions"], prepared["colors"])):
             self.assertEqual(actual.dtype, np.dtype(np.float32))
             self.assertEqual(actual.ndim, 1)
             self.assertTrue(actual.flags.c_contiguous)
             np.testing.assert_array_equal(actual, expected.reshape(-1))
-        np.testing.assert_allclose(args[0].reshape(-1, 3)[-1], [1.05625, 0., 0.])
+        np.testing.assert_allclose(args[0].reshape(-1, 3)[-1], [1.028125, 0., 0.])
+
+    def test_final_layer_initialization_is_independent_of_ray_hit_capacity(self):
+        self.config.schedule.target_resolution = 1024
+        prepared = []
+        for max_hits in (1, 16, 32):
+            config = copy.deepcopy(self.config)
+            config.render.max_hits = max_hits
+            prepared.append(common.prepare_dataset(config, np))
+        for value in prepared:
+            self.assertEqual(value["resolution"], 260)
+            self.assertEqual(value["grid_max"], [65/64]*3)
+            self.assertEqual(value["initialization"]["initial_background_layers"], 2)
+            np.testing.assert_array_equal(value["positions"], prepared[0]["positions"])
+
+    def test_saved_legacy_config_keeps_original_layout(self):
+        import preview
+        import train
+        from reconstruction_dataset import prepare_colmap
+        legacy = prepare_colmap(self.scene, shell_layers=16)["initialization"]
+        legacy.update(version=3, scene_mode="unbounded", scene_mapping="radial_seed_shell",
+                      background_refinement="fixed_layers", background_layers=8,
+                      background_opacity=.5, shell_layers=8)
+        entries = {"data": {"dataset": str(self.scene), "initialization": legacy}}
+        for update in (train.update, preview.update_config):
+            with self.subTest(loader=update.__module__):
+                config = TrainConfig()
+                update(config, entries)
+                self.assertIsNone(config.data.background_final_layers)
+                restored = common.prepare_dataset(config, np)
+                self.assertEqual(restored["resolution"], 272)
+                self.assertEqual(restored["grid_max"], [1.0625]*3)
+                self.assertEqual(restored["initialization"], legacy)
+                config.data.background_final_layers = 8
+                with self.assertRaisesRegex(ValueError, "original background_layers"):
+                    common.prepare_dataset(config, np)
 
     def test_fixed_resolution_uses_same_core_spacing_and_full_final_shell(self):
         self.config.schedule.enabled = False
