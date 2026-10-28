@@ -297,6 +297,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("rgb_only_version") = nb::int_(Model::rgb_only_version);
     cls.attr("rgb_growth_version") = nb::int_(Model::rgb_growth_version);
     cls.attr("rgb_deletion_version") = nb::int_(Model::rgb_deletion_version);
+    cls.attr("background_rgb_deletion_version") = nb::int_(Model::background_rgb_deletion_version);
     cls.attr("distortion_version") = nb::int_(Model::distortion_version);
     cls.attr("dssim_version") = nb::int_(Model::dssim_version);
     cls.attr("sh_schedule_version") = nb::int_(Model::sh_schedule_version);

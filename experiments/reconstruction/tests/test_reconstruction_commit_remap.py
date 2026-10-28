@@ -75,6 +75,8 @@ class Optimizer(FalcorOptimizer):
         # on CPU arrays, including its actual cache clearing and step counts.
         self.mi, self.dr = SimpleNamespace(Float=Float, UInt32=UInt), Dr
         self.count = count
+        self.radiance_degree_steps = False
+        self.sh_degree_count = 3
         self.dimensions = dict(radiance_sh=27, opacity_sh=1, centers=3,
                                log_scales=3, rotation_tangent=3)
         self._state = {

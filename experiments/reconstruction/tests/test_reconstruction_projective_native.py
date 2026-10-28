@@ -148,18 +148,24 @@ def make_ray(mi, np, origins, directions, maxt=math.inf):
 
 
 def native(model, mi, dr, ray, *, use_octree=True, coefficient=.7, max_hits=64,
-           threshold=0., replay=None, evidence=False, growth=False):
+           threshold=0., replay=None, evidence=False, growth=False,
+           reference=(.3,.4,.5), dssim_weight=0., image_size=None):
     options={"rgb_only":1.,"max_hits":float(max_hits),"max_candidates":4.,
         "use_octree":float(use_octree),"distortion_loss_weight":coefficient,
         "transmittance_threshold":threshold,"collect_rgb_deletion_evidence":float(evidence),
         "collect_growth_evidence":float(growth),"max_growth_hits":8.}
-    args=(ray,mi.Color3f(.3,.4,.5),mi.Float(0),mi.Color3f(0),mi.Float(1),options)
+    if dssim_weight:
+        options.update(dssim_loss_weight=dssim_weight,
+                       image_width=float(image_size[0]), image_height=float(image_size[1]))
+    args=(ray,mi.Color3f(*(float(v) for v in reference)),mi.Float(0),mi.Color3f(0),mi.Float(1),options)
     result=model.loss_and_grad(*args) if replay is None else replay(model,*args)
     dr.eval(result);dr.sync_thread()
     return result
 
 
 def run_checks(mi,dr,np):
+    assert int(getattr(mi.VoxelReconstruction,'background_rgb_deletion_version',0)) >= 1, \
+        'Rebuild this checkout before testing projective background RGB deletion'
     payload=fixture(np);model=restore_model(payload,mi)
     rays=[((.8,0,0),(.6,0,.8)), ((3,.15,.23),(-1,.02,.04)),
           ((0,0,0),(1,1,0)),((0,0,0),(-1,-1,-1)),
@@ -217,12 +223,14 @@ def run_checks(mi,dr,np):
     replay=NativeLossReplay(dr)
     for i in (0,1,2,0):
         changing=make_ray(mi,np,[rays[i][0]],[rays[i][1]])
-        reference=native(model,mi,dr,changing)
-        actual=native(model,mi,dr,changing,replay=replay)
-        for key in ('raw_rgb','hit_count','distortion_loss'):
+        reference=native(model,mi,dr,changing,evidence=True)
+        actual=native(model,mi,dr,changing,replay=replay,evidence=True)
+        for key in ('raw_rgb','hit_count','distortion_loss','deletion_gain',
+                    'deletion_observed','deletion_unknown'):
             np.testing.assert_allclose(np.asarray(actual[key]),np.asarray(reference[key]),atol=2e-6)
     report['changing_camera_frozen_replay']='passed'
     report.update(check_appearance_and_evidence(payload,rays,mi,dr,np))
+    report.update(check_background_removal(mi,dr,np))
     return report
 
 
@@ -261,8 +269,17 @@ def check_appearance_and_evidence(payload,rays,mi,dr,np):
         ray=make_ray(mi,np,[o],[d])
         original=restore_model(payload,mi)
         deletion=native(original,mi,dr,ray,evidence=True)
-        for key in ('deletion_gain','deletion_observed','deletion_unknown'):
-            assert not np.asarray(deletion[key])[~core_mask].any(),key
+        background_hits=[hit[1] for hit in expected['hits'] if not core_mask[hit[1]]]
+        assert background_hits,case
+        for background_row in background_hits:
+            background_omitted=subset(np.arange(count)!=background_row)
+            background_without=oracle(background_omitted,o,d,np)
+            background_gain=(np.sum((expected['rgb']-target)**2)-
+                             np.sum((background_without['rgb']-target)**2))
+            np.testing.assert_allclose(np.asarray(deletion['deletion_gain'])[background_row],
+                                       background_gain,atol=3e-6)
+            assert int(np.asarray(deletion['deletion_observed'])[background_row])==1
+            assert int(np.asarray(deletion['deletion_unknown'])[background_row])==0
         without=oracle(omitted,o,d,np)
         gain=np.sum((expected['rgb']-target)**2)-np.sum((without['rgb']-target)**2)
         np.testing.assert_allclose(float(np.asarray(deletion['deletion_gain'])[row]),gain,atol=3e-6)
@@ -280,7 +297,69 @@ def check_appearance_and_evidence(payload,rays,mi,dr,np):
             np.testing.assert_array_equal(np.asarray(truncated['growth_unknown']),[1])
     return {'world_direction_spherical_harmonics':'passed',
         'core_growth_and_removal_with_cross_chart_background_suffix':'passed',
-        'truncated_core_growth_abstention_and_no_background_rgb_votes':'passed'}
+        'projective_background_single_removal_matches_world_oracle':'passed',
+        'truncated_core_growth_abstention':'passed'}
+
+
+def check_background_removal(mi,dr,np):
+    # Two covering background cells on the +Z chart. The front white, half-
+    # transparent cell contaminates the desired color of the cell behind it.
+    # Neither cell is below the ordinary low-opacity deletion threshold.
+    grid,core,layers=8,4,2
+    payload={'model_metadata':{'resolution':grid,'core_resolution':core,
+        'grid_min':[-2.]*3,'grid_max':[2.]*3,'scene_mapping':'projective_shell',
+        'background_refinement':'preserve_physical_width','background_layers':layers,
+        'sh_count':1,'opacity_sh_count':1},
+        'model_state':{'cell_indices':np.array([4+grid*(4+grid*z) for z in (6,7)],np.uint32),
+            'centers':np.full(6,.5),
+            'log_scales':np.full(6,math.log(math.sqrt(3)/4*(1+1e-6))),
+            'rotations':np.tile([1.,0.,0.,0.],2),
+            'radiance_sh':np.array([[1.,1.,1.],[.6,.8,1.]]).ravel()/Y00,
+            'opacity_sh':np.zeros(2)}}
+    omitted=copy.deepcopy(payload)
+    omitted['model_state']={key:value.reshape(2,-1)[1:].ravel().copy()
+                            for key,value in payload['model_state'].items()}
+    origin,direction=(.13,.22,0.),(0.,0.,1.)
+    expected=oracle(payload,origin,direction,np)
+    without=oracle(omitted,origin,direction,np)
+    target=np.array([.3,.4,.5])
+    assert len(expected['hits'])==2
+    np.testing.assert_allclose(without['rgb'],target,atol=1e-12)
+    gain=np.sum((expected['rgb']-target)**2)-np.sum((without['rgb']-target)**2)
+    assert gain>.1,gain
+    model=restore_model(payload,mi)
+    ray=make_ray(mi,np,[origin],[direction])
+    result=native(model,mi,dr,ray,evidence=True)
+    np.testing.assert_allclose(np.asarray(result['deletion_gain'])[0],gain,atol=3e-6)
+    np.testing.assert_array_equal(np.asarray(result['deletion_observed']),[1,1])
+    np.testing.assert_array_equal(np.asarray(result['deletion_unknown']),[0,0])
+    # Evidence must also protect a useful half-transparent background cell.
+    perfect=native(model,mi,dr,ray,evidence=True,reference=expected['rgb'])
+    expected_negative=-np.sum((without['rgb']-expected['rgb'])**2)
+    np.testing.assert_allclose(np.asarray(perfect['deletion_gain'])[0],expected_negative,atol=3e-6)
+    assert float(np.asarray(perfect['deletion_gain'])[0])<0
+    for cap,threshold in ((1,0.),(64,.6)):
+        truncated=native(model,mi,dr,ray,evidence=True,max_hits=cap,threshold=threshold)
+        np.testing.assert_array_equal(np.asarray(truncated['hit_count']),[1])
+        np.testing.assert_array_equal(np.asarray(truncated['deletion_gain']),[0.,0.])
+        np.testing.assert_array_equal(np.asarray(truncated['deletion_observed']),[0,0])
+        np.testing.assert_array_equal(np.asarray(truncated['deletion_unknown']),[1,0])
+
+    # A complete image uses its DSSIM gradient for optimization, while the
+    # deletion criterion remains exact RGB-L2 removal gain for every hit.
+    origins=[(.13+.01*x,.22+.01*y,0.) for y in range(3) for x in range(4)]
+    image=make_ray(mi,np,origins,[direction]*len(origins))
+    off=native(model,mi,dr,image,evidence=True)
+    on=native(model,mi,dr,image,evidence=True,dssim_weight=.2,image_size=(4,3))
+    for key in ('deletion_gain','deletion_observed','deletion_unknown'):
+        np.testing.assert_allclose(np.asarray(on[key]),np.asarray(off[key]),atol=3e-6)
+    np.testing.assert_allclose(np.asarray(on['deletion_gain'])[0],len(origins)*gain,atol=1e-5)
+    assert np.isfinite(np.asarray(on['dssim_loss'])).all()
+    assert not np.allclose(np.asarray(on['gradients']['radiance_sh']),
+                           np.asarray(off['gradients']['radiance_sh']))
+    return {'half_transparent_background_positive_and_negative_rgb_removal_gain':'passed',
+            'truncated_background_removal_abstains':'passed',
+            'dssim_background_removal_keeps_rgb_criterion':'passed'}
 
 
 def main():

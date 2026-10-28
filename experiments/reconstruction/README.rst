@@ -345,7 +345,16 @@ opacity，不是 ``T*a`` 贡献、参考 alpha 或未经 sigmoid 的系数；仅
 旧模型仍可独立评价。完整投票定义、截断弃权、每射线记录容量与
 局限见 ``docs/reconstruction_training.rst`` 开头。
 已有原生 RGB 删除要求 ``mi.VoxelReconstruction.rgb_deletion_version >= 1``，
-持续低 opacity 分支及本次出生 opacity 继承仅修改 Python，多父体生长修正仍需要上述 C++ 构建。
+projective 背景删除还要求 ``mi.VoxelReconstruction.background_rgb_deletion_version >= 1``，
+修改后必须增量编译并重新启动。启用已有 RGB 删除时，核心和六个背景分区在所有层级
+直接共用同一删除收益、支持／反对视角和连续窗口确认规则，不增加背景配置开关。
+半透明背景只要删除收益通过确认即可被删除，不要求 opacity 先降到 ``0.1``；
+低 opacity 分支的背景最细层保护仍独立保留，背景仍不参与生长。
+因透射率或命中上限提前结束的路径仍记为 unknown，不能用不完整后方颜色决定删除。
+因此启用背景 RGB 删除不会保证所有重叠背景立即消失，也不会改变已有模型的纯渲染结果。
+旧 projective checkpoint 续训时重置旧的 RGB 删除证据窗口和确认计数，
+重新收集完整的前景／背景视角证据；模型、Adam 和低 opacity 确认状态保留。
+持续低 opacity 分支及出生 opacity 继承仅修改 Python，多父体生长修正仍需要上述 C++ 构建。
 旧 checkpoint 缺少 ``use_rgb_deletion`` 时按 ``False`` 恢复，
 保留原有已保存配置，不自动给原来关闭删除的实验启用此机制；启用应新开实验。
 旧 checkpoint 缺少 ``use_low_opacity_deletion`` 时也按 ``False`` 恢复；
@@ -605,9 +614,12 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
      --config "E:\lck\reconstruction\mitsuba\experiments\reconstruction\configs\bicycle_1024.json"
 
 配置采用 256 → 512 → 1024、4:3:3 的轮数比例（600 / 450 / 450 轮）、最终 8 层背景（2 → 4 → 8），
-Distortion 权重 0.1，启用 GPU 拓扑和原生重放，关闭性能抽样。训练为整图 1 spp，
+Distortion 和 D-SSIM 权重均为 0.2，启用 GPU 拓扑和原生重放，关闭性能抽样。训练为整图 1 spp，
 最终评价为 64 spp，训练集和测试集均评价全部视角。
-前景与外景的 radiance 均使用 9 个 SH 系数（0、1、2 阶），保留方向性；opacity 仍仅优化 DC。
+前景与外景的 radiance 均存储每通道 9 个 SH 系数（0、1、2 阶），共用
+``training.sh_degree_weights=[8,0,2]``：第 1–1200 轮仅优化 DC，
+第 1201–1500 轮同时开启 1、2 阶方向性颜色。网格在第 1051 轮进入 1024，
+因此该层级先优化 150 轮 DC；opacity 仍仅优化 DC。
 COLMAP 图像尺寸由数据集读取，会覆盖 JSON 中 ``render.width`` / ``render.height`` 的初始值。
 
 日常修改 JSON 中的 ``data.dataset``、``training.num_epochs``、

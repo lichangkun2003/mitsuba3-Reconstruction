@@ -20,7 +20,7 @@ RGB-only 训练、在线生长与删除（当前默认）
    CONFIG.render.traversal = "octree"
    CONFIG.training.num_epochs = 1000
    CONFIG.training.sh_degree_progression = True
-   CONFIG.training.sh_degree_weights = (4, 3, 3)
+   CONFIG.training.sh_degree_weights = (8, 0, 2)
    CONFIG.gradient.alpha_loss_weight = 0
    CONFIG.gradient.alpha_geometry_weight = 0
    CONFIG.gradient.background_carve_weight = 0
@@ -74,7 +74,8 @@ RGB 收益与持续低 opacity 两条删除分支，总开关关闭时两者均�
 渐进开启辐射颜色的 SH 阶数
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-新实验默认按总训练轮数的 ``4:3:3`` 比例逐步开启辐射颜色的球谐系数。
+新实验默认在前 80% 的训练轮数只开启辐射颜色的 0 阶，在最后 20% 同时开启 1、2 阶。
+前景和 projective 背景共用同一阶数调度，方向性颜色使用世界空间射线方向。
 这里的三组是 ``l=0、1、2``，各有 ``1、3、5`` 个基函数；累计开启数为
 ``1、4、9``。每个系数包含 RGB 三个颜色分量，因此完整颜色参数仍为每体素 27 个数。
 opacity 始终保持原来的单个 DC logit，不参与这个颜色阶数调度。
@@ -86,15 +87,18 @@ opacity 始终保持原来的单个 DC logit，不参与这个颜色阶数调度
    {
      "training": {
        "sh_degree_progression": true,
-       "sh_degree_weights": [4, 3, 3]
+       "sh_degree_weights": [8, 0, 2]
      }
    }
 
-对于 ``num_epochs=1500``，第 1–600 轮只优化 0 阶；第 601–1050 轮同时优化
-0、1 阶；第 1051–1500 轮同时优化 0、1、2 阶。两个切换点分别取总轮数的
-40% 和 70% 向下取整，按已完成的 epoch 数判断下一轮的阶数。
+对于 ``num_epochs=1500``，第 1–1200 轮只优化 0 阶；第 1201–1500 轮同时优化
+0、1、2 阶，每通道的活跃系数从 1 个直接变成 9 个。切换点取总轮数的
+80% 向下取整，按已完成的 epoch 数判断下一轮的阶数。配合网格的 ``4:3:3``
+分辨率调度，1024 层级的第 1051–1200 轮仍为 DC，之后才开启方向性颜色。
 这个调度独立于网格分辨率，升层不会重新回到 0 阶；多卡的所有 rank 使用同一阶数。
-``sh_degree_weights`` 可以调整三个阶段的比例；关闭 ``sh_degree_progression``
+``sh_degree_weights`` 是 DC、0+1 阶、0+1+2 阶三个阶段的比例；首尾必须为正整数，
+中间允许为 0，表示跳过单独的 0+1 阶阶段。原来的 ``[4, 3, 3]`` 仍支持在
+40% 和 70% 分别开启 1、2 阶，旧 checkpoint 按保存的比例续训。关闭 ``sh_degree_progression``
 则从第一轮使用模型中存储的全部 SH 系数。
 
 模型始终分配完整的 SH 参数、梯度与 Adam 动量缓冲区，不随阶段改变参数排列。
@@ -111,8 +115,8 @@ opacity 始终保持原来的单个 DC logit，不参与这个颜色阶数调度
 快照保存当前 ``active_sh_count``，因此中途保存的模型在预览、评价和恢复时不会
 提前使用尚未开启的高阶颜色。续训保留动量与分阶更新计数，依据原总轮数和已完成
 轮数继续调度。旧 checkpoint 缺少渐进配置时保持原先的全阶行为；底层原生模型
-也默认使用全部已存系数。此功能需要重新编译，运行时要求
-``mi.VoxelReconstruction.sh_schedule_version >= 1``。
+也默认使用全部已存系数。原生 SH 调度功能要求
+``mi.VoxelReconstruction.sh_schedule_version >= 1``；已有此构建时，修改阶段比例无需重新编译。
 
 可选 Distortion：约束沿射线分散的贡献
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

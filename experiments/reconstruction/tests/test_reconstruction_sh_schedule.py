@@ -15,6 +15,7 @@ from pathlib import Path
 import sys
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -28,7 +29,8 @@ from test_reconstruction_dssim import evaluate as evaluate_image
 
 
 def check_schedule():
-    from reconstruction_sh_schedule import active_sh_count_for_epoch, resolve_resume_sh_schedule, validate_sh_schedule
+    from reconstruction_sh_schedule import (active_sh_count_for_epoch, resolve_resume_sh_schedule,
+                                            sh_schedule_protocol, validate_sh_schedule)
     from reconstruction_memory import estimate_training_memory
 
     config = SimpleNamespace(
@@ -50,9 +52,25 @@ def check_schedule():
     assert active_sh_count_for_epoch(config, 599, 9) == 1
     assert active_sh_count_for_epoch(config, 600, 9) == 4
     assert active_sh_count_for_epoch(config, 1050, 9) == 9
+    config.training.sh_degree_weights = (8, 0, 2)
+    validate_sh_schedule(config)
+    for completed, count in ((0, 1), (1199, 1), (1200, 9), (1499, 9)):
+        assert active_sh_count_for_epoch(config, completed, 9) == count
+    assert sh_schedule_protocol(config)["transition_completed_epochs"] == [1200, 1200]
+    for total in (1, 2, 10, 11, 1001, 1500):
+        config.training.num_epochs = total
+        boundary = total * 8 // 10
+        assert sh_schedule_protocol(config)["transition_completed_epochs"] == [boundary, boundary]
+        for completed in range(total):
+            expected = 1 if completed < boundary else 9
+            assert active_sh_count_for_epoch(config, completed, 9) == expected
+            assert active_sh_count_for_epoch(config, completed, 4) == min(expected, 4)
+            assert active_sh_count_for_epoch(config, completed, 1) == 1
+    config.training.num_epochs = 1500
     config.training.sh_degree_progression = False
     assert active_sh_count_for_epoch(config, 0, 9) == 9
-    for invalid in ((0, 3, 3), (4, 3), (4, 3, 3, 1), (True, 3, 3), (4., 3, 3)):
+    for invalid in ((0, 3, 3), (4, 3), (4, 3, 3, 1), (True, 3, 3), (4., 3, 3),
+                    (8, -1, 2), (8, 0, 0), (0, 0, 2), (8, False, 2), (8, 0., 2)):
         config.training.sh_degree_weights = invalid
         try:
             validate_sh_schedule(config)
@@ -85,12 +103,38 @@ def check_schedule():
         pass
     else:
         raise AssertionError("Resume changed the total SH schedule budget")
+    import train
+    # Exercise both user entry points, while preserving legacy checkpoint defaults.
+    assert train.TrainingSettings().sh_degree_weights == (4, 3, 3)
+    preset = json.loads((Path(__file__).resolve().parents[1] / "configs" / "bicycle_1024.json")
+                        .read_text(encoding="utf-8"))
+    for values in ({}, preset):
+        fresh = copy.deepcopy(train.CONFIG)
+        with patch.object(sys, "argv", ["train.py"]):
+            arguments = train.parse_arguments()
+        train.apply_arguments(fresh, arguments, values)
+        validate_sh_schedule(fresh)
+        assert fresh.training.sh_degree_progression is True
+        assert tuple(fresh.training.sh_degree_weights) == (8, 0, 2)
+        assert sh_schedule_protocol(fresh)["transition_completed_epochs"] == [1200, 1200]
+        resumed = copy.deepcopy(fresh)
+        resolve_resume_sh_schedule(resumed, saved, {})
+        assert tuple(resumed.training.sh_degree_weights) == (4, 3, 3)
+        assert active_sh_count_for_epoch(resumed, 600, 9) == 4
+        simultaneous = {"config": {"training": {"num_epochs": 1500, "sh_degree_progression": True,
+                                                "sh_degree_weights": [8, 0, 2]}}}
+        resolve_resume_sh_schedule(resumed, simultaneous, {"training": {"sh_degree_weights": [8, 0, 2]}})
+        assert tuple(resumed.training.sh_degree_weights) == (8, 0, 2)
+        assert active_sh_count_for_epoch(resumed, 1199, 9) == 1
+        assert active_sh_count_for_epoch(resumed, 1200, 9) == 9
     memory_options = dict(active_voxels=17, sh_count=9, opacity_sh_count=1,
                           compact_capacity=0, ray_count=35, max_hits=8, max_candidates=4)
     ordinary = estimate_training_memory(**memory_options)
     progressive = estimate_training_memory(**memory_options, radiance_degree_steps=True)
     assert progressive["known_logical_bytes"] - ordinary["known_logical_bytes"] == 17 * 8
     return {"total_epoch_40_70_percent_boundaries_and_stored_capacity": "passed",
+            "DC_first_80_percent_then_both_higher_bands_and_rounding": "passed",
+            "fresh_default_and_bicycle_preset_80_percent_with_legacy_resume_preserved": "passed",
             "schedule_validation_legacy_resume_and_progressive_resume_contract": "passed",
             "degree_clock_memory_budget_includes_two_extra_UInt32_per_voxel": "passed"}
 
@@ -160,7 +204,7 @@ def check_rendering_and_replay(mi, dr, np):
     colors = []
     options = {"collect_growth_evidence": 1., "collect_rgb_deletion_evidence": 1.,
                "max_growth_hits": 4., "max_candidates": 4.}
-    for active_count in (1, 4, 9, 1):
+    for active_count in (1, 4, 9, 1, 9):
         model.set_active_sh_count(active_count)
         unchanged_revision = int(model.topology_revision)
         model.set_active_sh_count(active_count)
@@ -193,9 +237,11 @@ def check_rendering_and_replay(mi, dr, np):
     assert not np.allclose(colors[0], colors[1], atol=1e-5)
     assert not np.allclose(colors[1], colors[2], atol=1e-5)
     np.testing.assert_array_equal(colors[0], colors[3])
+    np.testing.assert_array_equal(colors[2], colors[4])
     assert replay.statistics()["replays"] >= 8
     return {"nonzero_inactive_SH_render_gradients_and_topology_evidence": "passed",
-            "dda_octree_and_native_replay_across_SH_stages": "passed"}
+            "dda_octree_and_native_replay_across_SH_stages": "passed",
+            "direct_DC_to_all_bands_invalidates_replay_and_restores_full_color": "passed"}
 
 
 def optimizer_snapshot(model, optimizer, np):
@@ -256,7 +302,7 @@ def check_optimizer_freezing(mi, dr, np):
                                   replay_updates="replay" in mode, radiance_degree_steps=True)
                   for mode, model in zip(modes, models)]
     expected_clocks = np.zeros((3, 3), dtype=np.uint32)
-    for iteration, active_count in enumerate((9, 1, 1, 4, 4, 9, 9, 1)):
+    for iteration, active_count in enumerate((1, 1, 9, 9, 1, 1, 4, 4, 9, 9, 1)):
         expected_clocks[:, :int(active_count ** .5)] += 1
         states = []
         for mode, model, optimizer in zip(modes, models, optimizers):
@@ -288,6 +334,12 @@ def check_optimizer_freezing(mi, dr, np):
                                               err_msg=mode + "." + key)
             np.testing.assert_array_equal(np.asarray(current_state["groups"]["radiance_sh"]["steps"])
                                           .reshape(3, 3), expected_clocks, err_msg=mode)
+            if iteration <= 2:
+                # Two DC updates must not age either higher band. Both degree
+                # clocks start at one on their simultaneous first update.
+                clocks = np.asarray(current_state["groups"]["radiance_sh"]["steps"]).reshape(3, 3)
+                np.testing.assert_array_equal(clocks[:, 1:], 1 if iteration == 2 else 0,
+                                              err_msg=mode + ".simultaneous_degree_clock_start")
             states.append((current, current_state))
         for mode, (parameters, state) in zip(modes[1:], states[1:]):
             for name, value in states[0][0].items():
@@ -321,6 +373,7 @@ def check_optimizer_freezing(mi, dr, np):
             np.testing.assert_array_equal(np.asarray(after_remap[name][key]).reshape(3, -1),
                                           np.concatenate((rows[[2, 0]], np.zeros_like(rows[:1]))))
     return {"dense_device_compact_reference_Adam_and_replay_parity": "passed",
+            "direct_DC_to_SH2_starts_both_new_Adam_degree_clocks_at_one": "passed",
             "inactive_parameters_moments_and_degree_clocks_frozen_with_stale_momentum": "passed",
             "degree_clock_checkpoint_legacy_migration_and_topology_remap": "passed"}
 

@@ -43,6 +43,8 @@ public:
     static constexpr uint32_t rgb_growth_version = 3;
     /// Per-hit single-removal RGB gains on complete baseline paths.
     static constexpr uint32_t rgb_deletion_version = 1;
+    /// RGB removal evidence includes projective background hits.
+    static constexpr uint32_t background_rgb_deletion_version = 1;
     /// Point-pair L1 depth distortion with exact fixed-hit continuous gradients.
     static constexpr uint32_t distortion_version = 1;
     /// Linear-RGB whole-image Gaussian SSIM with an explicit image adjoint.

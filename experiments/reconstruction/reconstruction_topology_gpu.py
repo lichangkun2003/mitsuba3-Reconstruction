@@ -614,12 +614,7 @@ class GPUTopologyLifecycle:
         if (m.schedule.enabled and m.core_resolution < m.schedule.target_resolution and
                 boundary - m.level_start_epoch >= m.level_budget):
             return self.refine(model, optimizer, boundary, event)
-        region_eligible = None
-        if m.scene_mapping == "projective_shell" and m._rgb_deletion_due(boundary):
-            from reconstruction_projective import core_mask_device
-            region_eligible = core_mask_device(self.UInt(model.snapshot()["cell_indices"]),
-                                               m.resolution, m.core_resolution, dr)
-        rgb = self.evaluate_rgb_deletion(boundary, event, region_eligible=region_eligible)
+        rgb = self.evaluate_rgb_deletion(boundary, event)
         opacity = self.evaluate_opacity(model, boundary, event)
         event["evidence_window_evaluated"] = rgb is not None
         masks = [mask for mask in (rgb, opacity) if mask is not None]

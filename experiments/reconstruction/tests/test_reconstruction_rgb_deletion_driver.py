@@ -6,6 +6,7 @@ import copy
 from dataclasses import asdict
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -18,6 +19,23 @@ from test_reconstruction_collective import _fixture, _accumulator
 
 
 class RGBDeletionDriverTests(unittest.TestCase):
+    def test_projective_background_deletion_requires_updated_native_build(self):
+        config = copy.deepcopy(train.CONFIG)
+        config.data.initialization = {"scene_mapping": "projective_shell"}
+        for native in (SimpleNamespace(), SimpleNamespace(background_rgb_deletion_version=0)):
+            with self.assertRaisesRegex(RuntimeError, "background_rgb_deletion_version"):
+                train.require_background_rgb_deletion(config, native)
+        train.require_background_rgb_deletion(
+            config, SimpleNamespace(background_rgb_deletion_version=1))
+        config.topology.enable_deletion = False
+        train.require_background_rgb_deletion(config, SimpleNamespace())
+        config.topology.enable_deletion = True
+        config.topology.use_rgb_deletion = False
+        train.require_background_rgb_deletion(config, SimpleNamespace())
+        config.topology.use_rgb_deletion = True
+        config.data.initialization = None
+        train.require_background_rgb_deletion(config, SimpleNamespace())
+
     def test_default_and_legacy_native_flags_are_separate(self):
         config = copy.deepcopy(train.CONFIG)
         train.validate(config)

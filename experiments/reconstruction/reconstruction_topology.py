@@ -16,6 +16,9 @@ from reconstruction_deletion_rgb import RGB_DELETION_EVIDENCE_VERSION
 from reconstruction_sh_schedule import sh_model_metadata
 
 
+BACKGROUND_RGB_DELETION_VERSION = 1
+
+
 @dataclass
 class TopologySettings:
     enable_deletion: bool = True
@@ -1589,9 +1592,7 @@ class TopologyManager:
             if self.core_resolution != self.resolution:
                 event["core_resolution"] = self.core_resolution
             return replacement, event
-        region_eligible = (self._core_region_numpy(model)
-                           if self.scene_mapping == "projective_shell" and self._rgb_deletion_due(boundary) else None)
-        rgb_delete = (self._evaluate_rgb_deletion(boundary, event, region_eligible=region_eligible)
+        rgb_delete = (self._evaluate_rgb_deletion(boundary, event)
                       if cfg.use_rgb_deletion else None)
         opacity_delete = self._evaluate_low_opacity_deletion(model, boundary, event)
         event["evidence_window_evaluated"] = (
@@ -1707,6 +1708,7 @@ class TopologyManager:
         state = {"settings": asdict(self.settings), "schedule": asdict(self.schedule), "view_count": self.view_count,
                  "rgb_growth_evidence_version": RGB_GROWTH_EVIDENCE_VERSION,
                  "rgb_deletion_evidence_version": RGB_DELETION_EVIDENCE_VERSION,
+                  "background_rgb_deletion_version": BACKGROUND_RGB_DELETION_VERSION,
                  "opacity_warmup": self.opacity_warmup, "opacity_ramp": self.opacity_ramp,
                  "resolution": self.resolution, "schedule_start_resolution": self.schedule_start_resolution,
                  "level_start_epoch": self.level_start_epoch, "budgets": {str(key): value for key, value in self.budgets.items()},
@@ -1736,6 +1738,11 @@ class TopologyManager:
         if (state["resolution"] != self.resolution or
                 state.get("core_resolution", state["resolution"]) != self.core_resolution):
             raise ValueError("Topology checkpoint grid/core resolution does not match the model")
+        background_version = state.get("background_rgb_deletion_version", 0)
+        if type(background_version) is not int or not 0 <= background_version <= BACKGROUND_RGB_DELETION_VERSION:
+            raise ValueError("Unsupported background RGB deletion version")
+        reset_background_window = (self.scene_mapping == "projective_shell" and
+            state["settings"].get("use_rgb_deletion", False) and background_version == 0)
         if (state["settings"].get("use_rgb_growth", False) and
                 state.get("rgb_growth_evidence_version") != RGB_GROWTH_EVIDENCE_VERSION):
             raise ValueError("RGB growth evidence version differs; start a new run "
@@ -1764,6 +1771,14 @@ class TopologyManager:
         state = copy.deepcopy(state)
         state.pop("rgb_growth_evidence_version", None)
         state.pop("rgb_deletion_evidence_version", None)
+        state.pop("background_rgb_deletion_version", None)
+        if reset_background_window:
+            # Old windows mark views seen although native kernels excluded the
+            # background. Do not reuse their partial evidence or confirmation
+            # streaks with the expanded domain. Other lifecycle state survives.
+            state["pending_rgb_deletion"] = None
+            state["rgb_deletion_streak"] = self.np.zeros(self.count, dtype=self.np.uint32)
+            state["rgb_deletion_last_boundary"] = None
         state.setdefault("core_resolution", state["resolution"])
         if state["count"] != self.count or state["view_count"] != self.view_count:
             raise ValueError("Topology checkpoint dimensions do not match model or dataset")

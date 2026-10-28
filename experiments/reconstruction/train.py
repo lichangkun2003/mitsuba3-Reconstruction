@@ -56,7 +56,7 @@ from reconstruction_topology import (TopologyManager, TopologySettings, CoarseTo
 class TrainingSettings:
     rgb_only: bool = False  # Legacy schema default; CONFIG enables RGB-only phase 1.
     sh_degree_progression: bool = False  # Legacy schema default; CONFIG enables progressive radiance.
-    sh_degree_weights: tuple[int, int, int] = (4, 3, 3)  # Global epochs: degree 0, then 0+1, then 0+1+2.
+    sh_degree_weights: tuple[int, int, int] = (4, 3, 3)  # Legacy default; zero middle weight skips the 0+1 stage.
     num_epochs: int = 1000
     chunk_size: int = 0  # 0: submit the whole image; positive: explicit ray batches.
     sampling_workers: int = 2  # Single-GPU RGB: prefetch the exact CPU RNG stream; 0 disables.
@@ -133,6 +133,7 @@ class TrainConfig:
 # 路径相对于 mitsuba 仓库的父目录；切换场景只需修改下面的 dataset。
 CONFIG = TrainConfig()
 CONFIG.training.sh_degree_progression = True
+CONFIG.training.sh_degree_weights = (8, 0, 2)  # 前 80% 仅 DC，最后 20% 前景／背景同时开启 1、2 阶。
 CONFIG.data.dataset = "datasets/bicycle"
 CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
@@ -703,6 +704,16 @@ def resolve_resume_reference_compositing(config, checkpoint, overrides):
         raise ValueError("Cannot change data.reference_compositing while resuming; "
                          "start a new experiment for different reference targets")
     config.data.reference_compositing = saved
+
+
+def require_background_rgb_deletion(config, native_model_type):
+    """Reject stale native builds that silently omit projective shell votes."""
+    projective = (config.data.initialization or {}).get("scene_mapping") == "projective_shell"
+    if (projective and config.topology.enable_deletion and config.topology.use_rgb_deletion
+            and getattr(native_model_type, "background_rgb_deletion_version", 0) < 1):
+        raise RuntimeError("Projective background RGB deletion requires native "
+                           "background_rgb_deletion_version >= 1; incrementally rebuild "
+                           "this Mitsuba source checkout and restart training")
 
 
 def settings(config):
@@ -1501,6 +1512,7 @@ def run_training(distributed=None):
         dataset = workspace_path(config.data.dataset, WORKSPACE)
         emit("Loading training views and checking reference files:", dataset, flush=True)
         prepared = prepare_dataset(config, np, load_points=checkpoint is None)
+        require_background_rgb_deletion(config, mi.VoxelReconstruction)
         # COLMAP preparation can replace the preset dimensions with actual image
         # dimensions. Check the full-image loss contract again before allocation.
         if dssim_enabled and effective_chunk_size(config) != config.render.width * config.render.height:
@@ -1517,7 +1529,10 @@ def run_training(distributed=None):
                 "ray_extent": "infinity",
                 "segments": "analytic world-region intervals; same color/transmittance/hit capacity across charts",
                 "background_growth": False,
-                "background_rgb_deletion": False,
+                "background_rgb_deletion": rgb_deletion_enabled,
+                "background_rgb_deletion_version": getattr(
+                    mi.VoxelReconstruction, "background_rgb_deletion_version", 0),
+                "background_rgb_deletion_scope": "all levels; same complete-ray RGB votes and confirmation as core",
                 "background_opacity_deletion": "configured finest level only; existing warmup and confirmation windows",
             }
         views = (prepared["views"] if prepared is not None else

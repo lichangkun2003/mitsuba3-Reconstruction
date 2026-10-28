@@ -46,7 +46,7 @@
   "training": {
     "rgb_only": true,
     "sh_degree_progression": true,
-    "sh_degree_weights": [4, 3, 3],
+    "sh_degree_weights": [8, 0, 2],
     "num_epochs": 1500,
     "chunk_size": 0,
     "sampling_workers": 2,

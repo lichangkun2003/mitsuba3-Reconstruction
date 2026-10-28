@@ -2597,7 +2597,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 // alpha approaches one; never divide by (1-alpha).
                 Color3f dc = before*opacity*(s.behind-radiance);
                 Float gain = -2.f*dr::dot(deletion_residual,dc)-dr::squared_norm(dc);
-                Mask eligible=projective_core_ids(id,valid);
+                // Projective background hits use the same complete-ray RGB
+                // removal test as core hits. Truncated suffixes remain unknown.
+                Mask eligible=valid;
                 Mask known = eligible & deletion_complete & dr::isfinite(before) &
                              dr::isfinite(opacity) & dr::all(dr::isfinite(radiance)) &
                              dr::all(dr::isfinite(s.behind)) &

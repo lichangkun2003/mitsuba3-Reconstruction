@@ -9,8 +9,10 @@ def validate_sh_schedule(config):
         raise ValueError("training.sh_degree_progression must be a boolean")
     weights = training.sh_degree_weights
     if (not isinstance(weights, (list, tuple)) or len(weights) != 3
-            or any(type(value) is not int or value <= 0 for value in weights)):
-        raise ValueError("training.sh_degree_weights must contain three positive integers")
+            or any(type(value) is not int or value < 0 for value in weights)
+            or weights[0] == 0 or weights[2] == 0):
+        raise ValueError("training.sh_degree_weights must contain three integers: "
+                         "positive first/last weights and a nonnegative middle weight")
     if training.sh_degree_progression and config.model.sh_count > 9:
         raise ValueError("Progressive radiance SH supports at most 9 stored coefficients (degree 2)")
 
@@ -24,6 +26,8 @@ def active_sh_count_for_epoch(config, completed_epochs, sh_count=None):
     total = config.training.num_epochs
     first = total * weights[0] // sum(weights)
     second = total * (weights[0] + weights[1]) // sum(weights)
+    # A zero middle weight skips the degree-1-only stage: both higher
+    # bands become active at the same global epoch, for core and background.
     count = 1 if completed_epochs < first else 4 if completed_epochs < second else 9
     return min(stored, count)
 
