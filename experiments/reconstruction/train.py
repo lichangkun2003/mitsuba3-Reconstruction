@@ -667,6 +667,32 @@ def release_topology_cache(model, dr):
     return time.perf_counter() - started
 
 
+def release_training_caches(reference_cache, gpu_reference_cache, native_replay, optimizer, sampler, dr):
+    """Retire training-only owners before a final or explicit-stop checkpoint.
+
+    Refinement checkpoints deliberately do not call this: reference caches
+    remain useful at the next level, and exporting state must not evict them.
+    """
+    from reconstruction_sampling import PrefetchedUniformSampler
+
+    started = time.perf_counter()
+    statistics = {}
+    if isinstance(sampler, PrefetchedUniformSampler):
+        sampler.close()
+    for name, cache in (("reference_cache", reference_cache),
+                        ("gpu_reference_cache", gpu_reference_cache),
+                        ("native_replay", native_replay)):
+        if cache is not None:
+            statistics[name] = cache.statistics()
+            cache.clear()
+    if optimizer is not None:
+        optimizer.clear_replay()
+    dr.sync_thread()
+    dr.flush_malloc_cache()
+    statistics["seconds"] = time.perf_counter() - started
+    return statistics
+
+
 def materialize_topology_state(checkpoint, dr):
     """Finish replacement fields one at a time after retiring the old model.
 
@@ -1687,24 +1713,31 @@ def run_training(distributed=None):
             if not primary:
                 return
             save_started = time.perf_counter()
+            from reconstruction_export import checkpoint_array_sources
+
             dr.eval(*model.snapshot().values())
             dr.sync_thread()
-            arrays = {key: np.array(value, copy=True) for key, value in model.snapshot().items()}
             metadata = model_metadata(model)
-            optimizer_state, topology_state = optimizer.state_dict(), topology.state_dict()
-            save_checkpoint(path, arrays, metadata,
-                training_state={"completed_epochs": epochs, "global_step": global_step,
-                    "optimizer_step": optimizer_step, "update_protocol": update_protocol,
-                    "rng_state": rng.bit_generator.state, "contour_state": sampler.state_dict(),
-                    "topology_state": topology_state, "dataset_signature": signature,
-                    # Sample before serialization; a resumed checkpoint cannot
-                    # recover the time spent writing that same checkpoint.
-                    "reconstruction_seconds": prior_seconds + time.perf_counter() - run_started,
-                    "reconstruction_time_complete": time_complete,
-                    "pending_epoch_transition": pending_epoch_transition},
-                optimizer_state=optimizer_state, config=asdict(config), provenance=report["provenance"])
-            # These potentially multi-GiB CPU exports must die before refinement.
-            del arrays, metadata, optimizer_state, topology_state
+            arrays = optimizer_state = topology_state = None
+            try:
+                arrays = checkpoint_array_sources(model.snapshot(), dr=dr)
+                optimizer_state = checkpoint_array_sources(optimizer.device_state_dict(), dr=dr)
+                topology_state = topology.checkpoint_state()
+                save_checkpoint(path, arrays, metadata,
+                    training_state={"completed_epochs": epochs, "global_step": global_step,
+                        "optimizer_step": optimizer_step, "update_protocol": update_protocol,
+                        "rng_state": rng.bit_generator.state, "contour_state": sampler.state_dict(),
+                        "topology_state": topology_state, "dataset_signature": signature,
+                        # Sample before serialization; a resumed checkpoint cannot
+                        # recover the time spent writing that same checkpoint.
+                        "reconstruction_seconds": prior_seconds + time.perf_counter() - run_started,
+                        "reconstruction_time_complete": time_complete,
+                        "pending_epoch_transition": pending_epoch_transition},
+                    optimizer_state=optimizer_state, config=asdict(config), provenance=report["provenance"])
+            finally:
+                # Borrowed sources must die before refinement or any update;
+                # release them even if an export fails partway through.
+                arrays = optimizer_state = topology_state = None
             report["checkpoint"] = str(path)
             performance.record_checkpoint(path, time.perf_counter()-save_started)
 
@@ -2163,6 +2196,11 @@ def run_training(distributed=None):
                               topology_execution=entry["topology_execution"])
         performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
         training_loop_started = None
+        # Loop locals can keep the last reference image alive after LRU clear.
+        # Their contents are unnecessary once the last training epoch finishes.
+        rgba = gpu_reference = deferred_checks = None
+        report["checkpoint_cache_release"] = release_training_caches(
+            reference_cache, gpu_reference_cache, native_replay, optimizer, sampler, dr)
         if end_epoch < config.training.num_epochs:
             stopped_checkpoint = output / f"epoch-{end_epoch:05d}.npz"
             save(stopped_checkpoint, end_epoch)

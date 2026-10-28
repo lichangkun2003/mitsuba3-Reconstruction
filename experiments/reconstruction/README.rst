@@ -764,6 +764,13 @@ HPC 使用 ``$HOME/envs/mitsuba/bin/python`` 执行同一 ``-m pip install -r`` 
 配置兼容，不再安排定期快照。训练结束仍保存最终 ``model.npz``；显式 ``--stop-after-epochs``
 仍保存可续训的停止点。已有实验文件不自动删除。
 
+保存时按最多 4 MiB 的数组块从 GPU 读取、校验并压缩写入，不再先把完整模型、Adam
+和拓扑状态同时复制到 CPU。兼容字段中的全零视角掩码也按块生成。文件仍为原来的
+NPZ 格式，包含全部续训状态和逐数组 SHA256；写入失败不会替换已有 checkpoint。
+最终保存和显式停止前会释放训练图片缓存及重放缓存；升层前保存保留图片缓存，
+不会改动 JSON 中的缓存容量或后续训练结果。大模型压缩仍需要时间，但暂存不随
+整套参数总量增长到数十 GiB。此修改只涉及 Python，无需重新编译。
+
 旧 alpha 监督 checkpoint 不能直接切换为 RGB-only 续训，应新开实验；旧模型仍可
 单独评价。完整说明见 `训练与评价文档 <../../docs/reconstruction_training.rst>`_、
 `初始化预览文档 <../../docs/reconstruction_preview.rst>`_ 和

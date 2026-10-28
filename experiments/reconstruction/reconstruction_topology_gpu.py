@@ -703,6 +703,57 @@ class GPUTopologyLifecycle:
         self.reduce_event(event)
         return checkpoint, event
 
+    def checkpoint_fields(self):
+        """Export the portable schema without moving the live lifecycle to CPU."""
+        from reconstruction_export import CHUNK_BYTES, checkpoint_array_sources, device_array_source, zero_array_source
+
+        m, np = self.manager, self.manager.np
+        state = {name: device_array_source(value, dtype=np.int64 if name in EPOCH_FIELDS else None,
+                                           dr=self.dr)
+                 for name, value in self.fields.items()}
+        words = (m.view_count + 31) // 32
+        state.update(candidates=device_array_source(self.candidates, dr=self.dr),
+                     foreground_masks=zero_array_source((m.count, words), np.uint32),
+                     background_masks=zero_array_source((m.count, words), np.uint32),
+                     qualified=zero_array_source((m.count,), np.bool_))
+        # Cooldowns are scalar JSON entries in the existing portable format.
+        # Keep that schema, but never read the full device buffers at once.
+        cells = device_array_source(self.cooldown_cells, dr=self.dr)
+        expiry = device_array_source(self.cooldown_expiry, dr=self.dr)
+        cooldown = {}
+        step = min(cells.max_chunk_elements, expiry.max_chunk_elements,
+                   max(1, CHUNK_BYTES // (np.dtype(np.uint32).itemsize + np.dtype(np.int64).itemsize)))
+        for start in range(0, len(self.cooldown_cells), step):
+            count = min(step, len(self.cooldown_cells) - start)
+            cell_chunk = cells.read_chunk(start, count)
+            expiry_chunk = expiry.read_chunk(start, count)
+            cooldown.update((str(int(cell)), int(until)) for cell, until in zip(cell_chunk, expiry_chunk))
+        state["cooldown"] = cooldown
+        for key in ("pending_growth", "pending_rgb_deletion"):
+            pending = getattr(m, key)
+            if pending is None:
+                state[key] = None
+                continue
+            result = dict(pending)
+            count = len(pending["cells"])
+            for name, value in pending.items():
+                if not self.dr.is_array_v(type(value)):
+                    continue
+                dtype = np.uint32 if key == "pending_rgb_deletion" and name in DELETION_VIEW_FIELDS else None
+                width = ROW_WIDTHS.get(name, 1)
+                if name == "radiance_sh":
+                    sh = len(value) // (count * 3) if count else pending.get("sh_count", 0)
+                    shape = (count, sh, 3)
+                elif name == "opacity_sh":
+                    sh = len(value) // count if count else pending.get("opacity_sh_count", 1)
+                    shape = (count, sh)
+                else:
+                    shape = (len(value) // width, width) if width > 1 else (len(value),)
+                result[name] = device_array_source(value, dtype=dtype, shape=shape, dr=self.dr)
+            result["seen_views"] = sorted(pending["seen_views"])
+            state[key] = checkpoint_array_sources(result, dr=self.dr)
+        return state
+
     def materialize(self):
         """Serialize once at explicit checkpoints; never called per view."""
         m, np, dr = self.manager, self.manager.np, self.dr

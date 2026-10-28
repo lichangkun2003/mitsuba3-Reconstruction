@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from pathlib import Path
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import zipfile
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -182,6 +184,154 @@ class CheckpointTests(unittest.TestCase):
                          {**self.metadata, "sh_count": 17}):
             with self.subTest(metadata=metadata), self.assertRaises(ValueError):
                 checkpoint.save_checkpoint(self.path, self.model, metadata)
+
+    def source(self, array, calls=None, fail_at=None):
+        from reconstruction_export import ArraySource
+        array = np.asarray(array)
+
+        def read(start, count):
+            if calls is not None:
+                calls.append((start, count))
+            if fail_at is not None and start >= fail_at:
+                raise OSError("simulated chunk read failure")
+            return array.flat[start:start + count]
+
+        return ArraySource(array.shape, array.dtype, read)
+
+    def test_streamed_model_and_nested_state_round_trip_bit_exact(self):
+        import reconstruction_export as export
+        calls = {name: [] for name in self.model}
+        state = {name: self.source(value, calls[name]) for name, value in self.model.items()}
+        special = np.array([-0., np.finfo(np.float32).tiny, -1.25, 3.5], np.float32)
+        training = {"nested": (self.source(special), [self.source(np.zeros((0, 16), np.float64))]),
+                    "clock": self.source(np.array(19, np.uint64))}
+        with patch.object(export, "CHUNK_BYTES", 16):
+            checkpoint.save_checkpoint(self.path, state, self.metadata, training_state=training)
+        loaded = checkpoint.load_checkpoint(self.path)
+        for name, value in self.model.items():
+            self.assertEqual(loaded["model_state"][name].tobytes(), value.tobytes())
+            self.assertEqual(sum(count for _, count in calls[name]), value.size)
+            self.assertLessEqual(max(count for _, count in calls[name]), 4)
+        self.assertEqual(loaded["training_state"]["nested"][0].tobytes(), special.tobytes())
+        self.assertEqual(loaded["training_state"]["nested"][1][0].shape, (0, 16))
+        self.assertEqual(loaded["training_state"]["clock"].shape, ())
+
+    def test_streaming_uses_compatible_zip64_npy_manifest_and_metadata_last(self):
+        state = {name: self.source(value) for name, value in self.model.items()}
+        checkpoint.save_checkpoint(self.path, state, self.metadata)
+        with zipfile.ZipFile(self.path) as archive:
+            self.assertEqual(archive.namelist()[-1], "metadata_json.npy")
+            self.assertTrue(all(info.compress_type == zipfile.ZIP_DEFLATED for info in archive.infolist()))
+            self.assertTrue(all(info.extract_version >= 45 for info in archive.infolist()))
+        arrays = self.archive()
+        header = json.loads(arrays.pop("metadata_json").tobytes())
+        self.assertEqual(header["version"], checkpoint.FORMAT_VERSION)
+        self.assertEqual(header["format"], checkpoint.FORMAT)
+        self.assertEqual(set(arrays), set(header["arrays"]))
+        for key, value in arrays.items():
+            self.assertEqual(header["arrays"][key], {
+                "shape": list(value.shape), "dtype": value.dtype.str,
+                "sha256": hashlib.sha256(value.tobytes(order="C")).hexdigest()})
+        # An archive created by the historical NumPy writer still loads.
+        np.savez_compressed(self.path, **arrays,
+                            metadata_json=np.frombuffer(json.dumps(header).encode(), np.uint8))
+        checkpoint.load_checkpoint(self.path, self.metadata)
+
+    def test_noncontiguous_numpy_arrays_are_written_in_c_order(self):
+        import reconstruction_export as export
+        model = {name: np.column_stack([value, value]).ravel()[::2]
+                 for name, value in self.model.items()}
+        moments = np.arange(90, dtype=np.float64).reshape(9, 10).T[::-1, ::2]
+        with patch.object(export, "CHUNK_BYTES", 32):
+            checkpoint.save_checkpoint(self.path, model, self.metadata,
+                                       optimizer_state={"strided": moments})
+        restored = checkpoint.load_checkpoint(self.path)
+        for name, value in model.items():
+            np.testing.assert_array_equal(restored["model_state"][name], value)
+        np.testing.assert_array_equal(restored["optimizer_state"]["strided"], moments)
+
+    def test_stream_read_failure_is_atomic_and_cleans_temporary_files(self):
+        import reconstruction_export as export
+        self.save(training_state={"epoch": 1})
+        old = self.path.read_bytes()
+        source = self.source(np.arange(12, dtype=np.float32), fail_at=4)
+        with patch.object(export, "CHUNK_BYTES", 16), self.assertRaisesRegex(OSError, "chunk read"):
+            self.save(optimizer_state={"moments": source})
+        self.assertEqual(self.path.read_bytes(), old)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_stream_validation_rejects_nonfinite_and_zero_rotation(self):
+        import reconstruction_export as export
+        for name, array, message in (
+                ("centers", np.array([0., 0., 0., 0., np.nan, 0.], np.float32), "nonfinite"),
+                ("rotations", np.array([1., 0., 0., 0., 0., 0., 0., 0.], np.float32), "zero quaternion")):
+            with self.subTest(name=name), patch.object(export, "CHUNK_BYTES", 16):
+                with self.assertRaisesRegex(ValueError, message):
+                    checkpoint.save_checkpoint(self.path, {**self.model, name: self.source(array)}, self.metadata)
+                self.assertEqual(list(self.path.parent.iterdir()), [])
+        with self.assertRaisesRegex(ValueError, "nonfinite"):
+            self.save(optimizer_state={"moments": self.source(np.array([np.inf], np.float32))})
+
+    def test_stream_cells_detect_duplicates_across_chunks_and_allow_unordered(self):
+        import reconstruction_export as export
+        count = 8
+        model = {"cell_indices": np.array([7, 1, 3, 0, 6, 2, 5, 4], np.uint32),
+                 "centers": np.zeros(count * 3, np.float32),
+                 "log_scales": np.zeros(count * 3, np.float32),
+                 "rotations": np.tile(np.array([1, 0, 0, 0], np.float32), count),
+                 "radiance_sh": np.zeros(count * 3, np.float32),
+                 "opacity_sh": np.zeros(count, np.float32)}
+        with patch.object(export, "CHUNK_BYTES", 16):
+            checkpoint.save_checkpoint(self.path, {key: self.source(value) for key, value in model.items()}, self.metadata)
+            np.testing.assert_array_equal(checkpoint.load_checkpoint(self.path)["model_state"]["cell_indices"], model["cell_indices"])
+            old = self.path.read_bytes()
+            for cells in ([7, 1, 3, 0, 6, 2, 5, 7], [7, 1, 3, 0, 6, 2, 5, 8],
+                          [7, 1, 3, 0, 6, 2, 5, -1]):
+                with self.subTest(cells=cells), self.assertRaises(ValueError):
+                    checkpoint.save_checkpoint(self.path,
+                        {**model, "cell_indices": self.source(np.array(cells, np.int64))}, self.metadata)
+                self.assertEqual(self.path.read_bytes(), old)
+                self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_streamed_empty_model_and_source_chunk_contract(self):
+        from reconstruction_export import ArraySource
+        empty = {key: self.source(np.empty(0, value.dtype)) for key, value in self.model.items()}
+        checkpoint.save_checkpoint(self.path, empty, self.metadata)
+        restored = checkpoint.load_checkpoint(self.path)
+        self.assertTrue(all(value.size == 0 for value in restored["model_state"].values()))
+        for reader in (lambda start, count: np.zeros(count + 1, np.float32),
+                       lambda start, count: np.zeros(count, np.float64)):
+            source = ArraySource((6,), np.dtype(np.float32), reader)
+            with self.assertRaisesRegex(ValueError, "chunk"):
+                checkpoint.save_checkpoint(self.path, {**self.model, "centers": source}, self.metadata)
+
+    def test_stream_preserves_projective_cell_region_validation(self):
+        metadata = dict(self.metadata, resolution=4, core_resolution=2,
+                        grid_min=[-2.] * 3, grid_max=[2.] * 3,
+                        scene_mapping="projective_shell", background_layers=1,
+                        background_refinement="preserve_physical_width")
+        valid = np.array([21, 20], np.uint32)  # core (1,1,1), face (0,1,1).
+        checkpoint.save_checkpoint(self.path, {**self.model, "cell_indices": self.source(valid)}, metadata)
+        for cells in (np.array([21, 0], np.uint32), np.array([21, 16], np.uint32)):
+            with self.subTest(cells=cells), self.assertRaisesRegex(ValueError, "atlas corners"):
+                checkpoint.save_checkpoint(self.path, {**self.model, "cell_indices": self.source(cells)}, metadata)
+
+    def test_small_source_limit_keeps_quaternion_validation_across_chunks(self):
+        from reconstruction_export import ArraySource
+        calls = []
+
+        def source(array):
+            def read(start, count):
+                calls.append(count)
+                return array[start:start + count]
+            return ArraySource(array.shape, array.dtype, read, max_chunk_elements=3)
+
+        checkpoint.save_checkpoint(self.path,
+            {**self.model, "rotations": source(self.model["rotations"])}, self.metadata)
+        self.assertLessEqual(max(calls), 3)
+        invalid = np.array([1, 0, 0, 0, 0, 0, 0, 0], np.float32)
+        with self.assertRaisesRegex(ValueError, "zero quaternion"):
+            checkpoint.save_checkpoint(self.path, {**self.model, "rotations": source(invalid)}, self.metadata)
 
 
 class MetricTests(unittest.TestCase):

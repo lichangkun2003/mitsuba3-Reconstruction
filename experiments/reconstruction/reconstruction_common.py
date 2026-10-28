@@ -258,6 +258,11 @@ class ReferenceImageCache:
             self.resident_bytes += rgba.nbytes
         return rgba
 
+    def clear(self):
+        """Release decoded images while preserving the budget and counters."""
+        self._images.clear()
+        self.resident_bytes = 0
+
     def statistics(self):
         return {"capacity_bytes": self.capacity_bytes, "resident_bytes": self.resident_bytes,
                 "images": len(self._images), "hits": self.hits, "misses": self.misses,

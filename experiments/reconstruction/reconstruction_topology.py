@@ -1696,15 +1696,8 @@ class TopologyManager:
         event.update(finished=final, active_voxel_count=self.count)
         return checkpoint, event
 
-    def state_dict(self):
-        import copy
-        device = getattr(self, "_gpu_lifecycle", None)
-        if device is not None:
-            device.materialize()
-            self._gpu_lifecycle = None
-        self._materialize_deletion_masks()
-        self._materialize_growth()
-        self._materialize_rgb_deletion()
+    def _checkpoint_fields(self):
+        """Borrow host fields without synchronizing or changing their owners."""
         state = {"settings": asdict(self.settings), "schedule": asdict(self.schedule), "view_count": self.view_count,
                  "rgb_growth_evidence_version": RGB_GROWTH_EVIDENCE_VERSION,
                  "rgb_deletion_evidence_version": RGB_DELETION_EVIDENCE_VERSION,
@@ -1721,9 +1714,81 @@ class TopologyManager:
                  "low_opacity_deletion_last_boundary": self.low_opacity_deletion_last_boundary}
         if self.core_resolution != self.resolution:
             state["core_resolution"] = self.core_resolution
-        for name in ("foreground_masks", "background_masks", "qualified", "candidates",
-                     "deletion_eligible", "growth_birth", "growth_wait_start"):
+        # Properties can materialize device evidence; checkpoint exporters must
+        # be able to replace stale host fields before performing any readback.
+        state.update(foreground_masks=self._foreground_masks, background_masks=self._background_masks,
+                     deletion_eligible=self._deletion_eligible)
+        for name in ("qualified", "candidates", "growth_birth", "growth_wait_start"):
             state[name] = getattr(self, name)
+        return state
+
+    def checkpoint_state(self):
+        """Borrow a complete checkpoint using bounded, non-destructive readback.
+
+        Only use this while training is paused, and release its array sources
+        before the next update. Unlike state_dict(), this preserves device
+        residency, pending evidence owners and the mutable CPU lifecycle.
+        """
+        from reconstruction_export import ArraySource, checkpoint_array_sources, device_array_source, zero_array_source
+
+        state = self._checkpoint_fields()
+        device = getattr(self, "_gpu_lifecycle", None)
+        if device is not None:
+            state.update(device.checkpoint_fields())
+        else:
+            evidence = self._deletion_device
+            if evidence is not None:
+                def mask_source(columns):
+                    shape = (evidence.count, len(columns))
+                    if evidence.is_cleared:
+                        return zero_array_source(shape, self.np.uint32)
+                    sources = [device_array_source(value, dr=evidence.dr) for value in columns]
+
+                    def read(start, count):
+                        words = len(sources)
+                        if not count:
+                            return self.np.empty(0, self.np.uint32)
+                        first, last = start // words, (start + count + words - 1) // words
+                        block = self.np.empty((last - first, words), self.np.uint32)
+                        for word, source in enumerate(sources):
+                            block[:, word] = source.read_chunk(first, last - first)
+                        return block.reshape(-1)[start - first * words:start - first * words + count]
+
+                    return ArraySource(shape, self.np.uint32, read)
+
+                state["foreground_masks"] = mask_source(evidence.foreground)
+                state["background_masks"] = mask_source(evidence.background)
+            # These devices own fresher counters than their host pending dict.
+            # Borrow their arrays instead of materialize(), which mutates both.
+            for name, attribute in (("pending_growth", "_rgb_growth_device"),
+                                    ("pending_growth", "_growth_device"),
+                                    ("pending_rgb_deletion", "_rgb_deletion_device")):
+                cached = getattr(self, attribute)
+                if cached is None or cached[0] is not getattr(self, name):
+                    continue
+                pending, evidence = cached
+                result = dict(state[name])
+                values = (evidence.arrays if hasattr(evidence, "arrays") else
+                          {field: getattr(evidence, field) for field in ("foreground", "background")})
+                result.update({field: device_array_source(value, dr=evidence.dr)
+                               for field, value in values.items()})
+                state[name] = result
+        for name in ("pending_growth", "pending_rgb_deletion"):
+            if state[name] is not None:
+                state[name] = dict(state[name])
+                state[name]["seen_views"] = sorted(state[name]["seen_views"])
+        return checkpoint_array_sources(state)
+
+    def state_dict(self):
+        import copy
+        device = getattr(self, "_gpu_lifecycle", None)
+        if device is not None:
+            device.materialize()
+            self._gpu_lifecycle = None
+        self._materialize_deletion_masks()
+        self._materialize_growth()
+        self._materialize_rgb_deletion()
+        state = self._checkpoint_fields()
         state = copy.deepcopy(state)
         if state["pending_growth"] is not None:
             state["pending_growth"]["seen_views"] = sorted(state["pending_growth"]["seen_views"])

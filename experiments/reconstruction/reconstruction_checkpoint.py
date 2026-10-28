@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+import zipfile
 
 
 FORMAT = "mitsuba-voxel-reconstruction"
@@ -33,8 +34,7 @@ def _integer(value, name, minimum=0, maximum=None):
     return value
 
 
-def validate_model_state(state: dict, metadata: dict) -> None:
-    """Validate the voxel-major AoS layout consumed by the native constructor."""
+def _validate_model_metadata(metadata):
     import numpy as np
 
     if not isinstance(metadata, dict):
@@ -74,6 +74,14 @@ def validate_model_state(state: dict, metadata: dict) -> None:
         if (not np.allclose(lo, [-extent]*3, rtol=0, atol=1e-7)
                 or not np.allclose(hi, [extent]*3, rtol=0, atol=1e-7)):
             raise ValueError("Shell grid bounds must preserve the normalized core")
+    return resolution, core, mapping, sh, opacity_sh
+
+
+def validate_model_state(state: dict, metadata: dict) -> None:
+    """Validate the voxel-major AoS layout consumed by the native constructor."""
+    import numpy as np
+
+    resolution, core, mapping, sh, opacity_sh = _validate_model_metadata(metadata)
     if not isinstance(state, dict) or set(state) != set(MODEL_FIELDS):
         raise ValueError(f"model_state must contain exactly {MODEL_FIELDS}")
     arrays = {key: np.asarray(value) for key, value in state.items()}
@@ -105,19 +113,138 @@ def validate_model_state(state: dict, metadata: dict) -> None:
         raise ValueError("rotations contains a zero quaternion")
 
 
+def _is_array_source(value):
+    from reconstruction_export import ArraySource
+    return isinstance(value, ArraySource)
+
+
+def _array_description(value):
+    import numpy as np
+
+    dtype = np.dtype(value.dtype)
+    shape = tuple(value.shape)
+    if (dtype.kind not in "biuf" or dtype.hasobject or
+            any(type(item) is not int or item < 0 for item in shape)):
+        raise ValueError(f"Unsupported checkpoint array dtype or shape: {dtype}, {shape}")
+    if math.prod(shape) != value.size:
+        raise ValueError("Checkpoint array shape and size disagree")
+    return dtype, shape
+
+
+def _validate_save_layout(model_state, metadata):
+    """Check layout without reading a device source or copying a whole table."""
+    import numpy as np
+
+    resolution, core, mapping, sh, opacity_sh = _validate_model_metadata(metadata)
+    if not isinstance(model_state, dict) or set(model_state) != set(MODEL_FIELDS):
+        raise ValueError(f"model_state must contain exactly {MODEL_FIELDS}")
+    state = {key: value if _is_array_source(value) else np.asarray(value)
+             for key, value in model_state.items()}
+    cells = state["cell_indices"]
+    dtype, shape = _array_description(cells)
+    if len(shape) != 1 or dtype.kind not in "ui":
+        raise ValueError("cell_indices must be a flat integer array")
+    count = cells.size
+    for name, width in (("centers", 3), ("log_scales", 3), ("rotations", 4),
+                        ("radiance_sh", 3 * sh), ("opacity_sh", opacity_sh)):
+        dtype, shape = _array_description(state[name])
+        if shape != (count * width,) or dtype.kind != "f":
+            raise ValueError(f"{name} must be a flat floating array of length {count * width}")
+    return state, (resolution, core, mapping)
+
+
+def _array_chunks(value, *, alignment=1):
+    """Yield C-order flat chunks; even strided NumPy inputs stay bounded."""
+    import numpy as np
+    from reconstruction_export import CHUNK_BYTES
+
+    dtype, _ = _array_description(value)
+    if not value.size:
+        return
+    limit = CHUNK_BYTES // max(dtype.itemsize, 4)
+    source = _is_array_source(value)
+    if source:
+        limit = min(limit, getattr(value, "max_chunk_elements", limit))
+    if not isinstance(limit, int) or limit < 1:
+        raise ValueError("Checkpoint chunk capacity must be positive")
+    if limit >= alignment:
+        limit -= limit % alignment
+    for start in range(0, value.size, limit):
+        count = min(limit, value.size - start)
+        if source:
+            chunk = value.read_chunk(start, count)
+            if not isinstance(chunk, np.ndarray) or chunk.dtype != dtype or chunk.shape != (count,):
+                raise ValueError("Checkpoint array source returned an invalid chunk dtype or shape")
+        elif value.flags.c_contiguous:
+            chunk = value.reshape(-1)[start:start + count]
+        else:
+            chunk = value.flat[start:start + count]
+        yield np.ascontiguousarray(chunk)
+
+
+class _CellValidation:
+    """Exact uniqueness with a disk-backed bitset, including unordered cells.
+
+    The largest supported grid needs 134 MiB of mapped address bits. Sorting
+    and all index temporaries cover at most one export chunk, never N rows.
+    """
+
+    def __init__(self, layout, directory):
+        self.resolution, self.core, self.mapping = layout
+        self.directory = directory
+        self.stream = self.seen = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        if self.seen is not None:
+            self.seen._mmap.close()
+            self.seen = None
+        if self.stream is not None:
+            self.stream.close()
+
+    def check(self, chunk):
+        import numpy as np
+
+        extent = self.resolution ** 3
+        if np.any(chunk < 0) or np.any(chunk >= extent):
+            raise ValueError("cell_indices contains an index outside the grid")
+        ordered = np.sort(np.asarray(chunk, dtype=np.uint32))
+        if np.any(ordered[1:] == ordered[:-1]):
+            raise ValueError("cell_indices must be unique")
+        if self.mapping == "projective_shell":
+            padding = (self.resolution - self.core) // 2
+            outside = np.zeros(ordered.size, dtype=np.uint8)
+            for stride in (1, self.resolution, self.resolution * self.resolution):
+                coordinate = ordered // stride % self.resolution
+                outside += (coordinate < padding) | (coordinate >= padding + self.core)
+            if np.any(outside > 1):
+                raise ValueError("Projective voxels must belong to the core or one face slab, not atlas corners")
+        if self.seen is None:
+            self.stream = tempfile.TemporaryFile(mode="w+b", dir=self.directory)
+            size = (extent + 7) // 8
+            self.stream.truncate(size)
+            self.seen = np.memmap(self.stream, mode="r+", dtype=np.uint8, shape=(size,))
+        byte = ordered >> 3
+        first = np.r_[0, np.flatnonzero(byte[1:] != byte[:-1]) + 1]
+        bits = np.left_shift(np.uint8(1), (ordered & 7).astype(np.uint8))
+        masks = np.bitwise_or.reduceat(bits, first)
+        indices = byte[first]
+        previous = self.seen[indices]
+        if np.any(previous & masks):
+            raise ValueError("cell_indices must be unique")
+        self.seen[indices] = previous | masks
+
+
 def _encode(value, arrays, manifest):
     import numpy as np
 
-    if isinstance(value, np.ndarray):
-        if value.dtype.kind not in "biuf" or value.dtype.hasobject:
-            raise ValueError(f"Unsupported checkpoint array dtype: {value.dtype}")
-        array = np.asarray(value, order="C")
-        if array.dtype.kind == "f" and not np.isfinite(array).all():
-            raise ValueError("Checkpoint arrays must contain only finite values")
+    if isinstance(value, np.ndarray) or _is_array_source(value):
+        dtype, shape = _array_description(value)
         key = f"a{len(arrays):06d}"
-        arrays[key] = array
-        manifest[key] = {"dtype": array.dtype.str, "shape": list(array.shape),
-                         "sha256": _array_digest(array)}
+        arrays[key] = value
+        manifest[key] = {"dtype": dtype.str, "shape": list(shape)}
         return {"type": "array", "key": key}
     if isinstance(value, np.generic):
         return _encode(value.item(), arrays, manifest)
@@ -156,17 +283,19 @@ def save_checkpoint(path, model_state, model_metadata, *, training_state=None,
                     optimizer_state=None, config=None, provenance=None) -> Path:
     """Save a complete snapshot; replace the destination only after a full write.
 
-    The caller must evaluate/synchronize GPU arrays and convert them to NumPy.
+    Arrays may be NumPy arrays or bounded ArraySource exports. The caller must
+    keep all sources immutable until the write returns; GPU export factories
+    manage their own synchronization. Each array is read only once, validated,
+    hashed, and compressed in chunks before writing the final JSON manifest.
     Model arrays are flat AoS; quaternions use wxyz; SH uses coefficient then RGB.
-    RNG states and optimizer moments may contain nested numeric NumPy arrays.
+    RNG states and optimizer moments may contain nested numeric array sources.
     """
     import numpy as np
 
     path = Path(path)
     if path.suffix.lower() != ".npz":
         raise ValueError("Checkpoint filename must end with .npz")
-    state = {key: np.asarray(value) for key, value in model_state.items()}
-    validate_model_state(state, model_metadata)
+    state, layout = _validate_save_layout(model_state, model_metadata)
     payload = {"model_state": state, "model_metadata": model_metadata,
                "training_state": training_state or {}, "optimizer_state": optimizer_state or {},
                "config": config or {}, "provenance": provenance or {}}
@@ -175,16 +304,45 @@ def save_checkpoint(path, model_state, model_metadata, *, training_state=None,
     header = {"format": FORMAT, "version": FORMAT_VERSION, "layout":
               "flat voxel-major AoS; rotations wxyz; radiance SH coefficient then RGB",
               "arrays": manifest, "payload": encoded}
-    arrays["metadata_json"] = np.frombuffer(
-        json.dumps(header, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8"),
-        dtype=np.uint8)
+    model_keys = {node["key"]: name for name, node in
+                  encoded["items"]["model_state"]["items"].items()}
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="wb", prefix=f".{path.name}.", suffix=".tmp",
                                          dir=path.parent, delete=False) as stream:
             temporary = Path(stream.name)
-            np.savez_compressed(stream, **arrays)
+            with zipfile.ZipFile(stream, mode="w", compression=zipfile.ZIP_DEFLATED,
+                                 allowZip64=True) as archive:
+                for key, value in arrays.items():
+                    name = model_keys.get(key)
+                    digest = hashlib.sha256()
+                    rotation_tail = np.empty(0, dtype=value.dtype)
+                    with _CellValidation(layout, path.parent) as cells:
+                        with archive.open(key + ".npy", mode="w", force_zip64=True) as member:
+                            np.lib.format.write_array_header_1_0(member, {
+                                "descr": np.lib.format.dtype_to_descr(np.dtype(value.dtype)),
+                                "fortran_order": False, "shape": tuple(value.shape)})
+                            for chunk in _array_chunks(value, alignment=4 if name == "rotations" else 1):
+                                if chunk.dtype.kind == "f" and not np.isfinite(chunk).all():
+                                    raise ValueError(f"Checkpoint array {name or key} contains a nonfinite value")
+                                if name == "cell_indices":
+                                    cells.check(chunk)
+                                elif name == "rotations":
+                                    rotations = (np.concatenate((rotation_tail, chunk))
+                                                 if rotation_tail.size else chunk)
+                                    complete = rotations.size - rotations.size % 4
+                                    if np.any(np.linalg.norm(rotations[:complete].reshape(-1, 4), axis=1) == 0):
+                                        raise ValueError("rotations contains a zero quaternion")
+                                    rotation_tail = rotations[complete:].copy()
+                                raw = memoryview(chunk).cast("B")
+                                digest.update(raw)
+                                member.write(raw)
+                    manifest[key]["sha256"] = digest.hexdigest()
+                metadata = np.frombuffer(json.dumps(header, ensure_ascii=False, allow_nan=False,
+                    separators=(",", ":")).encode("utf-8"), dtype=np.uint8)
+                with archive.open("metadata_json.npy", mode="w", force_zip64=True) as member:
+                    np.lib.format.write_array(member, metadata, allow_pickle=False)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
