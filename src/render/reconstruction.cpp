@@ -145,7 +145,7 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     const std::array<float, 3> &grid_min, const std::array<float, 3> &grid_max,
     double opacity_threshold, uint32_t sh_count, uint32_t opacity_sh_count)
     : m_resolution(resolution), m_core_resolution(resolution), m_active_count(0), m_sh_count(sh_count),
-      m_opacity_sh_count(opacity_sh_count), m_min(grid_min), m_max(grid_max) {
+      m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count), m_min(grid_min), m_max(grid_max) {
     if (resolution < 1 || resolution > max_core_resolution)
         Throw("VoxelReconstruction: resolution must be in [1, 1024].");
     if (sh_count < 1 || sh_count > 16 || opacity_sh_count < 1 || opacity_sh_count > 16)
@@ -167,7 +167,7 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     const std::array<float, 3> &grid_max, uint32_t sh_count,
     uint32_t opacity_sh_count, uint32_t core_resolution)
     : m_resolution(resolution), m_core_resolution(core_resolution ? core_resolution : resolution),
-      m_active_count(0), m_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count),
+      m_active_count(0), m_sh_count(sh_count), m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count),
       m_min(grid_min), m_max(grid_max) {
     if (resolution < 1 || resolution > max_grid_resolution ||
         m_core_resolution > max_core_resolution || m_core_resolution > resolution)
@@ -231,7 +231,7 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     uint32_t sh_count, uint32_t opacity_sh_count, uint32_t core_resolution)
     : m_resolution(resolution), m_core_resolution(core_resolution ? core_resolution : resolution),
       m_active_count((uint32_t) cells.size()),
-      m_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count),
+      m_sh_count(sh_count), m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count),
       m_min(grid_min), m_max(grid_max) {
     if (!resolution || resolution > max_grid_resolution ||
         m_core_resolution > max_core_resolution || m_core_resolution > resolution ||
@@ -573,6 +573,7 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                 setting("lr_rotation"), rotation_limit}
         }};
         const size_t input_rows = compact_indices ? compact_indices->size() : m_active_count;
+        const uint32_t radiance_degrees = uint32_t(std::ceil(std::sqrt(double(m_sh_count))));
         if (dr::width(allowed) != 1 || appearance_valid.size() != input_rows ||
             geometry_valid.size() != input_rows || background_carve_valid.size() != input_rows ||
             (compact_indices && (!compact_count || dr::width(*compact_count) != 1)))
@@ -585,7 +586,9 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
             if (mean == means.end() || square == squared_means.end() || clock == steps.end() ||
                 !mean->second || !square->second || !clock->second ||
                 mean->second->size() != size || square->second->size() != size ||
-                clock->second->size() != m_active_count ||
+                (clock->second->size() != m_active_count &&
+                 !(std::string(group.name) == "radiance_sh" &&
+                   clock->second->size() == size_t(m_active_count) * radiance_degrees)) ||
                 (group.rate > 0.f && (gradient == gradients.end() ||
                                      gradient->second.size() != input_rows * group.size)))
                 Throw("VoxelReconstruction.optimizer_step_device(): invalid group %s.", group.name);
@@ -655,6 +658,7 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                 if (group.rate <= 0.f)
                     continue;
                 const bool rotation = std::string(group.name) == "rotation_tangent";
+                const bool radiance = std::string(group.name) == "radiance_sh";
                 const bool centers = std::string(group.name) == "centers";
                 const bool scales = std::string(group.name) == "log_scales";
                 const auto &compact_rows = group.geometry ? geometry : appearance;
@@ -665,6 +669,28 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                 FloatBuffer &mean_target = *means.at(group.name),
                             &square_target = *squared_means.at(group.name);
                 UIntBuffer &clock_target = *steps.at(group.name);
+                const uint32_t component_count = radiance ? m_active_sh_count * 3 : group.size;
+                // Legacy callers retain one voxel clock. Progressive training
+                // supplies voxel-major degree clocks so a newly enabled degree
+                // starts its own Adam bias correction without altering DC age.
+                const uint32_t clock_width = clock_target.size() == m_active_count ? 1 : radiance_degrees;
+                const uint32_t active_clocks = clock_width == 1 ? 1 :
+                    uint32_t(std::ceil(std::sqrt(double(m_active_sh_count))));
+                auto component_clock = [&](uint32_t component) {
+                    return clock_width == 1 ? 0u : uint32_t(std::sqrt(double(component / 3)));
+                };
+                auto clock_biases = [&](const UIntBuffer &buffer, const UInt32 &ids, const Mask &active) {
+                    std::vector<std::tuple<UInt32, Float, Float>> result;
+                    result.reserve(active_clocks);
+                    for (uint32_t degree = 0; degree < active_clocks; ++degree) {
+                        UInt32 next = dr::gather<UInt32>(buffer, ids * clock_width + degree, active) + 1u;
+                        Float exponent(next);
+                        result.emplace_back(next,
+                            dr::maximum(1.f - dr::pow(Float(beta1), exponent), 1e-8f),
+                            dr::maximum(1.f - dr::pow(Float(beta2), exponent), 1e-8f));
+                    }
+                    return result;
+                };
 
                 auto row_scale = [&](const UInt32 &ids, const Mask &active) {
                     if (!group.geometry)
@@ -752,13 +778,11 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                             UInt32 input_row = compact_indices ? s.ordinal : ids;
                             if (compact_indices)
                                 active &= dr::gather<UInt32>(validity, input_row, active) > 0u;
-                            UInt32 next_clock = dr::gather<UInt32>(clock_target, ids, active) + 1u;
-                            Float exponent(next_clock);
-                            Float bias1 = dr::maximum(1.f - dr::pow(Float(beta1), exponent), 1e-8f);
-                            Float bias2 = dr::maximum(1.f - dr::pow(Float(beta2), exponent), 1e-8f);
+                            auto clocks = clock_biases(clock_target, ids, active);
                             Float scale = row_scale(input_row, active);
                             std::array<Float, 3> rotation_delta;
-                            for (uint32_t component = 0; component < group.size; ++component) {
+                            for (uint32_t component = 0; component < component_count; ++component) {
+                                const auto &[next_clock, bias1, bias2] = clocks[component_clock(component)];
                                 auto [mean, square, delta] = adam(input_row * group.size + component,
                                     ids * group.size + component,
                                     active, mean_target, square_target, bias1, bias2, scale);
@@ -811,18 +835,15 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                             UInt32 input_row = compact_indices ? s.ordinal : ids;
                             if (compact_indices)
                                 active &= dr::gather<UInt32>(validity, input_row, active) > 0u;
-                            UInt32 next_clock = dr::gather<UInt32>(scalar_clock.size() ? scalar_clock : s.clock,
-                                                                 ids, active) + 1u;
-                            Float exponent(next_clock);
-                            Float bias1 = dr::maximum(1.f - dr::pow(Float(beta1), exponent), 1e-8f);
-                            Float bias2 = dr::maximum(1.f - dr::pow(Float(beta2), exponent), 1e-8f);
+                            auto clocks = clock_biases(scalar_clock.size() ? scalar_clock : s.clock, ids, active);
                             Float scale = row_scale(input_row, active);
                             std::array<Float, 3> rotation_delta;
                             std::vector<Float> next_means, next_squares, next_parameters;
-                            next_means.reserve(group.size);
-                            next_squares.reserve(group.size);
-                            next_parameters.reserve(rotation ? 4 : group.size);
-                            for (uint32_t component = 0; component < group.size; ++component) {
+                            next_means.reserve(component_count);
+                            next_squares.reserve(component_count);
+                            next_parameters.reserve(rotation ? 4 : component_count);
+                            for (uint32_t component = 0; component < component_count; ++component) {
+                                const auto &[next_clock, bias1, bias2] = clocks[component_clock(component)];
                                 UInt32 index = ids * group.size + component;
                                 auto [mean, square, delta] = adam(input_row * group.size + component, index, active,
                                     scalar_mean.size() ? scalar_mean : s.mean,
@@ -844,15 +865,17 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                             // Read all old components before starting writes.
                             // Compact IDs are unique, and different coefficient
                             // addresses are disjoint, so NoConflicts is exact.
-                            for (uint32_t component = 0; component < group.size; ++component) {
+                            for (uint32_t component = 0; component < component_count; ++component) {
                                 UInt32 index = ids * group.size + component;
                                 dr::scatter(s.mean, dr::detach(next_means[component]), index, active, ReduceMode::NoConflicts);
                                 dr::scatter(s.square, dr::detach(next_squares[component]), index, active, ReduceMode::NoConflicts);
                             }
                             for (uint32_t component = 0; component < next_parameters.size(); ++component)
                                 dr::scatter(s.parameter, dr::detach(next_parameters[component]),
-                                    ids * uint32_t(next_parameters.size()) + component, active, ReduceMode::NoConflicts);
-                            dr::scatter(s.clock, next_clock, ids, active, ReduceMode::NoConflicts);
+                                    ids * (rotation ? 4u : group.size) + component, active, ReduceMode::NoConflicts);
+                            for (uint32_t degree = 0; degree < active_clocks; ++degree)
+                                dr::scatter(s.clock, std::get<0>(clocks[degree]), ids * clock_width + degree,
+                                            active, ReduceMode::NoConflicts);
                             s.ordinal += batch_size;
                         }, "Voxel reconstruction Adam commit");
                     mean_target = std::move(state.mean);
@@ -1056,6 +1079,16 @@ template <typename T> static T reconstruction_sh(uint32_t i, const Vector<T, 3> 
         case 14: return z*(x*x-y*y) * (.25f * std::sqrt(105.f) * inv_sqrt_pi);
         case 15: return x*(x*x-3.f*y*y) * (.125f * std::sqrt(70.f) * inv_sqrt_pi);
         default: return T(0.f);
+    }
+}
+
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_active_sh_count(uint32_t count) {
+    if (!count || count > m_sh_count)
+        Throw("VoxelReconstruction.set_active_sh_count(): count must be in [1, %u].", m_sh_count);
+    if (count != m_active_sh_count) {
+        m_active_sh_count = count;
+        // Frozen rendering captures the active coefficient loop bound.
+        ++m_topology_revision;
     }
 }
 
@@ -1375,9 +1408,9 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
                                              (discriminant >= 0.f) & (t0 <= t1));
             Color3f emission(0.f);
             Float logit = 0.f;
-            for (uint32_t k = 0; k < std::max(m_sh_count, m_opacity_sh_count); ++k) {
+            for (uint32_t k = 0; k < std::max(m_active_sh_count, m_opacity_sh_count); ++k) {
                 Float sh = reconstruction_sh(k, Vector3f(-world_d));
-                if (k < m_sh_count)
+                if (k < m_active_sh_count)
                     for (uint32_t channel = 0; channel < 3; ++channel)
                         emission[channel] += sh * dr::gather<Float>(m_radiance,
                             (id*m_sh_count+k)*3+channel, hit);
@@ -1801,9 +1834,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     auto appearance = [this, clean](UInt32 id, const Vector3f &view, Mask mask, Color3f &rgb, Float &alpha) {
         rgb = Color3f(0.f);
         Float logit(0.f);
-        for (uint32_t k=0; k<std::max(m_sh_count,m_opacity_sh_count); ++k) {
+        for (uint32_t k=0; k<std::max(m_active_sh_count,m_opacity_sh_count); ++k) {
             Float sh = reconstruction_sh(k,view);
-            if (k<m_sh_count)
+            if (k<m_active_sh_count)
                 for (uint32_t a=0;a<3;++a)
                     rgb[a] += sh*dr::gather<Float>(m_radiance,(id*m_sh_count+k)*3+a,mask);
             if (k<m_opacity_sh_count)
@@ -2265,9 +2298,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     Mask hit = growth_intersects(id,cell,segment_entry,segment_end,ray.o,d,valid);
                     Color3f radiance(0.f);
                     Float logit(0.f);
-                    for (uint32_t j=0; j<std::max(m_sh_count,m_opacity_sh_count); ++j) {
+                    for (uint32_t j=0; j<std::max(m_active_sh_count,m_opacity_sh_count); ++j) {
                         Float sh = reconstruction_sh(j,Vector3f(-d));
-                        if (j<m_sh_count)
+                        if (j<m_active_sh_count)
                             for (uint32_t channel=0; channel<3; ++channel)
                                 radiance[channel] += sh*dr::gather<Float>(m_growth_radiance,
                                     (id*m_sh_count+j)*3+channel,hit);
@@ -2538,9 +2571,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 s.distortion_moment += contribution*depth;
                 s.distortion_weight_derivative += contribution*derivative;
             }
-            for(uint32_t k=0;k<std::max(m_sh_count,m_opacity_sh_count);++k) {
+            for(uint32_t k=0;k<std::max(m_active_sh_count,m_opacity_sh_count);++k) {
                 Float sh=reconstruction_sh(k,Vector3f(-d));
-                if(k<m_sh_count)
+                if(k<m_active_sh_count)
                     for(uint32_t j=0;j<3;++j)
                         dr::scatter_reduce(ReduceOp::Add,s.gradients["radiance_sh"],grad_rgb[j]*sh,(row*m_sh_count+k)*3+j,stored);
                 if(k<m_opacity_sh_count)
@@ -2636,7 +2669,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
 MI_VARIANT std::string VoxelReconstruction<Float, Spectrum>::to_string() const {
     std::ostringstream out;
     out << "VoxelReconstruction[resolution=" << m_resolution << ", active_voxels="
-        << m_active_count << ", sh_count=" << m_sh_count << ", opacity_sh_count="
+        << m_active_count << ", sh_count=" << m_sh_count << ", active_sh_count="
+        << m_active_sh_count << ", opacity_sh_count="
         << m_opacity_sh_count << "]";
     return out.str();
 }

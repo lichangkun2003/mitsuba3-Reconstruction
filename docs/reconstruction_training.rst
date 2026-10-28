@@ -19,6 +19,8 @@ RGB-only 训练、在线生长与删除（当前默认）
    CONFIG.render.spp = 1
    CONFIG.render.traversal = "octree"
    CONFIG.training.num_epochs = 1000
+   CONFIG.training.sh_degree_progression = True
+   CONFIG.training.sh_degree_weights = (4, 3, 3)
    CONFIG.gradient.alpha_loss_weight = 0
    CONFIG.gradient.alpha_geometry_weight = 0
    CONFIG.gradient.background_carve_weight = 0
@@ -68,6 +70,49 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 RGB 收益与持续低 opacity 两条删除分支，总开关关闭时两者均不执行。
 当前 RGB-only 训练入口保留 RGB 删除分支；可单独将 ``use_low_opacity_deletion=False``
 以对照新增清理规则的影响。
+
+渐进开启辐射颜色的 SH 阶数
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+新实验默认按总训练轮数的 ``4:3:3`` 比例逐步开启辐射颜色的球谐系数。
+这里的三组是 ``l=0、1、2``，各有 ``1、3、5`` 个基函数；累计开启数为
+``1、4、9``。每个系数包含 RGB 三个颜色分量，因此完整颜色参数仍为每体素 27 个数。
+opacity 始终保持原来的单个 DC logit，不参与这个颜色阶数调度。
+
+在 JSON 中设置：
+
+.. code-block:: json
+
+   {
+     "training": {
+       "sh_degree_progression": true,
+       "sh_degree_weights": [4, 3, 3]
+     }
+   }
+
+对于 ``num_epochs=1500``，第 1–600 轮只优化 0 阶；第 601–1050 轮同时优化
+0、1 阶；第 1051–1500 轮同时优化 0、1、2 阶。两个切换点分别取总轮数的
+40% 和 70% 向下取整，按已完成的 epoch 数判断下一轮的阶数。
+这个调度独立于网格分辨率，升层不会重新回到 0 阶；多卡的所有 rank 使用同一阶数。
+``sh_degree_weights`` 可以调整三个阶段的比例；关闭 ``sh_degree_progression``
+则从第一轮使用模型中存储的全部 SH 系数。
+
+模型始终分配完整的 SH 参数、梯度与 Adam 动量缓冲区，不随阶段改变参数排列。
+尚未开启的系数不参与前向颜色计算，也不产生颜色梯度；Adam 冻结其参数、
+一阶与二阶动量。渐进训练为每体素的每个 SH 阶保存独立 Adam 更新计数，
+新开启的阶从自己的更新次数开始进行偏差校正，已开启阶继续原有优化状态。
+在线生长／删除证据、几何代理使用的颜色和 D-SSIM 反传同样遵守当前阶数。
+阶段变化会使前向及优化器重放重新录制，后续视角继续复用录制结果。
+渐进训练在网格升层时让子体素继承父体素的全部颜色 SH 系数，避免把已经学习的
+1 阶或 2 阶颜色清零；尚未开启的系数仍不参与渲染。未开启渐进训练的旧模型保留
+原有核心区域仅继承 DC 的分裂规则。
+网格升层仍沿用原有的 Adam 重置策略；仅切换 SH 阶数时不会重置已开启阶的优化状态。
+
+快照保存当前 ``active_sh_count``，因此中途保存的模型在预览、评价和恢复时不会
+提前使用尚未开启的高阶颜色。续训保留动量与分阶更新计数，依据原总轮数和已完成
+轮数继续调度。旧 checkpoint 缺少渐进配置时保持原先的全阶行为；底层原生模型
+也默认使用全部已存系数。此功能需要重新编译，运行时要求
+``mi.VoxelReconstruction.sh_schedule_version >= 1``。
 
 可选 Distortion：约束沿射线分散的贡献
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -13,6 +13,7 @@ import time
 
 from reconstruction_growth_rgb import RGB_GROWTH_EVIDENCE_VERSION
 from reconstruction_deletion_rgb import RGB_DELETION_EVIDENCE_VERSION
+from reconstruction_sh_schedule import sh_model_metadata
 
 
 @dataclass
@@ -191,6 +192,7 @@ def model_checkpoint(model, fields=None) -> dict:
     metadata = {"resolution": int(model.resolution), "grid_min": list(model.grid_min),
                 "grid_max": list(model.grid_max), "sh_count": int(model.sh_count),
                 "opacity_sh_count": int(model.opacity_sh_count)}
+    metadata.update(sh_model_metadata(model))
     core_resolution = int(getattr(model, "core_resolution", model.resolution))
     if core_resolution != metadata["resolution"]:
         metadata["core_resolution"] = core_resolution
@@ -512,8 +514,14 @@ def refine_state(checkpoint: dict, config: CoarseToFineConfig, max_active_voxels
         count = len(parent_ids)
         if count > max_active_voxels:
             raise RuntimeError("Refinement exceeds max_active_voxels")
-    new_radiance = np.zeros((count, metadata["sh_count"], 3), dtype=np.float32)
-    new_radiance[:, 0] = radiance[parent_ids, 0]
+    if "active_sh_count" in metadata:
+        # The global SH schedule can cross a spatial refinement boundary while
+        # degree one is already trained. Preserve learned and dormant storage;
+        # the model's active count controls which coefficients affect rendering.
+        new_radiance = radiance[parent_ids].astype(np.float32)
+    else:
+        new_radiance = np.zeros((count, metadata["sh_count"], 3), dtype=np.float32)
+        new_radiance[:, 0] = radiance[parent_ids, 0]
     new_opacity = np.zeros((count, metadata["opacity_sh_count"]), dtype=np.float32)
     parent_logit = opacity[parent_ids, 0].astype(np.float64) * y0
     attenuation = float(np.clip(config.opacity_optical_depth_scale, .01, 1.))

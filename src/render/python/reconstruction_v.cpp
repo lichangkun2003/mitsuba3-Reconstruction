@@ -212,6 +212,8 @@ MI_PY_EXPORT(VoxelReconstruction) {
            "Install frozen empty-cell candidates for online RGB evidence; does not grow the model.")
         .def("clear_growth_candidates", &Model::clear_growth_candidates)
         .def("set_scene_mapping", &Model::set_scene_mapping, "mapping"_a)
+        .def("set_active_sh_count", &Model::set_active_sh_count, "count"_a,
+             "Activate the first count radiance SH coefficients; preserve stored parameters.")
         .def("native_scene_mapping", &Model::native_scene_mapping)
         .def_prop_ro("growth_candidate_count", &Model::growth_candidate_count)
         .def_prop_ro("topology_revision", &Model::topology_revision)
@@ -275,6 +277,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
         .def_prop_ro("core_resolution", &Model::core_resolution)
         .def_prop_ro("active_voxel_count", &Model::active_voxel_count)
         .def_prop_ro("sh_count", &Model::sh_count)
+        .def_prop_ro("active_sh_count", &Model::active_sh_count)
         .def_prop_ro("opacity_sh_count", &Model::opacity_sh_count)
         .def_prop_ro("grid_min", &Model::grid_min)
         .def_prop_ro("grid_max", &Model::grid_max)
@@ -296,6 +299,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("rgb_deletion_version") = nb::int_(Model::rgb_deletion_version);
     cls.attr("distortion_version") = nb::int_(Model::distortion_version);
     cls.attr("dssim_version") = nb::int_(Model::dssim_version);
+    cls.attr("sh_schedule_version") = nb::int_(Model::sh_schedule_version);
     cls.attr("projective_version") = nb::int_(Model::projective_version);
     cls.attr("octree_version") = nb::int_(Model::octree_version);
     cls.attr("optimizer_device_version") = nb::int_(Model::optimizer_device_version);

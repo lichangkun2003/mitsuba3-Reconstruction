@@ -47,6 +47,8 @@ public:
     static constexpr uint32_t distortion_version = 1;
     /// Linear-RGB whole-image Gaussian SSIM with an explicit image adjoint.
     static constexpr uint32_t dssim_version = 1;
+    /// Progressive radiance SH with dormant coefficients and Adam degree clocks.
+    static constexpr uint32_t sh_schedule_version = 1;
     /// GPU occupancy octree, including separately tagged hypothetical leaves.
     static constexpr uint32_t octree_version = 1;
     /// Device-resident compact Adam, including transactional moment updates.
@@ -100,7 +102,9 @@ public:
     /// Borrow moment arrays in place: no full-table snapshots/copies are made.
     /// A validation pass precedes a commit pass using the same scalar gate;
     /// fixed-size device batches bound temporary storage independently of SH
-    /// table size. Per-view/group clocks and zero-gradient updates are retained.
+    /// table size. Radiance may use voxel-major clocks per SH degree instead
+    /// of one clock per voxel; inactive degrees and their moments are frozen.
+    /// Active coefficients retain zero-gradient momentum updates.
     Mask optimizer_step_device(
         const std::map<std::string, FloatBuffer> &gradients,
         const UIntBuffer &appearance_valid, const UIntBuffer &geometry_valid,
@@ -146,6 +150,8 @@ public:
     /// Mapping is model metadata, never a trainable parameter. Changing it
     /// invalidates frozen recordings through topology_revision().
     void set_scene_mapping(const std::string &mapping);
+    /// Limit evaluated/trainable radiance coefficients without changing storage.
+    void set_active_sh_count(uint32_t count);
     std::string native_scene_mapping() const { return m_scene_mapping; }
 
     struct TrainingResult {
@@ -227,6 +233,7 @@ public:
     uint32_t core_resolution() const { return m_core_resolution; }
     uint32_t active_voxel_count() const { return m_active_count; }
     uint32_t sh_count() const { return m_sh_count; }
+    uint32_t active_sh_count() const { return m_active_sh_count; }
     uint32_t opacity_sh_count() const { return m_opacity_sh_count; }
     std::array<float, 3> grid_min() const { return m_min; }
     std::array<float, 3> grid_max() const { return m_max; }
@@ -289,7 +296,8 @@ private:
                           const Vector3f &inv_d, const Float &exit,
                           Mask active, const UInt32 &log_size) const;
 
-    uint32_t m_resolution, m_core_resolution, m_active_count, m_sh_count, m_opacity_sh_count;
+    uint32_t m_resolution, m_core_resolution, m_active_count, m_sh_count, m_active_sh_count,
+             m_opacity_sh_count;
     std::string m_scene_mapping = "bounded";
     std::array<float, 3> m_min, m_max, m_size;
     std::map<std::string, uint64_t> m_statistics;

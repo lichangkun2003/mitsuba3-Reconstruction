@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 
 from reconstruction_color import reference_from_bitmap, validate_reference_compositing
+from reconstruction_sh_schedule import restore_sh_state, sh_model_metadata
 
 from preview import (
     REPOSITORY, WORKSPACE, PreviewConfig, RenderConfig, RuntimeConfig, configure_drjit_threads,
@@ -361,6 +362,7 @@ def model_metadata(model) -> dict:
     metadata = {"resolution": int(model.resolution), "grid_min": list(model.grid_min),
             "grid_max": list(model.grid_max), "sh_count": int(model.sh_count),
             "opacity_sh_count": int(model.opacity_sh_count)}
+    metadata.update(sh_model_metadata(model))
     core = int(getattr(model, "core_resolution", model.resolution))
     if core != metadata["resolution"]:
         metadata["core_resolution"] = core
@@ -380,6 +382,7 @@ def restore_model(checkpoint, mi):
     options = ({"core_resolution": metadata["core_resolution"]} if "core_resolution" in metadata else {})
     model = mi.VoxelReconstruction.from_state(metadata["resolution"], metadata["grid_min"],
         metadata["grid_max"], state, metadata["sh_count"], metadata["opacity_sh_count"], **options)
+    restore_sh_state(model, metadata)
     mapping = metadata.get("scene_mapping", "bounded")
     if mapping in ("radial_seed_shell", "projective_shell"):
         model.scene_mapping = mapping

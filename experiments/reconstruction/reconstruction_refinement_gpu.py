@@ -127,10 +127,13 @@ def _refine(checkpoint, config, max_active_voxels, dr):
     rows = dr.arange(U, total)
     sh_count = metadata["sh_count"]
     result["radiance_sh"] = dr.zeros(F, total * sh_count * 3)
-    for component in range(3):
-        dc = dr.gather(F, state["radiance_sh"], parents * sh_count * 3 + component)
-        dr.scatter(result["radiance_sh"], dc, rows * sh_count * 3 + component)
-    if fixed_shell:
+    # Progressive SH is global across spatial levels. Keep all stored parent
+    # coefficients so refinement does not erase already trained higher degrees.
+    radiance_components = sh_count * 3 if "active_sh_count" in metadata else 3
+    for component in range(radiance_components):
+        value = dr.gather(F, state["radiance_sh"], parents * sh_count * 3 + component)
+        dr.scatter(result["radiance_sh"], value, rows * sh_count * 3 + component)
+    if fixed_shell and radiance_components == 3:
         for coefficient in range(3, sh_count * 3):
             value = dr.gather(F, state["radiance_sh"], parents * sh_count * 3 + coefficient)
             dr.scatter(result["radiance_sh"], value, rows * sh_count * 3 + coefficient, inherit_shell)

@@ -12,6 +12,7 @@ import time
 
 from reconstruction_growth_rgb import RGB_STAT_FIELDS, RGB_GROWTH_EVIDENCE_VERSION
 from reconstruction_deletion_rgb import RGB_DELETION_EVIDENCE_VERSION
+from reconstruction_sh_schedule import sh_model_metadata
 
 
 ROW_WIDTHS = {"cell_indices": 1, "cells": 1, "parent_cells": 1, "parent_ids": 1,
@@ -53,6 +54,7 @@ def device_checkpoint(model):
     metadata = {"resolution": int(model.resolution), "grid_min": list(model.grid_min),
                 "grid_max": list(model.grid_max), "sh_count": int(model.sh_count),
                 "opacity_sh_count": int(model.opacity_sh_count)}
+    metadata.update(sh_model_metadata(model))
     core = int(getattr(model, "core_resolution", model.resolution))
     if core != metadata["resolution"]:
         metadata["core_resolution"] = core

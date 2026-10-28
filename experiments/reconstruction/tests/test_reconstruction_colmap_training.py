@@ -58,13 +58,14 @@ def run_check(args, output):
 
     dataset = output / "dataset"
     write_scene(dataset, np)
-    full, resumed = output / "full", output / "resumed"
+    full = output / "full"
     config = {
         "data": {"dataset": str(dataset), "background_final_layers": 4},
-        "model": {"grid_resolution": 4, "opacity_sh_count": 1},
+        "model": {"grid_resolution": 4, "sh_count": 9, "opacity_sh_count": 1},
         "render": {"width": 93, "height": 97, "spp": 1, "max_hits": 2},
         "runtime": {"build_dir": args.build_dir, "gpu": args.gpu},
         "training": {"rgb_only": True, "num_epochs": 3, "chunk_size": 0,
+                     "sh_degree_progression": True, "sh_degree_weights": [4, 3, 3],
                      "sync_view_checks": args.sync_view_checks,
                      "save_count": 3, "profile_views": 0, "profile_interval_epochs": 0,
                      "output": str(full)},
@@ -146,13 +147,50 @@ def run_check(args, output):
     assert final["config"]["gradient"]["dssim_loss_weight"] == args.dssim_weight
     assert report["training_protocol"]["dssim"]["enabled"] == (args.dssim_weight > 0)
     assert [row["training_resolution"] for row in history] == [6, 12, 24]
+    assert [row["active_sh_count"] for row in history] == [1, 4, 9]
+    assert [row["active_sh_degree"] for row in history] == [0, 1, 2]
     assert history[0]["topology"]["refined"] is True
     assert history[1]["topology"]["refined"] is True
     assert final["model_state"]["radiance_sh"].size > 0
-    for saved in (first, second, final):
+    for saved, active in ((first, 1), (second, 4), (final, 9)):
         metadata, state = saved["model_metadata"], saved["model_state"]
-        assert state["radiance_sh"].size == len(state["cell_indices"]) * metadata["sh_count"] * 3
+        count = len(state["cell_indices"])
+        assert state["radiance_sh"].size == count * metadata["sh_count"] * 3
+        assert metadata["active_sh_count"] == active
+        assert saved["config"]["training"]["sh_degree_progression"] is True
+        assert list(saved["config"]["training"]["sh_degree_weights"]) == [4, 3, 3]
+        assert saved["optimizer_state"]["radiance_degree_steps"] is True
+        clocks = saved["optimizer_state"]["groups"]["radiance_sh"]["steps"].reshape(count, 3)
+        assert np.any(clocks[:, :{1: 1, 4: 2, 9: 3}[active]] > 0)
+        if active < 9:
+            coefficients = state["radiance_sh"].reshape(count, 9, 3)
+            np.testing.assert_array_equal(coefficients[:, active:], 0)
+            np.testing.assert_array_equal(clocks[:, {1: 1, 4: 2}[active]:], 0)
+            for field in ("mean", "squared_mean"):
+                moments = saved["optimizer_state"]["groups"]["radiance_sh"][field].reshape(count, 9, 3)
+                np.testing.assert_array_equal(moments[:, active:], 0)
+    assert np.any(second["model_state"]["radiance_sh"].reshape(-1, 9, 3)[:, 1:4] != 0)
     assert not np.array_equal(first["model_state"]["radiance_sh"], final["model_state"]["radiance_sh"])
+
+    # Standalone evaluation must render the saved stage, not enable all SH
+    # coefficients merely because this is an evaluation entry point.
+    evaluation_entry = entry.with_name("evaluate.py")
+    for core, path, saved in ((4, first_path, first), (8, second_path, second)):
+        stage_output = output / f"evaluate-stage-{core}"
+        run([sys.executable, "-u", "-I", str(evaluation_entry), "--checkpoint", str(path),
+             "--split", "train", "--train-max-views", "1", "--spp", "1",
+             "--seed", str(saved["config"]["evaluation"]["seed"]),
+             "--output-dir", str(stage_output), "--build-dir", args.build_dir,
+             "--gpu", str(args.gpu)], f"evaluate-stage-{core}")
+        stage_report = json.loads((stage_output / "evaluation-report.json").read_text(encoding="utf-8"))
+        assert stage_report["status"] == "passed"
+        assert stage_report["checkpoint"]["model_metadata"]["active_sh_count"] == saved["model_metadata"]["active_sh_count"]
+        stage_image = stage_report["splits"]["train"]["views"][0]["prediction"]
+        with Image.open(stage_image) as reproduced, Image.open(report["level_renders"][str(core)]["image"]) as original:
+            # Bitmap.convert uses ordered dithering for stage previews;
+            # metrics PNGs use floor(sRGB*255+.5) without dithering.
+            np.testing.assert_allclose(np.asarray(reproduced), np.asarray(original),
+                                       atol=1, rtol=0, err_msg=f"saved SH stage {core} rendering")
 
     evaluation = json.loads((full / "evaluation-report.json").read_text(encoding="utf-8"))
     assert evaluation["status"] == "passed"
@@ -175,34 +213,41 @@ def run_check(args, output):
                                    [7., 8.5, 8.75, 5.25], atol=0, rtol=0)
         assert (camera["width"], camera["height"]) == (16, 12)
 
-    run([sys.executable, "-u", "-I", str(entry), "--resume", str(first_path),
-         "--output-dir", str(resumed), "--build-dir", args.build_dir, "--gpu", str(args.gpu)], "resume")
-    recovered = load_checkpoint(resumed / "model.npz")
-    assert recovered["model_metadata"] == final["model_metadata"]
-    assert recovered["config"]["data"]["initialization"] == initialization
-    assert recovered["training_state"]["rng_state"] == final["training_state"]["rng_state"]
-    assert recovered["training_state"]["global_step"] == 21
-    resume_report = json.loads((resumed / "training-report.json").read_text(encoding="utf-8"))
-    assert resume_report["trained_epochs_this_run"] == 2
-    resumed_history = [json.loads(line) for line in Path(resume_report["history_file"]).read_text().splitlines()]
-    assert [row["epoch"] for row in resumed_history] == [2, 3]
-    for key, value in final["model_state"].items():
-        np.testing.assert_allclose(recovered["model_state"][key], value, atol=2e-6, rtol=2e-6,
-                                   err_msg=f"resumed model {key}")
-    for group, parameters in final["optimizer_state"]["groups"].items():
-        for key, value in parameters.items():
-            np.testing.assert_allclose(recovered["optimizer_state"]["groups"][group][key], value,
-                                       atol=2e-6, rtol=2e-6, err_msg=f"resumed Adam {group}/{key}")
-    resume_evaluation = json.loads((resumed / "evaluation-report.json").read_text(encoding="utf-8"))
-    assert resume_evaluation["status"] == "passed"
-    for split, count in (("train", 7), ("test", 2)):
-        assert resume_evaluation["splits"][split]["aggregate"]["view_count"] == count
+    for resume_epoch, resume_path in ((1, first_path), (2, second_path)):
+        resumed = output / f"resumed-{resume_epoch}"
+        run([sys.executable, "-u", "-I", str(entry), "--resume", str(resume_path),
+             "--output-dir", str(resumed), "--build-dir", args.build_dir, "--gpu", str(args.gpu)],
+            f"resume-{resume_epoch}")
+        recovered = load_checkpoint(resumed / "model.npz")
+        assert recovered["model_metadata"] == final["model_metadata"]
+        assert recovered["config"]["data"]["initialization"] == initialization
+        assert recovered["training_state"]["rng_state"] == final["training_state"]["rng_state"]
+        assert recovered["training_state"]["global_step"] == 21
+        resume_report = json.loads((resumed / "training-report.json").read_text(encoding="utf-8"))
+        assert resume_report["trained_epochs_this_run"] == 3 - resume_epoch
+        resumed_history = [json.loads(line) for line in Path(resume_report["history_file"]).read_text().splitlines()]
+        assert [row["epoch"] for row in resumed_history] == list(range(resume_epoch + 1, 4))
+        assert [row["active_sh_count"] for row in resumed_history] == [1, 4, 9][resume_epoch:]
+        for key, value in final["model_state"].items():
+            np.testing.assert_allclose(recovered["model_state"][key], value, atol=2e-6, rtol=2e-6,
+                                       err_msg=f"resumed from epoch {resume_epoch}, model {key}")
+        for group, parameters in final["optimizer_state"]["groups"].items():
+            for key, value in parameters.items():
+                np.testing.assert_allclose(recovered["optimizer_state"]["groups"][group][key], value,
+                    atol=2e-6, rtol=2e-6, err_msg=f"resumed from epoch {resume_epoch}, Adam {group}/{key}")
+        resume_evaluation = json.loads((resumed / "evaluation-report.json").read_text(encoding="utf-8"))
+        assert resume_evaluation["status"] == "passed"
+        for split, count in (("train", 7), ("test", 2)):
+            assert resume_evaluation["splits"][split]["aggregate"]["view_count"] == count
     return {"status": "passed", "output": str(output), "checks": [
         "COLMAP binary initialization without PLY", "fixed camera normalization and thin shell",
         "fixed physical shell: layers 1 -> 2 -> 4 and grid 6 -> 12 -> 24",
         "sorted filename split: 7 train / 2 test",
         "full scaled fx/fy/cx/cy and 16x12 reference alignment", "all-view train/test evaluation",
-        "resume preserves model, Adam, RNG and initialization metadata"]}
+        "global 4:3:3 SH schedule activates 1 -> 4 -> 9 coefficients across grid changes",
+        "inactive SH coefficients, moments and per-degree clocks remain zero",
+        "saved stage rendering reproduces pre-refinement images",
+        "both SH transitions resume with identical model, Adam, RNG and initialization metadata"]}
 
 
 def main():

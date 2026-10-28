@@ -61,6 +61,8 @@ def validate_model_state(state: dict, metadata: dict) -> None:
     if mapping == "projective_shell" and policy != "preserve_physical_width":
         raise ValueError("Projective mapping requires preserve_physical_width refinement metadata")
     sh = _integer(metadata["sh_count"], "sh_count", 1, 16)
+    if "active_sh_count" in metadata:
+        _integer(metadata["active_sh_count"], "active_sh_count", 1, sh)
     opacity_sh = _integer(metadata["opacity_sh_count"], "opacity_sh_count", 1, 16)
     lo, hi = np.asarray(metadata["grid_min"]), np.asarray(metadata["grid_max"])
     if (lo.shape != (3,) or hi.shape != (3,) or lo.dtype.kind not in "iuf"

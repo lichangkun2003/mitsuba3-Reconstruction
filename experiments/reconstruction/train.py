@@ -44,6 +44,8 @@ from reconstruction_reference import GPUReferenceCache
 from reconstruction_replay import NativeLossReplay
 from reconstruction_gradient_storage import gradient_capacity, native_gradient_result
 from reconstruction_memory import plan_training_memory, probe_cuda_allocator
+from reconstruction_sh_schedule import (apply_sh_schedule, sh_schedule_protocol,
+    validate_sh_schedule, resolve_resume_sh_schedule)
 from reconstruction_sampling import PrefetchedUniformSampler
 from reconstruction_growth_rgb import RGB_GROWTH_EVIDENCE_VERSION
 from reconstruction_topology import (TopologyManager, TopologySettings, CoarseToFineConfig,
@@ -53,6 +55,8 @@ from reconstruction_topology import (TopologyManager, TopologySettings, CoarseTo
 @dataclass
 class TrainingSettings:
     rgb_only: bool = False  # Legacy schema default; CONFIG enables RGB-only phase 1.
+    sh_degree_progression: bool = False  # Legacy schema default; CONFIG enables progressive radiance.
+    sh_degree_weights: tuple[int, int, int] = (4, 3, 3)  # Global epochs: degree 0, then 0+1, then 0+1+2.
     num_epochs: int = 1000
     chunk_size: int = 0  # 0: submit the whole image; positive: explicit ray batches.
     sampling_workers: int = 2  # Single-GPU RGB: prefetch the exact CPU RNG stream; 0 disables.
@@ -128,6 +132,7 @@ class TrainConfig:
 # ==================== 训练实验配置：常用参数在这里修改 ====================
 # 路径相对于 mitsuba 仓库的父目录；切换场景只需修改下面的 dataset。
 CONFIG = TrainConfig()
+CONFIG.training.sh_degree_progression = True
 CONFIG.data.dataset = "datasets/bicycle"
 CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
@@ -350,6 +355,7 @@ def apply_arguments(config, args, values):
 
 def validate(config):
     validate_config(PreviewConfig(data=config.data, model=config.model, render=config.render, runtime=config.runtime))
+    validate_sh_schedule(config)
     if config.schedule.enabled:
         level_budgets(config.schedule.start_resolution, config.schedule.target_resolution,
                       config.schedule.total_epochs, config.schedule.level_weights)
@@ -625,6 +631,7 @@ def configure_training_memory(config, model, cache, report, view_count, *, world
         compact = compact_capacity_override
     plan = plan_training_memory(active_voxels=int(model.active_voxel_count),
         sh_count=int(model.sh_count), opacity_sh_count=int(model.opacity_sh_count),
+        radiance_degree_steps=config.training.sh_degree_progression,
         compact_capacity=compact, ray_count=effective_chunk_size(config),
         reference_image_pixels=pixels, max_hits=config.render.max_hits,
         max_candidates=config.gradient.max_candidates,
@@ -1234,6 +1241,12 @@ def run_training(distributed=None):
     if checkpoint is not None:
         validate_resume_supervision(config, checkpoint)
         resolve_resume_reference_compositing(config, checkpoint, overrides)
+        # Resolve new fields before the first validation/runtime check too.
+        # The full immutable-settings check follows loading the saved config.
+        saved_training = checkpoint["config"].get("training", {})
+        for name, default in (("sh_degree_progression", False), ("sh_degree_weights", (4, 3, 3))):
+            setattr(config.training, name, overrides.get("training", {}).get(
+                name, saved_training.get(name, default)))
     output = prepare_training_output(config, resume_path, checkpoint["config"] if checkpoint else None) if primary else None
     if distributed is not None:
         location, config.training.output = distributed.broadcast(
@@ -1285,6 +1298,9 @@ def run_training(distributed=None):
         if config.training.rgb_only and getattr(mi.VoxelReconstruction, "rgb_only_version", 0) < 1:
             raise RuntimeError("RGB-only training requires the new native implementation; "
                                "incrementally rebuild this Mitsuba source checkout")
+        if config.training.sh_degree_progression and getattr(mi.VoxelReconstruction, "sh_schedule_version", 0) < 1:
+            raise RuntimeError("Progressive SH requires a rebuilt native implementation; "
+                               "incrementally rebuild this Mitsuba source checkout")
         if distributed is not None:
             from reconstruction_collective import NcclCollective
             collective = NcclCollective(distributed.rank, distributed.world_size,
@@ -1311,6 +1327,8 @@ def run_training(distributed=None):
             config.render = RenderConfig()
             config.topology = TopologySettings()
             config.gradient = GradientSettings()
+            config.training.sh_degree_progression = False
+            config.training.sh_degree_weights = (4, 3, 3)
             update(config, checkpoint["config"])
             # The field did not exist in legacy checkpoints. Do not inherit a
             # newer CONFIG default when loading their algorithm settings.
@@ -1319,6 +1337,7 @@ def run_training(distributed=None):
             apply_arguments(config, args, overrides)
             validate_resume_supervision(config, checkpoint)
             resolve_resume_reference_compositing(config, checkpoint, overrides)
+            resolve_resume_sh_schedule(config, checkpoint, overrides)
             # JSON may request automatic naming with null; keep the already
             # selected location instead of restoring null or a stale host path.
             config.training.output = training_output
@@ -1402,6 +1421,7 @@ def run_training(distributed=None):
                            + (" and hard-hit distortion loss" if distortion_enabled else "")
                            + (" and linear RGB D-SSIM" if dssim_enabled else "")
                            if config.training.rgb_only else "Legacy Falcor NoLightTransport alpha-supervised training")
+        report["training_protocol"]["radiance_sh_schedule"] = sh_schedule_protocol(config)
         report["training_protocol"].update(
             rgb_only=config.training.rgb_only,
             render_color_space="linear",
@@ -1621,13 +1641,15 @@ def run_training(distributed=None):
             emit("Initializing voxel model:", "COLMAP normalized points" if prepared is not None
                  else str(dataset / config.data.point_cloud), flush=True)
             model = initialize_model(config, dataset, mi, np, prepared=prepared)
+            apply_sh_schedule(model, config, 0)
         del prepared
         if config.training.rgb_only and int(model.opacity_sh_count) != 1:
             raise ValueError("RGB-only model/checkpoint must contain exactly one opacity coefficient per voxel")
         configure_training_memory(config, model, gpu_reference_cache, report, len(views),
                                   world_size=world_size, emit=emit)
         performance.metadata["memory_plans"] = report["memory_plans"]
-        optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native)
+        optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native,
+                                   radiance_degree_steps=config.training.sh_degree_progression)
         if not callable(getattr(model, "optimizer_step_device", None)):
             raise RuntimeError("Device sparse Adam requires a rebuilt native optimizer_step_device binding; "
                                "incrementally rebuild this checkout before training")
@@ -1744,7 +1766,8 @@ def run_training(distributed=None):
             report.update(initial["refinement_artifacts"])
             if not primary:
                 model = restore_model(initial, mi)
-                optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native)
+                optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native,
+                                           radiance_degree_steps=config.training.sh_degree_progression)
                 optimizer.load_state_dict(initial["optimizer_state"])
                 rng.bit_generator.state = initial["rng_state"]
                 sampler.load_state_dict(initial["contour_state"])
@@ -1792,6 +1815,14 @@ def run_training(distributed=None):
                      if args.stop_after_epochs is not None else config.training.num_epochs)
         for epoch in range(completed, end_epoch):
             started = time.perf_counter()
+            previous_sh_count = int(getattr(model, "active_sh_count", model.sh_count))
+            active_sh_count = apply_sh_schedule(model, config, epoch)
+            if active_sh_count != previous_sh_count:
+                native_replay.clear()
+                optimizer.clear_replay()
+            if epoch == completed or active_sh_count != previous_sh_count:
+                emit(f"Radiance SH: {active_sh_count}/{int(model.sh_count)} coefficients active "
+                     f"from epoch {epoch + 1}", flush=True)
             training_resolution = int(model.resolution)
             active_voxels_before = int(model.active_voxel_count)
             entering_resolution = last_training_resolution != training_resolution
@@ -2021,7 +2052,8 @@ def run_training(distributed=None):
                     materialize_topology_state(new_state, dr)
                 model = restore_model(new_state, mi)
                 if not primary:
-                    optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native)
+                    optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native,
+                                               radiance_degree_steps=config.training.sh_degree_progression)
                     optimizer.load_state_dict(new_optimizer)
             # Release borrowed state before updates resume: retaining a full
             # model/Adam transfer snapshot would force native copy-on-write.
@@ -2039,6 +2071,8 @@ def run_training(distributed=None):
                                           world_size=world_size, emit=emit)
                 event["topology_cache_release_seconds"] = release_topology_cache(model, dr)
             entry = {"epoch": epoch+1, "global_step": global_step, "mean_loss": epoch_loss / len(views),
+                     "active_sh_count": active_sh_count,
+                     "active_sh_degree": math.isqrt(active_sh_count - 1),
                      "optimizer_step": optimizer_step, "views_per_update": world_size,
                      "updates_per_epoch": (len(views) + world_size - 1) // world_size,
                      "mean_rgb_loss": epoch_rgb_loss / len(views) if epoch_rgb_loss is not None else None,

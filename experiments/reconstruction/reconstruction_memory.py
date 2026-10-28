@@ -98,7 +98,8 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
                              compact_capacity, ray_count, max_hits, max_candidates,
                              distortion=True, dssim=False, lifecycle_epoch_bytes=4,
                              rgb_only=True, known_index_bytes=0,
-                             allocator_policy="cuda_2m", reference_image_pixels=None):
+                             allocator_policy="cuda_2m", reference_image_pixels=None,
+                             radiance_degree_steps=False):
     """Return named logical/allocated bytes for one view, excluding its cache.
 
     ``compact_capacity=0`` is the original N-row gradient layout. A positive
@@ -111,6 +112,8 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
     and one boolean per model row; epoch fields can use four or eight bytes.
     ``ray_count`` is the submitted batch size; ``reference_image_pixels`` is
     the complete cached image size and defaults to ray_count for whole views.
+    ``radiance_degree_steps`` allocates one radiance Adam clock per SH degree
+    and voxel so newly enabled degrees start with independent bias correction.
     """
     values = {
         "active_voxels": (active_voxels, 0), "sh_count": (sh_count, 1),
@@ -129,8 +132,8 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         raise ValueError("Reference image pixels must fit UInt32")
     if isinstance(lifecycle_epoch_bytes, bool) or lifecycle_epoch_bytes not in (4, 8):
         raise ValueError("lifecycle_epoch_bytes must be 4 or 8")
-    if not all(isinstance(value, bool) for value in (distortion, dssim, rgb_only)):
-        raise ValueError("distortion, dssim and rgb_only must be booleans")
+    if not all(isinstance(value, bool) for value in (distortion, dssim, rgb_only, radiance_degree_steps)):
+        raise ValueError("distortion, dssim, rgb_only and radiance_degree_steps must be booleans")
     round_cuda_allocation(0, allocator_policy)
 
     n = active_voxels
@@ -170,6 +173,9 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         # RGB/raw RGB, alpha/raw alpha, three loss planes, and hit_count.
         "render_result_planes": [(ray_count * 4, 12)],
     }
+    if radiance_degree_steps:
+        degree_count = math.isqrt(sh_count - 1) + 1
+        buffers["adam_step_counters"] = [(n * 4, 4), (n * degree_count * 4, 1)]
     if dssim:
         # Horizontal/vertical moments can retain 15 float planes each. Allow
         # another 18 for adjoints, image loss and coordinate/index temporaries.
@@ -201,6 +207,7 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         "model_float_components": model_width,
         "gradient_float_components": gradient_width,
         "lifecycle_epoch_bytes": lifecycle_epoch_bytes,
+        "radiance_degree_steps": radiance_degree_steps,
         "allocator_policy": allocator_policy,
         "allocator_policy_requires_patched_runtime": allocator_policy == "cuda_2m",
         "buffer_groups": {name: [{"logical_bytes_each": size, "count": count}
@@ -241,7 +248,8 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
                          rgb_only=True, workspace_reserve_mib=1536,
                          device_reserve_mib=1024, known_index_bytes=0,
                          pressure_cache_cap_mib=256, cache_quantum_mib=128,
-                         allocator_policy="cuda_2m", reference_image_pixels=None):
+                         allocator_policy="cuda_2m", reference_image_pixels=None,
+                         radiance_degree_steps=False):
     """Recommend a reference-cache cap without changing training algorithms.
 
     ``gpu`` is the runtime report containing ``memory_mib`` (number or numeric
@@ -274,7 +282,8 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         max_candidates=max_candidates, distortion=distortion, dssim=dssim,
         lifecycle_epoch_bytes=lifecycle_epoch_bytes, rgb_only=rgb_only,
         known_index_bytes=known_index_bytes, allocator_policy=allocator_policy,
-        reference_image_pixels=reference_image_pixels)
+        reference_image_pixels=reference_image_pixels,
+        radiance_degree_steps=radiance_degree_steps)
     image_pixels = estimate["reference_image_pixels"]
     image_bytes = image_pixels * (3 if rgb_only else 4) * 4
     image_allocated_bytes = round_cuda_allocation(image_pixels * 4, allocator_policy) * (3 if rgb_only else 4)
