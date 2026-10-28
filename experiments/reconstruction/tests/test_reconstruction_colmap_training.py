@@ -65,11 +65,14 @@ def run_check(args, output):
         "render": {"width": 93, "height": 97, "spp": 1, "max_hits": 2},
         "runtime": {"build_dir": args.build_dir, "gpu": args.gpu},
         "training": {"rgb_only": True, "num_epochs": 3, "chunk_size": 0,
+                     "sync_view_checks": args.sync_view_checks,
                      "save_count": 3, "profile_views": 0, "profile_interval_epochs": 0,
                      "output": str(full)},
         "schedule": {"enabled": True, "start_resolution": 4, "target_resolution": 16,
                      "level_weights": [1, 1, 1]},
         "topology": {"enable_growth": False, "enable_deletion": False},
+        "gradient": {"dssim_loss_weight": args.dssim_weight,
+                     "distortion_loss_weight": args.distortion_weight},
         "evaluation": {"spp": 1, "max_views": None},
     }
     config_path = output / "config.json"
@@ -135,6 +138,13 @@ def run_check(args, output):
     assert initialization["background_opacity"] == .5
     assert not (dataset / "init_points.ply").exists()
     history = [json.loads(line) for line in (full / "training.jsonl").read_text().splitlines()]
+    for row in history:
+        np.testing.assert_allclose(row["mean_loss"], row["mean_rgb_loss"]
+            + row["mean_weighted_dssim_loss"] + row["mean_weighted_distortion_loss"], atol=2e-7, rtol=2e-6)
+        assert row["dssim_loss_weight"] == args.dssim_weight
+        assert row["mean_dssim_loss"] > 0 if args.dssim_weight else row["mean_dssim_loss"] == 0
+    assert final["config"]["gradient"]["dssim_loss_weight"] == args.dssim_weight
+    assert report["training_protocol"]["dssim"]["enabled"] == (args.dssim_weight > 0)
     assert [row["training_resolution"] for row in history] == [6, 12, 24]
     assert history[0]["topology"]["refined"] is True
     assert history[1]["topology"]["refined"] is True
@@ -200,6 +210,9 @@ def main():
     parser.add_argument("--output-dir", default="outputs/mitsuba/colmap-training-tests")
     parser.add_argument("--build-dir", default=RuntimeConfig().build_dir)
     parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--dssim-weight", type=float, default=0.)
+    parser.add_argument("--distortion-weight", type=float, default=.1)
+    parser.add_argument("--sync-view-checks", action="store_true")
     args = parser.parse_args()
     root = workspace_path(args.output_dir, WORKSPACE)
     if root.is_relative_to(REPOSITORY):

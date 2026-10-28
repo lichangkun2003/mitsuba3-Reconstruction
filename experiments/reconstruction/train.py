@@ -76,6 +76,7 @@ class TrainingSettings:
 class GradientSettings:
     alpha_loss_weight: float = .5
     distortion_loss_weight: float = 0.  # Legacy checkpoint/schema default; CONFIG enables it for new experiments.
+    dssim_loss_weight: float = 0.  # Additive linear-image 1-SSIM; zero retains the original native path.
     geometry_tau_voxel_fraction: float = .12
     geometry_grad_clamp: float = 5
     alpha_geometry_weight: float = .1
@@ -231,6 +232,8 @@ def parse_arguments():
                         help="Use RGB-only training (CONFIG default); requires DC opacity and disabled reference-alpha priors")
     parser.add_argument("--distortion-weight", type=float,
                         help="Nonnegative hard-hit distortion loss weight (CONFIG default: 0.1); 0 explicitly disables it")
+    parser.add_argument("--dssim-weight", type=float,
+                        help="Additive linear RGB D-SSIM weight; 0 disables it (requires full-image RGB-only training)")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--target-resolution", type=int, choices=(512, 1024),
                         help="Final core grid resolution (start remains 256 by default)")
@@ -303,6 +306,7 @@ def apply_arguments(config, args, values):
         (getattr(args, "gpu_topology", None), "topology", "gpu_topology"),
         (args.rgb_only, "training", "rgb_only"),
         (getattr(args, "distortion_weight", None), "gradient", "distortion_loss_weight"),
+        (getattr(args, "dssim_weight", None), "gradient", "dssim_loss_weight"),
         (args.eval_spp, "evaluation", "spp"),
         (getattr(args, "eval_train_max_views", None), "evaluation", "train_max_views"),
         (getattr(args, "eval_test_max_views", None), "evaluation", "test_max_views"),
@@ -439,9 +443,16 @@ def validate(config):
         raise ValueError("training.batch_reduction must be 'auto' or 'dense'")
     if isinstance(config.gradient.distortion_loss_weight, bool):
         raise ValueError("gradient.distortion_loss_weight must be finite and nonnegative")
+    if isinstance(config.gradient.dssim_loss_weight, bool):
+        raise ValueError("gradient.dssim_loss_weight must be finite and nonnegative")
     for name, value in asdict(config.gradient).items():
         if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError(f"Invalid gradient.{name}: {value}")
+    if config.gradient.dssim_loss_weight > 0:
+        if not config.training.rgb_only:
+            raise ValueError("D-SSIM requires training.rgb_only=true")
+        if effective_chunk_size(config) != config.render.width * config.render.height:
+            raise ValueError("D-SSIM requires a complete image; set training.chunk_size=0")
     if config.gradient.geometry_tau_voxel_fraction <= 0:
         raise ValueError("geometry_tau_voxel_fraction must be positive")
     if not isinstance(config.evaluation.enabled, bool):
@@ -619,6 +630,7 @@ def configure_training_memory(config, model, cache, report, view_count, *, world
         max_candidates=config.gradient.max_candidates,
         reference_cache_mib=config.training.gpu_reference_cache_mib,
         gpu=report.get("gpu"), distortion=config.gradient.distortion_loss_weight > 0,
+        dssim=config.gradient.dssim_loss_weight > 0,
         reference_image_count=view_count, rgb_only=config.training.rgb_only,
         allocator_policy=report["cuda_allocator"]["policy"])
     core = str(int(getattr(model, "core_resolution", model.resolution)))
@@ -692,6 +704,10 @@ def settings(config):
         # The disabled path stays usable with existing native builds and keeps
         # its original replay key. The native default is also zero.
         result.pop("distortion_loss_weight")
+    if config.gradient.dssim_loss_weight == 0:
+        result.pop("dssim_loss_weight")
+    else:
+        result.update(image_width=config.render.width, image_height=config.render.height)
     result.update(rgb_only=config.training.rgb_only,
         foreground_alpha_min=config.topology.foreground_alpha_min,
         background_alpha_max=config.topology.background_alpha_max,
@@ -737,6 +753,11 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
             or not 0 <= pixel_begin < pixel_end <= count):
         raise ValueError("Pixel shard must be a nonempty interval within the full image")
     chunk_size = effective_chunk_size(config)
+    dssim_enabled = config.gradient.dssim_loss_weight > 0
+    if dssim_enabled and (not config.training.rgb_only or config.render.spp != 1
+                          or chunk_size != count or pixel_begin != 0 or pixel_end != count):
+        raise ValueError("D-SSIM requires one complete RGB-only 1-spp image per GPU; "
+                         "ray chunks and same-image pixel sharding are unsupported")
     channels = 3 if config.training.rgb_only else 4
     if rgba.shape != (config.render.height, config.render.width, channels):
         raise ValueError(f"Training reference must have shape (height, width, {channels}); "
@@ -749,8 +770,11 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
     estimated_alpha = allocate(mi.Float, count) if need_rendered_alpha else None
     accumulator = {"gradients": {}}
     distortion_enabled = config.gradient.distortion_loss_weight > 0
-    if distortion_enabled:
+    components_enabled = distortion_enabled or dssim_enabled
+    if components_enabled:
         accumulator.update(rgb_loss_sum=mi.Float(0), distortion_loss_sum=mi.Float(0))
+    if dssim_enabled:
+        accumulator["dssim_loss_sum"] = mi.Float(0)
     total_loss, finite = mi.Float(0), mi.Bool(True)
     camera = prepare_camera(config.render, view["camera"], mi, dr)
     native_settings = native_traversal_settings(model, settings(config))
@@ -801,10 +825,11 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
                     value = float(value) if name == "wall_seconds" or name.endswith("_ms") else int(value)
                     totals[name] = totals.get(name, 0) + value
         total_loss += dr.sum(result["loss"])
-        if distortion_enabled:
-            for name in ("rgb_loss", "distortion_loss"):
+        if components_enabled:
+            for name in (("rgb_loss", "distortion_loss", "dssim_loss") if dssim_enabled
+                         else ("rgb_loss", "distortion_loss")):
                 if name not in result:
-                    raise RuntimeError("Distortion loss components are unavailable; incrementally rebuild this source checkout")
+                    raise RuntimeError(f"Native {name} component is unavailable; incrementally rebuild this source checkout")
                 accumulator[name + "_sum"] += dr.sum(result[name])
                 finite &= dr.all(dr.isfinite(result[name]))
         finite &= dr.all(dr.isfinite(result["raw_alpha"])) & dr.all(dr.isfinite(result["alpha"]))
@@ -850,8 +875,10 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
     if "deletion_gain" in accumulator and dr.width(accumulator["deletion_gain"]):
         finite &= dr.all(dr.isfinite(accumulator["deletion_gain"]))
     finite &= dr.isfinite(total_loss)
-    if distortion_enabled:
+    if components_enabled:
         finite &= dr.isfinite(accumulator["rgb_loss_sum"]) & dr.isfinite(accumulator["distortion_loss_sum"])
+    if dssim_enabled:
+        finite &= dr.isfinite(accumulator["dssim_loss_sum"])
     return accumulator, total_loss, finite, raw_alpha, estimated_alpha
 
 
@@ -863,33 +890,43 @@ def finalize_view(partial, view, config, sampler, token, mi, dr, np, *, alpha_on
     # Read loss and the combined validity flag together, rather than performing
     # a separate host synchronization for every parameter group and ray batch.
     distortion_enabled = config.gradient.distortion_loss_weight > 0
+    dssim_enabled = config.gradient.dssim_loss_weight > 0
+    components_enabled = distortion_enabled or dssim_enabled
     if deferred_checks is not None:
-        # Four scalar statistics per view; no image/parameter readback. A device
+        # Four/five scalar statistics per view; no image/parameter readback. A device
         # guard blocks invalid updates immediately, even before host reporting.
         mean_loss = total_loss / count
-        rgb = accumulator.pop("rgb_loss_sum") / count if distortion_enabled else mean_loss
-        distortion = accumulator.pop("distortion_loss_sum") / count if distortion_enabled else mi.Float(0.)
+        rgb = accumulator.pop("rgb_loss_sum") / count if components_enabled else mean_loss
+        distortion = accumulator.pop("distortion_loss_sum") / count if components_enabled else mi.Float(0.)
         finite &= dr.isfinite(mean_loss) & dr.isfinite(rgb) & dr.isfinite(distortion)
-        summary = dr.concat([mean_loss, mi.Float(finite), rgb, distortion])
+        if dssim_enabled:
+            dssim = accumulator.pop("dssim_loss_sum") / count
+            finite &= dr.isfinite(dssim)
+            summary = dr.concat([mean_loss, mi.Float(finite), rgb, distortion, dssim])
+        else:
+            summary = dr.concat([mean_loss, mi.Float(finite), rgb, distortion])
         deferred_checks.add(view["index"], summary)
         accumulator["_update_allowed"] = finite & (mean_loss >= 0)
         if token is not None:
             # Legacy contour history consumes a host image; preserve its original
             # validation and observation ordering when explicitly requested.
             deferred_checks.read(rgb_only=config.training.rgb_only,
-                                 distortion_weight=config.gradient.distortion_loss_weight)
+                                 distortion_weight=config.gradient.distortion_loss_weight,
+                                 dssim_weight=config.gradient.dssim_loss_weight)
         if raw_alpha is not None:
             sampler.observe(token, np.asarray(raw_alpha))
         alpha = estimated_alpha
         if alpha is not None and not alpha_on_device:
             alpha = np.asarray(alpha).reshape(config.render.height, config.render.width)
         return accumulator, mean_loss, alpha
-    summary = dr.zeros(mi.Float, 4 if distortion_enabled else 2)
+    summary = dr.zeros(mi.Float, 5 if dssim_enabled else 4 if components_enabled else 2)
     dr.scatter(summary, total_loss / count, 0)
     dr.scatter(summary, mi.Float(finite), 1)
-    if distortion_enabled:
+    if components_enabled:
         dr.scatter(summary, accumulator.pop("rgb_loss_sum") / count, 2)
         dr.scatter(summary, accumulator.pop("distortion_loss_sum") / count, 3)
+    if dssim_enabled:
+        dr.scatter(summary, accumulator.pop("dssim_loss_sum") / count, 4)
     dr.eval(summary)
     host_summary = np.asarray(summary)
     mean_loss = float(host_summary[0])
@@ -902,12 +939,16 @@ def finalize_view(partial, view, config, sampler, token, mi, dr, np, *, alpha_on
         # Distortion is deliberately not evaluated at weight zero. In RGB-only
         # mode the baseline total is already the pure RGB loss, without another
         # reduction or host transfer. Legacy alpha loss cannot be separated here.
-        rgb_loss = float(host_summary[2]) if distortion_enabled else mean_loss if config.training.rgb_only else None
-        distortion_loss = float(host_summary[3]) if distortion_enabled else 0.
-        if (rgb_loss is not None and not math.isfinite(rgb_loss)) or not math.isfinite(distortion_loss):
+        rgb_loss = float(host_summary[2]) if components_enabled else mean_loss if config.training.rgb_only else None
+        distortion_loss = float(host_summary[3]) if components_enabled else 0.
+        dssim_loss = float(host_summary[4]) if dssim_enabled else 0.
+        if ((rgb_loss is not None and not math.isfinite(rgb_loss))
+                or not math.isfinite(distortion_loss) or not math.isfinite(dssim_loss)):
             raise RuntimeError(f"Nonfinite loss component at training view {view['index']}")
         loss_components.update(rgb_loss=rgb_loss, distortion_loss=distortion_loss,
-                               weighted_distortion_loss=config.gradient.distortion_loss_weight * distortion_loss)
+                               weighted_distortion_loss=config.gradient.distortion_loss_weight * distortion_loss,
+                               dssim_loss=dssim_loss,
+                               weighted_dssim_loss=config.gradient.dssim_loss_weight * dssim_loss)
     if raw_alpha is not None:
         sampler.observe(token, np.asarray(raw_alpha))
     # Topology voting consumes the device image directly. Keep the host return
@@ -955,8 +996,10 @@ def train_view(model, view, rgba, config, sampler, rng, mi, dr, np, *, need_rend
         if "deletion_gain" in accumulator and dr.width(accumulator["deletion_gain"]):
             finite &= dr.all(dr.isfinite(accumulator["deletion_gain"]))
         finite &= dr.isfinite(total_loss)
-        if config.gradient.distortion_loss_weight > 0:
+        if config.gradient.distortion_loss_weight > 0 or config.gradient.dssim_loss_weight > 0:
             finite &= dr.isfinite(accumulator["rgb_loss_sum"]) & dr.isfinite(accumulator["distortion_loss_sum"])
+        if config.gradient.dssim_loss_weight > 0:
+            finite &= dr.isfinite(accumulator["dssim_loss_sum"])
         partial = accumulator, total_loss, finite, raw_alpha, estimated_alpha
     return finalize_view(partial, view, config, sampler, token, mi, dr, np,
                          alpha_on_device=alpha_on_device, loss_components=loss_components,
@@ -1336,6 +1379,10 @@ def run_training(distributed=None):
         rgb_growth_enabled = config.topology.use_rgb_growth and config.topology.enable_growth and (
             not config.schedule.enabled or config.schedule.enable_coarse_growth)
         distortion_enabled = config.gradient.distortion_loss_weight > 0
+        dssim_enabled = config.gradient.dssim_loss_weight > 0
+        if dssim_enabled and getattr(mi.VoxelReconstruction, "dssim_version", 0) < 1:
+            raise RuntimeError("D-SSIM requires native dssim_version >= 1; "
+                               "incrementally rebuild this Mitsuba source checkout")
         if distortion_enabled and getattr(mi.VoxelReconstruction, "distortion_version", 0) < 1:
             raise RuntimeError("Distortion loss requires native distortion_version >= 1; "
                                "incrementally rebuild this Mitsuba source checkout")
@@ -1353,12 +1400,27 @@ def run_training(distributed=None):
                            + (" and RGB deletion from existing reverse paths" if rgb_deletion_enabled else "")
                            + (" and persistent low-opacity pruning" if low_opacity_deletion_enabled else "")
                            + (" and hard-hit distortion loss" if distortion_enabled else "")
+                           + (" and linear RGB D-SSIM" if dssim_enabled else "")
                            if config.training.rgb_only else "Legacy Falcor NoLightTransport alpha-supervised training")
         report["training_protocol"].update(
             rgb_only=config.training.rgb_only,
             render_color_space="linear",
             traversal=config.render.traversal,
             loss_color_space="linear",
+            dssim={
+                "enabled": dssim_enabled,
+                "weight": config.gradient.dssim_loss_weight,
+                "native_version": getattr(mi.VoxelReconstruction, "dssim_version", 0),
+                "formula": "1 - mean(SSIM over RGB channels and image pixels); additive to original RGB L2",
+                "window_size": 11, "sigma": 1.5, "padding": "zero",
+                "data_range": 1.0, "C1": 0.0001, "C2": 0.0009,
+                "color_space": "linear", "prediction_clamp": False,
+                "numerical_stability": "variance >= 0, SSIM in [-1,1], derivatives follow clamps",
+                "estimator": "sum gradients, mean reported loss; full image per GPU at 1 spp",
+                "execution": "separable Gaussian and analytic image adjoint between one forward and existing reverse",
+                "topology_evidence": "RGB-only insertion/removal gains remain unchanged",
+                "zero_weight": "not computed; logged D-SSIM values are zero, not measurements",
+            },
             distortion={
                 "enabled": distortion_enabled,
                 "weight": config.gradient.distortion_loss_weight,
@@ -1414,10 +1476,15 @@ def run_training(distributed=None):
             deletion_batch_policy="independent online votes; not a guarantee of joint loss decrease" if rgb_deletion_enabled else None,
             reported_loss=("mean pixel RGB squared-error sum over channels, then mean over views"
                            if config.training.rgb_only else "mean RGB plus alpha loss over pixels and views")
-                          + (" + weight * mean hard-hit distortion" if distortion_enabled else ""))
+                          + (" + weight * mean hard-hit distortion" if distortion_enabled else "")
+                          + (" + weight * mean linear RGB D-SSIM" if dssim_enabled else ""))
         dataset = workspace_path(config.data.dataset, WORKSPACE)
         emit("Loading training views and checking reference files:", dataset, flush=True)
         prepared = prepare_dataset(config, np, load_points=checkpoint is None)
+        # COLMAP preparation can replace the preset dimensions with actual image
+        # dimensions. Check the full-image loss contract again before allocation.
+        if dssim_enabled and effective_chunk_size(config) != config.render.width * config.render.height:
+            raise ValueError("D-SSIM requires a complete image at the dataset resolution; set training.chunk_size=0")
         report["scene_background"] = scene_background_protocol(config.data, config.render)
         report["training_protocol"]["reference_background"] = list(config.render.background)
         if (config.data.initialization or {}).get("scene_mapping") == "projective_shell":
@@ -1505,6 +1572,8 @@ def run_training(distributed=None):
              "| rendering and RGB loss: linear", flush=True)
         emit("Distortion loss:", f"weight={config.gradient.distortion_loss_weight:g}; "
              + ("hard-hit pairwise depth concentration" if distortion_enabled else "disabled"), flush=True)
+        emit("D-SSIM loss:", f"weight={config.gradient.dssim_loss_weight:g}; "
+             + ("linear RGB, Gaussian 11x11, one forward" if dssim_enabled else "disabled"), flush=True)
         emit("Training supervision:", ("RGB only; DC opacity; "
              + "refinement" + (" + RGB growth" if rgb_growth_enabled else "")
              + (" + RGB deletion" if rgb_deletion_enabled else "")) if config.training.rgb_only
@@ -1766,6 +1835,7 @@ def run_training(distributed=None):
             epoch_loss = 0.
             epoch_rgb_loss = 0. if config.training.rgb_only or distortion_enabled else None
             epoch_distortion_loss = 0.
+            epoch_dssim_loss = 0.
             deferred_checks = (None if config.training.sync_view_checks else DeferredViewChecks(mi, dr, np))
             stage_totals = dict(reference=0., gradients=0., topology_observation=0., optimizer=0.)
             communication_before = collective.statistics() if collective is not None else None
@@ -1789,6 +1859,7 @@ def run_training(distributed=None):
                 epoch_loss = batch_result["epoch_loss"]
                 epoch_rgb_loss = batch_result["epoch_rgb_loss"]
                 epoch_distortion_loss = batch_result["epoch_distortion_loss"]
+                epoch_dssim_loss = batch_result["epoch_dssim_loss"]
                 stage_totals = batch_result["stage_totals"]
                 validation_seconds = batch_result["validation_seconds"]
                 processed_views = batch_result["processed_views"]
@@ -1850,7 +1921,8 @@ def run_training(distributed=None):
                                 # Sparse diagnostics are explicit synchronization
                                 # boundaries; normal views never fetch loss scalars.
                                 measurements = deferred_checks.read(rgb_only=config.training.rgb_only,
-                                    distortion_weight=config.gradient.distortion_loss_weight)[-1]
+                                    distortion_weight=config.gradient.distortion_loss_weight,
+                                    dssim_weight=config.gradient.dssim_loss_weight)[-1]
                                 loss = measurements.pop("loss")
                                 loss_components.update(measurements)
                         optimizer_done = time.perf_counter()
@@ -1872,6 +1944,7 @@ def run_training(distributed=None):
                         if epoch_rgb_loss is not None:
                             epoch_rgb_loss += loss_components["rgb_loss"]
                         epoch_distortion_loss += loss_components["distortion_loss"]
+                        epoch_dssim_loss += loss_components["dssim_loss"]
                     loss_text = f"loss={loss:.6f}" if deferred_checks is None or profiling else "loss at epoch end"
                     progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} "
                         f"| view {progress}/{len(views)} ({100*progress/len(views):.0f}%) "
@@ -1898,13 +1971,15 @@ def run_training(distributed=None):
                 validation_started = time.perf_counter()
                 if deferred_checks is not None:
                     measurements = deferred_checks.read(rgb_only=config.training.rgb_only,
-                        distortion_weight=config.gradient.distortion_loss_weight)
+                        distortion_weight=config.gradient.distortion_loss_weight,
+                        dssim_weight=config.gradient.dssim_loss_weight)
                     # Sum host doubles in view order, exactly as the original per-view
                     # path. Topology/save cannot consume an unvalidated epoch.
                     epoch_loss = sum(value["loss"] for value in measurements)
                     if epoch_rgb_loss is not None:
                         epoch_rgb_loss = sum(value["rgb_loss"] for value in measurements)
                     epoch_distortion_loss = sum(value["distortion_loss"] for value in measurements)
+                    epoch_dssim_loss = sum(value["dssim_loss"] for value in measurements)
                 validation_seconds = time.perf_counter() - validation_started
             progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} "
                                  f"| view {len(views)}/{len(views)} (100%) | updating topology...", force=True)
@@ -1970,6 +2045,9 @@ def run_training(distributed=None):
                      "mean_distortion_loss": epoch_distortion_loss / len(views),
                      "mean_weighted_distortion_loss": config.gradient.distortion_loss_weight * epoch_distortion_loss / len(views),
                      "distortion_loss_weight": config.gradient.distortion_loss_weight,
+                     "mean_dssim_loss": epoch_dssim_loss / len(views),
+                     "mean_weighted_dssim_loss": config.gradient.dssim_loss_weight * epoch_dssim_loss / len(views),
+                     "dssim_loss_weight": config.gradient.dssim_loss_weight,
                      "rgb_only": config.training.rgb_only,
                      "seconds": time.perf_counter()-started, "resolution": int(model.resolution),
                      "training_resolution": training_resolution, "active_voxels_before": active_voxels_before,

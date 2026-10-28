@@ -64,6 +64,7 @@
   "gradient": {
     "alpha_loss_weight": 0.0,
     "distortion_loss_weight": 0.1,
+    "dssim_loss_weight": 0.1,
     "geometry_tau_voxel_fraction": 0.12,
     "geometry_grad_clamp": 5,
     "alpha_geometry_weight": 0.0,

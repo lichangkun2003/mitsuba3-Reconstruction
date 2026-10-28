@@ -96,7 +96,7 @@ def round_cuda_allocation(size, allocator_policy="cuda_2m"):
 
 def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
                              compact_capacity, ray_count, max_hits, max_candidates,
-                             distortion=True, lifecycle_epoch_bytes=4,
+                             distortion=True, dssim=False, lifecycle_epoch_bytes=4,
                              rgb_only=True, known_index_bytes=0,
                              allocator_policy="cuda_2m", reference_image_pixels=None):
     """Return named logical/allocated bytes for one view, excluding its cache.
@@ -129,8 +129,8 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         raise ValueError("Reference image pixels must fit UInt32")
     if isinstance(lifecycle_epoch_bytes, bool) or lifecycle_epoch_bytes not in (4, 8):
         raise ValueError("lifecycle_epoch_bytes must be 4 or 8")
-    if not isinstance(distortion, bool) or not isinstance(rgb_only, bool):
-        raise ValueError("distortion and rgb_only must be booleans")
+    if not all(isinstance(value, bool) for value in (distortion, dssim, rgb_only)):
+        raise ValueError("distortion, dssim and rgb_only must be booleans")
     round_cuda_allocation(0, allocator_policy)
 
     n = active_voxels
@@ -170,6 +170,12 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         # RGB/raw RGB, alpha/raw alpha, three loss planes, and hit_count.
         "render_result_planes": [(ray_count * 4, 12)],
     }
+    if dssim:
+        # Horizontal/vertical moments can retain 15 float planes each. Allow
+        # another 18 for adjoints, image loss and coordinate/index temporaries.
+        # No statistics are cached per camera. This is a conservative
+        # single-view workspace allowance, not another hit record.
+        buffers["dssim_image_workspace"] = [(reference_image_pixels * 4, 48)]
     if n:
         # Reconstruction.cpp: 9 hit floats (+2 distortion fields), hit IDs,
         # four reverse-suffix floats, and candidates with 6 floats + 2 UInt32s.
@@ -230,7 +236,7 @@ def _gpu_memory_bytes(gpu):
 
 def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
                          compact_capacity, ray_count, max_hits, max_candidates,
-                         reference_cache_mib, gpu, distortion=True,
+                         reference_cache_mib, gpu, distortion=True, dssim=False,
                          lifecycle_epoch_bytes=4, reference_image_count=None,
                          rgb_only=True, workspace_reserve_mib=1536,
                          device_reserve_mib=1024, known_index_bytes=0,
@@ -265,7 +271,7 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
     estimate = estimate_training_memory(
         active_voxels=active_voxels, sh_count=sh_count, opacity_sh_count=opacity_sh_count,
         compact_capacity=compact_capacity, ray_count=ray_count, max_hits=max_hits,
-        max_candidates=max_candidates, distortion=distortion,
+        max_candidates=max_candidates, distortion=distortion, dssim=dssim,
         lifecycle_epoch_bytes=lifecycle_epoch_bytes, rgb_only=rgb_only,
         known_index_bytes=known_index_bytes, allocator_policy=allocator_policy,
         reference_image_pixels=reference_image_pixels)

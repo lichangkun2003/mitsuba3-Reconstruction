@@ -126,7 +126,8 @@ class SchedulingTests(unittest.TestCase):
         self.assertTrue(_finite_accumulator(baseline, np.array([0.]), np.bool_(True), dr))
 
 
-def _fake_epoch(losses=(1., 3., 9.), *, gradient_nan=False, sync=False, rank=0):
+def _fake_epoch(losses=(1., 3., 9.), *, gradient_nan=False, sync=False, rank=0,
+                dssim_weight=0., distortion_weight=0., dssim_nan=False):
     """Run the actual epoch driver using CPU arrays and simulated peer views."""
     import train
 
@@ -143,11 +144,13 @@ def _fake_epoch(losses=(1., 3., 9.), *, gradient_nan=False, sync=False, rank=0):
         training=SimpleNamespace(rgb_only=True, profile_interval_epochs=0, profile_views=0,
                                  sync_view_checks=sync, num_epochs=1, freeze_native=True),
         render=SimpleNamespace(width=1, height=1, spp=1),
-        gradient=SimpleNamespace(distortion_loss_weight=0.),
+        gradient=SimpleNamespace(distortion_loss_weight=distortion_weight, dssim_loss_weight=dssim_weight),
         schedule=SimpleNamespace(enabled=False))
     traced, votes, updates, broadcasts, submitted = [], [], [], [], []
     gradient_values = (2., 4., 6.)
     evidence_values = (1., -1., 2.)
+    dssim_values = (.2, .4, .8)
+    distortion_values = (.1, .2, .3)
 
     def partial(index):
         out, _, finite, _, _ = zero_view_partial(model, mi, dr)
@@ -161,8 +164,16 @@ def _fake_epoch(losses=(1., 3., 9.), *, gradient_nan=False, sync=False, rank=0):
             out[f"{kind}_gain"] = mi.Float(evidence_values[index])
             out[f"{kind}_observed"] = mi.UInt32(1)
             out[f"{kind}_unknown"] = mi.UInt32(0)
+        loss = losses[index]
+        if distortion_weight or dssim_weight:
+            out["rgb_loss_sum"] = mi.Float(loss)
+            out["distortion_loss_sum"] = mi.Float(distortion_values[index] if distortion_weight else 0.)
+            loss += distortion_weight * distortion_values[index]
+        if dssim_weight:
+            out["dssim_loss_sum"] = mi.Float(np.nan if dssim_nan and index == 1 else dssim_values[index])
+            loss += dssim_weight * dssim_values[index]
         traced.append((index, model.value))
-        return out, mi.Float(losses[index]), finite, None, None
+        return out, mi.Float(loss), finite, None, None
 
     def compute(model, view, *args, **kwargs):
         submitted.append(view["index"])
@@ -182,6 +193,10 @@ def _fake_epoch(losses=(1., 3., 9.), *, gradient_nan=False, sync=False, rank=0):
             self.indices = list(range(self.batch_index * 2, min(self.batch_index * 2 + 2, 3)))
             self.sources = {source: partial(index) for source, index in enumerate(self.indices)}
             neutral = zero_view_partial(model, mi, dr)
+            component_keys = (("rgb_loss_sum", "distortion_loss_sum") if distortion_weight or dssim_weight else ())
+            if dssim_weight:
+                component_keys += ("dssim_loss_sum",)
+            neutral[0].update({key: mi.Float(0.) for key in component_keys})
             items = []
             for source in range(2):
                 if source == rank:
@@ -196,6 +211,8 @@ def _fake_epoch(losses=(1., 3., 9.), *, gradient_nan=False, sync=False, rank=0):
                 out[key] = sum(item[0][key] for item in items)
             for key in MAX_COUNTER_KEYS:
                 out[key] = np.maximum(items[0][0][key], items[1][0][key])
+            for key in component_keys:
+                out[key] = sum(item[0][key] for item in items)
             self.batch_index += 1
             return out, sum(item[1] for item in items), mi.Bool(all(item[2] for item in items))
 
@@ -244,6 +261,24 @@ def _fake_epoch(losses=(1., 3., 9.), *, gradient_nan=False, sync=False, rank=0):
 
 
 class EpochDriverTests(unittest.TestCase):
+    def test_dssim_components_weight_actual_tail_and_keep_rgb_separate(self):
+        for rank in (0, 1):
+            for distortion in (0., .2):
+                for sync in (False, True):
+                    with self.subTest(rank=rank, distortion=distortion, sync=sync):
+                        trial = _fake_epoch(dssim_weight=.1, distortion_weight=distortion, rank=rank, sync=sync)
+                        self.assertAlmostEqual(trial.result["epoch_rgb_loss"], 13.)
+                        self.assertAlmostEqual(trial.result["epoch_dssim_loss"], 1.4, places=6)
+                        self.assertAlmostEqual(trial.result["epoch_distortion_loss"], .6 if distortion else 0., places=6)
+                        self.assertAlmostEqual(trial.result["epoch_loss"], 13.14 + distortion * .6, places=5)
+                        self.assertEqual(trial.updates, [(2, 6., True), (1, 6., True)])
+
+    def test_nonfinite_dssim_component_blocks_update_even_when_total_is_finite(self):
+        trial = _fake_epoch(dssim_weight=.1, dssim_nan=True)
+        self.assertIsInstance(trial.error, RuntimeError)
+        self.assertEqual(trial.model.value, 0.)
+        self.assertTrue(all(not accepted for _, _, accepted in trial.updates))
+
     def test_per_view_votes_do_not_cancel_and_adam_runs_once_per_batch(self):
         trial = _fake_epoch()
         self.assertTrue(trial.uint_keys_correct)

@@ -215,6 +215,16 @@ MI_PY_EXPORT(VoxelReconstruction) {
         .def("native_scene_mapping", &Model::native_scene_mapping)
         .def_prop_ro("growth_candidate_count", &Model::growth_candidate_count)
         .def_prop_ro("topology_revision", &Model::topology_revision)
+        .def_static("dssim_image_loss_and_grad", [](const Color3f &rgb,
+                 const Color3f &reference, uint32_t width, uint32_t height) {
+            auto values = Model::dssim_image_loss_and_grad(rgb, reference, width, height);
+            nb::dict result;
+            result["loss"] = values.first;
+            result["dcolor"] = values.second;
+            return result;
+        }, "rgb"_a, "reference"_a, "width"_a, "height"_a,
+           "Per-pixel linear-RGB 1-SSIM and derivative of its pixel sum; "
+           "11x11 sigma-1.5 Gaussian, zero padding, no ray traversal.")
         .def("loss_and_grad", [](const Model &model, const Ray3f &ray,
                  const Color3f &reference_rgb, const Float &reference_alpha,
                  const Color3f &background, const Float &inverse_pdf,
@@ -230,6 +240,8 @@ MI_PY_EXPORT(VoxelReconstruction) {
             result["loss"] = values.loss;
             result["rgb_loss"] = values.rgb_loss;
             result["distortion_loss"] = values.distortion_loss;
+            if (values.dssim_enabled)
+                result["dssim_loss"] = values.dssim_loss;
             result["gradients"] = values.gradients;
             if (values.compact_gradients) {
                 result["voxel_ids"] = values.voxel_ids;
@@ -283,6 +295,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("rgb_growth_version") = nb::int_(Model::rgb_growth_version);
     cls.attr("rgb_deletion_version") = nb::int_(Model::rgb_deletion_version);
     cls.attr("distortion_version") = nb::int_(Model::distortion_version);
+    cls.attr("dssim_version") = nb::int_(Model::dssim_version);
     cls.attr("projective_version") = nb::int_(Model::projective_version);
     cls.attr("octree_version") = nb::int_(Model::octree_version);
     cls.attr("optimizer_device_version") = nb::int_(Model::optimizer_device_version);

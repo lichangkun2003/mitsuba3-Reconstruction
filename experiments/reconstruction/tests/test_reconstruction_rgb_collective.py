@@ -52,11 +52,13 @@ class ArrayDr(_Dr):
         target[index] = value
 
 
-def inputs(count=32, *, dense=False, invalid=False, nan=False):
+def inputs(count=32, *, dense=False, invalid=False, nan=False, dssim=False):
     peers = []
     for rank in range(3):
         value = {"gradients": {}, "loss_sum": _float(rank + .25), "finite": _uint(not (nan and rank == 1)),
                  "rgb_loss_sum": _float(rank + .125), "distortion_loss_sum": _float(.125)}
+        if dssim:
+            value["dssim_loss_sum"] = _float((rank + 1) * .0625 if rank < 2 else 0.)
         for key in SUM_COUNTER_KEYS + MAX_COUNTER_KEYS:
             value[key] = np.zeros(count, np.uint32)
         active = np.arange(count) if dense else np.asarray([1, 3] if rank == 0 else [3, 7])
@@ -94,7 +96,7 @@ def packets(peers, mode):
     for rank, value in enumerate(peers):
         first = {key: value[key] for key in ("appearance_valid", "geometry_valid")}
         first.update(losses=np.concatenate([value[key] for key in
-                     ("loss_sum", "rgb_loss_sum", "distortion_loss_sum")]),
+                     ("loss_sum", "rgb_loss_sum", "distortion_loss_sum", "dssim_loss_sum") if key in value]),
                      finite=value["finite"] & _uint(all(np.all(value[key] == 0) for key in
                          ("background_carve_valid", *MAX_COUNTER_KEYS))))
         gradient = {key: rows.reshape(count, -1)[ids].reshape(-1) if sparse else rows
@@ -150,6 +152,8 @@ def expected(peers):
                             for key in GRADIENT_KEYS}}
     for key in ("appearance_valid", "geometry_valid", "rgb_loss_sum", "distortion_loss_sum"):
         result[key] = np.sum([value[key] for value in peers], axis=0)
+    if "dssim_loss_sum" in peers[0]:
+        result["dssim_loss_sum"] = np.sum([value["dssim_loss_sum"] for value in peers], axis=0)
     for key in ("background_carve_valid", *MAX_COUNTER_KEYS):
         result[key] = np.zeros_like(peers[0][key])
     loss = np.sum([value["loss_sum"] for value in peers], axis=0)
@@ -194,6 +198,22 @@ def compare(test, output, oracle):
 
 
 class CpuTests(unittest.TestCase):
+    def test_dssim_scalar_survives_sparse_dense_and_idle_tail_rank(self):
+        peers = inputs(dssim=True)
+        for mode in ("auto", "dense"):
+            stages, _, _ = packets(peers, mode)
+            for rank in range(len(peers)):
+                with self.subTest(mode=mode, rank=rank):
+                    collective = _fixture(len(peers))
+                    collective.rank, collective.dr = rank, ArrayDr()
+                    collective._lib = PeerLibrary(stages, rank)
+                    local = peers[rank]
+                    result = collective.reduce_batch(local, local["loss_sum"], local["finite"],
+                        rgb_only=True, mode=mode, compact_output=True)
+                    compare(self, result, expected(peers))
+                    loss_calls = [call for call in collective._lib.calls if call[0] == "losses"]
+                    self.assertEqual(loss_calls, [("losses", 4, _NCCL_FLOAT32, _NCCL_SUM)])
+
     def test_compact_output_keeps_ids_counts_and_gradient_rows(self):
         class NoGradientExpansionDr(ArrayDr):
             @staticmethod

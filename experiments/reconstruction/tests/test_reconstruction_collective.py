@@ -191,6 +191,15 @@ def main():
     assert components.statistics()["calls"] == 5
     assert components.dr.syncs == 1
 
+    # D-SSIM adds a scalar to the same transfer, not another NCCL launch.
+    dssim_components = _fixture()
+    source["dssim_loss_sum"] = _float(.375)
+    result, _, _, _, _ = dssim_components.reduce_view(source, 3., True)
+    np.testing.assert_array_equal(result["dssim_loss_sum"], [1.75])
+    assert dssim_components._lib.calls[3] == (4, _NCCL_FLOAT32, _NCCL_SUM)
+    assert dssim_components.statistics()["calls"] == 5
+    assert dssim_components.dr.syncs == 1
+
     # Empty topology still participates in the loss/finite scalar collectives.
     empty = _fixture()
     result, _, _, out_raw, out_alpha = empty.reduce_view(_accumulator(0), 0., True)

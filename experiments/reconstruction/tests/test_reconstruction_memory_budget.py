@@ -88,6 +88,20 @@ class MemoryBudgetTests(unittest.TestCase):
                          narrow["components_bytes"]["lifecycle_deletion_streaks"] +
                          narrow["components_bytes"]["lifecycle_candidate_mask"], 100 * 21)
 
+    def test_dssim_workspace_is_one_image_independent_of_distortion_and_cache(self):
+        baseline = estimate_training_memory(**self.inputs(), distortion=False)
+        enabled = estimate_training_memory(**self.inputs(), distortion=False, dssim=True)
+        self.assertEqual(enabled["known_logical_bytes"] - baseline["known_logical_bytes"], 20 * 192)
+        self.assertEqual(enabled["components_bytes"]["hit_record_floats"],
+                         baseline["components_bytes"]["hit_record_floats"])
+        small = self.plan(dssim=True, reference_image_count=1)
+        large = self.plan(dssim=True, reference_image_count=1000)
+        self.assertEqual(small["components_bytes"]["dssim_image_workspace"],
+                         large["components_bytes"]["dssim_image_workspace"])
+        self.assertGreater(small["known_allocated_bytes"], self.plan()["known_allocated_bytes"])
+        with self.assertRaises(ValueError):
+            self.plan(dssim=1)
+
     def test_small_model_keeps_requested_cache_and_does_not_mutate_gpu_report(self):
         gpu = {"memory_mib": "32607", "name": "test"}
         before = copy.deepcopy(gpu)

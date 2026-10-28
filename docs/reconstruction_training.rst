@@ -166,6 +166,68 @@ tangent 的导数。深度最小点位于网格段内部时使用解析导数；
 小型数值回归位于 ``tests/test_reconstruction_distortion.py``，包括独立路径公式、
 opacity／深度几何有限差分、分批及重放；完整场景的改善需另行验证。
 
+可选 D-SSIM：线性 RGB 的局部结构损失
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+JSON 的 ``gradient.dssim_loss_weight`` 控制独立的加法权重，也可用
+``--dssim-weight`` 覆盖。通用配置与旧 checkpoint 缺失该字段时使用 ``0``，
+保持原执行路径；``configs/bicycle_1024.json`` 显式设置 ``0.1``，可改为 ``0`` 做对照。
+启用需要重新编译 C++，要求 ``mi.VoxelReconstruction.dssim_version >= 1``。
+将下面字段加入现有 ``gradient`` 对象，保留其他已有参数：
+
+.. code-block:: json
+
+   {
+     "gradient": {
+       "dssim_loss_weight": 0.1,
+       "distortion_loss_weight": 0.1
+     }
+   }
+
+损失定义为：
+
+.. math::
+
+   d_p=1-\frac{1}{3}\sum_{c\in\{R,G,B\}}\operatorname{SSIM}_{p,c},\qquad
+   L=\frac{1}{HW}\sum_p\left[\|\mathbf C_p-\mathbf R_p\|_2^2+
+      \lambda_{\mathrm{ssim}}d_p+\lambda_{\mathrm{dist}}D_p\right].
+
+图像与参考均为已经准备好的**线性 RGB**，不转换到 sRGB，不读取 alpha，
+也不在计算前把大于 1 的预测颜色截断。RGB 项保留三通道平方误差的和，
+D-SSIM 则在通道间平均；采用 ``1-SSIM`` 定义，没有再除以 2。
+它是现有 RGB 项上的独立加法权重，不是 3DGS 的 ``(1-lambda)*L1+lambda*(1-SSIM)``，
+相同 lambda 数值不能视为等强度。原生输出仍为逐像素损失以及按像素求和的梯度，
+报告阶段才除以像素数，避免 D-SSIM 梯度被单独缩小 ``HW`` 倍。
+
+窗口固定为归一化的 11×11 高斯核，``sigma=1.5``，图像外零填充，边界不重新归一化。
+稳定常数为 ``C1=0.01²``、``C2=0.03²``，参考动态范围固定为 1。
+数值误差造成的负方差截为零，SSIM 截在 ``[-1,1]``；解析反向包含相应截断导数。
+
+原生实现使用现有训练前向产生的完整 RGB 图像，在命中反向之前计算局部统计及
+``dL/dC``。水平、垂直可分离滤波与其伴随均在 GPU 执行；一个像素的导数累加
+所有包含它的窗口贡献，而不只考虑以它为中心的窗口。
+现有命中和 near-miss 记录继续用于颜色、opacity 和几何代理反向，不增加场景追踪。
+几何部分仍为当前 hard-hit 模型的代理梯度，不因加入图像损失就变成精确可见性导数。
+重放包含新增图像运算，权重和图像尺寸纳入缓存键。
+
+首版要求 RGB-only、1 spp、完整行优先图像、单位采样权重。
+``training.chunk_size=0`` 或不小于图像像素数均可；较小分块与旧的同图像素分卡路径
+会明确拒绝，避免在块边界错误计算邻域。当前每卡独立完整视角的多卡方式正常支持，
+不增加跨卡图像通信，各卡梯度按实际参与视角数平均，尾批规则保持一致。
+新增工作区按单视角复用，不默认缓存全部参考图的局部均值与方差。
+
+生长及 RGB 删除仍按纯 RGB 单体素反事实收益投票，低 opacity 删除也保持原规则；
+不把图像邻域导数直接代入原来的精确单像素收益公式。
+``training.jsonl`` 增加 ``mean_dssim_loss``、``mean_weighted_dssim_loss`` 与
+``dssim_loss_weight``，总 ``mean_loss`` 包含该项。原生返回 ``dssim_loss``，
+分段诊断另列 ``image_loss``；关闭时不执行 SSIM 滤波或分配其工作区。
+评价继续计算已有 ``psnr_srgb_png``，不把训练 loss 当作图像评价指标。
+
+``tests/test_reconstruction_dssim.py`` 使用独立 NumPy 二维卷积与有限差分检查
+常量图、小图、边界、超过 1 的预测颜色、图像梯度和原生颜色/opacity 梯度，
+并覆盖零权重、空模型、紧凑梯度、重放、拓扑证据不变及配置校验。
+完整场景的质量、速度和峰值显存需要实际对照实验。
+
 在线 RGB 生长：复用训练前向，不增加验证渲染
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

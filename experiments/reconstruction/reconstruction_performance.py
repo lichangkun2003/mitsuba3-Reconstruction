@@ -13,7 +13,7 @@ import time
 
 _PROFILE_FIELDS = ("wall_seconds", "operations", "jit_kernels", "cache_hits", "cache_misses",
                    "codegen_ms", "backend_compile_ms", "device_ms")
-_NATIVE_STAGES = ("forward", "hit_backward", "candidate_backward")
+_NATIVE_STAGES = ("forward", "image_loss", "hit_backward", "candidate_backward")
 
 
 def _number(value):

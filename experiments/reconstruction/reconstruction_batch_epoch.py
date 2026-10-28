@@ -26,7 +26,7 @@ def _finite_accumulator(accumulator, loss, finite, dr):
         # and keep the existing scalar guard intact.
         if dr.width(value):
             finite &= dr.all(dr.isfinite(value))
-    for key in ("rgb_loss_sum", "distortion_loss_sum"):
+    for key in ("rgb_loss_sum", "distortion_loss_sum", "dssim_loss_sum"):
         if key in accumulator:
             finite &= dr.all(dr.isfinite(accumulator[key]))
     for key in ("growth_gain", "deletion_gain"):
@@ -61,6 +61,9 @@ def run_view_batch_epoch(*, model, config, views, order, epoch, optimizer, topol
     if primary != (collective.rank == 0):
         raise ValueError("View-batch primary rank is inconsistent with the collective")
     distortion_enabled = config.gradient.distortion_loss_weight > 0
+    dssim_weight = getattr(config.gradient, "dssim_loss_weight", 0.)
+    dssim_enabled = dssim_weight > 0
+    separate_losses = distortion_enabled or dssim_enabled
     checks = DeferredViewChecks(mi, dr, np)
     batch_sizes = []
     stage_totals = dict(reference=0., gradients=0., topology_observation=0., optimizer=0.)
@@ -102,8 +105,10 @@ def run_view_batch_epoch(*, model, config, views, order, epoch, optimizer, topol
                     native_replay=native_replay)
             else:
                 partial = zero_view_partial(model, mi, dr)
-                if distortion_enabled:
+                if separate_losses:
                     partial[0].update(rgb_loss_sum=mi.Float(0), distortion_loss_sum=mi.Float(0))
+                if dssim_enabled:
+                    partial[0]["dssim_loss_sum"] = mi.Float(0)
             accumulator, loss_sum, finite, _, _ = partial
             finite = _finite_accumulator(accumulator, loss_sum, finite, dr)
             evidence = {}
@@ -127,10 +132,14 @@ def run_view_batch_epoch(*, model, config, views, order, epoch, optimizer, topol
             finite = _finite_accumulator(reduced, loss_sum, finite, dr)
             divisor = ray_count * batch_size
             loss = loss_sum / divisor
-            rgb = reduced.pop("rgb_loss_sum") / divisor if distortion_enabled else loss
-            distortion = reduced.pop("distortion_loss_sum") / divisor if distortion_enabled else mi.Float(0)
-            finite &= dr.isfinite(loss) & dr.isfinite(rgb) & dr.isfinite(distortion)
-            checks.add(indices[0], dr.concat([loss, mi.Float(finite), rgb, distortion]))
+            rgb = reduced.pop("rgb_loss_sum") / divisor if separate_losses else loss
+            distortion = reduced.pop("distortion_loss_sum") / divisor if separate_losses else mi.Float(0)
+            dssim = reduced.pop("dssim_loss_sum") / divisor if dssim_enabled else mi.Float(0)
+            finite &= dr.isfinite(loss) & dr.isfinite(rgb) & dr.isfinite(distortion) & dr.isfinite(dssim)
+            summary = [loss, mi.Float(finite), rgb, distortion]
+            if dssim_enabled:
+                summary.append(dssim)
+            checks.add(indices[0], dr.concat(summary))
             gradients_done = time.perf_counter()
             if evidence:
                 uint_keys = tuple(key for key in evidence if not key.endswith("_gain"))
@@ -152,7 +161,7 @@ def run_view_batch_epoch(*, model, config, views, order, epoch, optimizer, topol
             host_measurement = None
             if profiling or config.training.sync_view_checks:
                 host_measurement = checks.read(rgb_only=config.training.rgb_only,
-                    distortion_weight=config.gradient.distortion_loss_weight)[-1]
+                    distortion_weight=config.gradient.distortion_loss_weight, dssim_weight=dssim_weight)[-1]
             optimizer_done = time.perf_counter()
         batch_sizes.append(batch_size)
         stage = dict(reference=reference_done - batch_started,
@@ -197,10 +206,12 @@ def run_view_batch_epoch(*, model, config, views, order, epoch, optimizer, topol
             performance.record_profile(profile)
     validation_started = time.perf_counter()
     measurements = checks.read(rgb_only=config.training.rgb_only,
-                               distortion_weight=config.gradient.distortion_loss_weight)
+                               distortion_weight=config.gradient.distortion_loss_weight,
+                               dssim_weight=dssim_weight)
     return dict(
         epoch_loss=sum(value["loss"] * count for value, count in zip(measurements, batch_sizes)),
         epoch_rgb_loss=sum(value["rgb_loss"] * count for value, count in zip(measurements, batch_sizes)),
         epoch_distortion_loss=sum(value["distortion_loss"] * count for value, count in zip(measurements, batch_sizes)),
+        epoch_dssim_loss=sum(value["dssim_loss"] * count for value, count in zip(measurements, batch_sizes)),
         stage_totals=stage_totals, validation_seconds=time.perf_counter() - validation_started,
         processed_views=processed_views, global_step=global_step, optimizer_step=optimizer_step)

@@ -21,7 +21,17 @@ import time
 GRADIENT_KEYS = ("radiance_sh", "opacity_sh", "centers", "log_scales", "rotation_tangent")
 SUM_COUNTER_KEYS = ("appearance_valid", "geometry_valid", "background_carve_valid")
 MAX_COUNTER_KEYS = ("foreground_evidence", "background_evidence")
-LOSS_COMPONENT_KEYS = ("rgb_loss_sum", "distortion_loss_sum")
+LOSS_COMPONENT_KEYS = ("rgb_loss_sum", "distortion_loss_sum", "dssim_loss_sum")
+
+
+def _loss_component_names(accumulator):
+    """Preserve the two legacy components; D-SSIM adds one optional scalar."""
+    base = LOSS_COMPONENT_KEYS[:2]
+    present = [name in accumulator for name in base]
+    if ((any(present) and not all(present)) or
+            ("dssim_loss_sum" in accumulator and not all(present))):
+        raise ValueError("Loss component reductions require both RGB and distortion loss sums")
+    return tuple(name for name in LOSS_COMPONENT_KEYS if name in accumulator)
 
 _NCCL_FLOAT32, _NCCL_UINT32 = 7, 3
 _NCCL_SUM, _NCCL_MAX, _NCCL_MIN = 0, 2, 3
@@ -215,10 +225,7 @@ class NcclCollective:
         loss_sum, finite = mi.Float(loss_sum), mi.UInt32(finite)
         if dr.width(loss_sum) != 1 or dr.width(finite) != 1:
             raise ValueError("Loss and finite-status reductions require scalar device arrays")
-        component_presence = [name in accumulator for name in LOSS_COMPONENT_KEYS]
-        if any(component_presence) and not all(component_presence):
-            raise ValueError("Distortion reductions require both RGB and distortion loss sums")
-        component_names = LOSS_COMPONENT_KEYS if all(component_presence) else ()
+        component_names = _loss_component_names(accumulator)
         if any(dr.width(accumulator[name]) != 1 for name in component_names):
             raise ValueError("Loss component reductions require scalar device arrays")
         # Pack these scalars into the existing loss collective, so reporting
@@ -403,10 +410,7 @@ class NcclCollective:
         loss_sum, finite = mi.Float(loss_sum), mi.Bool(finite)
         if dr.width(loss_sum) != 1 or dr.width(finite) != 1:
             raise ValueError("Loss and finite-status reductions require scalar device arrays")
-        present = [name in accumulator for name in LOSS_COMPONENT_KEYS]
-        if any(present) and not all(present):
-            raise ValueError("Distortion reductions require both RGB and distortion loss sums")
-        component_names = LOSS_COMPONENT_KEYS if all(present) else ()
+        component_names = _loss_component_names(accumulator)
         if any(dr.width(accumulator[name]) != 1 for name in component_names):
             raise ValueError("Loss component reductions require scalar device arrays")
         # Native RGB-only tracing guarantees these arrays are zero. Guard that

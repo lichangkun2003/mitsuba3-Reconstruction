@@ -1424,6 +1424,131 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
     return {ls.color + ls.transmittance*background, 1.f-ls.transmittance, ls.hits};
 }
 
+MI_VARIANT std::pair<Float, typename VoxelReconstruction<Float, Spectrum>::Color3f>
+VoxelReconstruction<Float, Spectrum>::dssim_image_loss_and_grad(
+    const Color3f &rgb, const Color3f &reference,
+    uint32_t image_width, uint32_t image_height) {
+    if constexpr (!dr::is_jit_v<Float>) {
+        Throw("VoxelReconstruction.dssim_image_loss_and_grad(): complete images require a JIT variant.");
+    } else {
+        const uint64_t pixels = uint64_t(image_width) * image_height;
+        if (!image_width || !image_height || pixels > INT32_MAX)
+            Throw("VoxelReconstruction.dssim_image_loss_and_grad(): invalid image dimensions.");
+        for (uint32_t c = 0; c < 3; ++c)
+            if ((dr::width(rgb[c]) != 1 && dr::width(rgb[c]) != pixels) ||
+                (dr::width(reference[c]) != 1 && dr::width(reference[c]) != pixels))
+                Throw("VoxelReconstruction.dssim_image_loss_and_grad(): RGB buffers must cover one complete image.");
+        using Value = dr::detached_t<Float>;
+        using Index = dr::uint32_array_t<Value>;
+        using SignedIndex = dr::int32_array_t<Value>;
+        using ImageMask = dr::mask_t<Value>;
+        const uint32_t count = uint32_t(pixels);
+        Index lane = dr::arange<Index>(count);
+        SignedIndex x = SignedIndex(lane % image_width), y = SignedIndex(lane / image_width);
+        std::array<float, 11> kernel;
+        double kernel_sum = 0.;
+        for (int tap = -5; tap <= 5; ++tap)
+            kernel_sum += std::exp(-double(tap * tap) / (2. * 1.5 * 1.5));
+        for (int tap = -5; tap <= 5; ++tap)
+            kernel[tap + 5] = float(std::exp(-double(tap * tap) / (2. * 1.5 * 1.5)) / kernel_sum);
+        auto materialize = [](const auto &planes) {
+            for (const auto &plane : planes)
+                dr::schedule(plane);
+            dr::eval();
+        };
+        // Detached image arithmetic is explicit: only dcolor is propagated into
+        // the renderer's custom reverse, never an ordinary AD ray-tracing tape.
+        std::array<Value, 3> image, target;
+        for (uint32_t c = 0; c < 3; ++c) {
+            image[c] = dr::detach<false>(rgb[c]) + dr::zeros<Value>(count);
+            target[c] = dr::detach<false>(reference[c]) + dr::zeros<Value>(count);
+        }
+        materialize(image);
+        materialize(target);
+        auto blur_axis = [&](const auto &input, bool horizontal) {
+            auto output = input;
+            for (auto &plane : output)
+                plane = dr::zeros<Value>(count);
+            for (int tap = -5; tap <= 5; ++tap) {
+                SignedIndex xx = x + (horizontal ? tap : 0);
+                SignedIndex yy = y + (horizontal ? 0 : tap);
+                ImageMask valid = (xx >= 0) & (xx < int(image_width)) &
+                                  (yy >= 0) & (yy < int(image_height));
+                Index index = Index(yy * int(image_width) + xx);
+                for (size_t plane = 0; plane < input.size(); ++plane)
+                    output[plane] += kernel[tap + 5] *
+                        dr::gather<Value>(input[plane], index, valid);
+            }
+            materialize(output);
+            return output;
+        };
+        std::array<Value, 15> moments;
+        // Fuse the first moment pass: each neighboring x/y value is gathered
+        // once, then reused for x, y, x*x, y*y and x*y.
+        for (auto &plane : moments)
+            plane = dr::zeros<Value>(count);
+        for (int tap = -5; tap <= 5; ++tap) {
+            SignedIndex xx = x + tap;
+            ImageMask valid = (xx >= 0) & (xx < int(image_width));
+            Index index = Index(y * int(image_width) + xx);
+            for (uint32_t c = 0; c < 3; ++c) {
+                Value a = dr::gather<Value>(image[c], index, valid);
+                Value b = dr::gather<Value>(target[c], index, valid);
+                const float k = kernel[tap + 5];
+                moments[c * 5] += k * a;
+                moments[c * 5 + 1] += k * b;
+                moments[c * 5 + 2] += k * a * a;
+                moments[c * 5 + 3] += k * b * b;
+                moments[c * 5 + 4] += k * a * b;
+            }
+        }
+        materialize(moments);
+        moments = blur_axis(moments, false);
+        std::array<Value, 9> adjoint;
+        Value loss = dr::zeros<Value>(count);
+        for (uint32_t c = 0; c < 3; ++c) {
+            const Value &mu_x = moments[c * 5], &mu_y = moments[c * 5 + 1];
+            Value raw_var_x = moments[c * 5 + 2] - dr::square(mu_x);
+            Value raw_var_y = moments[c * 5 + 3] - dr::square(mu_y);
+            Value var_x = dr::maximum(raw_var_x, 0.f), var_y = dr::maximum(raw_var_y, 0.f);
+            Value covariance = moments[c * 5 + 4] - mu_x * mu_y;
+            Value a = 2.f * mu_x * mu_y + .01f * .01f;
+            Value b = 2.f * covariance + .03f * .03f;
+            Value denominator_mu = dr::square(mu_x) + dr::square(mu_y) + .01f * .01f;
+            Value denominator_var = var_x + var_y + .03f * .03f;
+            Value inverse = dr::rcp(denominator_mu * denominator_var);
+            Value score = a * b * inverse;
+            ImageMask finite = dr::isfinite(score) & dr::isfinite(raw_var_x) & dr::isfinite(raw_var_y);
+            ImageMask live = finite & (score > -1.f) & (score < 1.f);
+            Value stabilized = dr::select(finite, dr::clip(score, -1.f, 1.f),
+                                          std::numeric_limits<float>::quiet_NaN());
+            loss += (1.f - stabilized) / 3.f;
+            Value d_mu = dr::select(live, 2.f * mu_y * b * inverse -
+                                   2.f * mu_x * score / denominator_mu, 0.f);
+            Value d_var = dr::select(live & (raw_var_x > 0.f), -score / denominator_var, 0.f);
+            Value d_cov = dr::select(live, 2.f * a * inverse, 0.f);
+            adjoint[c * 3] = -(d_mu - 2.f * mu_x * d_var - mu_y * d_cov) / 3.f;
+            adjoint[c * 3 + 1] = -d_var / 3.f;
+            adjoint[c * 3 + 2] = -d_cov / 3.f;
+        }
+        dr::schedule(loss);
+        materialize(adjoint);
+        for (auto &plane : moments)
+            plane = Value();
+        // Symmetric zero padding makes the convolution self-adjoint. Applying
+        // it to the three coefficient planes sums every overlapping window's
+        // contribution without pixel scatter atomics or another ray traversal.
+        adjoint = blur_axis(adjoint, true);
+        adjoint = blur_axis(adjoint, false);
+        Color3f dcolor;
+        for (uint32_t c = 0; c < 3; ++c)
+            dcolor[c] = Float(adjoint[c * 3] + 2.f * image[c] * adjoint[c * 3 + 1] +
+                              target[c] * adjoint[c * 3 + 2]);
+        dr::eval(dcolor);
+        return {Float(loss), dcolor};
+    }
+}
+
 // Port of Falcor NoLightTransport GradientPass/PathRecord semantics, source
 // 398f634ec788bbb2e86a6f4d0ab78d41158d9905. The geometry terms below are
 // deliberately surrogate derivatives of a hard forward model, not ordinary AD.
@@ -1446,7 +1571,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         {"use_octree", 1.f}, {"rgb_only", 0.f},
         {"collect_rgb_deletion_evidence", 0.f},
         {"collect_growth_evidence", 0.f}, {"max_growth_hits", 8.f},
-        {"distortion_loss_weight", 0.f}, {"compact_gradient_capacity", 0.f}};
+        {"distortion_loss_weight", 0.f}, {"compact_gradient_capacity", 0.f},
+        {"dssim_loss_weight", 0.f}, {"image_width", 0.f}, {"image_height", 0.f}};
     for (const auto &[key, value] : settings) {
         if (cfg.find(key) == cfg.end() || !std::isfinite(value) || value < 0.f)
             Throw("VoxelReconstruction.loss_and_grad(): unknown/invalid setting %s.", key.c_str());
@@ -1457,6 +1583,19 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     const bool profile_traversal = cfg["profile_traversal"] != 0.f;
     const float distortion_weight = cfg["distortion_loss_weight"];
     const bool distortion_enabled = distortion_weight > 0.f;
+    const float dssim_weight = cfg["dssim_loss_weight"];
+    const bool dssim_enabled = dssim_weight > 0.f;
+    uint32_t image_width = 0, image_height = 0;
+    if (dssim_enabled) {
+        if (!dr::is_jit_v<Float> || !rgb_only)
+            Throw("VoxelReconstruction.loss_and_grad(): D-SSIM requires a JIT RGB-only full-image batch.");
+        for (const char *name : {"image_width", "image_height"})
+            if (cfg[name] < 1.f || double(cfg[name]) > double(INT32_MAX) ||
+                std::floor(cfg[name]) != cfg[name])
+                Throw("VoxelReconstruction.loss_and_grad(): D-SSIM requires positive integer image_width/image_height.");
+        image_width = uint32_t(cfg["image_width"]);
+        image_height = uint32_t(cfg["image_height"]);
+    }
     const float requested_capacity = cfg["compact_gradient_capacity"];
     if (double(requested_capacity) > double(UINT32_MAX) ||
         std::floor(requested_capacity) != requested_capacity)
@@ -1486,6 +1625,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     // differently sized compatibility alpha argument must not affect the batch.
     if (!rgb_only)
         width = std::max(width, dr::width(reference_alpha));
+    if (dssim_enabled && (uint64_t(image_width) * image_height != width || width > INT32_MAX))
+        Throw("VoxelReconstruction.loss_and_grad(): D-SSIM requires exactly image_width*image_height rays in row-major order.");
     const uint32_t hit_fields = distortion_enabled ? 11u : 9u;
     if (width == 0 || width * std::max(max_hits, std::max(max_candidates,
         collect_growth ? max_growth_hits : 1u)) * hit_fields > UINT32_MAX)
@@ -1496,6 +1637,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         if constexpr (dr::is_jit_v<Float>) {
             dr::schedule(result.rgb, result.raw_rgb, result.alpha, result.raw_alpha,
                          result.loss, result.rgb_loss, result.distortion_loss, result.hit_count);
+            if (result.dssim_enabled)
+                dr::schedule(result.dssim_loss);
             if (result.compact_gradients)
                 dr::schedule(result.voxel_ids, result.voxel_count, result.compact_gradient_overflow);
             for (const auto &[key, value] : result.gradients)
@@ -1549,9 +1692,23 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             result.deletion_counts["deletion_observed"] = dr::zeros<UIntBuffer>(0);
             result.deletion_counts["deletion_unknown"] = dr::zeros<UIntBuffer>(0);
         }
+        if (dssim_enabled) {
+            if (profiler.enabled()) {
+                evaluate_result(result);
+                profiler.finish("forward");
+                profiler.begin();
+            }
+            result.dssim_enabled = true;
+            auto image_loss = dssim_image_loss_and_grad(result.rgb, target, image_width, image_height);
+            // A device guard preserves frozen replay and avoids synchronizing
+            // every view just to validate the uniform sampling contract.
+            result.dssim_loss = dr::select(dr::all(inverse_pdf == 1.f), image_loss.first,
+                                           std::numeric_limits<float>::quiet_NaN());
+            result.loss += dssim_weight * result.dssim_loss;
+        }
         if (profiler.enabled()) {
             evaluate_result(result);
-            profiler.finish("forward");
+            profiler.finish(dssim_enabled ? "image_loss" : "forward");
             profiler.zero_stage("hit_backward");
             profiler.zero_stage("candidate_backward");
             result.stage_profile = std::move(profiler.profile);
@@ -2037,6 +2194,22 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     }
     if (distortion_enabled)
         result.loss += distortion_weight*result.distortion_loss;
+    if (dssim_enabled) {
+        result.dssim_enabled = true;
+        auto image_loss = dssim_image_loss_and_grad(result.rgb, target, image_width, image_height);
+        Mask uniform = dr::all(inverse_pdf == 1.f);
+        result.dssim_loss = dr::select(uniform, image_loss.first,
+                                       std::numeric_limits<float>::quiet_NaN());
+        result.loss += dssim_weight * result.dssim_loss;
+        dcolor += dssim_weight * image_loss.second;
+        dcolor = dr::select(uniform, dcolor,
+                            Color3f(std::numeric_limits<float>::quiet_NaN()));
+        if (profiler.enabled()) {
+            dr::eval(result.rgb_loss, result.distortion_loss, result.dssim_loss, result.loss, dcolor);
+            profiler.finish("image_loss");
+            profiler.begin();
+        }
+    }
     if (growth_requested) {
         result.growth_sums["growth_gain"] = dr::zeros<FloatBuffer>(m_growth_count);
         result.growth_counts["growth_observed"] = dr::zeros<UIntBuffer>(m_growth_count);

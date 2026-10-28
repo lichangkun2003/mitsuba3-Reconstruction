@@ -7,6 +7,7 @@
 #include <map>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 NAMESPACE_BEGIN(mitsuba)
@@ -44,6 +45,8 @@ public:
     static constexpr uint32_t rgb_deletion_version = 1;
     /// Point-pair L1 depth distortion with exact fixed-hit continuous gradients.
     static constexpr uint32_t distortion_version = 1;
+    /// Linear-RGB whole-image Gaussian SSIM with an explicit image adjoint.
+    static constexpr uint32_t dssim_version = 1;
     /// GPU occupancy octree, including separately tagged hypothetical leaves.
     static constexpr uint32_t octree_version = 1;
     /// Device-resident compact Adam, including transactional moment updates.
@@ -148,6 +151,8 @@ public:
     struct TrainingResult {
         Color3f rgb, raw_rgb;
         Float alpha, raw_alpha, loss, rgb_loss, distortion_loss;
+        Float dssim_loss;
+        bool dssim_enabled = false;
         UInt32 hit_count;
         /// Fixed-capacity compact gradient layout; the required count may exceed
         /// capacity, in which case the caller must retry before any Adam update.
@@ -169,6 +174,15 @@ public:
         std::map<std::string, std::map<std::string, double>> stage_profile;
     };
 
+    /// Per-pixel 1 - mean_RGB(SSIM), and the derivative of its pixel SUM.
+    /// Images are complete row-major arrays. The 11-tap sigma-1.5 Gaussian
+    /// uses zero padding and data_range=1, without clipping input linear RGB.
+    /// Negative roundoff variances and SSIM outside [-1, 1] are clipped;
+    /// the returned derivative includes these stabilization masks.
+    static std::pair<Float, Color3f> dssim_image_loss_and_grad(
+        const Color3f &rgb, const Color3f &reference,
+        uint32_t image_width, uint32_t image_height);
+
     /// One sample per ray/view. Pixel contributions are summed into voxel
     /// gradients; the caller owns the optimizer and the per-view update clock.
     /// With settings["rgb_only"] != 0, reference_rgb is the composited target
@@ -188,6 +202,10 @@ public:
     /// validity counters in sorted voxel_ids order, with a device voxel_count.
     /// Topology evidence retains full model indexing. Unused capacity is ignored;
     /// an overflow never writes outside the buffers and must not be optimized.
+    /// dssim_loss_weight > 0 adds the whole-image linear-RGB loss above, using
+    /// image_width/image_height and the same forward records. It requires
+    /// RGB-only, complete row-major images and unit inverse_pdf. Invalid device
+    /// weights produce nonfinite loss/gradients for the caller's finite guard.
     TrainingResult loss_and_grad(const Ray3f &ray, const Color3f &reference_rgb,
                                  const Float &reference_alpha,
                                  const Color3f &background,
