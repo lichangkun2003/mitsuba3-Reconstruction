@@ -37,6 +37,12 @@ class NativeLossReplay:
         self._empty_model_bypasses = 0
         self._empty_growth_bypasses = 0
         self._topology_changes = 0
+        self._gradient_count_readbacks = self._gradient_overflow_retries = 0
+        self._gradient_capacity_hint = 0
+        self._gradient_capacity_revision = None
+        # The training driver may reject an overflow expansion that exceeds
+        # its memory budget. Keep this policy across recording invalidations.
+        self.gradient_capacity_guard = None
 
         # The only closure capture is the Dr.Jit module. Never capture a model,
         # options dictionary, camera, reference, or previous result here.
@@ -54,6 +60,8 @@ class NativeLossReplay:
         self._entries.clear()
         self._model = None
         self._topology_revision = None
+        self._gradient_capacity_hint = 0
+        self._gradient_capacity_revision = None
         self._clears += 1
 
     def __call__(self, model, ray, rgb, alpha, background, inverse_pdf, options):
@@ -137,5 +145,8 @@ class NativeLossReplay:
                 "empty_growth_bypasses": self._empty_growth_bypasses,
                 "cached_recordings": sum(f.n_cached_recordings for f in self._entries.values()),
                 "max_entries": self.max_entries, "clears": self._clears,
+                "gradient_count_readbacks": self._gradient_count_readbacks,
+                "gradient_overflow_retries": self._gradient_overflow_retries,
+                "gradient_capacity_rows": self._gradient_capacity_hint,
                 "model_changes": self._model_changes, "topology_changes": self._topology_changes,
                 "evictions": self._evictions}

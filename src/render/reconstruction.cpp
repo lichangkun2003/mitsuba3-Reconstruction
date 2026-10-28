@@ -595,13 +595,20 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
             if (!input_rows)
                 return accepted & (*compact_count == 0u);
             UIntBuffer ordinal = dr::arange<UIntBuffer>(input_rows);
+            auto present = ordinal < *compact_count;
             auto in_bounds = *compact_indices < m_active_count;
-            UIntBuffer previous = dr::gather<UIntBuffer>(*compact_indices, ordinal - 1u, ordinal > 0u);
-            accepted &= (in_bounds & ((ordinal == 0u) | (*compact_indices > previous))).all_async_();
+            UIntBuffer previous = dr::gather<UIntBuffer>(*compact_indices, ordinal - 1u,
+                                                        present & (ordinal > 0u));
+            accepted &= (!present | (in_bounds & ((ordinal == 0u) |
+                                                  (*compact_indices > previous)))).all_async_();
             // Do not capture host input_rows in this comparison: frozen calls
             // can receive a different K. This IDs-only kernel infers its width
             // from the compact input, independently of the full model buffers.
-            UInt32 actual_rows = dr::max(dr::select(in_bounds, ordinal + 1u, UIntBuffer(0u)));
+            // Keep this reduction dependent on runtime IDs, not just arange():
+            // a literal capacity would be captured by freeze when K changes.
+            // Only the valid prefix participates, so arbitrary tail IDs are
+            // ignored while an over-capacity count still rejects atomically.
+            UInt32 actual_rows = dr::sum(UIntBuffer(present & in_bounds));
             accepted &= *compact_count == actual_rows;
             dr::eval(accepted);
         }
@@ -1439,7 +1446,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         {"use_octree", 1.f}, {"rgb_only", 0.f},
         {"collect_rgb_deletion_evidence", 0.f},
         {"collect_growth_evidence", 0.f}, {"max_growth_hits", 8.f},
-        {"distortion_loss_weight", 0.f}};
+        {"distortion_loss_weight", 0.f}, {"compact_gradient_capacity", 0.f}};
     for (const auto &[key, value] : settings) {
         if (cfg.find(key) == cfg.end() || !std::isfinite(value) || value < 0.f)
             Throw("VoxelReconstruction.loss_and_grad(): unknown/invalid setting %s.", key.c_str());
@@ -1450,6 +1457,13 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     const bool profile_traversal = cfg["profile_traversal"] != 0.f;
     const float distortion_weight = cfg["distortion_loss_weight"];
     const bool distortion_enabled = distortion_weight > 0.f;
+    const float requested_capacity = cfg["compact_gradient_capacity"];
+    if (double(requested_capacity) > double(UINT32_MAX) ||
+        std::floor(requested_capacity) != requested_capacity)
+        Throw("VoxelReconstruction.loss_and_grad(): compact_gradient_capacity must be an integer in [0, UINT32_MAX].");
+    const bool compact_gradients = requested_capacity > 0.f;
+    const uint32_t gradient_rows = compact_gradients ?
+        std::min(uint32_t(requested_capacity), m_active_count) : m_active_count;
     const bool collect_rgb_deletion = cfg["collect_rgb_deletion_evidence"] != 0.f;
     if (collect_rgb_deletion && !rgb_only)
         Throw("VoxelReconstruction.loss_and_grad(): RGB deletion evidence requires RGB-only mode.");
@@ -1482,6 +1496,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         if constexpr (dr::is_jit_v<Float>) {
             dr::schedule(result.rgb, result.raw_rgb, result.alpha, result.raw_alpha,
                          result.loss, result.rgb_loss, result.distortion_loss, result.hit_count);
+            if (result.compact_gradients)
+                dr::schedule(result.voxel_ids, result.voxel_count, result.compact_gradient_overflow);
             for (const auto &[key, value] : result.gradients)
                 dr::schedule(value);
             for (const auto &[key, value] : result.counters)
@@ -1499,6 +1515,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     };
     if (!m_active_count && !collect_growth) {
         TrainingResult result;
+        result.compact_gradients = compact_gradients;
+        if (compact_gradients)
+            result.voxel_ids = dr::empty<UIntBuffer>(0);
         result.raw_alpha = dr::zeros<Float>(width);
         result.raw_rgb = background + result.raw_alpha;
         Float weight = dr::select(inverse_pdf > 0.f, inverse_pdf, 1.f);
@@ -2095,11 +2114,44 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 },"Voxel reconstruction growth cell evidence");
         }
     }
-    for(const auto &[name,size]:std::map<std::string,size_t>{{"centers",size_t(m_active_count)*3},
-        {"log_scales",size_t(m_active_count)*3},{"rotation_tangent",size_t(m_active_count)*3},
-        {"radiance_sh",size_t(m_active_count)*m_sh_count*3},{"opacity_sh",size_t(m_active_count)*m_opacity_sh_count}})
+    result.compact_gradients = compact_gradients;
+    UIntBuffer gradient_slots = dr::zeros<UIntBuffer>(1);
+    if (compact_gradients && m_active_count) {
+        // Mark every recorded hit and geometric near-miss, including rows whose
+        // numerical gradient is zero: their validity still advances Adam clocks.
+        // One dense UInt32 prefix replaces all dense floating-point gradients.
+        // No compress()/host count readback occurs inside a frozen native call.
+        UIntBuffer touched = dr::zeros<UIntBuffer>(m_active_count);
+        for (uint32_t k = 0; k < max_hits; ++k) {
+            Mask valid = k < state.hits;
+            UInt32 id = dr::gather<UInt32>(records.hit_id, k * ray_count + lane, valid);
+            dr::scatter_reduce(ReduceOp::Max, touched, UInt32(1), id, valid);
+        }
+        for (uint32_t k = 0; k < max_candidates; ++k)
+            dr::scatter_reduce(ReduceOp::Max, touched, UInt32(1), records.candidates[k].id,
+                               k < state.candidates);
+        dr::eval(touched);
+        gradient_slots = dr::prefix_sum(touched, false);
+        result.voxel_count = dr::gather<UInt32>(gradient_slots, UInt32(m_active_count - 1));
+        result.compact_gradient_overflow = result.voxel_count > gradient_rows;
+        result.voxel_ids = dr::full<UIntBuffer>(UINT32_MAX, gradient_rows);
+        UIntBuffer ordinal = dr::arange<UIntBuffer>(m_active_count);
+        auto stored = (touched != 0u) & (gradient_slots <= gradient_rows);
+        dr::scatter(result.voxel_ids, ordinal, gradient_slots - 1u, stored, ReduceMode::NoConflicts);
+        dr::eval(gradient_slots, result.voxel_ids, result.voxel_count, result.compact_gradient_overflow);
+    } else if (compact_gradients) {
+        result.voxel_ids = dr::empty<UIntBuffer>(0);
+    }
+    auto gradient_row = [compact_gradients, gradient_slots](const UInt32 &id, const Mask &active) {
+        return compact_gradients ? dr::gather<UInt32>(gradient_slots, id, active) - 1u : id;
+    };
+    for(const auto &[name,size]:std::map<std::string,size_t>{{"centers",size_t(gradient_rows)*3},
+        {"log_scales",size_t(gradient_rows)*3},{"rotation_tangent",size_t(gradient_rows)*3},
+        {"radiance_sh",size_t(gradient_rows)*m_sh_count*3},{"opacity_sh",size_t(gradient_rows)*m_opacity_sh_count}})
         result.gradients[name]=dr::zeros<FloatBuffer>(size);
-    for(const auto *key:{"appearance_valid","geometry_valid","background_carve_valid","foreground_evidence","background_evidence"})
+    for(const auto *key:{"appearance_valid","geometry_valid","background_carve_valid"})
+        result.counters[key]=dr::zeros<UIntBuffer>(gradient_rows);
+    for(const auto *key:{"foreground_evidence","background_evidence"})
         result.counters[key]=dr::zeros<UIntBuffer>(m_active_count);
     if (collect_rgb_deletion) {
         result.deletion_sums["deletion_gain"] = dr::zeros<FloatBuffer>(m_active_count);
@@ -2118,7 +2170,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     const float tau=std::max(cfg["geometry_tau_voxel_fraction"]*m_size[0],1e-8f);
     using GradientMap = std::map<std::string, FloatBuffer>;
     using CounterMap = std::map<std::string, UIntBuffer>;
-    auto add_geometry=[this,quaternion,rotate,clean,is_background,dcolor,dalpha,weight,tau,cfg,rgb_only](
+    auto add_geometry=[this,quaternion,rotate,clean,is_background,dcolor,dalpha,weight,tau,cfg,rgb_only,
+                       gradient_row,gradient_rows](
                           GradientMap &gradients,CounterMap &counters,
                           UInt32 id,const Vector3f &offset,Float gmin,Float before,
                           Float opacity,const Color3f &radiance,const Color3f &behind,
@@ -2168,14 +2221,16 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         }
         Vector3f weighted=principal/(scale*scale);
         Vector3f gc=-2.f*rotate(weighted,qw,qv),gs=-2.f*weighted*principal,gr=2.f*dr::cross(weighted,principal);
+        UInt32 row = gradient_row(id, valid);
+        Mask stored = valid & (row < gradient_rows);
         // Apply 1/pdf after the nonlinear proxy clamp and transition gates.
         for(uint32_t j=0;j<3;++j) {
-            dr::scatter_reduce(ReduceOp::Add,gradients["centers"],clean(dg*gc[j]*m_size[j])*weight,id*3+j,valid);
-            dr::scatter_reduce(ReduceOp::Add,gradients["log_scales"],clean(dg*gs[j])*weight,id*3+j,valid);
-            dr::scatter_reduce(ReduceOp::Add,gradients["rotation_tangent"],clean(dg*gr[j])*weight,id*3+j,valid);
+            dr::scatter_reduce(ReduceOp::Add,gradients["centers"],clean(dg*gc[j]*m_size[j])*weight,row*3+j,stored);
+            dr::scatter_reduce(ReduceOp::Add,gradients["log_scales"],clean(dg*gs[j])*weight,row*3+j,stored);
+            dr::scatter_reduce(ReduceOp::Add,gradients["rotation_tangent"],clean(dg*gr[j])*weight,row*3+j,stored);
         }
-        dr::scatter_reduce(ReduceOp::Add,counters["geometry_valid"],UInt32(1),id,valid);
-        if(!rgb_only && hard_hit) dr::scatter_reduce(ReduceOp::Add,counters["background_carve_valid"],UInt32(1),id,valid&is_background);
+        dr::scatter_reduce(ReduceOp::Add,counters["geometry_valid"],UInt32(1),row,stored);
+        if(!rgb_only && hard_hit) dr::scatter_reduce(ReduceOp::Add,counters["background_carve_valid"],UInt32(1),row,stored&is_background);
         return valid;
     };
 
@@ -2222,9 +2277,12 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
          is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry,rgb_only,
          collect_rgb_deletion,deletion_complete,deletion_residual,distortion_enabled,
          distortion_weight,diagonal,quaternion,rotate,projective,ray_origin=ray.o,
-         total_mass=state.distortion_mass,total_moment=state.distortion_moment](ReverseState &s) {
+         total_mass=state.distortion_mass,total_moment=state.distortion_moment,
+         gradient_row,gradient_rows](ReverseState &s) {
             Mask valid=UInt32(s.hit)<hit_count;
             UInt32 slot=UInt32(s.hit)*ray_count+lane,id=dr::gather<UInt32>(hit_ids,slot,valid);
+            UInt32 row = gradient_row(id, valid);
+            Mask stored = valid & (row < gradient_rows);
             Vector3f offset;Color3f radiance;
             for(uint32_t j=0;j<3;++j) {
                 offset[j]=dr::gather<Float>(hit_records,j*hit_stride+slot,valid);
@@ -2295,13 +2353,13 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 Mask rotation_valid=dr::isfinite(rotation_norm2)&(rotation_norm2>1e-20f);
                 for(uint32_t j=0;j<3;++j) {
                     dr::scatter_reduce(ReduceOp::Add,s.gradients["centers"],
-                        clean(factor*center_gradient[j]*m_size[j]),id*3+j,distortion_geometry_valid);
+                        clean(factor*center_gradient[j]*m_size[j]),row*3+j,distortion_geometry_valid&stored);
                     dr::scatter_reduce(ReduceOp::Add,s.gradients["log_scales"],
-                        clean(factor*scale_gradient[j]),id*3+j,
-                        distortion_geometry_valid&(log_scale[j]>-30.f)&(log_scale[j]<30.f));
+                        clean(factor*scale_gradient[j]),row*3+j,
+                        distortion_geometry_valid&stored&(log_scale[j]>-30.f)&(log_scale[j]<30.f));
                     dr::scatter_reduce(ReduceOp::Add,s.gradients["rotation_tangent"],
-                        clean(factor*rotation_gradient[j]),id*3+j,
-                        distortion_geometry_valid&rotation_valid);
+                        clean(factor*rotation_gradient[j]),row*3+j,
+                        distortion_geometry_valid&stored&rotation_valid);
                 }
                 s.distortion_mass += contribution;
                 s.distortion_moment += contribution*depth;
@@ -2311,11 +2369,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 Float sh=reconstruction_sh(k,Vector3f(-d));
                 if(k<m_sh_count)
                     for(uint32_t j=0;j<3;++j)
-                        dr::scatter_reduce(ReduceOp::Add,s.gradients["radiance_sh"],grad_rgb[j]*sh,(id*m_sh_count+k)*3+j,valid);
+                        dr::scatter_reduce(ReduceOp::Add,s.gradients["radiance_sh"],grad_rgb[j]*sh,(row*m_sh_count+k)*3+j,stored);
                 if(k<m_opacity_sh_count)
-                    dr::scatter_reduce(ReduceOp::Add,s.gradients["opacity_sh"],grad_logit*sh,id*m_opacity_sh_count+k,valid);
+                    dr::scatter_reduce(ReduceOp::Add,s.gradients["opacity_sh"],grad_logit*sh,row*m_opacity_sh_count+k,stored);
             }
-            dr::scatter_reduce(ReduceOp::Add,s.counters["appearance_valid"],UInt32(1),id,valid);
+            dr::scatter_reduce(ReduceOp::Add,s.counters["appearance_valid"],UInt32(1),row,stored);
             if(!rgb_only && cfg.at("collect_deletion_evidence")!=0.f) {
                 Color3f dc=before*opacity*(s.behind-radiance);
                 Float da=-before*opacity*s.after;
@@ -2349,7 +2407,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 before,opacity,radiance,s.behind,s.after,valid,true);
             if (distortion_enabled)
                 dr::scatter_reduce(ReduceOp::Add,s.counters["geometry_valid"],UInt32(1),
-                    id,distortion_geometry_valid&!proxy_geometry_valid);
+                    row,distortion_geometry_valid&!proxy_geometry_valid&stored);
             s.behind=dr::select(valid,clean(opacity*radiance+(1.f-opacity)*s.behind),s.behind);
             s.after=dr::select(valid,dr::clip(clean(s.after*(1.f-opacity)),0.f,1.f),s.after);
             // Each ray writes each slot once; the four planes are disjoint.

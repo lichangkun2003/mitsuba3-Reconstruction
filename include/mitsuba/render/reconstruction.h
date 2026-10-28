@@ -50,6 +50,7 @@ public:
     static constexpr uint32_t optimizer_device_version = 1;
     /// Pre-compacted gradient rows can feed Adam without dense reconstruction.
     static constexpr uint32_t compact_optimizer_version = 1;
+    static constexpr uint32_t compact_gradient_version = 1;
     static constexpr uint32_t projective_version = 1;
 
     VoxelReconstruction(const std::string &filename, uint32_t resolution,
@@ -148,6 +149,12 @@ public:
         Color3f rgb, raw_rgb;
         Float alpha, raw_alpha, loss, rgb_loss, distortion_loss;
         UInt32 hit_count;
+        /// Fixed-capacity compact gradient layout; the required count may exceed
+        /// capacity, in which case the caller must retry before any Adam update.
+        bool compact_gradients = false;
+        UIntBuffer voxel_ids;
+        UInt32 voxel_count = UInt32(0);
+        Mask compact_gradient_overflow = Mask(false);
         std::map<std::string, FloatBuffer> gradients;
         std::map<std::string, UIntBuffer> counters;
         /// Per-candidate single-insertion RGB loss gain and ray coverage.
@@ -177,6 +184,10 @@ public:
     /// Projective models use world distance t/(t+core_half_extent), including
     /// its exact local-distance derivative. Environment color, unrecorded
     /// suffixes, near-miss surrogates, and extra tracing are not included.
+    /// compact_gradient_capacity > 0 stores gradients and the three optimizer
+    /// validity counters in sorted voxel_ids order, with a device voxel_count.
+    /// Topology evidence retains full model indexing. Unused capacity is ignored;
+    /// an overflow never writes outside the buffers and must not be optimized.
     TrainingResult loss_and_grad(const Ray3f &ray, const Color3f &reference_rgb,
                                  const Float &reference_alpha,
                                  const Color3f &background,

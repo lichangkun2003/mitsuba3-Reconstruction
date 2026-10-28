@@ -522,6 +522,7 @@ endif()
 if (MSVC AND MI_ENABLE_PYTHON)
   set(COPY_TARGETS mitsuba ${MI_DEPEND} ${MI_PLUGIN_TARGETS})
   add_custom_target(copy-targets ALL DEPENDS ${COPY_TARGETS})
+  set(MI_DRJIT_RUNTIME_TARGETS drjit-core drjit-extra nanothread)
 
   foreach(target ${COPY_TARGETS})
     get_target_property(TARGET_FOLDER ${target} FOLDER)
@@ -535,6 +536,18 @@ if (MSVC AND MI_ENABLE_PYTHON)
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:${target}> ${COPY_TARGET_DESTINATION}
     )
+    if (NOT SKBUILD AND target IN_LIST MI_DRJIT_RUNTIME_TARGETS)
+      # Python can load dependencies beside the Dr.Jit extension before other
+      # registered DLL directories. Update this copy even if the extension did
+      # not relink: copy-targets is an always-run dependency of copy-targets-python.
+      add_custom_command(
+        TARGET copy-targets POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${MI_BINARY_DIR}/python/drjit"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "$<TARGET_FILE:${target}>" "${MI_BINARY_DIR}/python/drjit/$<TARGET_FILE_NAME:${target}>"
+        VERBATIM
+      )
+    endif()
   endforeach(target)
 
   add_dependencies(copy-targets-python copy-targets)

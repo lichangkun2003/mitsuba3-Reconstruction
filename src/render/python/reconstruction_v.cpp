@@ -231,6 +231,11 @@ MI_PY_EXPORT(VoxelReconstruction) {
             result["rgb_loss"] = values.rgb_loss;
             result["distortion_loss"] = values.distortion_loss;
             result["gradients"] = values.gradients;
+            if (values.compact_gradients) {
+                result["voxel_ids"] = values.voxel_ids;
+                result["voxel_count"] = values.voxel_count;
+                result["compact_gradient_overflow"] = values.compact_gradient_overflow;
+            }
             for (const auto &[key, value] : values.counters)
                 result[nb::str(key.c_str())] = value;
             for (const auto &[key, value] : values.growth_sums)
@@ -282,5 +287,6 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("octree_version") = nb::int_(Model::octree_version);
     cls.attr("optimizer_device_version") = nb::int_(Model::optimizer_device_version);
     cls.attr("compact_optimizer_version") = nb::int_(Model::compact_optimizer_version);
+    cls.attr("compact_gradient_version") = nb::int_(Model::compact_gradient_version);
     drjit::bind_traverse(cls);
 }

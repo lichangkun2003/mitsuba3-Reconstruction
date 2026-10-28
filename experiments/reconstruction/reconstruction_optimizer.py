@@ -275,6 +275,8 @@ class FalcorOptimizer:
         compact_input = "voxel_ids" in out
         ids = mi.UInt32(out["voxel_ids"]) if compact_input else None
         row_count = int(dr.width(ids)) if compact_input else self.count
+        device_row_count = (mi.UInt32(out["voxel_count"]) if compact_input and "voxel_count" in out
+                            else dr.opaque(mi.UInt32, row_count) if compact_input else None)
         if compact_input and not callable(getattr(model, "optimizer_step_compact_device", None)):
             raise RuntimeError("Compact gradient Adam requires optimizer_step_compact_device; "
                                "rebuild this source checkout")
@@ -330,7 +332,7 @@ class FalcorOptimizer:
         if compact_input:
             # K changes with the camera batch. Pass it as a GPU input rather
             # than baking it into the frozen C++ loop or its cache key.
-            arguments = (model, ids, dr.opaque(mi.UInt32, row_count), gradients,
+            arguments = (model, ids, device_row_count, gradients,
                          *counts, means, squares, steps, settings, allowed, guarded)
             native, cache = self._native_compact_update, self._compact_update_cache
         # Separate genuine external aliases before recording/replaying writes,
@@ -603,13 +605,21 @@ class FalcorOptimizer:
                 state["mean"] = dr.gather(mi.Float, state["mean"], old, exists)
                 # Finish one replacement before building the next. Otherwise
                 # all lazy gathers retain the complete old Adam tables while
-                # allocating the complete new tables. Stream ordering handles
-                # lifetime safely; this does not add a host synchronization.
+                # allocating the complete new tables. Changed row counts can
+                # also put old/new arrays in different allocator buckets: trim
+                # each retired field at this topology-only boundary rather than
+                # retaining an entire old Adam state as inactive allocations.
                 dr.eval(state["mean"])
+                dr.sync_thread()
+                dr.flush_malloc_cache()
                 state["squared_mean"] = dr.gather(mi.Float, state["squared_mean"], old, exists)
                 dr.eval(state["squared_mean"])
+                dr.sync_thread()
+                dr.flush_malloc_cache()
                 state["steps"] = dr.gather(mi.UInt32, state["steps"], source_ids, valid)
                 dr.eval(state["steps"])
+                dr.sync_thread()
+                dr.flush_malloc_cache()
         self.count = new_count
         dr.eval(*[value for state in self._state.values() for value in state.values()])
         self._remember_state()

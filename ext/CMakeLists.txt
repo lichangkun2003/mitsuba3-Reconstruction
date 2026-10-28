@@ -74,6 +74,7 @@ if (NOT SKBUILD)
     set(DRJIT_PYTHON_DST_DIR "${CMAKE_CURRENT_BINARY_DIR}/../python/drjit")
   endif()
   add_subdirectory(drjit)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/DrJitAllocation.cmake")
 
   if (NOT MI_ENABLE_JIT)
     add_subdirectory(drjit/ext/drjit-core/ext/nanothread)

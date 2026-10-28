@@ -99,6 +99,24 @@ def concat_rows(first, second):
     return dr.concat([first, second])
 
 
+def append_model_rows(first, second, dr):
+    """Describe an append without allocating its full destination yet.
+
+    The driver releases the previous native model before materializing these
+    fields one at a time. ``dr.concat`` allocates eagerly and would retain both
+    complete models until the replacement constructor returns.
+    """
+    if not len(first):
+        return second
+    if not len(second):
+        return first
+    index = dr.arange(dr.uint32_array_t(type(first)), len(first) + len(second))
+    existing = index < len(first)
+    return dr.select(existing,
+        dr.gather(type(first), first, index, existing),
+        dr.gather(type(second), second, index - len(first), ~existing))
+
+
 class GPUTopologyLifecycle:
     def __init__(self, manager):
         import drjit as dr
@@ -651,12 +669,20 @@ class GPUTopologyLifecycle:
                 # Retire the old Adam tables before allocating the appended
                 # model. Otherwise its large radiance array competes with
                 # both the old and new radiance moments during remapping.
+                # Candidate revalidation can leave large inactive buffers in
+                # the allocator; evict them at this topology-only boundary.
+                dr.sync_thread()
+                dr.flush_malloc_cache()
                 optimizer.remap(adam_survivors if adam_survivors is not None else survivors, new_count)
                 adam_survivors = None
                 self.remap(survivors, new_count, boundary)
+                # Remapping also leaves old-size buckets behind. Release them
+                # before the replacement model allocates its complete tables.
+                dr.sync_thread()
+                dr.flush_malloc_cache()
                 for name, value in checkpoint["model_state"].items():
                     addition = selected["cells" if name == "cell_indices" else name]
-                    checkpoint["model_state"][name] = concat_rows(value, type(value)(addition))
+                    checkpoint["model_state"][name] = append_model_rows(value, type(value)(addition), dr)
                 # Lazy appends own only the materialized winner arrays now.
                 # Other selected fields and loop aliases have no later consumer.
                 selected = value = addition = None

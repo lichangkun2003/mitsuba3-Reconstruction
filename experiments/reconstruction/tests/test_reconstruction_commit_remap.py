@@ -47,7 +47,10 @@ class Dr:
     empty = staticmethod(lambda dtype, count: dtype(np.empty(count)))
     full = staticmethod(lambda dtype, value, count: dtype(np.full(count, value)))
     width = staticmethod(len)
+    uint32_array_t = staticmethod(lambda dtype: UInt)
     eval = staticmethod(lambda *values: None)
+    sync_thread = staticmethod(lambda: None)
+    flush_malloc_cache = staticmethod(lambda: None)
     compress = staticmethod(lambda mask: UInt(np.flatnonzero(mask)))
     select = staticmethod(lambda mask, first, second: type(first)(np.where(mask, first, second)))
 
@@ -93,6 +96,17 @@ class Optimizer(FalcorOptimizer):
 
 
 class CommitRemapTests(unittest.TestCase):
+    def test_model_append_preserves_component_bits_and_empty_sources(self):
+        bits = np.array([0, 0x80000000, 1, 0x80000001, 0x3f800000, 0x7fc01234],
+                        dtype=np.uint32)
+        first, second = Float(bits[:3].view(np.float32)), Float(bits[3:].view(np.float32))
+        result = topology_gpu.append_model_rows(first, second, Dr)
+        np.testing.assert_array_equal(result.view(np.uint32), bits)
+        self.assertIs(topology_gpu.append_model_rows(Float([]), second, Dr), second)
+        self.assertIs(topology_gpu.append_model_rows(first, Float([]), Dr), first)
+        ids = topology_gpu.append_model_rows(UInt([0, 2**31]), UInt([2**32 - 1]), Dr)
+        np.testing.assert_array_equal(ids, np.array([0, 2**31, 2**32 - 1], dtype=np.uint32))
+
     def run_commit(self, *, removed=(), added=0, growth_due=True,
                    selected_none=False, count=4, failure=None):
         settings = TopologySettings(growth_protection_epochs=5, deletion_cooldown_epochs=5)
@@ -167,11 +181,21 @@ class CommitRemapTests(unittest.TestCase):
                 phase["model_concats"] += 1
             return type(first)(np.concatenate((first, second)))
 
+        real_append = topology_gpu.append_model_rows
+
+        def append(first, second, dr):
+            self.assertTrue(phase["selected"])
+            self.assertEqual(len(optimizer.calls), 1,
+                             "Model append must follow the single Adam migration")
+            phase["model_concats"] += 1
+            return real_append(first, second, dr)
+
         lifecycle.evaluate_rgb_deletion, lifecycle.select_growth = evaluate, select
         checkpoint = {"model_state": model_state, "model_metadata": {"sh_count": 9, "opacity_sh_count": 1}}
         with (patch.object(topology_gpu, "device_checkpoint", return_value={
                   "model_state": dict(model_state), "model_metadata": checkpoint["model_metadata"]}),
               patch.object(topology_gpu, "take_rows", side_effect=take_rows),
+              patch.object(topology_gpu, "append_model_rows", side_effect=append),
               patch.object(topology_gpu, "concat_rows", side_effect=concat)):
             if failure is not None:
                 with self.assertRaises(type(failure)):
@@ -202,6 +226,12 @@ class CommitRemapTests(unittest.TestCase):
             self.assertEqual(len(replacement["model_state"]["cell_indices"]), expected_count)
             np.testing.assert_array_equal(replacement["model_state"]["cell_indices"][:len(survivors)],
                                           model_state["cell_indices"][survivors])
+            for name, original in model_state.items():
+                width = len(original) // count
+                expected = np.concatenate((take_rows(original, UInt(survivors), width),
+                                           np.arange(effective_added * width) + 100))
+                np.testing.assert_array_equal(replacement["model_state"][name], expected,
+                                              err_msg=name)
         else:
             self.assertIsNone(replacement)
         self.assertEqual(phase["model_concats"], len(model_state) if effective_added else 0)

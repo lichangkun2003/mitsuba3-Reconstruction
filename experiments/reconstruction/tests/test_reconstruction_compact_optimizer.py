@@ -254,8 +254,8 @@ class CompactOptimizerTests(unittest.TestCase):
                 self.assertFalse(bool(np.asarray(result["accepted"])[0]))
                 assert_equal(self, capture(model, optimizer), before, exact=True)
 
-    def test_direct_native_count_mismatch_rejects_without_partial_commit(self):
-        for ids, supplied_count in (([1, 3], 1), ([1, 3], 3), ([], 1)):
+    def test_direct_native_count_over_capacity_rejects_without_partial_commit(self):
+        for ids, supplied_count in (([1, 3], 3), ([], 1)):
             with self.subTest(ids=ids, supplied_count=supplied_count):
                 models, optimizers = paired()
                 model, optimizer = models[1], optimizers[1]

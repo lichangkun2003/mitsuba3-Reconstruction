@@ -108,6 +108,16 @@ class GPUReferenceCache:
         self._images.clear()
         self.resident_bytes = 0
 
+    def resize(self, capacity_mib):
+        """Adjust the LRU budget at a model/topology boundary."""
+        if type(capacity_mib) is not int or capacity_mib < 0:
+            raise ValueError("Reference cache capacity must be a nonnegative integer")
+        self.capacity_bytes = capacity_mib * 1024 * 1024
+        while self.resident_bytes > self.capacity_bytes:
+            self._images.popitem(last=False)
+            self.resident_bytes -= self.image_bytes
+            self.evictions += 1
+
     def statistics(self):
         return {"capacity_bytes": self.capacity_bytes, "resident_bytes": self.resident_bytes,
                 "images": len(self._images), "hits": self.hits, "misses": self.misses,

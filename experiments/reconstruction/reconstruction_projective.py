@@ -130,7 +130,7 @@ def refine_projective_numpy(checkpoint, config, max_active_voxels, fit_core, np)
 
 def refine_projective_device(checkpoint, config, max_active_voxels, fit_core, dr):
     """CUDA counterpart: fitting workspace scales with core rows only."""
-    from reconstruction_topology_gpu import take_rows, concat_rows
+    from reconstruction_topology_gpu import take_rows
     import math
     U, F, D = dr.cuda.UInt32, dr.cuda.Float32, dr.cuda.Float64
     metadata = dict(checkpoint["model_metadata"])
@@ -145,6 +145,7 @@ def refine_projective_device(checkpoint, config, max_active_voxels, fit_core, dr
     core_state = {name: take_rows(value, core_ids, len(value)//count) for name, value in state.items()} if count else state
     core_result = fit_core({"model_metadata": dict(metadata, scene_mapping="bounded"), "model_state": core_state},
                           config, max_active_voxels - 8 * bg_count, dr)["model_state"]
+    del core_state, core_ids, inside
     metadata["resolution"] *= 2
     metadata["core_resolution"] *= 2
     metadata["background_layers"] = (metadata["resolution"] - metadata["core_resolution"]) // 2
@@ -153,31 +154,50 @@ def refine_projective_device(checkpoint, config, max_active_voxels, fit_core, dr
     rows = dr.arange(U, 8 * bg_count)
     parents = dr.gather(U, bg_ids, rows % bg_count)
     child = rows // bg_count
-    old = dr.gather(U, state["cell_indices"], parents)
-    xyz = [old % old_resolution, old // old_resolution % old_resolution,
-           old // (old_resolution * old_resolution)]
-    xyz = [xyz[j] * 2 + ((child >> j) & 1) for j in range(3)]
-    shell = {"cell_indices": xyz[0] + metadata["resolution"] * (xyz[1] + metadata["resolution"] * xyz[2])}
-    for name, value in state.items():
+    dr.eval(parents)
+    del bg_ids
+
+    def child_component(name, value, width, component):
+        # This scope releases coordinate/FP64 opacity scratch after its scatter
+        # is evaluated. Never materialize a full background SH table.
         if name == "cell_indices":
-            continue
-        width = len(value) // count
-        flat = dr.arange(U, 8 * bg_count * width)
-        parent = dr.gather(U, parents, flat // width)
-        values = dr.gather(F, value, parent * width + flat % width)
+            old = dr.gather(U, value, parents)
+            xyz = [old % old_resolution, old // old_resolution % old_resolution,
+                   old // (old_resolution * old_resolution)]
+            xyz = [xyz[j] * 2 + ((child >> j) & 1) for j in range(3)]
+            return xyz[0] + metadata["resolution"] * (xyz[1] + metadata["resolution"] * xyz[2])
+        values = dr.gather(F, value, parents * width + component)
         if name == "centers":
-            child_index = flat // (3 * bg_count)
-            bits = (child_index >> (flat % 3)) & 1
+            bits = (child >> component) & 1
             values = values * 2 - F(bits)
-        if name == "opacity_sh" and config.opacity_optical_depth_scale < 1:
+        if name == "opacity_sh" and component == 0 and config.opacity_optical_depth_scale < 1:
             attenuation = min(max(float(config.opacity_optical_depth_scale), .01), 1.)
             y0 = 1 / (2 * math.sqrt(math.pi))
             logit = D(values) * y0
             tau = (dr.maximum(logit, 0.) + dr.log1p(dr.exp(-dr.abs(logit)))) * attenuation
             child_logit = dr.select(tau > 15., tau, dr.log(dr.maximum(dr.expm1(dr.minimum(tau, 15.)), 1e-30)))
-            values = dr.select(flat % width == 0, F(dr.minimum(child_logit, logit) / y0), values)
-        shell[name] = values
-        dr.eval(values)
-    result = {name: concat_rows(core_result[name], value) for name, value in shell.items()}
-    dr.eval(*result.values())
+            values = F(dr.minimum(child_logit, logit) / y0)
+        return values
+
+    result = {}
+    for name in ("cell_indices", *(key for key in state if key != "cell_indices")):
+        value = state[name]
+        width = len(value) // count
+        core_value = core_result.pop(name)
+        core_size = len(core_value)
+        target = dr.empty(U if name == "cell_indices" else F, core_size + 8 * bg_count * width)
+        if core_size:
+            dr.scatter(target, core_value, dr.arange(U, core_size))
+            dr.eval(target)
+        del core_value
+        # Write directly into the only final buffer. Evaluating each component
+        # bounds scratch by background rows, not rows * SH width, and releases
+        # the current component before the next one. No host synchronization.
+        for component in range(width):
+            values = child_component(name, value, width, component)
+            dr.scatter(target, values, core_size + rows * width + component)
+            dr.eval(target)
+            del values
+        result[name] = target
+        del target
     return {"model_metadata": metadata, "model_state": result}

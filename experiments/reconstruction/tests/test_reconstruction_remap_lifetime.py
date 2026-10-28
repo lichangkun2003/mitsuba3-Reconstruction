@@ -59,6 +59,8 @@ class DeferredDr:
     maximum = staticmethod(np.maximum)
     select = staticmethod(np.where)
     opaque = staticmethod(lambda dtype, value: dtype(value))
+    sync_thread = staticmethod(lambda: None)
+    flush_malloc_cache = staticmethod(lambda: None)
     ReduceOp = SimpleNamespace(Add="add")
     ReduceMode = SimpleNamespace(Direct="direct", NoConflicts="no_conflicts")
 
