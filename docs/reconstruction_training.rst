@@ -71,6 +71,56 @@ RGB 收益与持续低 opacity 两条删除分支，总开关关闭时两者均�
 当前 RGB-only 训练入口保留 RGB 删除分支；可单独将 ``use_low_opacity_deletion=False``
 以对照新增清理规则的影响。
 
+用已知相机生成 Mip-NeRF 360 稠密初始化点云
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``experiments/reconstruction/generate_dense_points.py`` 直接复用场景中的
+``sparse/0/cameras.bin``、``images.bin`` 和 ``points3D.bin``，依次执行 COLMAP 的
+``image_undistorter``、CUDA ``patch_match_stereo`` 和 ``stereo_fusion``。
+无需重新提取特征、匹配或求解相机，也不需要编译 Mitsuba。
+脚本依赖现有 Python 环境中的 NumPy、Pillow，以及独立的 CUDA COLMAP。
+
+只需修改脚本顶部 ``SCENE = "bicycle"``，或用 ``--scene`` 切换场景：
+
+.. code-block:: powershell
+
+   Set-Location "D:\study\vs\reconstruction\mitsuba"
+   & "D:\study\vs\reconstruction\envs\mitsuba\Scripts\python.exe" -u -I `
+     .\experiments\reconstruction\generate_dense_points.py --scene bicycle
+
+默认在 ``reconstruction`` 的同级目录查找 ``colmap-x64-windows-cuda/COLMAP.bat``，
+路径根据脚本位置确定，不依赖终端的当前工作目录。更换目录布局时修改脚本中的
+``COLMAP``，或传入 ``--colmap``；``--dataset`` 可指定任意
+场景绝对路径。Windows 下脚本从该发行包定位 ``bin/colmap.exe``，设置对应 DLL 和
+Qt 插件路径后直接传递参数，支持目录名包含空格。
+
+室外 bicycle、flowers、garden、stump、treehill 使用 ``images_4``；室内 room、counter、
+kitchen、bonsai 使用 ``images_2``。这与
+`3DGS 官方评测脚本 <https://github.com/graphdeco-inria/gaussian-splatting/blob/main/full_eval.py>`_
+的选择一致。可用 ``--images`` 覆盖；自动选择的目录缺失时会报错，不会悄悄换成原图。
+相机宽高、焦距、主点和二维特征坐标均按实际图像宽高分别缩放，处理下采样取整误差。
+例如 bicycle 的 ``4946×3286`` 对应 ``images_4`` 的 ``1237×822``，不是严格除以四。
+
+默认 ``--split train``，按文件名排序后排除全局索引 0、8、16……，与训练入口的测试划分
+一致。对应工作副本会去掉测试图像及其稀疏轨迹，PatchMatch 的源视角也只来自训练集；
+至少保留两个训练视角观测的原始稀疏点用于邻居选择和深度范围估计。这仍使用数据集提供的
+相机与稀疏重建，并不重新估计 SfM。若确实要所有视角参与稠密重建，显式使用 ``--split all``。
+
+结果写入场景目录的 ``init_points.ply``，包含 COLMAP 原世界坐标的点、法线和 RGB。
+脚本不做坐标轴旋转、归一化或背景压缩；重建初始化会统一处理。新训练会自动优先读取此 PLY，
+继续已有 checkpoint 则仍使用保存的模型。原始图像和 ``sparse/0`` 文件保持不变。
+
+中间文件及每一步日志放在 ``场景/dense_init/images_4-train/``（室内为 ``images_2-train``），
+``dense-init.json`` 记录输入指纹、阶段和点数。中断后重跑相同命令即可复用已完成阶段，
+PatchMatch 会继续缺失的深度图。修改输入或算法选项时需用另一个 ``--workspace``，以免复用
+不匹配的深度图。已有 ``init_points.ply`` 默认不覆盖；使用 ``--overwrite`` 时，在新结果
+成功融合并通过非空 PLY 检查后，先备份旧文件，再替换结果。
+
+``--dry-run`` 只检查输入并列出命令；``--prepare-only`` 完成缩放和去畸变，之后去掉该参数
+即可继续稠密阶段。默认使用所选图像完整尺寸；``--max-image-size`` 可另设计算尺寸上限。
+``--gpu 0`` 选择显卡，``--cache-size 4`` 是 COLMAP CPU 缓存 GiB，并不是显存上限。
+此流程依据 `COLMAP 命令行文档 <https://colmap.github.io/cli.html>`_。
+
 渐进开启辐射颜色的 SH 阶数
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
