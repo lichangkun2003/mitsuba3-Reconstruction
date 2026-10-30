@@ -1,5 +1,7 @@
 """Independent COLMAP binary/projection fixtures for dense workspace preparation."""
 
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 import struct
 import sys
@@ -201,6 +203,66 @@ class DenseModelTests(unittest.TestCase):
         self.assertEqual(list(self.output.parent.iterdir()), [])
         for path, value in before.items():
             self.assertEqual(path.read_bytes(), value)
+
+    def test_generation_only_publishes_ply_into_dataset(self):
+        import generate_dense_points as generator
+
+        dataset = self.root / "datasets" / "bonsai"
+        write_fixture(dataset)
+        (dataset / "images_4").rename(dataset / "images_2")
+        (dataset / "poses_bounds.npy").write_bytes(b"original dataset metadata")
+        executable = self.root / "colmap.exe"
+        executable.write_bytes(b"CPU test stub; never executed")
+        cache = self.root / ".cache" / "colmap_dense"
+
+        def snapshot():
+            return {str(path.relative_to(dataset)): path.read_bytes() if path.is_file() else None
+                    for path in dataset.rglob("*")}
+
+        original = snapshot()
+        fused = (b"ply\nformat binary_little_endian 1.0\nelement vertex 1\n"
+                 b"property float x\nproperty float y\nproperty float z\n"
+                 b"property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"
+                 + struct.pack("<fffBBB", 1., 2., 3., 100, 120, 140))
+
+        def simulate_colmap(command, env, log_path):
+            if command[1] == "stereo_fusion":
+                Path(command[command.index("--output_path") + 1]).write_bytes(fused)
+
+        with patch.object(generator, "DATASETS_ROOT", dataset.parent), \
+             patch.object(generator, "DENSE_WORK_ROOT", cache), \
+             patch.object(sys, "argv", ["generate_dense_points", "--scene", "bonsai",
+                                        "--colmap", str(executable)]), \
+             patch.object(generator, "run_command", side_effect=simulate_colmap) as command, \
+             redirect_stdout(io.StringIO()):
+            args = generator.parse_arguments()
+            for work in (dataset, dataset / "dense_init", dataset.parent, self.root,
+                         dataset.parent / "bicycle" / "dense_init"):
+                args.workspace = work
+                with self.subTest(work=work), self.assertRaisesRegex(ValueError, "outside datasets"):
+                    generator.generate(args)
+            command.assert_not_called()
+            self.assertEqual(snapshot(), original)
+            args.workspace = None
+            args.dry_run = True
+            generator.generate(args)
+            self.assertFalse(cache.exists())
+            self.assertEqual(snapshot(), original)
+            args.dry_run = False
+            generator.generate(args)
+            expected = {**original, "init_points.ply": fused}
+            self.assertEqual(snapshot(), expected)
+            self.assertTrue((cache / "bonsai" / "images_2-train" / "dense-init.json").is_file())
+            with self.assertRaises(FileExistsError):
+                generator.generate(args)
+            self.assertEqual(snapshot(), expected)
+            args.overwrite = True
+            generator.generate(args)
+            backups = list((cache / "bonsai" / "images_2-train" / "backups").glob("*.ply"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), fused)
+            self.assertEqual(snapshot(), expected)
+            self.assertEqual(command.call_count, 3)  # Completed stages are reused.
 
 
 if __name__ == "__main__":

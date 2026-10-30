@@ -118,7 +118,7 @@ def run_check(root, colmap, gpu):
     reused = run(["--overwrite"], "overwrite")
     assert "Reusing completed" in reused
     assert {str(path): path.stat().st_mtime_ns for path in workspace.glob("*.log")} == logs_before
-    backups = list(destination.parent.glob("init_points.backup-*.ply"))
+    backups = list((workspace / "backups").glob("init_points.backup-*.ply"))
     assert len(backups) == 1
     assert hashlib.sha256(backups[0].read_bytes()).hexdigest() == output_hash
     assert hashlib.sha256(destination.read_bytes()).hexdigest() == output_hash
