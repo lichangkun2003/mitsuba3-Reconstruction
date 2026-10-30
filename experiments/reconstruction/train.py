@@ -17,9 +17,11 @@ import json
 import math
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import time
 import traceback
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -43,7 +45,9 @@ from reconstruction_progress import ProgressLine
 from reconstruction_reference import GPUReferenceCache
 from reconstruction_replay import NativeLossReplay
 from reconstruction_gradient_storage import gradient_capacity, native_gradient_result
-from reconstruction_memory import plan_training_memory, probe_cuda_allocator
+from reconstruction_memory import (TrainingMemoryError, estimate_spatial_index_bytes,
+    plan_refinement_memory, plan_training_memory, probe_cuda_allocator, query_cuda_memory,
+    round_cuda_allocation)
 from reconstruction_sh_schedule import (apply_sh_schedule, sh_schedule_protocol,
     validate_sh_schedule, resolve_resume_sh_schedule)
 from reconstruction_sampling import PrefetchedUniformSampler
@@ -67,7 +71,7 @@ class TrainingSettings:
     gpu_reference_cache_mib: int = 1024  # Float32 reference planes on the GPU; 0 disables.
     freeze_native: bool = True  # Replay native GPU work between topology changes.
     compact_gradients: bool = True  # Large single-GPU RGB full views use touched-voxel gradient rows.
-    compact_gradient_rows: int = 0  # 0: start with four rows per ray; overflow retries grow safely.
+    compact_gradient_rows: int = 0  # 0: start with two rows per ray; overflow retries grow safely.
     sync_view_checks: bool = False  # Diagnostic: read loss/validity after every view.
     batch_reduction: str = "auto"  # Multi-GPU RGB batches: exact sparse union, or dense diagnostic transport.
     seed: int = 42
@@ -189,7 +193,7 @@ CONFIG.training.chunk_size = 0  # 0 = 整图提交；显存不足时可显式改
 CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译、缓存和 GPU 耗时。
 CONFIG.training.profile_interval_epochs = 50  # 每 50 轮及首次进入各分辨率时抽样记录内核耗时；0 关闭。
 CONFIG.training.profile_stages = True  # 仅在抽样视角细分前向、命中反向和候选梯度；会增加诊断开销。
-CONFIG.training.reference_cache_mib = 4096  # 内存缓存上限；bicycle 全部 RGB 参考约 1967 MiB，避免每轮重新解码。
+CONFIG.training.reference_cache_mib = 8192  # RAM 上限；容纳 bonsai 的全部 RGB 参考（约 4727 MiB），避免每轮重新解码。
 CONFIG.training.gpu_reference_cache_mib = 4096  # 显存缓存上限，按需分配；容纳全部参考图以避免反复上传，0 关闭。
 CONFIG.training.freeze_native = True  # 重放原生计算；拓扑变化后重新记录，分段诊断时旁路。
 
@@ -621,16 +625,35 @@ def sampling_statistics(sampler):
     return sampler.statistics() if isinstance(sampler, PrefetchedUniformSampler) else {"workers": 0}
 
 
-def configure_training_memory(config, model, cache, report, view_count, *, world_size=1, emit=print,
-                              compact_capacity_override=None):
-    """Plan known allocations and trim static images before training a new grid."""
+def model_index_bytes(model, allocator_policy=None):
+    statistics = model.statistics() if callable(getattr(model, "statistics", None)) else {}
+    if (allocator_policy is not None and hasattr(model, "growth_candidate_count")
+            and all(name in statistics for name in
+                    ("octree_normal_parent_nodes", "octree_candidate_parent_nodes"))):
+        # Native statistics expose logical sizes. Each tree owns three node
+        # arrays and one leaf array; an empty tree retains scalar sentinels.
+        return sum(3 * round_cuda_allocation(max(1, int(nodes)) * 4, allocator_policy)
+                   + round_cuda_allocation(max(1, int(leaves)) * 4, allocator_policy)
+                   for nodes, leaves in (
+                       (statistics["octree_normal_parent_nodes"], model.active_voxel_count),
+                       (statistics["octree_candidate_parent_nodes"], model.growth_candidate_count)))
+    return sum(int(statistics.get(name, 0)) for name in
+               ("octree_allocated_bytes", "spatial_index_allocated_bytes"))
+
+
+def training_memory_plan(config, model, report, view_count, *, world_size=1,
+                         compact_capacity_override=None, active_voxels=None, known_index_bytes=None):
+    """Plan the current or proposed model without allocating or resizing caches."""
     pixels = config.render.width * config.render.height
-    compact = (gradient_capacity(model, pixels, enabled=config.training.compact_gradients,
+    count = int(model.active_voxel_count) if active_voxels is None else int(active_voxels)
+    capacity_model = SimpleNamespace(active_voxel_count=count,
+        compact_gradient_version=getattr(model, "compact_gradient_version", 0))
+    compact = (gradient_capacity(capacity_model, pixels, enabled=config.training.compact_gradients,
                                 requested=config.training.compact_gradient_rows)
                if world_size == 1 and config.training.rgb_only and effective_chunk_size(config) == pixels else 0)
     if compact_capacity_override is not None:
         compact = compact_capacity_override
-    plan = plan_training_memory(active_voxels=int(model.active_voxel_count),
+    return plan_training_memory(active_voxels=count,
         sh_count=int(model.sh_count), opacity_sh_count=int(model.opacity_sh_count),
         radiance_degree_steps=config.training.sh_degree_progression,
         compact_capacity=compact, ray_count=effective_chunk_size(config),
@@ -640,16 +663,153 @@ def configure_training_memory(config, model, cache, report, view_count, *, world
         gpu=report.get("gpu"), distortion=config.gradient.distortion_loss_weight > 0,
         dssim=config.gradient.dssim_loss_weight > 0,
         reference_image_count=view_count, rgb_only=config.training.rgb_only,
-        allocator_policy=report["cuda_allocator"]["policy"])
+        allocator_policy=report["cuda_allocator"]["policy"],
+        known_index_bytes=(model_index_bytes(model, report["cuda_allocator"]["policy"])
+                           if known_index_bytes is None else known_index_bytes),
+        path_record_layout_version=int(getattr(model, "path_record_layout_version", 0)))
+
+
+def configure_training_memory(config, model, cache, report, view_count, *, world_size=1, emit=print,
+                              compact_capacity_override=None):
+    """Plan known allocations and trim static images before training a new grid."""
+    plan = training_memory_plan(config, model, report, view_count, world_size=world_size,
+                                compact_capacity_override=compact_capacity_override)
     core = str(int(getattr(model, "core_resolution", model.resolution)))
     report.setdefault("memory_plans", {})[core] = plan
     if not plan["supported"]:
-        raise RuntimeError("Training memory preflight: " + plan["reason"])
+        raise TrainingMemoryError(plan)
     before = cache.capacity_bytes // (1024 * 1024)
     cache.resize(plan["recommended_reference_cache_mib"])
     if before != plan["recommended_reference_cache_mib"]:
         emit("Training memory plan:", plan["reason"], flush=True)
     return plan
+
+
+def refinement_memory_snapshot(gpu):
+    """Query free memory only at allocation boundaries, never per training view."""
+    live = query_cuda_memory()
+    identity = gpu.get("uuid", gpu.get("index")) if isinstance(gpu, dict) else None
+    if identity is not None:
+        try:
+            completed = subprocess.run(["nvidia-smi", "--id=" + str(identity),
+                "--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5, check=True)
+            total, free = [int(value.strip()) * 1024**2 for value in completed.stdout.strip().split(",")]
+            if 0 <= free <= total and total > 0:
+                if live is None:
+                    live = {"total_bytes": total, "free_bytes": free, "source": "nvidia-smi"}
+                else:
+                    live = dict(live, source=live["source"] + "+nvidia-smi")
+                live["dedicated_free_bytes"] = free
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass  # CUDA/static planning remains available; never invent free bytes.
+    return live
+
+
+def prepare_refinement_memory(config, model, optimizer, cache, native_replay, report,
+                              view_count, request, dr, *, world_size=1):
+    """Retire replay/cache owners and check both transition and next-view storage."""
+    native_replay.clear()
+    optimizer.clear_replay()
+    cache.clear()
+    dr.sync_thread()
+    dr.flush_malloc_cache()
+    policy = report["cuda_allocator"]["policy"]
+    metadata = request["model_metadata"]
+    index_bound = estimate_spatial_index_bytes(request["active_voxels"], metadata["resolution"],
+                                              allocator_policy=policy)
+    ordinary = training_memory_plan(config, model, report, view_count, world_size=world_size,
+        active_voxels=request["active_voxels"], known_index_bytes=index_bound)
+    transition = plan_refinement_memory(request, gpu=report.get("gpu"),
+        live_memory=refinement_memory_snapshot(report.get("gpu")), allocator_policy=policy,
+        known_index_bytes=model_index_bytes(model, policy),
+        radiance_degree_steps=config.training.sh_degree_progression)
+    record = {"stage": request["stage"], "exact_count": request["exact_count"],
+              "active_voxels": request["active_voxels"], "training": ordinary, "transition": transition}
+    report.setdefault("refinement_memory_plans", []).append(record)
+    if not ordinary["supported"]:
+        raise TrainingMemoryError(ordinary)
+    if not transition["supported"]:
+        raise TrainingMemoryError(transition)
+    return record
+
+
+def prepare_topology_commit_memory(config, model, optimizer, cache, native_replay, report,
+                                   view_count, request, dr, *, world_size=1):
+    """Check a selected grow/prune commit before new parameter/Adam fields exist.
+
+    Selection and confirmation are unchanged. Evidence may already have updated
+    lifecycle streaks, so a refused commit must resume an existing checkpoint;
+    the exception handler must not serialize the partial topology transaction.
+    """
+    native_replay.clear()
+    optimizer.clear_replay()
+    cache.clear()
+    dr.sync_thread()
+    dr.flush_malloc_cache()
+    # CUDA pool frees submitted by flush are asynchronous. Wait for those
+    # frees too, before querying physical memory for a replacement field.
+    dr.sync_thread()
+    policy = report["cuda_allocator"]["policy"]
+    count, metadata = int(request["active_voxels"]), request["model_metadata"]
+    ordinary = training_memory_plan(config, model, report, view_count, world_size=world_size,
+        active_voxels=count, known_index_bytes=estimate_spatial_index_bytes(
+            count, metadata["resolution"], allocator_policy=policy))
+    live = refinement_memory_snapshot(report.get("gpu"))
+    # Adam remaps and model materialization retire one field at a time. The
+    # largest destination is one SH field, not the difference in row counts.
+    field_bytes = round_cuda_allocation(count * 4 * max(
+        3 * int(metadata["sh_count"]), int(metadata["opacity_sh_count"]), 4), policy)
+    required = field_bytes + 1024**3
+    available = None if live is None else max(0, min(live["free_bytes"],
+        live.get("dedicated_free_bytes", live["free_bytes"])) - 1024**3)
+    old_field_bytes = round_cuda_allocation(int(request.get("old_voxels", count)) * 4 * max(
+        3 * int(metadata["sh_count"]), int(metadata["opacity_sh_count"]), 4), policy)
+    staged_required = max(0, field_bytes - old_field_bytes) + 1024**3
+    direct_supported = available is not None and required <= available
+    staged_supported = available is not None and staged_required <= available
+    migration_mode = "gpu" if direct_supported else "host_staged"
+    transition = {"stage": request["stage"], "active_voxels": count,
+        "largest_replacement_field_bytes": field_bytes, "additional_required_bytes": required,
+        "staged_additional_required_bytes": staged_required, "migration_mode": migration_mode,
+        "available_bytes": available, "supported": direct_supported or staged_supported,
+        "reason_code": "topology_commit_fits" if direct_supported else
+                       "topology_commit_host_staged" if staged_supported else
+                       "gpu_memory_unknown" if available is None else "topology_commit_exceeds_budget"}
+    transition["reason"] = (f"Topology {request['stage']} needs {required / 1024**3:.2f} GiB "
+        "for a replacement field and scratch; " + ("free memory is unknown." if available is None else
+        f"{available / 1024**3:.2f} GiB is available after the device reserve.") +
+        (f" Using bounded host staging ({staged_required / 1024**3:.2f} GiB device workspace)."
+         if not direct_supported and staged_supported else
+         " Resume the latest complete checkpoint if this commit is refused."))
+    record = {"stage": request["stage"], "active_voxels": count,
+              "migration_mode": migration_mode, "training": ordinary, "transition": transition}
+    report.setdefault("topology_commit_memory_plans", []).append(record)
+    if not ordinary["supported"]:
+        raise TrainingMemoryError(ordinary)
+    if not transition["supported"]:
+        raise TrainingMemoryError(transition)
+    if migration_mode == "gpu":
+        return record
+    print(transition["reason"], flush=True)
+    # Keep callbacks out of the JSON report, and do not capture the old model:
+    # its native parameter owners must die before a staged field is replaced.
+    gpu = report.get("gpu")
+
+    def allocation_guard(required_bytes):
+        memory = refinement_memory_snapshot(gpu)
+        free = None if memory is None else min(memory["free_bytes"],
+            memory.get("dedicated_free_bytes", memory["free_bytes"]))
+        supported = free is not None and int(required_bytes) + 1024**3 <= free
+        if not supported:
+            raise TrainingMemoryError({"stage": "topology_staged_upload", "supported": False,
+                "additional_required_bytes": int(required_bytes) + 1024**3,
+                "available_bytes": free, "reason_code": "topology_staged_upload_exceeds_budget",
+                "reason": "The old topology field was staged, but its replacement does not fit "
+                          "in free device memory. Resume the latest complete checkpoint."})
+
+    return {**record, "allocation_guard": allocation_guard, "allocator_policy": policy,
+            "scratch_directory": str(WORKSPACE / ".cache" / "topology-transfer")}
 
 
 def release_topology_cache(model, dr):
@@ -702,7 +862,13 @@ def materialize_topology_state(checkpoint, dr):
     """
     dr.sync_thread()
     dr.flush_malloc_cache()
-    for value in checkpoint["model_state"].values():
+    from reconstruction_parameter_transfer import DeferredRemapField
+
+    for key in checkpoint["model_state"]:
+        value = checkpoint["model_state"][key]
+        if isinstance(value, DeferredRemapField):
+            checkpoint["model_state"][key] = value.materialize()
+            continue
         if dr.is_array_v(type(value)):
             dr.eval(value)
             # Inactive old-size buckets from small fields must not compete
@@ -1697,6 +1863,16 @@ def run_training(distributed=None):
         topology = TopologyManager(model, len(views), settings=config.topology,
             schedule=replace(config.schedule, save_each_level=False),
             opacity_warmup=config.optimizer.opacity_warmup_epochs, opacity_ramp=config.optimizer.opacity_ramp_epochs)
+        report["refinement_memory_plans"] = []
+        performance.metadata["refinement_memory_plans"] = report["refinement_memory_plans"]
+        topology.refinement_memory_guard = lambda current_model, current_optimizer, request: prepare_refinement_memory(
+            config, current_model, current_optimizer, gpu_reference_cache, native_replay,
+            report, len(views), request, dr, world_size=world_size)
+        report["topology_commit_memory_plans"] = []
+        performance.metadata["topology_commit_memory_plans"] = report["topology_commit_memory_plans"]
+        topology.topology_memory_guard = lambda current_model, current_optimizer, request: prepare_topology_commit_memory(
+            config, current_model, current_optimizer, gpu_reference_cache, native_replay,
+            report, len(views), request, dr, world_size=world_size)
         coarse_path = model_path.parent / "train" / "0000-coarse.png"
         if not config.evaluation.enabled:
             report["coarse_render"] = dict(status="skipped", reason="evaluation_disabled")
@@ -2231,6 +2407,17 @@ def run_training(distributed=None):
         progress_line.finish()
         report.update(status="interrupted", training_status="interrupted")
         raise
+    except TrainingMemoryError as error:
+        progress_line.finish()
+        report.update(status="memory_limited", training_status="memory_limited",
+                      memory_refusal=error.plan, error=str(error))
+        emit(str(error), file=sys.stderr, flush=True)
+        if not report.get("checkpoint") and resume_path is not None:
+            report["checkpoint"] = str(resume_path)
+        if report.get("checkpoint"):
+            emit("Latest complete resume checkpoint:", report["checkpoint"], flush=True)
+        if distributed is not None:
+            raise
     except Exception:
         progress_line.finish()
         report.update(status="failed", training_status="failed", error=traceback.format_exc())

@@ -128,7 +128,7 @@ def refine_projective_numpy(checkpoint, config, max_active_voxels, fit_core, np)
         for name, value in shell.items()}}
 
 
-def refine_projective_device(checkpoint, config, max_active_voxels, fit_core, dr):
+def refine_projective_device(checkpoint, config, max_active_voxels, fit_core, dr, *, before_allocate=None):
     """CUDA counterpart: fitting workspace scales with core rows only."""
     from reconstruction_topology_gpu import take_rows
     import math
@@ -142,13 +142,39 @@ def refine_projective_device(checkpoint, config, max_active_voxels, fit_core, dr
     bg_count = len(bg_ids)
     if 8 * bg_count > max_active_voxels:
         raise RuntimeError("Refinement exceeds max_active_voxels")
+    next_metadata = dict(metadata, resolution=metadata["resolution"] * 2,
+                         core_resolution=metadata["core_resolution"] * 2)
+    next_metadata["background_layers"] = (next_metadata["resolution"] - next_metadata["core_resolution"]) // 2
+    if before_allocate is not None:
+        # Existing projective cells always produce eight background children.
+        # This is a lower bound for the complete model, not an eightfold guess
+        # for the fitted core. Refuse only when even this lower bound cannot fit.
+        before_allocate({"stage": "projective_forecast", "active_voxels": 8 * bg_count,
+            "exact_count": False, "allocation_voxels": 8 * bg_count,
+            "old_voxels": count, "existing_child_count": 0,
+            "core_parent_count": len(core_ids), "background_child_count": 8 * bg_count,
+            "model_metadata": dict(next_metadata)})
+
+    def core_allocation_guard(request):
+        # The exact core fit is now known, before its large appearance table.
+        # Expose the final whole-scene count to the training budget callback.
+        before_allocate(dict(request, stage="projective_core_appearance",
+            active_voxels=request["active_voxels"] + 8 * bg_count,
+            old_voxels=count, core_parent_count=len(core_ids),
+            background_child_count=8 * bg_count, model_metadata=dict(next_metadata)))
+
     core_state = {name: take_rows(value, core_ids, len(value)//count) for name, value in state.items()} if count else state
+    options = {} if before_allocate is None else {"before_allocate": core_allocation_guard}
     core_result = fit_core({"model_metadata": dict(metadata, scene_mapping="bounded"), "model_state": core_state},
-                          config, max_active_voxels - 8 * bg_count, dr)["model_state"]
+                          config, max_active_voxels - 8 * bg_count, dr, **options)["model_state"]
     del core_state, core_ids, inside
-    metadata["resolution"] *= 2
-    metadata["core_resolution"] *= 2
-    metadata["background_layers"] = (metadata["resolution"] - metadata["core_resolution"]) // 2
+    metadata = next_metadata
+    if before_allocate is not None:
+        core_count = len(core_result["cell_indices"])
+        before_allocate({"stage": "projective_model", "active_voxels": core_count + 8 * bg_count,
+            "exact_count": True, "allocation_voxels": core_count + 8 * bg_count if bg_count else 0,
+            "old_voxels": count, "existing_child_count": core_count,
+            "background_child_count": 8 * bg_count, "model_metadata": dict(metadata)})
     if not bg_count:
         return {"model_metadata": metadata, "model_state": core_result}
     rows = dr.arange(U, 8 * bg_count)

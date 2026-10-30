@@ -278,7 +278,8 @@ def _write_direction(fields, accepted, pairs, begin, count, parent_ids, parent_c
 
 
 def _parent_batch(state, metadata, parent_ids, blocked, selected_targets,
-                  offsets, offset_fields, penetration, cfg, region_allowed, batch_size, dr):
+                  offsets, offset_fields, penetration, cfg, region_allowed, batch_size, dr,
+                  parameter_parent_rows=None):
     """Two compactions per bounded parent batch, with unchanged FP64 contact math."""
     U, D = dr.cuda.UInt32, dr.cuda.Float64
     resolution = metadata['resolution']
@@ -293,8 +294,10 @@ def _parent_batch(state, metadata, parent_ids, blocked, selected_targets,
     if not count:
         return None
     geometry_state = {'cell_indices': parent_cells}
+    parameter_ids = (parent_ids if parameter_parent_rows is None else
+                     dr.gather(U, parameter_parent_rows, parent_ids))
     for name, width in (('centers', 3), ('log_scales', 3), ('rotations', 4)):
-        geometry_state[name] = gather_rows(state[name], parent_ids, width, dr)
+        geometry_state[name] = gather_rows(state[name], parameter_ids, width, dr)
     geometry = geometry_gpu(geometry_state, metadata, dr)
     del geometry_state
     dimensions = dict(parent_ids=1, parent_cells=1, cells=1, centers=3, log_scales=3, rotations=4)
@@ -344,6 +347,14 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
     U, I, D, F, B = dr.cuda.UInt32, dr.cuda.Int32, dr.cuda.Float64, dr.cuda.Float32, dr.cuda.Bool
     state, metadata, cfg = checkpoint['model_state'], checkpoint['model_metadata'], manager.settings
     state = {k: U(v) if k == 'cell_indices' else F(v) for k, v in state.items()}
+    # A memory-limited prune keeps parameter fields in the original row order
+    # until the old native model can retire. Occupancy and result parent IDs
+    # still use the compact surviving-row order; only parameter reads remap.
+    parameter_parent_rows = checkpoint.get('parameter_parent_rows')
+    if parameter_parent_rows is not None:
+        parameter_parent_rows = U(parameter_parent_rows)
+        if len(parameter_parent_rows) != len(state['cell_indices']):
+            raise ValueError('Parameter parent map must cover every surviving cell')
     occupied, resolution = state['cell_indices'], metadata['resolution']
     def empty_result():
         result = {k: dr.empty(U if k in ('parent_ids','parent_cells','cells','geometric_support') else D, 0)
@@ -412,7 +423,8 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
         positions = dr.arange(U, count) + dr.opaque(U, begin)
         batch_ids = dr.gather(U, parent_ids, positions)
         piece = _parent_batch(state, metadata, batch_ids, blocked, selected_targets,
-                              offsets, offset_fields, penetration, cfg, region_allowed, batch_size, dr)
+                              offsets, offset_fields, penetration, cfg, region_allowed, batch_size, dr,
+                              parameter_parent_rows=parameter_parent_rows)
         if piece is not None:
             pieces.append(piece)
     del blocked, selected_targets, parent_ids, batch_ids, positions, offset_fields, piece
@@ -456,8 +468,10 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
     from reconstruction_topology import validate_growth_opacity
     validate_growth_opacity(cfg, metadata['opacity_sh_count'])
     inverse_y0 = 2*math.sqrt(math.pi)
+    parameter_ids = (result['parent_ids'] if parameter_parent_rows is None else
+                     dr.gather(U, parameter_parent_rows, result['parent_ids']))
     if cfg.growth_inherit_opacity:
-        b0 = D(dr.gather(F, state['opacity_sh'], result['parent_ids']*metadata['opacity_sh_count']))
+        b0 = D(dr.gather(F, state['opacity_sh'], parameter_ids*metadata['opacity_sh_count']))
         z = b0 / inverse_y0
         # Stable log(sigmoid(z)), including extremely negative parent logits.
         log_alpha = dr.minimum(math.log(cfg.growth_initial_opacity), math.log(cfg.growth_opacity_scale)-
@@ -472,7 +486,7 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
     dr.scatter(opacity,F(child_b0),index*metadata['opacity_sh_count'])
     for channel in range(3):
         dr.scatter(radiance,dr.gather(F,state['radiance_sh'],
-            result['parent_ids']*metadata['sh_count']*3+channel),index*metadata['sh_count']*3+channel)
+             parameter_ids*metadata['sh_count']*3+channel),index*metadata['sh_count']*3+channel)
     result['candidate_state'] = dict(cell_indices=result['cells'],
         centers=F(result['centers']),log_scales=F(result['log_scales']),rotations=F(result['rotations']),
         radiance_sh=radiance,opacity_sh=opacity)

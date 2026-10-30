@@ -58,6 +58,9 @@ public:
     /// Pre-compacted gradient rows can feed Adam without dense reconstruction.
     static constexpr uint32_t compact_optimizer_version = 1;
     static constexpr uint32_t compact_gradient_version = 1;
+    /// RGB paths recompute unchanged hit appearance, reconstruct candidate
+    /// transmittance, and retain only the RGB reverse suffix.
+    static constexpr uint32_t path_record_layout_version = 1;
     static constexpr uint32_t projective_version = 1;
 
     VoxelReconstruction(const std::string &filename, uint32_t resolution,
@@ -214,6 +217,10 @@ public:
     /// image_width/image_height and the same forward records. It requires
     /// RGB-only, complete row-major images and unit inverse_pdf. Invalid device
     /// weights produce nonfinite loss/gradients for the caller's finite guard.
+    /// RGB-only paths use compact records by default. Appearance is recomputed
+    /// from the same unchanged model, and candidate transmittance is read from
+    /// the next hard hit or the final path. compact_path_records=0 retains the
+    /// original layout for differential diagnostics; it changes no estimator.
     TrainingResult loss_and_grad(const Ray3f &ray, const Color3f &reference_rgb,
                                  const Float &reference_alpha,
                                  const Color3f &background,

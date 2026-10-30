@@ -12,7 +12,10 @@ def gradient_capacity(model, ray_count, *, enabled=True, requested=0):
     if not enabled:
         return 0
     count = int(getattr(model, "active_voxel_count", 0))
-    capacity = requested or max(65536, 4 * ray_count)
+    # Capacity is a storage hint, never a limit on contributing voxels. Start
+    # with two rows per ray; native_gradient_result retries an overflowing pass
+    # before any optimizer update or topology vote consumes its output.
+    capacity = requested or max(65536, 2 * ray_count)
     if count <= capacity:
         return 0
     if getattr(model, "compact_gradient_version", 0) < 1:

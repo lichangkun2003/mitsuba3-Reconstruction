@@ -1,8 +1,8 @@
 """GPU-resident RGB topology lifecycle.
 
-Only compact event reductions cross to the host at epoch boundaries. Model
-rows, proposal statistics, cooldowns and Adam remaps stay in device arrays.
-Serialization is an explicit host border; coarse-to-fine fitting stays on CUDA.
+Ordinary topology updates retain rows, proposals, cooldowns and Adam on CUDA.
+When a complete replacement field would exceed free device memory, an exact
+chunked host transfer retires that field before allocating its replacement.
 """
 
 from __future__ import annotations
@@ -117,6 +117,42 @@ def append_model_rows(first, second, dr):
     return dr.select(existing,
         dr.gather(type(first), first, index, existing),
         dr.gather(type(second), second, index - len(first), ~existing))
+
+
+def prepare_model_remap(checkpoint, new_count, dr, *, selected=None, host_staged=False,
+                        scratch_directory=None, allocation_guard=None, allocator_policy="cuda_2m"):
+    """Describe one final parameter migration after pruning and growth selection.
+
+    Revalidation only compacts occupied cell IDs. Its optional parameter map
+    addresses the original native fields, avoiding an intermediate full SH or
+    geometry copy when deletion and growth share a boundary. Staged plans are
+    materialized by the driver after it releases the previous native model.
+    """
+    if host_staged:
+        from reconstruction_parameter_transfer import DeferredRemapField
+    state, metadata = checkpoint["model_state"], checkpoint["model_metadata"]
+    parameter_rows = checkpoint.pop("parameter_parent_rows", None)
+    count = len(state["cell_indices"])
+    identity = dr.arange(dr.uint32_array_t(type(state["cell_indices"])), count)
+    widths = dict(cell_indices=1, centers=3, log_scales=3, rotations=4,
+                  radiance_sh=int(metadata["sh_count"]) * 3,
+                  opacity_sh=int(metadata["opacity_sh_count"]))
+    for name in list(state):
+        value = state.pop(name)
+        rows = parameter_rows if name != "cell_indices" and parameter_rows is not None else identity
+        addition = (None if selected is None else
+                    type(value)(selected["cells" if name == "cell_indices" else name]))
+        if host_staged:
+            state[name] = DeferredRemapField(value, rows, widths[name], new_count,
+                append=addition, dr=dr, scratch_directory=scratch_directory,
+                allocation_guard=allocation_guard, allocator_policy=allocator_policy)
+        else:
+            if name != "cell_indices" and parameter_rows is not None:
+                value = take_rows(value, parameter_rows, widths[name])
+            state[name] = value if addition is None else append_model_rows(value, addition, dr)
+        # Do not retain another owner of an old field when the driver retires
+        # that field. Deferred plans must be its only remaining Python owner.
+        value = addition = None
 
 
 class GPUTopologyLifecycle:
@@ -551,7 +587,13 @@ class GPUTopologyLifecycle:
         from reconstruction_topology import model_checkpoint
         m, dr = self.manager, self.dr
         started = time.perf_counter()
-        replacement = refine_state_gpu(device_checkpoint(model), m.schedule, m.settings.max_active_voxels)
+        guard = getattr(m, "refinement_memory_guard", None)
+        options = {} if guard is None else {
+            "before_allocate": lambda request: guard(model, optimizer, request)}
+        # Every callback runs before lifecycle/optimizer mutation. A refusal
+        # leaves the previous model and moments usable for a safe checkpoint.
+        replacement = refine_state_gpu(device_checkpoint(model), m.schedule,
+                                       m.settings.max_active_voxels, **options)
         dr.sync_thread()
         fitted = time.perf_counter()
         if m.schedule.save_each_level:
@@ -589,6 +631,29 @@ class GPUTopologyLifecycle:
             event["core_resolution"] = m.core_resolution
         return replacement, event
 
+    def guard_commit_memory(self, model, optimizer, stage, count, *, added=0, deleted=0):
+        """Check exact selected row counts before allocating replacement tables.
+
+        Evidence evaluation may already have updated lifecycle streaks. A
+        refusal aborts the epoch; recovery must use an existing checkpoint,
+        rather than serializing a partially evaluated topology transaction.
+        The guard cannot alter selected IDs, their order, or the update rules.
+        """
+        guard = getattr(self.manager, "topology_memory_guard", None)
+        if guard is None:
+            return
+        metadata = {"resolution": int(model.resolution),
+            "core_resolution": int(getattr(model, "core_resolution", model.resolution)),
+            "sh_count": int(model.sh_count), "opacity_sh_count": int(model.opacity_sh_count)}
+        metadata.update(sh_model_metadata(model))
+        mapping = getattr(model, "scene_mapping", "")
+        if mapping:
+            metadata["scene_mapping"] = mapping
+        return guard(model, optimizer, {"stage": stage, "active_voxels": int(count), "count": int(count),
+            "exact_count": True, "old_voxels": int(model.active_voxel_count),
+            "current_voxels": int(self.manager.count), "added_voxels": int(added),
+            "deleted_voxels": int(deleted), "model_metadata": metadata})
+
     def finish(self, model, optimizer, boundary):
         m, dr, cfg = self.manager, self.dr, self.manager.settings
         m.before_refine_checkpoint = None
@@ -620,6 +685,11 @@ class GPUTopologyLifecycle:
         masks = [mask for mask in (rgb, opacity) if mask is not None]
         checkpoint = None
         adam_survivors = None
+        selected = None
+        host_staged = False
+        scratch_directory = None
+        allocation_guard = None
+        allocator_policy = "cuda_2m"
         if masks:
             # Compact decisions and scalar diagnostics must not keep the full
             # deletion evidence window alive throughout model/Adam remapping.
@@ -630,14 +700,22 @@ class GPUTopologyLifecycle:
                 delete = delete | mask
             survivors = dr.compress(~delete)
             if len(survivors) != m.count:
+                plan = self.guard_commit_memory(model, optimizer, "deletion_commit", len(survivors),
+                                                deleted=m.count - len(survivors))
+                if isinstance(plan, dict):
+                    host_staged = plan.get("migration_mode") == "host_staged"
+                    scratch_directory = plan.get("scratch_directory")
+                    allocation_guard = plan.get("allocation_guard")
+                    allocator_policy = plan.get("allocator_policy", allocator_policy)
                 checkpoint = device_checkpoint(model)
                 removed = dr.compress(delete)
                 self.cooldown_cells = concat_rows(self.cooldown_cells, take_rows(checkpoint["model_state"]["cell_indices"], removed))
                 self.cooldown_expiry = concat_rows(self.cooldown_expiry,
                     dr.full(self.Int64, boundary + cfg.deletion_cooldown_epochs, len(removed)))
                 old_count = m.count
-                checkpoint["model_state"] = {name: take_rows(value, survivors, len(value) // old_count)
-                                              for name, value in checkpoint["model_state"].items()}
+                checkpoint["model_state"]["cell_indices"] = take_rows(
+                    checkpoint["model_state"]["cell_indices"], survivors)
+                checkpoint["parameter_parent_rows"] = survivors
                 event["deleted"] = old_count - len(survivors)
                 if rgb is not None:
                     event["deletion_rgb"]["deleted"] = self.count(rgb)
@@ -662,6 +740,13 @@ class GPUTopologyLifecycle:
             if selected is not None and len(selected["cells"]):
                 added = len(selected["cells"])
                 old_count, new_count = m.count, m.count + added
+                plan = self.guard_commit_memory(model, optimizer, "growth_commit", new_count,
+                                                added=added, deleted=event["deleted"])
+                if isinstance(plan, dict):
+                    host_staged |= plan.get("migration_mode") == "host_staged"
+                    scratch_directory = plan.get("scratch_directory", scratch_directory)
+                    allocation_guard = plan.get("allocation_guard", allocation_guard)
+                    allocator_policy = plan.get("allocator_policy", allocator_policy)
                 survivors = dr.arange(self.UInt, old_count)
                 # Retire the old Adam tables before allocating the appended
                 # model. Otherwise its large radiance array competes with
@@ -670,19 +755,16 @@ class GPUTopologyLifecycle:
                 # the allocator; evict them at this topology-only boundary.
                 dr.sync_thread()
                 dr.flush_malloc_cache()
-                optimizer.remap(adam_survivors if adam_survivors is not None else survivors, new_count)
+                transfer_options = (dict(host_staged=True, scratch_directory=scratch_directory,
+                    allocation_guard=allocation_guard, allocator_policy=allocator_policy) if host_staged else {})
+                optimizer.remap(adam_survivors if adam_survivors is not None else survivors,
+                                new_count, **transfer_options)
                 adam_survivors = None
                 self.remap(survivors, new_count, boundary)
                 # Remapping also leaves old-size buckets behind. Release them
                 # before the replacement model allocates its complete tables.
                 dr.sync_thread()
                 dr.flush_malloc_cache()
-                for name, value in checkpoint["model_state"].items():
-                    addition = selected["cells" if name == "cell_indices" else name]
-                    checkpoint["model_state"][name] = append_model_rows(value, type(value)(addition), dr)
-                # Lazy appends own only the materialized winner arrays now.
-                # Other selected fields and loop aliases have no later consumer.
-                selected = value = addition = None
                 event["grown"] = added
             elif not event["deleted"]:
                 checkpoint = None
@@ -690,8 +772,17 @@ class GPUTopologyLifecycle:
             # Deletion-only commits include an empty survivor map. If growth
             # selection raises, let the existing failed-epoch path abort before
             # starting a migration or trying to save a partial transaction.
-            optimizer.remap(adam_survivors, m.count)
+            transfer_options = (dict(host_staged=True, scratch_directory=scratch_directory,
+                allocation_guard=allocation_guard, allocator_policy=allocator_policy) if host_staged else {})
+            optimizer.remap(adam_survivors, m.count, **transfer_options)
             adam_survivors = None
+        if checkpoint is not None:
+            prepare_model_remap(checkpoint, m.count, dr,
+                selected=selected if event["grown"] else None,
+                host_staged=host_staged, scratch_directory=scratch_directory,
+                allocation_guard=allocation_guard, allocator_policy=allocator_policy)
+            event["topology_transfer"] = "host_staged" if host_staged else "gpu"
+        selected = None
         m.pending_growth, m.pending_rgb_deletion = None, None
         m._growth_world_cache = m._growth_device = m._rgb_growth_device = m._rgb_deletion_device = None
         if len(self.cooldown_cells):

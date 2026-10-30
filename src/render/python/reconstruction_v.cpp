@@ -306,5 +306,6 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("optimizer_device_version") = nb::int_(Model::optimizer_device_version);
     cls.attr("compact_optimizer_version") = nb::int_(Model::compact_optimizer_version);
     cls.attr("compact_gradient_version") = nb::int_(Model::compact_gradient_version);
+    cls.attr("path_record_layout_version") = nb::int_(Model::path_record_layout_version);
     drjit::bind_traverse(cls);
 }

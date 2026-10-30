@@ -16,6 +16,34 @@ import reconstruction_growth_candidates_gpu as growth_gpu
 
 
 class Proposals(unittest.TestCase):
+    def test_pruned_parameter_indirection_matches_compacted_fields(self):
+        original = checkpoint([0, 73, 7, 75, 90])
+        rng = np.random.default_rng(38491)
+        original['model_state']['opacity_sh'] = np.linspace(-3, 3, 5, dtype=np.float32)
+        original['model_state']['radiance_sh'] = rng.normal(size=5*12).astype(np.float32)
+        original['model_state']['centers'] += rng.uniform(-.02, .02, 15).astype(np.float32)
+        survivors = np.array([1, 3, 4], np.uint32)
+        widths = dict(cell_indices=1, centers=3, log_scales=3, rotations=4,
+                      radiance_sh=12, opacity_sh=1)
+        compact = dict(model_metadata=dict(original['model_metadata']), model_state={
+            name: value.reshape(-1, widths[name])[survivors].reshape(-1)
+            for name, value in original['model_state'].items()})
+        indirect = dict(model_metadata=dict(original['model_metadata']),
+                        model_state=dict(original['model_state']), parameter_parent_rows=survivors)
+        indirect['model_state']['cell_indices'] = compact['model_state']['cell_indices']
+        manager = manager_for(compact, use_rgb_growth=True, growth_use_26_neighbors=True,
+            growth_min_supporting_parents=2, growth_evidence_penetration=0.,
+            growth_inherit_opacity=True, growth_initial_opacity=.3)
+        expected = generate_growth_gpu(manager, compact, 10, target_cells=dr.cuda.UInt32([74]))
+        actual = generate_growth_gpu(manager, indirect, 10, target_cells=dr.cuda.UInt32([74]))
+        self.assertGreater(len(actual['cells']), 0)
+        # Parent IDs remain in the compact topology row order. Every geometry,
+        # opacity and inherited DC read must address the original source row.
+        for name in (*widths, 'cells', 'parent_ids', 'parent_cells', 'geometric_support'):
+            if name == 'cell_indices':
+                continue
+            np.testing.assert_array_equal(np.array(actual[name]), np.array(expected[name]), err_msg=name)
+
     def compare(self, manager, state, boundary=10, target_cells=None, **device_options):
         expected=TopologyManager._generate_growth(manager,state,boundary)
         if target_cells is not None:

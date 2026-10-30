@@ -618,7 +618,9 @@ class FalcorOptimizer:
         return {"effective_opacity_lr": rates["opacity_sh"], "backward_samples": sample_count,
                 "accepted": self.update_healthy}
 
-    def remap(self, survivors, new_count: int, *, reset_radiance: bool = False):
+    def remap(self, survivors, new_count: int, *, reset_radiance: bool = False,
+              host_staged: bool = False, scratch_directory=None, allocation_guard=None,
+              allocator_policy="cuda_2m"):
         """Preserve surviving moments, append zero newborn state; all indices are old IDs."""
         self.clear_replay()
         dr, mi = self.dr, self.mi
@@ -631,6 +633,32 @@ class FalcorOptimizer:
                 state["mean"] = dr.zeros(mi.Float, new_count * self.dimensions[name])
                 state["squared_mean"] = dr.zeros(mi.Float, new_count * self.dimensions[name])
                 state["steps"] = dr.zeros(mi.UInt32, new_count * self._step_size(name))
+            self.count = new_count
+            self._remember_state()
+            return
+        if host_staged:
+            from reconstruction_memory import TrainingMemoryError
+            from reconstruction_parameter_transfer import DeferredRemapField
+            if self._state_exposed:
+                raise TrainingMemoryError({"stage": "topology_optimizer_staging", "supported": False,
+                    "reason_code": "optimizer_state_exposed",
+                    "reason": "Host-staged optimizer migration requires exclusive ownership; "
+                              "legacy mutable optimizer state was exposed to a caller."})
+            # Replace the dictionary's old owner before materializing. A local
+            # old/value variable or a copied state dictionary would defeat the
+            # transfer by keeping the original full GPU field alive.
+            for name, state in self._state.items():
+                if name == "radiance_sh" and reset_radiance:
+                    state["mean"] = dr.zeros(mi.Float, new_count * self.dimensions[name])
+                    state["squared_mean"] = dr.zeros(mi.Float, new_count * self.dimensions[name])
+                    state["steps"] = dr.zeros(mi.UInt32, new_count * self._step_size(name))
+                    continue
+                for key in ("mean", "squared_mean", "steps"):
+                    width = self._step_size(name) if key == "steps" else self.dimensions[name]
+                    state[key] = DeferredRemapField(state[key], source, width, new_count,
+                        dr=dr, scratch_directory=scratch_directory, allocation_guard=allocation_guard,
+                        allocator_policy=allocator_policy)
+                    state[key] = state[key].materialize()
             self.count = new_count
             self._remember_state()
             return

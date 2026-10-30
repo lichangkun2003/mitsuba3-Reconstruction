@@ -45,9 +45,10 @@ def configuration(gpu):
 
 def arrays_equal(first, second, np, *, path=""):
     if isinstance(first, dict):
-        # GPU backend reporting is the only additional event field.
-        assert set(first) - {"topology_backend"} == set(second) - {"topology_backend"}, path
-        for name in set(first) - {"topology_backend"}:
+        # Backend/transfer reporting does not change lifecycle semantics.
+        reporting = {"topology_backend", "topology_transfer"}
+        assert set(first) - reporting == set(second) - reporting, path
+        for name in set(first) - reporting:
             arrays_equal(first[name], second[name], np, path=f"{path}/{name}")
     elif isinstance(first, np.ndarray):
         if np.issubdtype(first.dtype, np.floating):
@@ -60,7 +61,7 @@ def arrays_equal(first, second, np, *, path=""):
         assert first == second, (path, first, second)
 
 
-def simulate(mi, dr, np, *, gpu):
+def simulate(mi, dr, np, *, gpu, host_staged=False, staging_options=None):
     model = restore_model(fixture(np), mi)
     cfg = configuration(gpu)
     schedule = CoarseToFineConfig(enabled=False, total_epochs=4)
@@ -101,13 +102,22 @@ def simulate(mi, dr, np, *, gpu):
                 manager.observe_rgb_growth(model, out, view, epoch, 16)
                 manager.observe_rgb_deletion(model, deletion, view, epoch, 16)
         if gpu:
+            if host_staged:
+                manager.topology_memory_guard = lambda *_: dict(staging_options)
             # Any accidental complete host model snapshot is a regression.
             with patch("reconstruction_topology.model_checkpoint", side_effect=AssertionError("GPU topology copied model")):
                 replacement, event = manager.finish_epoch(model, optimizer, epoch + 1)
         else:
             replacement, event = manager.finish_epoch(model, optimizer, epoch + 1)
         if replacement is not None:
-            if gpu:
+            if gpu and host_staged:
+                from reconstruction_parameter_transfer import DeferredRemapField
+                assert all(isinstance(value, DeferredRemapField)
+                           for value in replacement["model_state"].values())
+                model = None
+                for name in list(replacement["model_state"]):
+                    replacement["model_state"][name] = replacement["model_state"][name].materialize()
+            elif gpu:
                 assert all(dr.is_array_v(type(value)) for value in replacement["model_state"].values())
             model = restore_model(replacement, mi)
         events.append(event)
@@ -117,7 +127,7 @@ def simulate(mi, dr, np, *, gpu):
             "model": model_checkpoint(model), "optimizer": optimizer.state_dict(), "lifecycle": lifecycle}
 
 
-def delete_all(mi, dr, np):
+def delete_all(mi, dr, np, *, host_staged=False, staging_options=None):
     data = fixture(np)
     data["model_state"]["opacity_sh"][:] = -30.
     cfg = configuration(True)
@@ -126,6 +136,8 @@ def delete_all(mi, dr, np):
     model = restore_model(data, mi)
     manager = TopologyManager(model, 1, cfg, CoarseToFineConfig(enabled=False, total_epochs=3))
     optimizer = FalcorOptimizer(model)
+    if host_staged:
+        manager.topology_memory_guard = lambda *_: dict(staging_options)
     manager.prepare_rgb_growth(model, 0)
     n = len(manager.pending_growth["cells"])
     manager.observe_rgb_growth(model, {"growth_gain": dr.full(mi.Float, 1., n),
@@ -134,6 +146,10 @@ def delete_all(mi, dr, np):
     assert event["deleted"] == 4 and manager.count == optimizer.count == 0
     assert event["growth_rgb"]["rgb_qualified"] > 0
     assert event["growth_rgb"]["geometry_revalidated"] == 0
+    if host_staged:
+        model = None
+        for name in list(replacement["model_state"]):
+            replacement["model_state"][name] = replacement["model_state"][name].materialize()
     model = restore_model(replacement, mi)
     manager.prepare_rgb_growth(model, 1)
     for key in ("growth", "deletion"):
@@ -147,12 +163,36 @@ def delete_all(mi, dr, np):
 
 def main():
     with tempfile.TemporaryDirectory(prefix="mitsuba-gpu-lifecycle-") as temporary:
-        mi, dr, np, handles = initialize_runtime(RuntimeConfig(), Path(temporary), {})
+        report = {}
+        mi, dr, np, handles = initialize_runtime(RuntimeConfig(), Path(temporary), report)
+        from reconstruction_memory import TrainingMemoryError, probe_cuda_allocator
+        from train import refinement_memory_snapshot
+        policy = probe_cuda_allocator(dr)["policy"]
+
+        def allocation_guard(required_bytes):
+            # Dr.Jit need not leave its CUDA context current between calls.
+            # Use the same physical-memory fallback as production staging,
+            # retaining its device reserve instead of bypassing the guard.
+            memory = refinement_memory_snapshot(report.get("gpu"))
+            free = None if memory is None else min(memory["free_bytes"],
+                memory.get("dedicated_free_bytes", memory["free_bytes"]))
+            if free is None or int(required_bytes) + 1024**3 > free:
+                raise TrainingMemoryError({"stage": "topology_staged_test_upload", "supported": False,
+                    "required_bytes": int(required_bytes) + 1024**3, "available_bytes": free,
+                    "reason": "Staged topology regression requires enough real free GPU memory."})
+
+        staging_options = {"migration_mode": "host_staged", "allocation_guard": allocation_guard,
+                           "allocator_policy": policy, "scratch_directory": temporary}
         reference = simulate(mi, dr, np, gpu=False)
         actual = simulate(mi, dr, np, gpu=True)
         arrays_equal(reference, actual, np)
+        staged = simulate(mi, dr, np, gpu=True, host_staged=True, staging_options=staging_options)
+        arrays_equal(reference, staged, np)
         delete_all(mi, dr, np)
-        print(json.dumps({"cpu_gpu_votes_remap_revalidation_resume": "passed", "delete_all_empty_lifecycle": "passed"}))
+        delete_all(mi, dr, np, host_staged=True, staging_options=staging_options)
+        print(json.dumps({"cpu_gpu_votes_remap_revalidation_resume": "passed",
+                          "host_staged_votes_remap_revalidation_resume": "passed",
+                          "delete_all_empty_lifecycle": "passed"}))
     return 0
 
 

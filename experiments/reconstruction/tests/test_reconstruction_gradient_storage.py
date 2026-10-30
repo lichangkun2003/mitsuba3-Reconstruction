@@ -37,7 +37,7 @@ class GradientStorageTests(unittest.TestCase):
         cache.resize = resize
         report = {"gpu": {"memory_mib": 32607}, "cuda_allocator": {"policy": "cuda_2m"}}
         plan = configure_training_memory(config, model, cache, report, 169, emit=lambda *a, **kw: None)
-        self.assertEqual(plan["gradient_rows"], 4_067_256)
+        self.assertEqual(plan["gradient_rows"], 2_033_628)
         self.assertEqual(resized, [256])
         with self.assertRaisesRegex(RuntimeError, "memory preflight"):
             configure_training_memory(config, model, cache, report, 169,
@@ -52,7 +52,7 @@ class GradientStorageTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "rebuild"):
             gradient_capacity(model, 1_016_814)
         model.compact_gradient_version = 1
-        self.assertEqual(gradient_capacity(model, 1_016_814), 4_067_256)
+        self.assertEqual(gradient_capacity(model, 1_016_814), 2_033_628)
         self.assertEqual(gradient_capacity(model, 1_016_814, enabled=False), 0)
 
     def test_overflow_is_discarded_before_retry_and_capacity_hint_is_reused(self):

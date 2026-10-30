@@ -11,6 +11,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from reconstruction_memory import (GIB, MIB, estimate_training_memory,
+                                   estimate_spatial_index_bytes,
                                    plan_training_memory, probe_cuda_allocator,
                                    round_cuda_allocation)
 
@@ -21,6 +22,38 @@ class MemoryBudgetTests(unittest.TestCase):
                       compact_capacity=30, ray_count=20, max_hits=16, max_candidates=16)
         values.update(overrides)
         return values
+
+    def test_spatial_index_bound_uses_flattened_three_arrays_and_padded_root(self):
+        # Dense 4^3 grid: 8 parents plus the root, held in three arrays.
+        expected = round_cuda_allocation(64 * 4) + 3 * round_cuda_allocation(9 * 4) + 4 * 64
+        self.assertEqual(estimate_spatial_index_bytes(64, 4), expected)
+        self.assertEqual(estimate_spatial_index_bytes(0, 1040), 8 * 64)
+        self.assertEqual(estimate_spatial_index_bytes(1, 1), 8 * 64)
+        # A 1040 grid has depth eleven (padded to 2048), with real-domain
+        # parent counts ceil(1040 / 2^l)^3, not a fully occupied 2048 cube.
+        n = 51_910_528
+        nodes = sum(min(n, ((1040 + (1 << level) - 1) >> level)**3)
+                    for level in range(1, 12))
+        expected = round_cuda_allocation(n * 4) + 3 * round_cuda_allocation(nodes * 4) + 4 * 64
+        self.assertEqual(estimate_spatial_index_bytes(n, 1040), expected)
+        self.assertLess(estimate_spatial_index_bytes(n, 1040),
+                        estimate_spatial_index_bytes(n, 1040, allocator_policy="power_of_two"))
+
+    def test_spatial_bound_covers_exact_node_counts_for_small_occupancies(self):
+        # Enumerate small occupancy subsets independently of Morton ordering.
+        import itertools
+        for size in (1, 2, 3, 5):
+            cells = list(itertools.product(range(size), repeat=3))
+            depth = (size - 1).bit_length()
+            for chosen in (cells, cells[::2], cells[::5], cells[:1], []):
+                nodes = sum(len({tuple(v >> level for v in xyz) for xyz in chosen})
+                            for level in range(1, depth + 1))
+                actual = (round_cuda_allocation(max(1, len(chosen)) * 4) +
+                          3 * round_cuda_allocation(max(1, nodes) * 4) + 4 * 64)
+                self.assertLessEqual(actual, estimate_spatial_index_bytes(len(chosen), size))
+        for n, size in ((9, 2), (-1, 4), (1, 0), (0, 2048), (True, 4)):
+            with self.assertRaises(ValueError):
+                estimate_spatial_index_bytes(n, size)
 
     def plan(self, **overrides):
         values = dict(self.inputs(), reference_cache_mib=4096, gpu={"memory_mib": "32607"})
@@ -79,6 +112,20 @@ class MemoryBudgetTests(unittest.TestCase):
         self.assertEqual(c["reverse_suffix"], 20 * 16 * 4 * 4)
         self.assertEqual(c["geometric_candidate_state"], 20 * 16 * (6 + 2) * 4)
         self.assertEqual(enabled["known_logical_bytes"] - disabled["known_logical_bytes"], 20 * 16 * 2 * 4)
+
+    def test_compact_path_record_accounting_requires_native_capability_and_rgb(self):
+        legacy = estimate_training_memory(**self.inputs())
+        compact = estimate_training_memory(**self.inputs(), path_record_layout_version=1)
+        c = compact["components_bytes"]
+        self.assertEqual(c["hit_record_floats"], 20 * 16 * 7 * 4)
+        self.assertEqual(c["reverse_suffix"], 20 * 16 * 3 * 4)
+        self.assertEqual(c["geometric_candidate_state"], 20 * 16 * 7 * 4)
+        rgba = estimate_training_memory(**self.inputs(), path_record_layout_version=1, rgb_only=False)
+        for name in ("hit_record_floats", "reverse_suffix", "geometric_candidate_state"):
+            self.assertEqual(rgba["components_bytes"][name], legacy["components_bytes"][name])
+        self.assertEqual(self.plan(path_record_layout_version=1)["path_record_layout_version"], 1)
+        with self.assertRaises(ValueError):
+            self.plan(path_record_layout_version=True)
 
     def test_epoch_int64_fallback_and_known_indices_are_explicit(self):
         narrow = estimate_training_memory(**self.inputs())

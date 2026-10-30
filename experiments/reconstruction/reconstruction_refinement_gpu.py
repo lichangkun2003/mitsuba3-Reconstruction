@@ -81,18 +81,19 @@ def _closest_box(metric, lower, upper, inverse, dr):
     return minimum, best
 
 
-def refine_state_gpu(checkpoint, config, max_active_voxels=67108864):
+def refine_state_gpu(checkpoint, config, max_active_voxels=67108864, *, before_allocate=None):
     """Fit children on CUDA and return a device-backed replacement checkpoint."""
     import drjit as dr
     with dr.scoped_set_flag(dr.JitFlag.FastMath, False):
-        return _refine(checkpoint, config, max_active_voxels, dr)
+        return _refine(checkpoint, config, max_active_voxels, dr, before_allocate=before_allocate)
 
 
-def _refine(checkpoint, config, max_active_voxels, dr):
+def _refine(checkpoint, config, max_active_voxels, dr, *, before_allocate=None):
     U, D, F, B = dr.cuda.UInt32, dr.cuda.Float64, dr.cuda.Float32, dr.cuda.Bool
     if checkpoint["model_metadata"].get("scene_mapping") == "projective_shell":
         from reconstruction_projective import refine_projective_device
-        return refine_projective_device(checkpoint, config, max_active_voxels, _refine, dr)
+        return refine_projective_device(checkpoint, config, max_active_voxels, _refine, dr,
+                                        before_allocate=before_allocate)
     metadata = dict(checkpoint["model_metadata"])
     state = {name: (U if name == "cell_indices" else F)(value)
              for name, value in checkpoint["model_state"].items()}
@@ -122,6 +123,11 @@ def _refine(checkpoint, config, max_active_voxels, dr):
     # No child SH table is allocated until radial compression and deduplication
     # have completed. This bounds the largest appearance allocation by the
     # replacement model size, rather than all eight children of every parent.
+    if before_allocate is not None:
+        before_allocate({"stage": "core_appearance", "active_voxels": total,
+            "exact_count": True, "allocation_voxels": total, "old_voxels": n,
+            "existing_child_count": total, "background_child_count": 0,
+            "model_metadata": dict(metadata)})
     y0 = 1 / (2 * math.sqrt(math.pi))
     opacity_count = metadata["opacity_sh_count"]
     rows = dr.arange(U, total)
