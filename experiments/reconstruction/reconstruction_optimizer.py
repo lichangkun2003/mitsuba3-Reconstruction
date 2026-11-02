@@ -224,6 +224,21 @@ class FalcorOptimizer:
             exterior |= (coordinate < padding) | (coordinate >= padding + core)
         return self._expand(exterior, 3)
 
+    @staticmethod
+    def _background_use_ellipsoid(model):
+        getter = getattr(model, "native_background_use_ellipsoid", None)
+        return bool(getter() if callable(getter)
+                    else getattr(model, "background_use_ellipsoid", True))
+
+    def _geometry_valid(self, model, cells, geometry):
+        """Occupied background cells freeze geometry and its accumulated Adam state."""
+        if (getattr(model, "scene_mapping", "bounded") != "projective_shell"
+                or self._background_use_ellipsoid(model)):
+            return geometry
+        from reconstruction_projective import core_mask_device
+        core = core_mask_device(cells, int(model.resolution), int(model.core_resolution), self.dr)
+        return self.dr.select(core, geometry, 0)
+
     def _adam(self, name, gradient, valid, lr, lr_scale=1., *, state=None, count=None):
         dr, mi, cfg = self.dr, self.mi, self.config
         size = self.dimensions[name]
@@ -362,6 +377,7 @@ class FalcorOptimizer:
         key = (self.count, tuple(self.dimensions.items()), self.active_sh_count,
                self.radiance_degree_steps, tuple(float(v) for v in model.voxel_size),
                getattr(model, "scene_mapping", "bounded"),
+               self._background_use_ellipsoid(model),
                int(getattr(model, "core_resolution", model.resolution)),
                tuple(sorted((name, value) for name, value in settings.items()
                             if name != "gradient_factor")), guarded)
@@ -450,6 +466,8 @@ class FalcorOptimizer:
         carving = mi.UInt32(out["background_carve_valid"])
         if any(dr.width(counts) != self.count for counts in (appearance, geometry, carving)):
             raise ValueError("Validity counts must have one entry per voxel")
+        snapshot = model.snapshot()
+        geometry = self._geometry_valid(model, snapshot["cell_indices"], geometry)
         # Valid zero gradients must still advance Adam. Never compact by g != 0.
         # compress transfers only the list lengths, but DOES synchronize CUDA;
         # performance comparisons must include this cost and finish the queue.
@@ -462,7 +480,6 @@ class FalcorOptimizer:
             geometry_scale = 1 + (max(cfg.background_carve_multiplier, 1.) - 1) * dr.clip(
                 mi.Float(dr.gather(mi.UInt32, carving, geometry_ids)) /
                 dr.maximum(mi.Float(dr.gather(mi.UInt32, geometry, geometry_ids)), 1.), 0., 1.)
-        snapshot = model.snapshot()
         parameters, proposals, indices = {}, {}, {}
         for name, lr in rates.items():
             if lr <= 0:
@@ -560,9 +577,10 @@ class FalcorOptimizer:
         for counts in (appearance, geometry, carving):
             if dr.width(counts) != self.count:
                 raise ValueError("Validity counts must have one entry per voxel")
+        snapshot = model.snapshot()
+        geometry = self._geometry_valid(model, snapshot["cell_indices"], geometry)
         geometry_lr_scale = 1 + (max(cfg.background_carve_multiplier, 1.) - 1) * dr.clip(
             mi.Float(carving) / dr.maximum(mi.Float(geometry), 1.), 0., 1.)
-        snapshot = model.snapshot()
         parameters = {}
         rates = {"radiance_sh": cfg.lr_radiance,
                  "opacity_sh": self.effective_opacity_lr(epoch, coarse_to_fine),

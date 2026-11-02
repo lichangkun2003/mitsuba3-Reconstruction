@@ -11,13 +11,15 @@ import math
 
 
 def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=None, layers=None,
-                                mapping="radial_seed_shell", background_far_distance=None):
-    """Keep core seeds and fill the far shell with covering, black ellipsoids.
+                                mapping="radial_seed_shell", background_far_distance=None,
+                                background_use_ellipsoid=True):
+    """Keep core seeds and fill the far shell with black occupied cells.
 
     Existing far-cell radiance is retained, but its initial geometry and opacity
     use the same complete-coverage policy as empty far cells. All parameter
     assembly occurs on the selected device. Deletion may subsequently create
     holes: initialization is not an opaque boundary condition.
+    Geometry stays allocated for both modes; occupied-cell hits ignore it.
     """
     if not math.isfinite(opacity) or not 0 < opacity < 1:
         raise ValueError("Background opacity must be finite and between zero and one")
@@ -30,6 +32,13 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
         raise ValueError("Unknown background refinement policy")
     if mapping not in ("radial_seed_shell", "projective_shell"):
         raise ValueError("Unknown background mapping")
+    if type(background_use_ellipsoid) is not bool:
+        raise ValueError("background_use_ellipsoid must be a boolean")
+    if not background_use_ellipsoid:
+        if mapping != "projective_shell":
+            raise ValueError("Occupied-cell background requires projective mapping")
+        if not hasattr(model, "set_background_use_ellipsoid"):
+            raise RuntimeError("Rebuild this checkout: background geometry selection is missing")
     if background_far_distance is not None:
         if (mapping != "projective_shell" or isinstance(background_far_distance, bool)
                 or not isinstance(background_far_distance, (int, float))
@@ -114,6 +123,8 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
     result.scene_mapping = mapping
     if mapping == "projective_shell":
         result.set_scene_mapping(mapping)
+        if not background_use_ellipsoid:
+            result.set_background_use_ellipsoid(False)
         if background_far_distance is not None:
             result.set_background_far_distance(background_far_distance)
         result.background_refinement = "preserve_physical_width"
@@ -129,4 +140,6 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
         initialized_voxels=count, straight_ray_forward=mapping != "projective_shell")
     if background_far_distance is not None:
         result.background_initialization["background_far_distance"] = float(result.native_background_far_distance())
+    if mapping == "projective_shell":
+        result.background_initialization["background_use_ellipsoid"] = background_use_ellipsoid
     return result

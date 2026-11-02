@@ -61,7 +61,8 @@ def run_check(args, output):
     full = output / "full"
     config = {
         "data": {"dataset": str(dataset), "background_final_layers": 4},
-        "model": {"grid_resolution": 4, "sh_count": 9, "opacity_sh_count": 1},
+        "model": {"grid_resolution": 4, "sh_count": 9, "opacity_sh_count": 1,
+                  "background_use_ellipsoid": args.background_use_ellipsoid},
         "render": {"width": 93, "height": 97, "spp": 1, "max_hits": 2},
         "runtime": {"build_dir": args.build_dir, "gpu": args.gpu},
         "training": {"rgb_only": True, "num_epochs": 3, "chunk_size": 0,
@@ -136,6 +137,8 @@ def run_check(args, output):
     assert initialization["background_far_distance"] > 1
     for saved in (first, second, final):
         assert saved["model_metadata"]["background_far_distance"] == initialization["background_far_distance"]
+        assert saved["model_metadata"].get("background_use_ellipsoid", True) is args.background_use_ellipsoid
+        assert saved["config"]["model"]["background_use_ellipsoid"] is args.background_use_ellipsoid
     assert report["training_protocol"]["scene_mapping"]["ray_extent"] == "finite_scene_boundary"
     assert initialization["background_refinement"] == "preserve_physical_width"
     assert initialization["background_final_layers"] == 4
@@ -188,6 +191,7 @@ def run_check(args, output):
              "--gpu", str(args.gpu)], f"evaluate-stage-{core}")
         stage_report = json.loads((stage_output / "evaluation-report.json").read_text(encoding="utf-8"))
         assert stage_report["status"] == "passed"
+        assert stage_report["scene_background"]["background_use_ellipsoid"] is args.background_use_ellipsoid
         assert stage_report["checkpoint"]["model_metadata"]["active_sh_count"] == saved["model_metadata"]["active_sh_count"]
         stage_image = stage_report["splits"]["train"]["views"][0]["prediction"]
         with Image.open(stage_image) as reproduced, Image.open(report["level_renders"][str(core)]["image"]) as original:
@@ -198,6 +202,7 @@ def run_check(args, output):
 
     evaluation = json.loads((full / "evaluation-report.json").read_text(encoding="utf-8"))
     assert evaluation["status"] == "passed"
+    assert evaluation["scene_background"]["background_use_ellipsoid"] is args.background_use_ellipsoid
     assert (evaluation["render"]["width"], evaluation["render"]["height"]) == (16, 12)
     for split, expected in (("train", list(range(1, 8))), ("test", [0, 8])):
         result = evaluation["splits"][split]
@@ -247,6 +252,7 @@ def run_check(args, output):
         "COLMAP binary initialization without PLY", "fixed camera normalization and thin shell",
         "fixed physical shell: layers 1 -> 2 -> 4 and grid 6 -> 12 -> 24",
         "finite far distance preserved through both refinements, saved rendering and resume",
+        "background hit mode preserved through both refinements, saved rendering and resume",
         "sorted filename split: 7 train / 2 test",
         "full scaled fx/fy/cx/cy and 16x12 reference alignment", "all-view train/test evaluation",
         "global 4:3:3 SH schedule activates 1 -> 4 -> 9 coefficients across grid changes",
@@ -262,6 +268,7 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--dssim-weight", type=float, default=0.)
     parser.add_argument("--distortion-weight", type=float, default=.1)
+    parser.add_argument("--background-use-ellipsoid", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sync-view-checks", action="store_true")
     args = parser.parse_args()
     root = workspace_path(args.output_dir, WORKSPACE)

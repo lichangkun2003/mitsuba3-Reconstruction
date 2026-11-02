@@ -778,6 +778,10 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                             UInt32 input_row = compact_indices ? s.ordinal : ids;
                             if (compact_indices)
                                 active &= dr::gather<UInt32>(validity, input_row, active) > 0u;
+                            // Geometry is fixed for voxel backgrounds, including
+                            // externally supplied gradients and retained moments.
+                            if (group.geometry && !m_background_use_ellipsoid)
+                                active &= projective_core_ids(ids, active);
                             auto clocks = clock_biases(clock_target, ids, active);
                             Float scale = row_scale(input_row, active);
                             std::array<Float, 3> rotation_delta;
@@ -835,6 +839,8 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                             UInt32 input_row = compact_indices ? s.ordinal : ids;
                             if (compact_indices)
                                 active &= dr::gather<UInt32>(validity, input_row, active) > 0u;
+                            if (group.geometry && !m_background_use_ellipsoid)
+                                active &= projective_core_ids(ids, active);
                             auto clocks = clock_biases(scalar_clock.size() ? scalar_clock : s.clock, ids, active);
                             Float scale = row_scale(input_row, active);
                             std::array<Float, 3> rotation_delta;
@@ -1117,6 +1123,13 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_background_far_distanc
     }
 }
 
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_background_use_ellipsoid(bool enabled) {
+    if (m_background_use_ellipsoid != enabled) {
+        m_background_use_ellipsoid = enabled;
+        ++m_topology_revision;
+    }
+}
+
 MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::ProjectiveSegment
 VoxelReconstruction<Float, Spectrum>::next_projective_segment(const Point3f &origin,
     const Vector3f &direction, const Float &maxt, const UInt32 &visited) const {
@@ -1236,6 +1249,73 @@ VoxelReconstruction<Float, Spectrum>::projective_cell_inside(const Vector3i &cel
         inside &= (cell[j]>=lower)&(cell[j]<upper);
     }
     return inside;
+}
+
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
+VoxelReconstruction<Float, Spectrum>::projective_background_cell_has_extent(
+    const Vector3i &cell, const ProjectiveSegment &segment, const Point3f &origin,
+    const Vector3f &direction, const Float &maxt, const Mask &active) const {
+    // The mapped DDA endpoint and a tangent grid crossing can differ by one
+    // rounding unit even when both represent world infinity. Test the original
+    // linear cell preimage as well: no tolerance may discard a real short hit.
+    return dr::if_stmt(dr::make_tuple(cell, segment, origin, direction, maxt, active), active,
+        [this](const Vector3i &cell,const ProjectiveSegment &segment,const Point3f &origin,
+               const Vector3f &direction,const Float &maxt,const Mask &active) -> Mask {
+            const float half = .5f*m_size[0]*m_core_resolution;
+            const float physical_width = float(m_resolution-m_core_resolution)/m_core_resolution;
+            const float width = m_background_far_distance == 0.f ? physical_width :
+                physical_width*(m_background_far_distance/(m_background_far_distance-1.f));
+            const uint32_t layer = (m_resolution-m_core_resolution)/2;
+            Point3f center(.5f*(m_min[0]+m_max[0]),.5f*(m_min[1]+m_max[1]),.5f*(m_min[2]+m_max[2]));
+            // Clip local world distance from this chart's entry. Absolute t
+            // would round distinct thin-shell boundaries to the same value.
+            Vector3f d=direction/half;
+            Vector3f o=(origin-center)/half+segment.world_entry*d;
+            const UInt32 &chart=segment.chart;
+            Mask positive=(chart&1u)!=0u;
+            const Float &h=segment.h_start, &dh=segment.h_rate;
+            Float lo(0.f), hi=maxt-segment.world_entry;
+            Mask valid=active&(chart>0u);
+            auto clip=[&](const Float &a,const Float &b,const Mask &strict_parallel) {
+                Mask parallel=b==0.f;
+                valid &= !parallel | dr::select(strict_parallel,a>0.f,a>=0.f);
+                Float crossing=-a/dr::select(parallel,1.f,b);
+                lo=dr::maximum(lo,dr::select(b>0.f,crossing,-dr::Infinity<Float>));
+                hi=dr::minimum(hi,dr::select(b<0.f,crossing, dr::Infinity<Float>));
+            };
+            for (uint32_t j=0;j<3;++j) {
+                Mask normal=(chart-1u)/2u==j;
+                Float lower=(m_min[j]+Float(cell[j])*m_size[j]-center[j])/half;
+                Float upper=(m_min[j]+Float(cell[j]+1)*m_size[j]-center[j])/half;
+                Float radial_lower=dr::select(positive,lower,-upper);
+                Float radial_upper=dr::select(positive,upper,-lower);
+                // q = 1 + width*(h-1)/h. Keep the halfspaces in this
+                // factored form instead of rounding an explicit h boundary.
+                Float lower_fraction=(radial_lower-1.f)/width;
+                Float upper_fraction=(radial_upper-1.f)/width;
+                Mask outer=dr::select(positive,cell[j]==int(m_resolution)-1,cell[j]==0);
+                Float lower_a=dr::select(normal,(h-1.f)-lower_fraction*h,o[j]-lower*h);
+                Float lower_b=dr::select(normal,(1.f-lower_fraction)*dh,d[j]-lower*dh);
+                Float upper_a=dr::select(normal,upper_fraction*h-(h-1.f),upper*h-o[j]);
+                Float upper_b=dr::select(normal,(upper_fraction-1.f)*dh,upper*dh-d[j]);
+                if (m_background_far_distance==0.f) {
+                    upper_a=dr::select(normal&outer,1.f,upper_a);
+                    upper_b=dr::select(normal&outer,0.f,upper_b);
+                } else {
+                    upper_a=dr::select(normal&outer,m_background_far_distance-h,upper_a);
+                    upper_b=dr::select(normal&outer,-dh,upper_b);
+                }
+                // Grid ownership is half-open. The finite outer surface remains
+                // included, as in projective chart clipping and initialization.
+                clip(lower_a,lower_b,normal&(!positive|(radial_lower==1.f)));
+                clip(upper_a,upper_b,dr::select(normal,positive&!outer,
+                    cell[j]!=int(layer+m_core_resolution)-1));
+            }
+            return valid&(hi>lo);
+        },
+        [](const Vector3i &,const ProjectiveSegment &,const Point3f &,const Vector3f &,
+           const Float &,const Mask &) { return Mask(false); },
+        "Voxel reconstruction background cell preimage");
 }
 
 MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
@@ -1393,35 +1473,53 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
             }
             Float end = dr::minimum(dr::minimum(s.next.x(), dr::minimum(s.next.y(), s.next.z())), exit);
             end = dr::maximum(end, s.entry);
-            Vector3f local, scale, segment = d * (end - s.entry);
-            for (size_t a = 0; a < 3; ++a) {
-                Float c = dr::gather<Float>(m_centers, id * 3 + uint32_t(a), occupied);
-                Float log_scale = dr::gather<Float>(m_log_scales, id * 3 + uint32_t(a), occupied);
-                // Subtract the cell origin first to retain precision for small ellipsoids.
-                local[a] = s.segment.origin[a] + s.entry*d[a] -
-                           (m_min[a] + (Float(s.cell[a]) + c) * m_size[a]);
-                scale[a] = dr::exp(dr::clip(log_scale, -30.f, 30.f));
-            }
-            Float qw = dr::gather<Float>(m_rotations, id*4, occupied);
-            Vector3f qv;
-            for (size_t a = 0; a < 3; ++a)
-                qv[a] = dr::gather<Float>(m_rotations, id*4 + uint32_t(a+1), occupied);
-            Float qnorm = dr::sqrt(qw*qw + dr::squared_norm(qv));
-            Mask valid_q = dr::isfinite(qnorm) & (qnorm > 1e-10f);
-            qw = dr::select(valid_q, qw / qnorm, 1.f);
-            qv = dr::select(valid_q, -qv / qnorm, Vector3f(0.f)); // inverse quaternion
-            auto to_unit = [&](const Vector3f &v) {
-                return (v + 2.f * dr::cross(qv, dr::cross(qv, v) + qw*v)) / scale;
-            };
-            Vector3f u = to_unit(local), v = to_unit(segment);
-            Float a = dr::squared_norm(v), b = 2.f * dr::dot(u, v), c = dr::squared_norm(u) - 1.f;
-            Float discriminant = b*b - 4.f*a*c;
-            Float root = dr::sqrt(dr::maximum(discriminant, 0.f));
-            Float inv_a2 = .5f / dr::select(a > 1e-20f, a, 1.f);
-            Float t0 = dr::maximum(0.f, (-b-root)*inv_a2);
-            Float t1 = dr::minimum(1.f, (-b+root)*inv_a2);
-            Mask hit = occupied & dr::select(a <= 1e-20f, c <= 0.f,
+            const bool voxel_background = projective && !m_background_use_ellipsoid;
+            Mask ellipsoid = voxel_background ? projective_core_ids(id, occupied) : occupied;
+            auto intersects = [this](const UInt32 &id, const Vector3i &cell,
+                                    const Point3f &origin, const Vector3f &d,
+                                    const Float &entry, const Float &end, const Mask &occupied) -> Mask {
+                Vector3f local, scale, segment = d * (end - entry);
+                for (size_t a = 0; a < 3; ++a) {
+                    Float c = dr::gather<Float>(m_centers, id * 3 + uint32_t(a), occupied);
+                    Float log_scale = dr::gather<Float>(m_log_scales, id * 3 + uint32_t(a), occupied);
+                    // Subtract the cell origin first to retain precision for small ellipsoids.
+                    local[a] = origin[a] + entry*d[a] -
+                               (m_min[a] + (Float(cell[a]) + c) * m_size[a]);
+                    scale[a] = dr::exp(dr::clip(log_scale, -30.f, 30.f));
+                }
+                Float qw = dr::gather<Float>(m_rotations, id*4, occupied);
+                Vector3f qv;
+                for (size_t a = 0; a < 3; ++a)
+                    qv[a] = dr::gather<Float>(m_rotations, id*4 + uint32_t(a+1), occupied);
+                Float qnorm = dr::sqrt(qw*qw + dr::squared_norm(qv));
+                Mask valid_q = dr::isfinite(qnorm) & (qnorm > 1e-10f);
+                qw = dr::select(valid_q, qw / qnorm, 1.f);
+                qv = dr::select(valid_q, -qv / qnorm, Vector3f(0.f)); // inverse quaternion
+                auto to_unit = [&](const Vector3f &v) {
+                    return (v + 2.f * dr::cross(qv, dr::cross(qv, v) + qw*v)) / scale;
+                };
+                Vector3f u = to_unit(local), v = to_unit(segment);
+                Float a = dr::squared_norm(v), b = 2.f * dr::dot(u, v), c = dr::squared_norm(u) - 1.f;
+                Float discriminant = b*b - 4.f*a*c;
+                Float root = dr::sqrt(dr::maximum(discriminant, 0.f));
+                Float inv_a2 = .5f / dr::select(a > 1e-20f, a, 1.f);
+                Float t0 = dr::maximum(0.f, (-b-root)*inv_a2);
+                Float t1 = dr::minimum(1.f, (-b+root)*inv_a2);
+                return occupied & dr::select(a <= 1e-20f, c <= 0.f,
                                              (discriminant >= 0.f) & (t0 <= t1));
+            };
+            Mask hit = voxel_background ? dr::if_stmt(
+                dr::make_tuple(id, s.cell, s.segment.origin, d, s.entry, end, ellipsoid),
+                ellipsoid, intersects,
+                [](const UInt32 &, const Vector3i &, const Point3f &, const Vector3f &,
+                   const Float &, const Float &, const Mask &) { return Mask(false); },
+                "Voxel reconstruction core trace intersection") :
+                intersects(id, s.cell, s.segment.origin, d, s.entry, end, ellipsoid);
+            // DDA may visit tied faces with zero segment length. These are not
+            // occupied-volume hits, while the legacy ellipsoid rule is retained.
+            if (voxel_background)
+                hit |= projective_background_cell_has_extent(s.cell, s.segment,
+                    ray.o, world_d, ray.maxt*length, occupied & !ellipsoid & (end > s.entry));
             Color3f emission(0.f);
             Float logit = 0.f;
             for (uint32_t k = 0; k < std::max(m_active_sh_count, m_opacity_sh_count); ++k) {
@@ -2042,32 +2140,57 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 [this,rotate,quaternion,appearance,ray_count,hit_stride,lane,
                  max_candidates,diagonal,hit_buffers,distortion_enabled,world_d,projective,
                  compact_path_records,hit_before_field,hit_depth_field,
+                 world_origin=ray.o,world_maxt=ray.maxt*direction_length,
                  grid_entry=entry](State s,Candidates candidates,const UInt32 &id,
                     const Float &end,const Mask &occupied,const Point3f &origin,
                     const Vector3f &direction) {
-                    Vector3f relative,scale,segment=direction*(end-s.entry);
-                    for(uint32_t a=0;a<3;++a) {
-                        Float center=dr::gather<Float>(m_centers,id*3+a,occupied);
-                        relative[a]=origin[a]+s.entry*direction[a]-(m_min[a]+(Float(s.cell[a])+center)*m_size[a]);
-                        scale[a]=dr::exp(dr::clip(dr::gather<Float>(m_log_scales,id*3+a,occupied),-30.f,30.f));
-                    }
-                    Float qw;
-                    Vector3f qv;
-                    quaternion(id,occupied,qw,qv);
-                    Vector3f u=rotate(relative,qw,-qv)/scale, v=rotate(segment,qw,-qv)/scale;
-                    Float a=dr::squared_norm(v), b=2.f*dr::dot(u,v), c=dr::squared_norm(u)-1.f;
-                    Float discriminant=b*b-4.f*a*c, root=dr::sqrt(dr::maximum(discriminant,0.f));
-                    Float inv=.5f/dr::select(a>1e-20f,a,1.f);
-                    Float t0=dr::maximum(0.f,(-b-root)*inv), t1=dr::minimum(1.f,(-b+root)*inv);
-                    Mask hit=occupied & dr::select(a<=1e-20f,c<=0.f,(discriminant>=0.f)&(t0<=t1));
-                    Float star=dr::select(a>1e-20f,dr::clip(-dr::dot(u,v)/dr::select(a>1e-20f,a,1.f),0.f,1.f),0.f);
-                    Vector3f relative_star=relative+star*segment, unit_star=u+star*v;
-                    Float gmin=dr::squared_norm(unit_star)-1.f;
+                    const bool voxel_background = projective && !m_background_use_ellipsoid;
+                    Mask ellipsoid = voxel_background ? projective_core_ids(id, occupied) : occupied;
+                    auto intersect = [this, rotate, quaternion](const UInt32 &id,
+                        const Vector3i &cell, const Point3f &origin, const Vector3f &direction,
+                        const Float &entry, const Float &end, const Mask &occupied) {
+                        Vector3f relative,scale,segment=direction*(end-entry);
+                        for(uint32_t a=0;a<3;++a) {
+                            Float center=dr::gather<Float>(m_centers,id*3+a,occupied);
+                            relative[a]=origin[a]+entry*direction[a]-(m_min[a]+(Float(cell[a])+center)*m_size[a]);
+                            scale[a]=dr::exp(dr::clip(dr::gather<Float>(m_log_scales,id*3+a,occupied),-30.f,30.f));
+                        }
+                        Float qw;
+                        Vector3f qv;
+                        quaternion(id,occupied,qw,qv);
+                        Vector3f u=rotate(relative,qw,-qv)/scale, v=rotate(segment,qw,-qv)/scale;
+                        Float a=dr::squared_norm(v), b=2.f*dr::dot(u,v), c=dr::squared_norm(u)-1.f;
+                        Float discriminant=b*b-4.f*a*c, root=dr::sqrt(dr::maximum(discriminant,0.f));
+                        Float inv=.5f/dr::select(a>1e-20f,a,1.f);
+                        Float t0=dr::maximum(0.f,(-b-root)*inv), t1=dr::minimum(1.f,(-b+root)*inv);
+                        Mask hit=occupied & dr::select(a<=1e-20f,c<=0.f,(discriminant>=0.f)&(t0<=t1));
+                        Float star=dr::select(a>1e-20f,dr::clip(-dr::dot(u,v)/dr::select(a>1e-20f,a,1.f),0.f,1.f),0.f);
+                        Vector3f relative_star=relative+star*segment, unit_star=u+star*v;
+                        Float gmin=dr::squared_norm(unit_star)-1.f;
+                        return dr::make_tuple(relative_star, unit_star, scale, gmin, star, a, hit);
+                    };
+                    Vector3f relative_star, unit_star, scale;
+                    Float gmin, star, a;
+                    Mask hit;
+                    dr::tie(relative_star, unit_star, scale, gmin, star, a, hit) =
+                        voxel_background ? dr::if_stmt(
+                            dr::make_tuple(id, s.cell, origin, direction, s.entry, end, ellipsoid),
+                            ellipsoid, intersect,
+                            [](const UInt32 &, const Vector3i &, const Point3f &, const Vector3f &,
+                               const Float &, const Float &, const Mask &) {
+                                // Fixed background depth is the mapped-cell segment midpoint.
+                                return dr::make_tuple(Vector3f(0.f), Vector3f(0.f), Vector3f(1.f),
+                                    Float(0.f), Float(.5f), Float(0.f), Mask(false));
+                            }, "Voxel reconstruction core training intersection") :
+                            intersect(id, s.cell, origin, direction, s.entry, end, ellipsoid);
+                    if (voxel_background)
+                        hit |= projective_background_cell_has_extent(s.cell, s.segment,
+                            world_origin, world_d, world_maxt, occupied & !ellipsoid & (end > s.entry));
                     Float depth(0.f);
                     Float depth_chain(0.f);
                     if (distortion_enabled) {
                         Float distance=s.entry+star*(end-s.entry);
-                        Mask free=(a>1e-20f)&(star>0.f)&(star<1.f);
+                        Mask free=ellipsoid&(a>1e-20f)&(star>0.f)&(star<1.f);
                         depth=(distance-grid_entry)/diagonal;
                         depth_chain=Float(free);
                         if (projective) {
@@ -2118,7 +2241,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                             return s;
                         },"Voxel reconstruction training hit");
                     if(max_candidates) {
-                        Mask miss=occupied & !hit & dr::isfinite(gmin) & (gmin>=0.f);
+                        Mask miss=ellipsoid & !hit & dr::isfinite(gmin) & (gmin>=0.f);
                         dr::tie(s,candidates)=dr::if_stmt(
                             dr::make_tuple(s,candidates,id,relative_star,unit_star,scale,gmin,
                                            star,end,miss),miss,
@@ -2425,51 +2548,70 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                           UInt32 id,const Vector3f &offset,Float gmin,Float before,
                           Float opacity,const Color3f &radiance,const Color3f &behind,
                           Float after,Mask valid,bool hard_hit) {
-        Float qw;Vector3f qv,scale,center;
-        quaternion(id,valid,qw,qv);
-        for(uint32_t j=0;j<3;++j) {
-            scale[j]=dr::exp(dr::clip(dr::gather<Float>(m_log_scales,id*3+j,valid),-30.f,30.f));
-            center[j]=dr::gather<Float>(m_centers,id*3+j,valid);
-        }
-        Vector3f principal=rotate(offset,qw,-qv),unit=principal/scale;
-        Float radius2=dr::squared_norm(unit);
-        Float metric=2.f*dr::norm(unit/dr::sqrt(dr::maximum(radius2,1e-30f))/scale);
-        valid &= dr::isfinite(gmin)&dr::isfinite(radius2)&(radius2>1e-12f)&dr::isfinite(metric)&(metric>0.f);
-        if(!rgb_only && !hard_hit) valid &= !is_background;
-        Float distance_scale=dr::rcp(dr::select(valid,metric,1.f));
-        Float distance=gmin*distance_scale,w=dr::rcp(1.f+dr::exp(distance/tau));
-        Float derivative=dr::dot(dcolor,before*opacity*(radiance-behind))*(-w*(1.f-w)/tau);
-        if(!rgb_only) {
-            if(hard_hit) derivative=dr::select(is_background,-cfg.at("background_carve_weight")*w/tau,derivative);
-            derivative += cfg.at("alpha_geometry_weight")*dalpha*before*opacity*after*(-w*(1.f-w)/tau);
-        }
-        Float dg=dr::clip(clean(derivative*distance_scale),-cfg.at("geometry_grad_clamp"),cfg.at("geometry_grad_clamp"));
-        Mask contains(true);
-        const bool two_sided=!rgb_only && cfg.at("geometry_two_sided_boundary")!=0.f;
-        const bool transition_only=!rgb_only && cfg.at("geometry_transition_only")!=0.f;
-        if(hard_hit && (two_sided || (transition_only && cfg.at("geometry_hit_expansion_band_tau")>0.f))) {
-            for(uint32_t corner=0;corner<8;++corner) {
-                Vector3f corner_offset;
-                for(uint32_t j=0;j<3;++j) corner_offset[j]=(float((corner>>j)&1u)-center[j])*m_size[j];
-                contains &= dr::squared_norm(rotate(corner_offset,qw,-qv)/scale)<=1.f;
+        const bool voxel_background = m_scene_mapping == "projective_shell" && !m_background_use_ellipsoid;
+        if (voxel_background)
+            valid &= projective_core_ids(id, valid);
+        auto evaluate = [this,quaternion,rotate,clean,is_background,dcolor,dalpha,tau,cfg,rgb_only,hard_hit](
+            const UInt32 &id,const Vector3f &offset,const Float &gmin,const Float &before,
+            const Float &opacity,const Color3f &radiance,const Color3f &behind,
+            const Float &after,Mask valid) {
+            Float qw;Vector3f qv,scale,center;
+            quaternion(id,valid,qw,qv);
+            for(uint32_t j=0;j<3;++j) {
+                scale[j]=dr::exp(dr::clip(dr::gather<Float>(m_log_scales,id*3+j,valid),-30.f,30.f));
+                center[j]=dr::gather<Float>(m_centers,id*3+j,valid);
             }
-        }
-        if(two_sided) {
-            float band=tau*cfg.at("geometry_boundary_band_tau");
-            Float t=band>0.f?dr::clip(1.f-dr::abs(distance)/band,0.f,1.f):Float(0.f);
-            Float taper=t*t*(3.f-2.f*t);
-            dg*=hard_hit?dr::select(is_background,1.f,taper):taper;
-            if(hard_hit) dg=dr::select((dg>0.f)&(is_background|contains),0.f,dg);
-        } else if(transition_only) {
-            if(hard_hit) {
-                float band=tau*cfg.at("geometry_hit_expansion_band_tau");
-                Float t=band>0.f?dr::clip(1.f+distance/band,0.f,1.f):Float(0.f);
-                Float taper=dr::select(!is_background & !contains,t*t*(3.f-2.f*t),0.f);
-                dg=dr::select(dg>0.f,dg*taper,dg);
-            } else dg=dr::maximum(dg,0.f);
-        }
-        Vector3f weighted=principal/(scale*scale);
-        Vector3f gc=-2.f*rotate(weighted,qw,qv),gs=-2.f*weighted*principal,gr=2.f*dr::cross(weighted,principal);
+            Vector3f principal=rotate(offset,qw,-qv),unit=principal/scale;
+            Float radius2=dr::squared_norm(unit);
+            Float metric=2.f*dr::norm(unit/dr::sqrt(dr::maximum(radius2,1e-30f))/scale);
+            valid &= dr::isfinite(gmin)&dr::isfinite(radius2)&(radius2>1e-12f)&dr::isfinite(metric)&(metric>0.f);
+            if(!rgb_only && !hard_hit) valid &= !is_background;
+            Float distance_scale=dr::rcp(dr::select(valid,metric,1.f));
+            Float distance=gmin*distance_scale,w=dr::rcp(1.f+dr::exp(distance/tau));
+            Float derivative=dr::dot(dcolor,before*opacity*(radiance-behind))*(-w*(1.f-w)/tau);
+            if(!rgb_only) {
+                if(hard_hit) derivative=dr::select(is_background,-cfg.at("background_carve_weight")*w/tau,derivative);
+                derivative += cfg.at("alpha_geometry_weight")*dalpha*before*opacity*after*(-w*(1.f-w)/tau);
+            }
+            Float dg=dr::clip(clean(derivative*distance_scale),-cfg.at("geometry_grad_clamp"),cfg.at("geometry_grad_clamp"));
+            Mask contains(true);
+            const bool two_sided=!rgb_only && cfg.at("geometry_two_sided_boundary")!=0.f;
+            const bool transition_only=!rgb_only && cfg.at("geometry_transition_only")!=0.f;
+            if(hard_hit && (two_sided || (transition_only && cfg.at("geometry_hit_expansion_band_tau")>0.f))) {
+                for(uint32_t corner=0;corner<8;++corner) {
+                    Vector3f corner_offset;
+                    for(uint32_t j=0;j<3;++j) corner_offset[j]=(float((corner>>j)&1u)-center[j])*m_size[j];
+                    contains &= dr::squared_norm(rotate(corner_offset,qw,-qv)/scale)<=1.f;
+                }
+            }
+            if(two_sided) {
+                float band=tau*cfg.at("geometry_boundary_band_tau");
+                Float t=band>0.f?dr::clip(1.f-dr::abs(distance)/band,0.f,1.f):Float(0.f);
+                Float taper=t*t*(3.f-2.f*t);
+                dg*=hard_hit?dr::select(is_background,1.f,taper):taper;
+                if(hard_hit) dg=dr::select((dg>0.f)&(is_background|contains),0.f,dg);
+            } else if(transition_only) {
+                if(hard_hit) {
+                    float band=tau*cfg.at("geometry_hit_expansion_band_tau");
+                    Float t=band>0.f?dr::clip(1.f+distance/band,0.f,1.f):Float(0.f);
+                    Float taper=dr::select(!is_background & !contains,t*t*(3.f-2.f*t),0.f);
+                    dg=dr::select(dg>0.f,dg*taper,dg);
+                } else dg=dr::maximum(dg,0.f);
+            }
+            Vector3f weighted=principal/(scale*scale);
+            Vector3f gc=-2.f*rotate(weighted,qw,qv),gs=-2.f*weighted*principal,gr=2.f*dr::cross(weighted,principal);
+            return dr::make_tuple(gc, gs, gr, dg, valid);
+        };
+        Vector3f gc, gs, gr;
+        Float dg;
+        dr::tie(gc, gs, gr, dg, valid) = voxel_background ? dr::if_stmt(
+            dr::make_tuple(id, offset, gmin, before, opacity, radiance, behind, after, valid),
+            valid, evaluate,
+            [](const UInt32 &,const Vector3f &,const Float &,const Float &,const Float &,
+               const Color3f &,const Color3f &,const Float &,const Mask &) {
+                return dr::make_tuple(Vector3f(0.f), Vector3f(0.f), Vector3f(0.f), Float(0.f), Mask(false));
+            }, "Voxel reconstruction core geometry proxy") :
+            evaluate(id, offset, gmin, before, opacity, radiance, behind, after, valid);
         UInt32 row = gradient_row(id, valid);
         Mask stored = valid & (row < gradient_rows);
         // Apply 1/pdf after the nonlinear proxy clamp and transition gates.
@@ -2583,29 +2725,49 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 // Its implicit derivative is exact while hard-hit membership,
                 // cell clipping, and DDA ordering stay fixed. Clipped endpoints
                 // are fixed by the grid, so their geometric depth derivative is zero.
-                Float qw;Vector3f qv,scale,log_scale;
-                quaternion(id,valid,qw,qv);
-                for(uint32_t j=0;j<3;++j) {
-                    log_scale[j]=dr::gather<Float>(m_log_scales,id*3+j,valid);
-                    scale[j]=dr::exp(dr::clip(log_scale[j],-30.f,30.f));
-                }
-                Vector3f local_direction=projective_hit_direction(ray_origin,d,id,valid);
-                Vector3f principal=rotate(offset,qw,-qv), direction=rotate(local_direction,qw,-qv);
-                Vector3f weighted_point=principal/(scale*scale);
-                Vector3f weighted_direction=direction/(scale*scale);
-                Float denominator=dr::dot(direction,weighted_direction);
-                distortion_geometry_valid=valid&depth_free&dr::isfinite(depth_derivative)&
-                    (depth_derivative!=0.f)&dr::isfinite(denominator)&(denominator>0.f);
-                Float factor=dr::select(distortion_geometry_valid,
-                    depth_derivative/dr::select(distortion_geometry_valid,denominator,1.f),0.f);
-                Vector3f center_gradient=rotate(weighted_direction,qw,qv);
-                Vector3f scale_gradient=2.f*direction*weighted_point;
-                Vector3f rotation_gradient=dr::cross(direction,weighted_point)+
-                                          dr::cross(principal,weighted_direction);
-                Float rotation_norm2=dr::square(dr::gather<Float>(m_rotations,id*4,valid));
-                for(uint32_t j=0;j<3;++j)
-                    rotation_norm2 += dr::square(dr::gather<Float>(m_rotations,id*4+j+1,valid));
-                Mask rotation_valid=dr::isfinite(rotation_norm2)&(rotation_norm2>1e-20f);
+                const bool voxel_background = projective && !m_background_use_ellipsoid;
+                Mask geometry_hit = voxel_background ? projective_core_ids(id, valid) : valid;
+                auto depth_geometry = [this,quaternion,rotate,ray_origin,d](const UInt32 &id,
+                    const Vector3f &offset,const Float &depth_derivative,
+                    const Mask &depth_free,const Mask &valid) {
+                    Float qw;Vector3f qv,scale,log_scale;
+                    quaternion(id,valid,qw,qv);
+                    for(uint32_t j=0;j<3;++j) {
+                        log_scale[j]=dr::gather<Float>(m_log_scales,id*3+j,valid);
+                        scale[j]=dr::exp(dr::clip(log_scale[j],-30.f,30.f));
+                    }
+                    Vector3f local_direction=projective_hit_direction(ray_origin,d,id,valid);
+                    Vector3f principal=rotate(offset,qw,-qv), direction=rotate(local_direction,qw,-qv);
+                    Vector3f weighted_point=principal/(scale*scale);
+                    Vector3f weighted_direction=direction/(scale*scale);
+                    Float denominator=dr::dot(direction,weighted_direction);
+                    Mask distortion_geometry_valid=valid&depth_free&dr::isfinite(depth_derivative)&
+                        (depth_derivative!=0.f)&dr::isfinite(denominator)&(denominator>0.f);
+                    Float factor=dr::select(distortion_geometry_valid,
+                        depth_derivative/dr::select(distortion_geometry_valid,denominator,1.f),0.f);
+                    Vector3f center_gradient=rotate(weighted_direction,qw,qv);
+                    Vector3f scale_gradient=2.f*direction*weighted_point;
+                    Vector3f rotation_gradient=dr::cross(direction,weighted_point)+
+                                              dr::cross(principal,weighted_direction);
+                    Float rotation_norm2=dr::square(dr::gather<Float>(m_rotations,id*4,valid));
+                    for(uint32_t j=0;j<3;++j)
+                        rotation_norm2 += dr::square(dr::gather<Float>(m_rotations,id*4+j+1,valid));
+                    Mask rotation_valid=dr::isfinite(rotation_norm2)&(rotation_norm2>1e-20f);
+                    return dr::make_tuple(center_gradient, scale_gradient, rotation_gradient,
+                        log_scale, factor, rotation_valid, distortion_geometry_valid);
+                };
+                Vector3f center_gradient, scale_gradient, rotation_gradient, log_scale;
+                Float factor;
+                Mask rotation_valid;
+                dr::tie(center_gradient, scale_gradient, rotation_gradient, log_scale,
+                    factor, rotation_valid, distortion_geometry_valid) = voxel_background ? dr::if_stmt(
+                    dr::make_tuple(id, offset, depth_derivative, depth_free, geometry_hit),
+                    geometry_hit, depth_geometry,
+                    [](const UInt32 &,const Vector3f &,const Float &,const Mask &,const Mask &) {
+                        return dr::make_tuple(Vector3f(0.f), Vector3f(0.f), Vector3f(0.f),
+                            Vector3f(0.f), Float(0.f), Mask(false), Mask(false));
+                    }, "Voxel reconstruction core distortion geometry") :
+                    depth_geometry(id, offset, depth_derivative, depth_free, geometry_hit);
                 for(uint32_t j=0;j<3;++j) {
                     dr::scatter_reduce(ReduceOp::Add,s.gradients["centers"],
                         clean(factor*center_gradient[j]*m_size[j]),row*3+j,distortion_geometry_valid&stored);

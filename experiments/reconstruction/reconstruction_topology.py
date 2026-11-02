@@ -204,6 +204,9 @@ def model_checkpoint(model, fields=None) -> dict:
     if getattr(model, "scene_mapping", "") == "projective_shell":
         metadata["background_refinement"] = "preserve_physical_width"
         metadata["background_layers"] = (metadata["resolution"] - core_resolution)//2
+        if (hasattr(model, "native_background_use_ellipsoid")
+                and not model.native_background_use_ellipsoid()):
+            metadata["background_use_ellipsoid"] = False
         if hasattr(model, "native_background_far_distance"):
             distance = float(model.native_background_far_distance())
             if distance:

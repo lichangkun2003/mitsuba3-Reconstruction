@@ -215,6 +215,9 @@ MI_PY_EXPORT(VoxelReconstruction) {
         .def("set_background_far_distance", &Model::set_background_far_distance, "distance"_a,
              "Set the finite projective outer boundary (>1), or zero for legacy infinity.")
         .def("native_background_far_distance", &Model::native_background_far_distance)
+        .def("set_background_use_ellipsoid", &Model::set_background_use_ellipsoid, "enabled"_a,
+             "Use ellipsoids for projective background hits, or fixed occupied-cell coverage when false.")
+        .def("native_background_use_ellipsoid", &Model::native_background_use_ellipsoid)
         .def("set_active_sh_count", &Model::set_active_sh_count, "count"_a,
              "Activate the first count radiance SH coefficients; preserve stored parameters.")
         .def("native_scene_mapping", &Model::native_scene_mapping)
@@ -301,6 +304,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("rgb_growth_version") = nb::int_(Model::rgb_growth_version);
     cls.attr("rgb_deletion_version") = nb::int_(Model::rgb_deletion_version);
     cls.attr("background_rgb_deletion_version") = nb::int_(Model::background_rgb_deletion_version);
+    cls.attr("background_geometry_version") = nb::int_(Model::background_geometry_version);
     cls.attr("distortion_version") = nb::int_(Model::distortion_version);
     cls.attr("dssim_version") = nb::int_(Model::dssim_version);
     cls.attr("sh_schedule_version") = nb::int_(Model::sh_schedule_version);

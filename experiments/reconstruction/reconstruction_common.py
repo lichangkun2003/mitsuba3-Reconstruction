@@ -155,6 +155,9 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
         mapping = prepared["initialization"].get("scene_mapping")
         if mapping == "projective_shell" and not hasattr(mi.VoxelReconstruction, "set_scene_mapping"):
             raise RuntimeError("Rebuild this checkout: projective scene traversal is missing")
+        if (mapping == "projective_shell" and not config.model.background_use_ellipsoid
+                and not hasattr(mi.VoxelReconstruction, "set_background_use_ellipsoid")):
+            raise RuntimeError("Rebuild this checkout: background geometry selection is missing")
         model = mi.VoxelReconstruction.from_points(
             np.ascontiguousarray(prepared["positions"], dtype=np.float32).reshape(-1),
             np.ascontiguousarray(prepared["colors"], dtype=np.float32).reshape(-1),
@@ -164,6 +167,8 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
             import drjit as dr
             from reconstruction_background import initialize_background_model
             options = {"mapping": mapping} if mapping == "projective_shell" else {}
+            if mapping == "projective_shell" and not config.model.background_use_ellipsoid:
+                options["background_use_ellipsoid"] = False
             if "background_far_distance" in prepared["initialization"]:
                 options["background_far_distance"] = prepared["initialization"]["background_far_distance"]
             return initialize_background_model(model, mi, dr, np,
@@ -384,6 +389,9 @@ def model_metadata(model) -> dict:
     mapping = getattr(model, "scene_mapping", "bounded")
     if mapping in ("radial_seed_shell", "projective_shell"):
         metadata["scene_mapping"] = mapping
+        if (mapping == "projective_shell" and hasattr(model, "native_background_use_ellipsoid")
+                and not model.native_background_use_ellipsoid()):
+            metadata["background_use_ellipsoid"] = False
         if mapping == "projective_shell" and hasattr(model, "native_background_far_distance"):
             distance = float(model.native_background_far_distance())
             if distance:
@@ -409,6 +417,10 @@ def restore_model(checkpoint, mi):
             if not hasattr(model, "set_scene_mapping"):
                 raise RuntimeError("Rebuild this checkout: projective scene traversal is missing")
             model.set_scene_mapping(mapping)
+            if not metadata.get("background_use_ellipsoid", True):
+                if not hasattr(model, "set_background_use_ellipsoid"):
+                    raise RuntimeError("Rebuild this checkout: background geometry selection is missing")
+                model.set_background_use_ellipsoid(False)
             if "background_far_distance" in metadata:
                 if not hasattr(model, "set_background_far_distance"):
                     raise RuntimeError("Rebuild this checkout: finite projective background traversal is missing")

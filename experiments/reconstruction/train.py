@@ -261,6 +261,8 @@ def parse_arguments():
                         help="Radial background layers at the target resolution (default: 8); independent of max_hits")
     parser.add_argument("--background-layers", type=int, help="Legacy v2/v3 setting; use --background-final-layers for new runs")
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
+    parser.add_argument("--background-use-ellipsoid", action=argparse.BooleanOptionalAction, default=None,
+                        help="Projective far field: use ellipsoids (default); --no-background-use-ellipsoid uses occupied cells")
     parser.add_argument("--background-far-distance", type=float,
                         help="Finite scene-centered L-infinity radius H > 1, in core half extents (default: automatic)")
     parser.add_argument("--background-far-percentile", type=float,
@@ -310,6 +312,7 @@ def apply_arguments(config, args, values):
         (getattr(args, "background_layers", None), "data", "background_layers"),
         (getattr(args, "background_final_layers", None), "data", "background_final_layers"),
         (getattr(args, "background_opacity", None), "data", "background_opacity"),
+        (getattr(args, "background_use_ellipsoid", None), "model", "background_use_ellipsoid"),
         (getattr(args, "background_far_distance", None), "data", "background_far_distance"),
         (getattr(args, "background_far_percentile", None), "data", "background_far_percentile"),
         (getattr(args, "background_far_margin", None), "data", "background_far_margin"),
@@ -1307,6 +1310,8 @@ def prepare_training_output(config, resume_path=None, checkpoint_config=None):
 
 def normalized_algorithm_group(name, values):
     """Compare legacy saves with explicit defaults, without changing algorithms."""
+    if name == "model" and values is not None:
+        return {"background_use_ellipsoid": True, **values}
     if name == "render" and values is not None:
         # Traversal is an acceleration choice and can change on resume; it does
         # not change leaf shading, gradients, candidate evidence, or sampling.
@@ -1541,6 +1546,7 @@ def run_training(distributed=None):
             config.data = (DataConfig() if (saved_data.get("initialization") or {}).get("version") in (4, 5, 6)
                            else DataConfig(background_layers=8, background_final_layers=None))
             config.render = RenderConfig()
+            config.model = ModelConfig()
             config.topology = TopologySettings()
             config.gradient = GradientSettings()
             config.training.sh_degree_progression = False
@@ -1722,15 +1728,21 @@ def run_training(distributed=None):
         # dimensions. Check the full-image loss contract again before allocation.
         if dssim_enabled and effective_chunk_size(config) != config.render.width * config.render.height:
             raise ValueError("D-SSIM requires a complete image at the dataset resolution; set training.chunk_size=0")
-        report["scene_background"] = scene_background_protocol(config.data, config.render)
+        report["scene_background"] = scene_background_protocol(config.data, config.render, config.model)
         report["training_protocol"]["reference_background"] = list(config.render.background)
         if (config.data.initialization or {}).get("scene_mapping") == "projective_shell":
             report["training_protocol"]["distortion"]["depth"] = (
-                "hard-hit ellipsoid quadratic minimum mapped back to world ray distance t; "
+                ("hard-hit ellipsoid quadratic minimum mapped back to world ray distance t; "
+                 if config.model.background_use_ellipsoid else
+                 "core ellipsoid quadratic minimum / background occupied-cell segment midpoint mapped to world ray distance t; ") +
                 "s=t/(t+core_half_extent), t measured from ray origin")
             report["training_protocol"]["scene_mapping"] = {
                 "name": "projective_shell",
                 "native_version": getattr(mi.VoxelReconstruction, "projective_version", 0),
+                "background_use_ellipsoid": config.model.background_use_ellipsoid,
+                "background_geometry": report["scene_background"]["background_geometry"],
+                "background_geometry_version": getattr(mi.VoxelReconstruction, "background_geometry_version", 0),
+                "background_geometry_optimization": config.model.background_use_ellipsoid,
                 "ray_extent": report["scene_background"]["ray_extent"],
                 "background_far_distance": report["scene_background"]["background_far_distance"],
                 "segments": "analytic world-region intervals; same color/transmittance/hit capacity across charts",

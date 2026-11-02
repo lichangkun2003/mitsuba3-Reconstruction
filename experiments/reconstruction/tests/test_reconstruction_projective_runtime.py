@@ -30,6 +30,51 @@ def payload():
 
 
 class ProjectiveRuntimeTests(unittest.TestCase):
+    def test_background_geometry_roundtrip_and_config_agreement(self):
+        state, metadata = payload()
+        metadata["background_use_ellipsoid"] = False
+        config = {"model": {"background_use_ellipsoid": False}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "voxel.npz"
+            save_checkpoint(path, state, metadata, config=config)
+            saved = load_checkpoint(path)
+            for model_config in ({}, {"background_use_ellipsoid": True},
+                                 {"background_use_ellipsoid": 0}):
+                with self.assertRaisesRegex(ValueError, "background_use_ellipsoid"):
+                    save_checkpoint(path, state, metadata, config={"model": model_config})
+            self.assertEqual(load_checkpoint(path)["model_metadata"], metadata)
+
+        def factory(resolution, lo, hi, values, sh, opacity_sh, **kwargs):
+            model = SimpleNamespace(resolution=resolution, grid_min=lo, grid_max=hi,
+                sh_count=sh, opacity_sh_count=opacity_sh, core_resolution=kwargs["core_resolution"],
+                set_scene_mapping=lambda value: None, use_ellipsoid=True)
+            model.set_background_use_ellipsoid = lambda value: setattr(model, "use_ellipsoid", value)
+            model.native_background_use_ellipsoid = lambda: model.use_ellipsoid
+            return model
+
+        runtime = SimpleNamespace(UInt32=np.asarray, Float=np.asarray,
+                                  VoxelReconstruction=SimpleNamespace(from_state=factory))
+        restored = restore_model(saved, runtime)
+        self.assertIs(restored.use_ellipsoid, False)
+        self.assertEqual(model_metadata(restored), metadata)
+        legacy_metadata = {key: value for key, value in metadata.items()
+                           if key != "background_use_ellipsoid"}
+        restored = restore_model({**saved, "model_metadata": legacy_metadata}, runtime)
+        self.assertIs(restored.use_ellipsoid, True)
+        self.assertEqual(model_metadata(restored), legacy_metadata)
+
+    def test_background_geometry_rejects_invalid_metadata_and_old_native(self):
+        state, metadata = payload()
+        for value in (None, 0, 1, "false"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "background_use_ellipsoid"):
+                validate_model_state(state, {**metadata, "background_use_ellipsoid": value})
+        runtime = SimpleNamespace(UInt32=np.asarray, Float=np.asarray,
+            VoxelReconstruction=SimpleNamespace(from_state=lambda *args, **kwargs:
+                SimpleNamespace(set_scene_mapping=lambda value: None)))
+        with self.assertRaisesRegex(RuntimeError, "background geometry selection"):
+            restore_model({"model_state": state,
+                           "model_metadata": {**metadata, "background_use_ellipsoid": False}}, runtime)
+
     def test_finite_checkpoint_preserves_boundary_and_rejects_config_mismatch(self):
         state, metadata = payload()
         metadata["background_far_distance"] = 3.5

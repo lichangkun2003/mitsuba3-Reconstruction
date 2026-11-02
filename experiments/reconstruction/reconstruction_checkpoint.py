@@ -47,6 +47,9 @@ def _validate_model_metadata(metadata):
     mapping = metadata.get("scene_mapping", "bounded")
     if mapping not in ("bounded", "radial_seed_shell", "projective_shell"):
         raise ValueError("Unknown initialization scene_mapping")
+    if "background_use_ellipsoid" in metadata:
+        if type(metadata["background_use_ellipsoid"]) is not bool or mapping != "projective_shell":
+            raise ValueError("background_use_ellipsoid requires projective mapping and a boolean")
     if "background_far_distance" in metadata:
         distance = metadata["background_far_distance"]
         if (mapping != "projective_shell" or isinstance(distance, bool)
@@ -85,6 +88,12 @@ def _validate_model_metadata(metadata):
 
 def _validate_mapping_config(metadata, config):
     """A finite model cannot silently resume with an infinite/different atlas."""
+    if (metadata.get("scene_mapping") == "projective_shell"
+            and isinstance(config, dict) and "model" in config):
+        expected_mode = config["model"].get("background_use_ellipsoid", True)
+        if (type(expected_mode) is not bool
+                or expected_mode != metadata.get("background_use_ellipsoid", True)):
+            raise ValueError("Checkpoint background_use_ellipsoid differs between model and configuration")
     initialization = (config.get("data", {}).get("initialization") or {}) if isinstance(config, dict) else {}
     if initialization.get("scene_mapping") != "projective_shell":
         return

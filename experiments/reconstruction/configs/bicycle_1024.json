@@ -28,7 +28,8 @@
     "bounds_padding": 1.02,
     "opacity_threshold": 0.05,
     "sh_count": 9,
-    "opacity_sh_count": 1
+    "opacity_sh_count": 1,
+    "background_use_ellipsoid": true
   },
   "render": {
     "width": 800,

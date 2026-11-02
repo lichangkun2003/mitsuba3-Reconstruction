@@ -59,6 +59,7 @@ class ModelConfig:
     opacity_threshold: float = 0.05
     sh_count: int = 9  # Coefficient counts, not SH degrees.
     opacity_sh_count: int = 9
+    background_use_ellipsoid: bool = True  # Projective far field: False uses occupied cells directly.
 
 
 @dataclass
@@ -214,7 +215,7 @@ def resolve_scene_background(config, dataset_type: str) -> str:
     return resolved
 
 
-def scene_background_protocol(data, render) -> dict:
+def scene_background_protocol(data, render, model=None) -> dict:
     """Describe the actual compositing setting without resolving or changing it."""
     saved = data.initialization or {}
     mode = saved.get("scene_mode", "bounded" if data.scene_mode == "auto" else data.scene_mode)
@@ -224,10 +225,15 @@ def scene_background_protocol(data, render) -> dict:
     ray_extent = "configured far_clip"
     if saved.get("scene_mapping") == "projective_shell":
         ray_extent = "finite_scene_boundary" if far_distance is not None else "infinity"
+    background_use_ellipsoid = True if model is None else model.background_use_ellipsoid
+    background_geometry = (("ellipsoid" if background_use_ellipsoid else "occupied_cell")
+                           if saved.get("scene_mapping") == "projective_shell" else "not_applicable")
     return {"requested_scene_mode": data.scene_mode, "scene_mode": mode,
             "background_linear_rgb": list(render.background),
             "background_role": "residual ray transmittance color; no environment illumination",
             "scene_mapping": saved.get("scene_mapping", "bounded"),
+            "background_use_ellipsoid": background_use_ellipsoid,
+            "background_geometry": background_geometry,
             "ray_extent": ray_extent,
             "background_far_distance": far_distance,
             "initial_background_layers": (saved.get("initial_background_layers", saved.get("background_layers",
@@ -248,6 +254,8 @@ def parse_config(workspace: Path) -> PreviewConfig:
                         help="Background layers at the target resolution (default: 8); independent of max_hits")
     parser.add_argument("--background-layers", type=int, help="Legacy v2/v3 setting; use --background-final-layers for new runs")
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
+    parser.add_argument("--background-use-ellipsoid", action=argparse.BooleanOptionalAction, default=None,
+                        help="Projective far field: use ellipsoids (default); --no-background-use-ellipsoid uses occupied cells")
     parser.add_argument("--background-far-distance", type=float,
                         help="Finite scene-centered L-infinity radius H > 1, in core half extents (default: automatic)")
     parser.add_argument("--background-far-percentile", type=float,
@@ -280,6 +288,7 @@ def parse_config(workspace: Path) -> PreviewConfig:
         "scene_mode": ("data", "scene_mode"), "background_layers": ("data", "background_layers"),
         "background_final_layers": ("data", "background_final_layers"),
         "background_opacity": ("data", "background_opacity"),
+        "background_use_ellipsoid": ("model", "background_use_ellipsoid"),
         "background_far_distance": ("data", "background_far_distance"),
         "background_far_percentile": ("data", "background_far_percentile"),
         "background_far_margin": ("data", "background_far_margin"),
@@ -346,6 +355,8 @@ def validate_config(config: PreviewConfig) -> None:
     if not 0 <= config.render.transmittance_threshold < 1:
         raise ValueError("transmittance_threshold must be in [0, 1)")
     model = config.model
+    if type(model.background_use_ellipsoid) is not bool:
+        raise ValueError("model.background_use_ellipsoid must be a boolean")
     if not isinstance(model.grid_resolution, int) or not 1 <= model.grid_resolution <= 1024:
         raise ValueError("grid_resolution must be an integer in [1, 1024]")
     if not math.isfinite(model.bounds_padding) or model.bounds_padding <= 0:
@@ -628,7 +639,7 @@ def main() -> int:
         from reconstruction_common import prepare_dataset, initialize_model
         dataset = workspace_path(config.data.dataset, workspace)
         prepared = prepare_dataset(config, np)
-        report["scene_background"] = scene_background_protocol(config.data, config.render)
+        report["scene_background"] = scene_background_protocol(config.data, config.render, config.model)
         report["resolved"]["dataset"] = str(dataset)
         if prepared is None:
             point_cloud = (dataset / config.data.point_cloud).resolve()

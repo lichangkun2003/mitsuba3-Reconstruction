@@ -45,6 +45,8 @@ public:
     static constexpr uint32_t rgb_deletion_version = 1;
     /// RGB removal evidence includes projective background hits.
     static constexpr uint32_t background_rgb_deletion_version = 1;
+    /// Projective background cells can use fixed voxel coverage instead of ellipsoids.
+    static constexpr uint32_t background_geometry_version = 1;
     /// Point-pair L1 depth distortion with exact fixed-hit continuous gradients.
     static constexpr uint32_t distortion_version = 1;
     /// Linear-RGB whole-image Gaussian SSIM with an explicit image adjoint.
@@ -160,6 +162,10 @@ public:
     /// Changing the boundary invalidates frozen recordings.
     void set_background_far_distance(float distance);
     float native_background_far_distance() const { return m_background_far_distance; }
+    /// False uses occupied-cell coverage only outside the projective core.
+    /// Changing this flag invalidates frozen recordings.
+    void set_background_use_ellipsoid(bool enabled);
+    bool native_background_use_ellipsoid() const { return m_background_use_ellipsoid; }
     /// Limit evaluated/trainable radiance coefficients without changing storage.
     void set_active_sh_count(uint32_t count);
     std::string native_scene_mapping() const { return m_scene_mapping; }
@@ -212,7 +218,9 @@ public:
     /// recorded hard-hit contributions. Depth is the clipped ellipsoid-metric
     /// closest point, normalized by the fixed grid diagonal for legacy models.
     /// Projective models use world distance t/(t+core_half_extent), including
-    /// its exact local-distance derivative. Environment color, unrecorded
+    /// its exact local-distance derivative. Fixed background voxels instead
+    /// use mapped-segment midpoint depth with only opacity-weight gradients.
+    /// Environment color, unrecorded
     /// suffixes, near-miss surrogates, and extra tracing are not included.
     /// compact_gradient_capacity > 0 stores gradients and the three optimizer
     /// validity counters in sorted voxel_ids order, with a device voxel_count.
@@ -282,6 +290,9 @@ private:
         const Vector3f &direction, const UInt32 &id, const Mask &active) const;
     Mask projective_core_ids(const UInt32 &id, const Mask &active) const;
     Mask projective_cell_inside(const Vector3i &cell, const UInt32 &chart) const;
+    Mask projective_background_cell_has_extent(const Vector3i &cell, const ProjectiveSegment &segment,
+        const Point3f &origin, const Vector3f &direction, const Float &maxt,
+        const Mask &active) const;
     std::pair<Float,Float> projective_depth(const ProjectiveSegment &segment,
                                            const Float &distance) const;
     Mask optimizer_step_device_impl(
@@ -314,6 +325,7 @@ private:
              m_opacity_sh_count;
     std::string m_scene_mapping = "bounded";
     float m_background_far_distance = 0.f;
+    bool m_background_use_ellipsoid = true;
     std::array<float, 3> m_min, m_max, m_size;
     std::map<std::string, uint64_t> m_statistics;
     UIntBuffer m_cells;
