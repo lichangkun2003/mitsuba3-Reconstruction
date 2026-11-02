@@ -18,13 +18,17 @@ import train
 
 
 class BackgroundGeometryConfigTests(unittest.TestCase):
-    def test_default_and_bicycle_keep_ellipsoids(self):
+    def test_defaults_and_bicycle_background_modes_are_valid(self):
         self.assertIs(preview.ModelConfig().background_use_ellipsoid, True)
+        self.assertIs(preview.ModelConfig().background_layered_sampling, False)
         config = copy.deepcopy(train.CONFIG)
         path = Path(__file__).resolve().parents[1] / "configs" / "bicycle_1024.json"
         values = json.loads(path.read_text(encoding="utf-8"))
-        self.assertIs(values["model"]["background_use_ellipsoid"], True)
         train.update(config, values)
+        self.assertIs(type(config.model.background_use_ellipsoid), bool)
+        self.assertIs(type(config.model.background_layered_sampling), bool)
+        if config.model.background_layered_sampling:
+            self.assertIs(config.model.background_use_ellipsoid, False)
         train.validate(config)
 
     def test_json_requires_actual_boolean_in_preview_and_training(self):

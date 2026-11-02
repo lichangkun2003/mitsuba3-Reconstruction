@@ -60,6 +60,7 @@ class ModelConfig:
     sh_count: int = 9  # Coefficient counts, not SH degrees.
     opacity_sh_count: int = 9
     background_use_ellipsoid: bool = True  # Projective far field: False uses occupied cells directly.
+    background_layered_sampling: bool = False  # One occupied-cell query per inverse-depth layer midpoint.
 
 
 @dataclass
@@ -226,6 +227,7 @@ def scene_background_protocol(data, render, model=None) -> dict:
     if saved.get("scene_mapping") == "projective_shell":
         ray_extent = "finite_scene_boundary" if far_distance is not None else "infinity"
     background_use_ellipsoid = True if model is None else model.background_use_ellipsoid
+    layered = False if model is None else model.background_layered_sampling
     background_geometry = (("ellipsoid" if background_use_ellipsoid else "occupied_cell")
                            if saved.get("scene_mapping") == "projective_shell" else "not_applicable")
     return {"requested_scene_mode": data.scene_mode, "scene_mode": mode,
@@ -233,6 +235,9 @@ def scene_background_protocol(data, render, model=None) -> dict:
             "background_role": "residual ray transmittance color; no environment illumination",
             "scene_mapping": saved.get("scene_mapping", "bounded"),
             "background_use_ellipsoid": background_use_ellipsoid,
+            "background_layered_sampling": layered,
+            "background_sampling": (("layer_midpoint" if layered else "cell_traversal")
+                                    if saved.get("scene_mapping") == "projective_shell" else "not_applicable"),
             "background_geometry": background_geometry,
             "ray_extent": ray_extent,
             "background_far_distance": far_distance,
@@ -256,6 +261,8 @@ def parse_config(workspace: Path) -> PreviewConfig:
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
     parser.add_argument("--background-use-ellipsoid", action=argparse.BooleanOptionalAction, default=None,
                         help="Projective far field: use ellipsoids (default); --no-background-use-ellipsoid uses occupied cells")
+    parser.add_argument("--background-layered-sampling", action=argparse.BooleanOptionalAction, default=None,
+                        help="Query each projective background layer once; requires --no-background-use-ellipsoid")
     parser.add_argument("--background-far-distance", type=float,
                         help="Finite scene-centered L-infinity radius H > 1, in core half extents (default: automatic)")
     parser.add_argument("--background-far-percentile", type=float,
@@ -289,6 +296,7 @@ def parse_config(workspace: Path) -> PreviewConfig:
         "background_final_layers": ("data", "background_final_layers"),
         "background_opacity": ("data", "background_opacity"),
         "background_use_ellipsoid": ("model", "background_use_ellipsoid"),
+        "background_layered_sampling": ("model", "background_layered_sampling"),
         "background_far_distance": ("data", "background_far_distance"),
         "background_far_percentile": ("data", "background_far_percentile"),
         "background_far_margin": ("data", "background_far_margin"),
@@ -357,6 +365,14 @@ def validate_config(config: PreviewConfig) -> None:
     model = config.model
     if type(model.background_use_ellipsoid) is not bool:
         raise ValueError("model.background_use_ellipsoid must be a boolean")
+    if type(model.background_layered_sampling) is not bool:
+        raise ValueError("model.background_layered_sampling must be a boolean")
+    if model.background_layered_sampling:
+        if model.background_use_ellipsoid:
+            raise ValueError("background_layered_sampling requires background_use_ellipsoid=false")
+        mapping = (config.data.initialization or {}).get("scene_mapping")
+        if config.data.scene_mode == "bounded" or mapping not in (None, "projective_shell"):
+            raise ValueError("background_layered_sampling requires projective mapping")
     if not isinstance(model.grid_resolution, int) or not 1 <= model.grid_resolution <= 1024:
         raise ValueError("grid_resolution must be an integer in [1, 1024]")
     if not math.isfinite(model.bounds_padding) or model.bounds_padding <= 0:

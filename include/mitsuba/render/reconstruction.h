@@ -47,6 +47,8 @@ public:
     static constexpr uint32_t background_rgb_deletion_version = 1;
     /// Projective background cells can use fixed voxel coverage instead of ellipsoids.
     static constexpr uint32_t background_geometry_version = 1;
+    /// One fixed inverse-depth midpoint lookup per projective background layer.
+    static constexpr uint32_t background_layered_sampling_version = 1;
     /// Point-pair L1 depth distortion with exact fixed-hit continuous gradients.
     static constexpr uint32_t distortion_version = 1;
     /// Linear-RGB whole-image Gaussian SSIM with an explicit image adjoint.
@@ -166,6 +168,11 @@ public:
     /// Changing this flag invalidates frozen recordings.
     void set_background_use_ellipsoid(bool enabled);
     bool native_background_use_ellipsoid() const { return m_background_use_ellipsoid; }
+    /// Sample each background layer once at its outgoing L-infinity shell
+    /// intersection. Requires projective mapping and disabled ellipsoids.
+    /// The ordinary shared hit capacity and transmittance termination apply.
+    void set_background_layered_sampling(bool enabled);
+    bool native_background_layered_sampling() const { return m_background_layered_sampling; }
     /// Limit evaluated/trainable radiance coefficients without changing storage.
     void set_active_sh_count(uint32_t count);
     std::string native_scene_mapping() const { return m_scene_mapping; }
@@ -219,7 +226,8 @@ public:
     /// closest point, normalized by the fixed grid diagonal for legacy models.
     /// Projective models use world distance t/(t+core_half_extent), including
     /// its exact local-distance derivative. Fixed background voxels instead
-    /// use mapped-segment midpoint depth with only opacity-weight gradients.
+    /// use mapped-segment midpoint depth with only opacity-weight gradients;
+    /// layered sampling instead uses the fixed outgoing shell intersection.
     /// Environment color, unrecorded
     /// suffixes, near-miss surrogates, and extra tracing are not included.
     /// compact_gradient_capacity > 0 stores gradients and the three optimizer
@@ -326,6 +334,7 @@ private:
     std::string m_scene_mapping = "bounded";
     float m_background_far_distance = 0.f;
     bool m_background_use_ellipsoid = true;
+    bool m_background_layered_sampling = false;
     std::array<float, 3> m_min, m_max, m_size;
     std::map<std::string, uint64_t> m_statistics;
     UIntBuffer m_cells;

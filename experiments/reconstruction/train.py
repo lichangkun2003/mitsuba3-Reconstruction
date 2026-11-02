@@ -263,6 +263,8 @@ def parse_arguments():
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
     parser.add_argument("--background-use-ellipsoid", action=argparse.BooleanOptionalAction, default=None,
                         help="Projective far field: use ellipsoids (default); --no-background-use-ellipsoid uses occupied cells")
+    parser.add_argument("--background-layered-sampling", action=argparse.BooleanOptionalAction, default=None,
+                        help="Query each projective background layer once; requires --no-background-use-ellipsoid")
     parser.add_argument("--background-far-distance", type=float,
                         help="Finite scene-centered L-infinity radius H > 1, in core half extents (default: automatic)")
     parser.add_argument("--background-far-percentile", type=float,
@@ -313,6 +315,7 @@ def apply_arguments(config, args, values):
         (getattr(args, "background_final_layers", None), "data", "background_final_layers"),
         (getattr(args, "background_opacity", None), "data", "background_opacity"),
         (getattr(args, "background_use_ellipsoid", None), "model", "background_use_ellipsoid"),
+        (getattr(args, "background_layered_sampling", None), "model", "background_layered_sampling"),
         (getattr(args, "background_far_distance", None), "data", "background_far_distance"),
         (getattr(args, "background_far_percentile", None), "data", "background_far_percentile"),
         (getattr(args, "background_far_margin", None), "data", "background_far_margin"),
@@ -1311,7 +1314,7 @@ def prepare_training_output(config, resume_path=None, checkpoint_config=None):
 def normalized_algorithm_group(name, values):
     """Compare legacy saves with explicit defaults, without changing algorithms."""
     if name == "model" and values is not None:
-        return {"background_use_ellipsoid": True, **values}
+        return {"background_use_ellipsoid": True, "background_layered_sampling": False, **values}
     if name == "render" and values is not None:
         # Traversal is an acceleration choice and can change on resume; it does
         # not change leaf shading, gradients, candidate evidence, or sampling.
@@ -1731,15 +1734,23 @@ def run_training(distributed=None):
         report["scene_background"] = scene_background_protocol(config.data, config.render, config.model)
         report["training_protocol"]["reference_background"] = list(config.render.background)
         if (config.data.initialization or {}).get("scene_mapping") == "projective_shell":
+            background_depth = (
+                "core ellipsoid quadratic minimum / background inverse-depth layer midpoint world-shell intersection; "
+                if config.model.background_layered_sampling else
+                "core ellipsoid quadratic minimum / background occupied-cell segment midpoint mapped to world ray distance t; ")
             report["training_protocol"]["distortion"]["depth"] = (
                 ("hard-hit ellipsoid quadratic minimum mapped back to world ray distance t; "
                  if config.model.background_use_ellipsoid else
-                 "core ellipsoid quadratic minimum / background occupied-cell segment midpoint mapped to world ray distance t; ") +
+                 background_depth) +
                 "s=t/(t+core_half_extent), t measured from ray origin")
             report["training_protocol"]["scene_mapping"] = {
                 "name": "projective_shell",
                 "native_version": getattr(mi.VoxelReconstruction, "projective_version", 0),
                 "background_use_ellipsoid": config.model.background_use_ellipsoid,
+                "background_layered_sampling": config.model.background_layered_sampling,
+                "background_sampling": report["scene_background"]["background_sampling"],
+                "background_layered_sampling_version": getattr(
+                    mi.VoxelReconstruction, "background_layered_sampling_version", 0),
                 "background_geometry": report["scene_background"]["background_geometry"],
                 "background_geometry_version": getattr(mi.VoxelReconstruction, "background_geometry_version", 0),
                 "background_geometry_optimization": config.model.background_use_ellipsoid,

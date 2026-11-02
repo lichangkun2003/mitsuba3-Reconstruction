@@ -1101,6 +1101,8 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_active_sh_count(uint32
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_scene_mapping(const std::string &mapping) {
     if (mapping != "bounded" && mapping != "radial_seed_shell" && mapping != "projective_shell")
         Throw("VoxelReconstruction: unknown scene mapping '%s'.", mapping.c_str());
+    if (m_background_layered_sampling && mapping != "projective_shell")
+        Throw("VoxelReconstruction: disable layered background sampling before changing the projective mapping.");
     if (mapping == "projective_shell") {
         if (m_resolution <= m_core_resolution || (m_resolution-m_core_resolution)%2)
             Throw("VoxelReconstruction: projective mapping requires a symmetric exterior shell.");
@@ -1124,8 +1126,21 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_background_far_distanc
 }
 
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_background_use_ellipsoid(bool enabled) {
+    if (enabled && m_background_layered_sampling)
+        Throw("VoxelReconstruction: disable layered background sampling before enabling background ellipsoids.");
     if (m_background_use_ellipsoid != enabled) {
         m_background_use_ellipsoid = enabled;
+        ++m_topology_revision;
+    }
+}
+
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_background_layered_sampling(bool enabled) {
+    if (enabled && (m_scene_mapping != "projective_shell" || m_background_use_ellipsoid))
+        Throw("VoxelReconstruction: layered background sampling requires projective mapping and disabled background ellipsoids.");
+    if (enabled && (m_resolution-m_core_resolution)/2 >= 32u)
+        Throw("VoxelReconstruction: layered background sampling supports at most 31 layers.");
+    if (m_background_layered_sampling != enabled) {
+        m_background_layered_sampling = enabled;
         ++m_topology_revision;
     }
 }
@@ -1144,7 +1159,7 @@ VoxelReconstruction<Float, Spectrum>::next_projective_segment(const Point3f &ori
     Float best_start=dr::Infinity<Float>;
     // Each region is convex. Clip seven fixed sets of linear inequalities;
     // select the next interval in world-distance order, without ray marching.
-    for (uint32_t region=0;region<7;++region) {
+    for (uint32_t region=0;region<(m_background_layered_sampling ? 1u : 7u);++region) {
         Float lo(0.f), hi=maxt;
         Mask valid=(visited & (1u<<region))==0u;
         auto clip=[&](const Float &a,const Float &b,bool strict_parallel=false) {
@@ -1206,6 +1221,58 @@ VoxelReconstruction<Float, Spectrum>::next_projective_segment(const Point3f &ori
         best_start=dr::select(choose,lo,best_start);
     }
     best.visited=visited | dr::select(best.valid,UInt32(1)<<best.chart,UInt32(0));
+    if (m_background_layered_sampling) {
+        const uint32_t layers=(m_resolution-m_core_resolution)/2;
+        // Bit zero owns the core interval. Every remaining bit owns a radial
+        // layer, independently of the six faces and of cell occupancy.
+        // A layer is consumed even when its selected cell is absent: deleting
+        // a sample must never expose an alternative cell in the same layer.
+        const double inverse_span=m_background_far_distance==0.f ? 1. :
+            1.-1./double(m_background_far_distance);
+        for (uint32_t layer=0;layer<layers;++layer) {
+            const float u=(float(layer)+.5f)/float(layers);
+            const float h=float(1./(1.-double(u)*inverse_span));
+            Float lo=-dr::Infinity<Float>, hi=dr::Infinity<Float>;
+            UInt32 chart(0);
+            Mask valid=(visited & (1u<<(layer+1u)))==0u;
+            for (uint32_t j=0;j<3;++j) {
+                Mask parallel=d[j]==0.f;
+                valid &= !parallel | (dr::abs(o[j])<=h);
+                Float inverse=dr::rcp(dr::select(parallel,1.f,d[j]));
+                Float a=(-h-o[j])*inverse,b=(h-o[j])*inverse;
+                Float near=dr::select(parallel,-dr::Infinity<Float>,dr::minimum(a,b));
+                Float far=dr::select(parallel,dr::Infinity<Float>,dr::maximum(a,b));
+                // Strict replacement gives x/y/z priority at tied cube edges.
+                chart=dr::select(far<hi,UInt32(1u+2u*j)+dr::select(d[j]<0.f,1u,0u),chart);
+                lo=dr::maximum(lo,near);
+                hi=dr::minimum(hi,far);
+            }
+            // Only the outgoing intersection is represented, including for
+            // an external ray. Near-side shell occlusion is intentionally not
+            // part of this once-per-layer background parameterization.
+            valid &= (hi>lo)&(hi>=0.f)&(hi<=maxt)&dr::isfinite(hi)&(chart>0u);
+            Mask choose=valid&(hi<best_start);
+            Float t=dr::select(valid,hi,0.f);
+            Vector3f q=dr::clip((o+t*d)/h,-1.f,1.f);
+            for (uint32_t j=0;j<3;++j)
+                q[j]=dr::select((chart-1u)/2u==j,
+                    dr::select((chart&1u)!=0u,1.f,-1.f)*(1.f+physical_width*u),q[j]);
+            best.valid |= choose;
+            best.origin=dr::select(choose,center+half*q,best.origin);
+            // A sampled event has no DDA extent. Its exact cell is queried
+            // once and traversal immediately selects the following event.
+            best.direction=dr::select(choose,Vector3f(0.f),best.direction);
+            best.entry=dr::select(choose,0.f,best.entry);
+            best.exit=dr::select(choose,0.f,best.exit);
+            best.world_entry=dr::select(choose,t,best.world_entry);
+            best.h_start=dr::select(choose,h,best.h_start);
+            best.h_rate=dr::select(choose,0.f,best.h_rate);
+            best.speed=dr::select(choose,1.f,best.speed);
+            best.chart=dr::select(choose,chart,best.chart);
+            best.visited=dr::select(choose,visited | UInt32(1u<<(layer+1u)),best.visited);
+            best_start=dr::select(choose,t,best_start);
+        }
+    }
     return best;
 }
 
@@ -1462,6 +1529,8 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
             UInt32 id = UInt32(dr::maximum(id_signed, 0));
             if (use_octree) {
                 Mask empty = s.active & !occupied;
+                if (m_background_layered_sampling)
+                    empty &= s.segment.chart==0u;
                 s = dr::if_stmt(dr::make_tuple(s, empty, empty_log), empty,
                     [this, step, step_t, origin = s.segment.origin, inv_d, exit](
                         LoopState s, const Mask &empty, const UInt32 &empty_log) {
@@ -1517,9 +1586,13 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
                 intersects(id, s.cell, s.segment.origin, d, s.entry, end, ellipsoid);
             // DDA may visit tied faces with zero segment length. These are not
             // occupied-volume hits, while the legacy ellipsoid rule is retained.
-            if (voxel_background)
-                hit |= projective_background_cell_has_extent(s.cell, s.segment,
-                    ray.o, world_d, ray.maxt*length, occupied & !ellipsoid & (end > s.entry));
+            if (voxel_background) {
+                if (m_background_layered_sampling)
+                    hit |= occupied & !ellipsoid;
+                else
+                    hit |= projective_background_cell_has_extent(s.cell, s.segment,
+                        ray.o, world_d, ray.maxt*length, occupied & !ellipsoid & (end > s.entry));
+            }
             Color3f emission(0.f);
             Float logit = 0.f;
             for (uint32_t k = 0; k < std::max(m_active_sh_count, m_opacity_sh_count); ++k) {
@@ -2068,6 +2141,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             }
             if (use_octree) {
                 Mask empty = s.active & !visit;
+                if (m_background_layered_sampling)
+                    empty &= s.segment.chart==0u;
                 s = dr::if_stmt(dr::make_tuple(s, empty, empty_log), empty,
                     [this, step, step_t, origin = s.segment.origin, inv_d, exit, profile_traversal](
                         State s, const Mask &empty, const UInt32 &empty_log) {
@@ -2183,12 +2258,19 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                                     Float(0.f), Float(.5f), Float(0.f), Mask(false));
                             }, "Voxel reconstruction core training intersection") :
                             intersect(id, s.cell, origin, direction, s.entry, end, ellipsoid);
-                    if (voxel_background)
-                        hit |= projective_background_cell_has_extent(s.cell, s.segment,
-                            world_origin, world_d, world_maxt, occupied & !ellipsoid & (end > s.entry));
+                    if (voxel_background) {
+                        if (m_background_layered_sampling)
+                            hit |= occupied & !ellipsoid;
+                        else
+                            hit |= projective_background_cell_has_extent(s.cell, s.segment,
+                                world_origin, world_d, world_maxt, occupied & !ellipsoid & (end > s.entry));
+                    }
                     Float depth(0.f);
                     Float depth_chain(0.f);
                     if (distortion_enabled) {
+                        // A layered sample has entry=end=0 and world_entry at
+                        // the exact shell intersection. projective_depth then
+                        // returns t/(t+half), independent of cell geometry.
                         Float distance=s.entry+star*(end-s.entry);
                         Mask free=ellipsoid&(a>1e-20f)&(star>0.f)&(star<1.f);
                         depth=(distance-grid_entry)/diagonal;

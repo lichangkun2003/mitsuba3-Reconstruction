@@ -473,7 +473,8 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
         report["metric_protocol"]["background_linear_rgb"] = list(render.background)
         report["scene_background"] = preview.scene_background_protocol(
             checkpoint_data_config(saved), render, preview.ModelConfig(
-                background_use_ellipsoid=checkpoint["model_metadata"].get("background_use_ellipsoid", True)))
+                background_use_ellipsoid=checkpoint["model_metadata"].get("background_use_ellipsoid", True),
+                background_layered_sampling=checkpoint["model_metadata"].get("background_layered_sampling", False)))
         model = common.restore_model(checkpoint, mi)
         report["model_statistics"] = model.statistics()
         for split in config.splits:
@@ -693,7 +694,8 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
         report["metric_protocol"]["background_linear_rgb"] = list(render.background)
         report["scene_background"] = preview.scene_background_protocol(
             checkpoint_data_config(saved), render, preview.ModelConfig(
-                background_use_ellipsoid=checkpoint["model_metadata"].get("background_use_ellipsoid", True)))
+                background_use_ellipsoid=checkpoint["model_metadata"].get("background_use_ellipsoid", True),
+                background_layered_sampling=checkpoint["model_metadata"].get("background_layered_sampling", False)))
         model = common.restore_model(checkpoint, mi)
         report["model_statistics"] = model.statistics()
         (output / "evaluation-config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")

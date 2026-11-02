@@ -66,6 +66,9 @@ def device_checkpoint(model):
         if (hasattr(model, "native_background_use_ellipsoid")
                 and not model.native_background_use_ellipsoid()):
             metadata["background_use_ellipsoid"] = False
+        if (hasattr(model, "native_background_layered_sampling")
+                and model.native_background_layered_sampling()):
+            metadata["background_layered_sampling"] = True
         if hasattr(model, "native_background_far_distance"):
             distance = float(model.native_background_far_distance())
             if distance:

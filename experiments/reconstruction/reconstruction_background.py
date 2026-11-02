@@ -10,9 +10,23 @@ from __future__ import annotations
 import math
 
 
+def require_layered_background(native, mapping, use_ellipsoid, layered):
+    """Check mode semantics and reject stale builds before allocating a model."""
+    if type(layered) is not bool:
+        raise ValueError("background_layered_sampling must be a boolean")
+    if not layered:
+        return
+    if mapping != "projective_shell" or use_ellipsoid:
+        raise ValueError("background_layered_sampling requires projective mapping and background_use_ellipsoid=false")
+    if (getattr(native, "background_layered_sampling_version", 0) < 1
+            or not hasattr(native, "set_background_layered_sampling")
+            or not hasattr(native, "native_background_layered_sampling")):
+        raise RuntimeError("Rebuild this checkout: projective background layer-midpoint sampling is missing")
+
+
 def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=None, layers=None,
                                 mapping="radial_seed_shell", background_far_distance=None,
-                                background_use_ellipsoid=True):
+                                background_use_ellipsoid=True, background_layered_sampling=False):
     """Keep core seeds and fill the far shell with black occupied cells.
 
     Existing far-cell radiance is retained, but its initial geometry and opacity
@@ -34,6 +48,7 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
         raise ValueError("Unknown background mapping")
     if type(background_use_ellipsoid) is not bool:
         raise ValueError("background_use_ellipsoid must be a boolean")
+    require_layered_background(model, mapping, background_use_ellipsoid, background_layered_sampling)
     if not background_use_ellipsoid:
         if mapping != "projective_shell":
             raise ValueError("Occupied-cell background requires projective mapping")
@@ -125,6 +140,8 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
         result.set_scene_mapping(mapping)
         if not background_use_ellipsoid:
             result.set_background_use_ellipsoid(False)
+        if background_layered_sampling:
+            result.set_background_layered_sampling(True)
         if background_far_distance is not None:
             result.set_background_far_distance(background_far_distance)
         result.background_refinement = "preserve_physical_width"
@@ -142,4 +159,7 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
         result.background_initialization["background_far_distance"] = float(result.native_background_far_distance())
     if mapping == "projective_shell":
         result.background_initialization["background_use_ellipsoid"] = background_use_ellipsoid
+        result.background_initialization["background_layered_sampling"] = background_layered_sampling
+        result.background_initialization["background_sampling"] = (
+            "layer_midpoint" if background_layered_sampling else "cell_traversal")
     return result

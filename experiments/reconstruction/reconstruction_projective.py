@@ -115,6 +115,7 @@ def refine_projective_numpy(checkpoint, config, max_active_voxels, fit_core, np)
     core_metadata = dict(metadata, scene_mapping="bounded")
     core_metadata.pop("background_far_distance", None)
     core_metadata.pop("background_use_ellipsoid", None)
+    core_metadata.pop("background_layered_sampling", None)
     core_result = fit_core({"model_metadata": core_metadata, "model_state": core_state},
                           config, max_active_voxels - 8 * len(background))
     metadata["resolution"] *= 2
@@ -189,6 +190,7 @@ def refine_projective_device(checkpoint, config, max_active_voxels, fit_core, dr
     core_metadata = dict(metadata, scene_mapping="bounded")
     core_metadata.pop("background_far_distance", None)
     core_metadata.pop("background_use_ellipsoid", None)
+    core_metadata.pop("background_layered_sampling", None)
     core_result = fit_core({"model_metadata": core_metadata, "model_state": core_state},
                           config, max_active_voxels - 8 * bg_count, dr, **options)["model_state"]
     del core_state, core_ids, inside

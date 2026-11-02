@@ -10,6 +10,7 @@ import sys
 
 from reconstruction_color import reference_from_bitmap, validate_reference_compositing
 from reconstruction_sh_schedule import restore_sh_state, sh_model_metadata
+from reconstruction_background import require_layered_background
 
 from preview import (
     REPOSITORY, WORKSPACE, PreviewConfig, RenderConfig, RuntimeConfig, configure_drjit_threads,
@@ -149,6 +150,9 @@ def prepare_dataset(config, np, *, load_points=True):
 
 
 def initialize_model(config, dataset, mi, np, *, prepared=None):
+    mapping = prepared["initialization"].get("scene_mapping") if prepared is not None else "bounded"
+    require_layered_background(mi.VoxelReconstruction, mapping,
+                              config.model.background_use_ellipsoid, config.model.background_layered_sampling)
     if prepared is not None:
         if not hasattr(mi.VoxelReconstruction, "from_points"):
             raise RuntimeError("Rebuild this checkout: in-memory point-cloud initialization is missing")
@@ -169,6 +173,8 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
             options = {"mapping": mapping} if mapping == "projective_shell" else {}
             if mapping == "projective_shell" and not config.model.background_use_ellipsoid:
                 options["background_use_ellipsoid"] = False
+            if config.model.background_layered_sampling:
+                options["background_layered_sampling"] = True
             if "background_far_distance" in prepared["initialization"]:
                 options["background_far_distance"] = prepared["initialization"]["background_far_distance"]
             return initialize_background_model(model, mi, dr, np,
@@ -392,6 +398,9 @@ def model_metadata(model) -> dict:
         if (mapping == "projective_shell" and hasattr(model, "native_background_use_ellipsoid")
                 and not model.native_background_use_ellipsoid()):
             metadata["background_use_ellipsoid"] = False
+        if (mapping == "projective_shell" and hasattr(model, "native_background_layered_sampling")
+                and model.native_background_layered_sampling()):
+            metadata["background_layered_sampling"] = True
         if mapping == "projective_shell" and hasattr(model, "native_background_far_distance"):
             distance = float(model.native_background_far_distance())
             if distance:
@@ -404,6 +413,9 @@ def model_metadata(model) -> dict:
 
 def restore_model(checkpoint, mi):
     metadata = checkpoint["model_metadata"]
+    require_layered_background(mi.VoxelReconstruction, metadata.get("scene_mapping", "bounded"),
+                              metadata.get("background_use_ellipsoid", True),
+                              metadata.get("background_layered_sampling", False))
     state = {key: (mi.UInt32(value) if key == "cell_indices" else mi.Float(value))
              for key, value in checkpoint["model_state"].items()}
     options = ({"core_resolution": metadata["core_resolution"]} if "core_resolution" in metadata else {})
@@ -421,6 +433,8 @@ def restore_model(checkpoint, mi):
                 if not hasattr(model, "set_background_use_ellipsoid"):
                     raise RuntimeError("Rebuild this checkout: background geometry selection is missing")
                 model.set_background_use_ellipsoid(False)
+            if metadata.get("background_layered_sampling", False):
+                model.set_background_layered_sampling(True)
             if "background_far_distance" in metadata:
                 if not hasattr(model, "set_background_far_distance"):
                     raise RuntimeError("Rebuild this checkout: finite projective background traversal is missing")

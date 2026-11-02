@@ -378,6 +378,7 @@ class FalcorOptimizer:
                self.radiance_degree_steps, tuple(float(v) for v in model.voxel_size),
                getattr(model, "scene_mapping", "bounded"),
                self._background_use_ellipsoid(model),
+               bool(getattr(model, "native_background_layered_sampling", lambda: False)()),
                int(getattr(model, "core_resolution", model.resolution)),
                tuple(sorted((name, value) for name, value in settings.items()
                             if name != "gradient_factor")), guarded)
