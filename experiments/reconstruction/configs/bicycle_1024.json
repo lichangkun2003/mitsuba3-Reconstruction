@@ -57,7 +57,7 @@
     "profile_views": 0,
     "profile_interval_epochs": 0,
     "profile_stages": false,
-    "reference_cache_mib": 4096,
+    "reference_cache_mib": 8192,
     "gpu_reference_cache_mib": 4096,
     "freeze_native": true,
     "sync_view_checks": false,
