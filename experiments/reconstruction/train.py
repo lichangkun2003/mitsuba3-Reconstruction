@@ -145,6 +145,9 @@ CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再�
 CONFIG.data.scene_mode = "auto"  # 合成场景：有界白色背景；COLMAP：无界远景层、无白色背景尾项。
 CONFIG.data.background_final_layers = 8  # 最终远景层数；1024 终点按 2→4→8 层细分，物理范围不变。
 CONFIG.data.background_opacity = 0.5  # 远景新生体素 opacity；允许后续优化和删除。
+CONFIG.data.background_far_distance = None  # 自动估计场景中心有限远边界 H；手动值以核心半宽为单位。
+CONFIG.data.background_far_percentile = 99.9  # 归一化外景点（h>1）的 L∞ 距离分位数。
+CONFIG.data.background_far_margin = 1.2  # 自动边界在该分位数上额外留 20% 余量。
 
 CONFIG.render.width = 800
 CONFIG.render.height = 800
@@ -258,6 +261,12 @@ def parse_arguments():
                         help="Radial background layers at the target resolution (default: 8); independent of max_hits")
     parser.add_argument("--background-layers", type=int, help="Legacy v2/v3 setting; use --background-final-layers for new runs")
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
+    parser.add_argument("--background-far-distance", type=float,
+                        help="Finite scene-centered L-infinity radius H > 1, in core half extents (default: automatic)")
+    parser.add_argument("--background-far-percentile", type=float,
+                        help="Automatic far-distance point percentile in (0, 100] (default: 99.9)")
+    parser.add_argument("--background-far-margin", type=float,
+                        help="Automatic far-distance multiplier >= 1 (default: 1.2)")
     parser.add_argument("--output-dir", help="Override automatic outputs/SCENE-MM.DD-Eindex/training; on resume the default reuses the checkpoint's experiment")
     parser.add_argument("--build-dir")
     parser.add_argument("--gpu", type=int, help="Local physical index; ignored under Slurm")
@@ -301,6 +310,9 @@ def apply_arguments(config, args, values):
         (getattr(args, "background_layers", None), "data", "background_layers"),
         (getattr(args, "background_final_layers", None), "data", "background_final_layers"),
         (getattr(args, "background_opacity", None), "data", "background_opacity"),
+        (getattr(args, "background_far_distance", None), "data", "background_far_distance"),
+        (getattr(args, "background_far_percentile", None), "data", "background_far_percentile"),
+        (getattr(args, "background_far_margin", None), "data", "background_far_margin"),
         (args.build_dir, "runtime", "build_dir"), (args.gpu, "runtime", "gpu"),
         (args.chunk_size, "training", "chunk_size"),
         (getattr(args, "sampling_workers", None), "training", "sampling_workers"),
@@ -1302,12 +1314,13 @@ def normalized_algorithm_group(name, values):
     if name == "data" and values is not None:
         # Omitted/None COLMAP options are identical for historical synthetic runs.
         normalized = {"reference_compositing": "linear", "scene_mode": "auto",
-            "background_layers": 8, "background_final_layers": None, "background_opacity": .5, **{
+            "background_layers": 8, "background_final_layers": None, "background_opacity": .5,
+            "background_far_distance": None, "background_far_percentile": 99.9, "background_far_margin": 1.2, **{
             key: value for key, value in values.items()
             if key not in ("images", "initialization") or value is not None}}
         # The saved initializer determines which layer parameter is meaningful.
         # Preserve historical comparisons without silently changing its policy.
-        if (values.get("initialization") or {}).get("version") in (4, 5):
+        if (values.get("initialization") or {}).get("version") in (4, 5, 6):
             normalized.pop("background_layers", None)
         elif normalized["background_final_layers"] is None:
             normalized.pop("background_final_layers")
@@ -1525,7 +1538,7 @@ def run_training(distributed=None):
             # Fields introduced after a checkpoint must use their legacy
             # dataclass defaults, not the latest experiment's CONFIG switches.
             saved_data = checkpoint["config"].get("data", {})
-            config.data = (DataConfig() if (saved_data.get("initialization") or {}).get("version") in (4, 5)
+            config.data = (DataConfig() if (saved_data.get("initialization") or {}).get("version") in (4, 5, 6)
                            else DataConfig(background_layers=8, background_final_layers=None))
             config.render = RenderConfig()
             config.topology = TopologySettings()
@@ -1718,7 +1731,8 @@ def run_training(distributed=None):
             report["training_protocol"]["scene_mapping"] = {
                 "name": "projective_shell",
                 "native_version": getattr(mi.VoxelReconstruction, "projective_version", 0),
-                "ray_extent": "infinity",
+                "ray_extent": report["scene_background"]["ray_extent"],
+                "background_far_distance": report["scene_background"]["background_far_distance"],
                 "segments": "analytic world-region intervals; same color/transmittance/hit capacity across charts",
                 "background_growth": False,
                 "background_rgb_deletion": rgb_deletion_enabled,

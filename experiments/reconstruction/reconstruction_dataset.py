@@ -3,6 +3,8 @@
 Files and camera poses remain untouched. New unbounded scenes use the same
 piecewise-projective contraction for point seeds and native ray queries.
 Versions 1--4 retain their original point-only radial contraction and layout.
+Version 5 retains its infinite projective domain; version 6 has a saved finite
+far boundary measured in normalized max-abs coordinates.
 """
 
 from __future__ import annotations
@@ -341,16 +343,33 @@ def _grid_layout(start_core_resolution, target_core_resolution, shell_layers, *,
     return resolution, width
 
 
+def _canonical_background_far_distance(value):
+    """Use exactly the float32 far boundary accepted by native traversal."""
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+            not math.isfinite(value) or value <= 1):
+        raise ValueError("background_far_distance must be finite and greater than one")
+    with np.errstate(over="ignore"):
+        far = np.float32(value)
+    if not np.isfinite(far):
+        raise ValueError("background_far_distance must be representable as finite float32")
+    return float(max(far, np.nextafter(np.float32(1.), np.float32(np.inf))))
+
+
 def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_points.ply",
                    initialization=None, start_core_resolution=256, target_core_resolution=512,
                    shell_layers=16, load_points=True, *, scene_mode=None,
-                   background_layers=None, background_opacity=None, background_final_layers=None):
+                   background_layers=None, background_opacity=None, background_final_layers=None,
+                   background_far_distance=None, background_far_percentile=99.9,
+                   background_far_margin=1.2):
     """Prepare views and point seeds without writing dataset files.
 
     New explicit ``unbounded`` mode uses ``background_final_layers`` (eight by
     default) at the target resolution, independent of the ray hit capacity.
-    Version-5 metadata keeps the physical shell width constant, so a 256 to
+    Version-6 metadata keeps the physical shell width constant, so a 256 to
     1024 schedule starts with two layers and refines through four to eight.
+    Its finite far distance is a supplied normalized max-abs distance H > 1,
+    or the far-point percentile times its margin (1.2 without far points).
+    Initialization points beyond that distance are excluded with their colors.
     Saved version-2 and version-3 initializations retain their original policies.
     ``bounded`` mode fits cameras
     and points into one cube by a similarity transform, without contraction.
@@ -369,7 +388,7 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
         raise ValueError("COLMAP scene_mode must be bounded, unbounded, or legacy")
     saved = None if initialization is None else dict(initialization)
     version = 1 if saved is None else saved.get("version")
-    if saved is not None and version not in (1, 2, 3, 4, 5):
+    if saved is not None and version not in (1, 2, 3, 4, 5, 6):
         raise ValueError("Unsupported saved COLMAP initialization version")
     if saved is not None:
         mode = "legacy" if version == 1 else saved.get("scene_mode")
@@ -378,7 +397,7 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
         if version == 3 and (mode != "unbounded" or saved.get("background_refinement") != "fixed_layers"):
             raise ValueError("Version-3 initialization requires fixed_layers unbounded refinement")
         if version >= 4 and (mode != "unbounded" or saved.get("background_refinement") != "preserve_physical_width"):
-            raise ValueError("Version-4/5 initialization requires preserve_physical_width unbounded refinement")
+            raise ValueError("Version-4/5/6 initialization requires preserve_physical_width unbounded refinement")
         if version < 4 and any(key in saved for key in ("background_final_layers", "initial_background_layers")):
             raise ValueError("Legacy initialization cannot silently change to final background layers")
         if version < 3 and "background_refinement" in saved:
@@ -387,7 +406,37 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
             raise ValueError("Saved COLMAP initialization scene_mode disagrees with the configuration")
     else:
         mode = scene_mode or "legacy"
-        version = 1 if mode == "legacy" else (5 if mode == "unbounded" else 2)
+        version = 1 if mode == "legacy" else (6 if mode == "unbounded" else 2)
+
+    if version < 6 and background_far_distance is not None:
+        raise ValueError("background_far_distance requires a new unbounded reconstruction or saved version-6 initialization")
+    if version < 6 and saved is not None and any(key.startswith("background_far_") for key in saved):
+        raise ValueError("Legacy COLMAP initialization cannot silently change to a finite background far distance")
+    if version >= 6:
+        for name, value, valid in (
+                ("background_far_percentile", background_far_percentile,
+                 lambda v: 0 < v <= 100),
+                ("background_far_margin", background_far_margin, lambda v: v >= 1)):
+            if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                    not math.isfinite(value) or not valid(value)):
+                raise ValueError(f"{name} must be finite and " + (
+                    "lie in (0, 100]" if name.endswith("percentile") else "be at least one"))
+        if background_far_distance is not None:
+            background_far_distance = _canonical_background_far_distance(background_far_distance)
+        if saved is not None:
+            far = saved.get("background_far_distance")
+            if (isinstance(far, bool) or not isinstance(far, (int, float)) or
+                    not math.isfinite(far) or far <= 1):
+                raise ValueError("Saved COLMAP background_far_distance must be finite and greater than one")
+            if far != _canonical_background_far_distance(far):
+                raise ValueError("Saved COLMAP background_far_distance must be an exact float32 value")
+            if background_far_distance is not None and float(background_far_distance) != float(far):
+                raise ValueError("Saved COLMAP initialization background_far_distance disagrees with the configuration")
+            background_far_distance = float(far)
+            for name, value in (("background_far_percentile", background_far_percentile),
+                                ("background_far_margin", background_far_margin)):
+                if saved.get(name) != value:
+                    raise ValueError(f"Saved COLMAP initialization {name} disagrees with the configuration")
 
     if version < 4 and background_final_layers is not None:
         raise ValueError("background_final_layers requires a new unbounded reconstruction or saved version-4 initialization")
@@ -459,9 +508,9 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
     preferred_point_path = _inside(dataset, point_cloud, "Point cloud filename") if point_cloud else None
     point_path = preferred_point_path if preferred_point_path and preferred_point_path.is_file() else model / "points3D.bin"
     source_positions, source_colors = None, None
-    # A fresh bounded fit needs the same point-inclusive scale even for a
+    # Fresh bounded fits and finite far estimates need points even for a
     # cameras-only caller. Restoring saved cameras needs no point-cloud access.
-    if load_points or (saved is None and mode == "bounded"):
+    if load_points or (saved is None and (mode == "bounded" or version >= 6)):
         if point_path.suffix.lower() == ".ply":
             source_positions, source_colors = read_ply_points(point_path)
         else:
@@ -486,7 +535,7 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
         }
         if version >= 2:
             initialization.update(scene_mode=mode,
-                scene_mapping=("projective_shell" if version == 5 else "radial_seed_shell") if mode == "unbounded" else "bounded",
+                scene_mapping=("projective_shell" if version >= 5 else "radial_seed_shell") if mode == "unbounded" else "bounded",
                 background_opacity=float(background_opacity))
             if version >= 4:
                 initialization.update(background_final_layers=final_layers,
@@ -496,6 +545,31 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
                 initialization["background_layers"] = int(background_layers)
         if version == 3:
             initialization["background_refinement"] = "fixed_layers"
+        if version >= 6:
+            normalized = ((source_positions - center) / radius) @ _AXES.T
+            if not np.isfinite(normalized).all():
+                raise ValueError("Point normalization produced nonfinite coordinates")
+            h = np.max(np.abs(normalized), axis=1)
+            far_h = h[h > 1.]
+            quantile = float(np.percentile(far_h, background_far_percentile)) if len(far_h) else None
+            method = "manual"
+            if background_far_distance is None:
+                method = "point_cloud_percentile" if len(far_h) else "no_far_points"
+                background_far_distance = (max(float(np.nextafter(1., np.inf)),
+                    quantile * background_far_margin) if len(far_h) else 1.2)
+            background_far_distance = _canonical_background_far_distance(background_far_distance)
+            initialization.update(
+                background_far_distance=float(background_far_distance),
+                background_far_percentile=float(background_far_percentile),
+                background_far_margin=float(background_far_margin),
+                background_far_estimation={
+                    "method": method, "metric": "max_abs",
+                    "point_source": point_path.relative_to(dataset).as_posix(),
+                    "point_count": len(h), "far_point_count": len(far_h),
+                    "excluded_point_count": int(np.count_nonzero(h > background_far_distance)),
+                    "quantile_distance": quantile,
+                    "world_distance": float(background_far_distance * radius),
+                })
     else:
         initialization = saved
         expected = {"kind": "colmap", "version": version, "shell_layers": final_layers,
@@ -504,7 +578,7 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
                     "source_model": model.relative_to(dataset).as_posix(), "camera_count": len(images)}
         if version >= 2:
             expected.update(scene_mode=mode,
-                scene_mapping=("projective_shell" if version == 5 else "radial_seed_shell") if mode == "unbounded" else "bounded",
+                scene_mapping=("projective_shell" if version >= 5 else "radial_seed_shell") if mode == "unbounded" else "bounded",
                 background_opacity=float(background_opacity))
             if version >= 4:
                 expected.update(background_final_layers=final_layers,
@@ -574,10 +648,16 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
             positions = np.ascontiguousarray(((source_positions - center) / radius) @ _AXES.T, dtype=np.float32)
             if not np.isfinite(positions).all():
                 raise ValueError("Point normalization produced nonfinite coordinates")
-        elif version == 5:
+        elif version >= 5:
             from reconstruction_projective import projective_points
             normalized = ((source_positions - center) / radius) @ _AXES.T
-            positions = projective_points(normalized, shell_width, np)
+            if version >= 6:
+                if not np.isfinite(normalized).all():
+                    raise ValueError("Point normalization produced nonfinite coordinates")
+                inside = np.max(np.abs(normalized), axis=1) <= background_far_distance
+                normalized, source_colors = normalized[inside], source_colors[inside]
+            positions = projective_points(normalized, shell_width, np,
+                                          background_far_distance if version >= 6 else 0)
         else:
             positions = contract_points(source_positions, center, radius, shell_width)
         colors = np.ascontiguousarray(source_colors, dtype=np.float32)

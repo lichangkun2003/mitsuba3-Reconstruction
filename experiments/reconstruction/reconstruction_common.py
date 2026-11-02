@@ -123,7 +123,7 @@ def prepare_dataset(config, np, *, load_points=True):
     else:
         options.update(scene_mode=mode, background_opacity=config.data.background_opacity)
         saved = config.data.initialization
-        if mode == "unbounded" and (saved is None or saved.get("version") in (4, 5)):
+        if mode == "unbounded" and (saved is None or saved.get("version") in (4, 5, 6)):
             if config.data.background_layers is not None:
                 raise ValueError("New unbounded runs use data.background_final_layers / --background-final-layers; "
                                  "background_layers is only for legacy v2/v3 initializations")
@@ -133,6 +133,11 @@ def prepare_dataset(config, np, *, load_points=True):
                 raise ValueError("Saved v2/v3 initialization must keep its original background_layers; "
                                  "start a new run to use background_final_layers")
             options["background_layers"] = config.data.background_layers
+        if mode == "unbounded":
+            options["background_far_distance"] = config.data.background_far_distance
+            if saved is None or saved.get("version") == 6:
+                options["background_far_percentile"] = config.data.background_far_percentile
+                options["background_far_margin"] = config.data.background_far_margin
     prepared = prepare_colmap(dataset, split=_colmap_split(config.data.cameras), images_dir=config.data.images,
         point_cloud=config.data.point_cloud, initialization=config.data.initialization,
         start_core_resolution=start, target_core_resolution=target,
@@ -159,6 +164,8 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
             import drjit as dr
             from reconstruction_background import initialize_background_model
             options = {"mapping": mapping} if mapping == "projective_shell" else {}
+            if "background_far_distance" in prepared["initialization"]:
+                options["background_far_distance"] = prepared["initialization"]["background_far_distance"]
             return initialize_background_model(model, mi, dr, np,
                 opacity=prepared["initialization"]["background_opacity"],
                 refinement=prepared["initialization"].get("background_refinement"),
@@ -184,11 +191,14 @@ def load_views(dataset: Path, cameras_file: str, render: RenderConfig, np, *,
             raise ValueError("COLMAP views require the model's saved initialization metadata")
         if split is None:
             split = _colmap_split(cameras_file)
+        far_options = ({key: initialization[key] for key in (
+            "background_far_distance", "background_far_percentile", "background_far_margin")}
+            if initialization.get("version") == 6 else {})
         prepared = prepare_colmap(dataset, split=split, images_dir=data.images,
             initialization=initialization,
             start_core_resolution=initialization["start_core_resolution"],
             target_core_resolution=initialization["target_core_resolution"],
-            shell_layers=initialization["shell_layers"], load_points=False)
+            shell_layers=initialization["shell_layers"], load_points=False, **far_options)
         return _colmap_views(prepared, render)
     document = json.loads((dataset / cameras_file).read_text(encoding="utf-8"))
     frames = document.get("frames", [])
@@ -374,6 +384,10 @@ def model_metadata(model) -> dict:
     mapping = getattr(model, "scene_mapping", "bounded")
     if mapping in ("radial_seed_shell", "projective_shell"):
         metadata["scene_mapping"] = mapping
+        if mapping == "projective_shell" and hasattr(model, "native_background_far_distance"):
+            distance = float(model.native_background_far_distance())
+            if distance:
+                metadata["background_far_distance"] = distance
         if hasattr(model, "background_refinement"):
             metadata["background_refinement"] = model.background_refinement
             metadata["background_layers"] = int(model.background_layers)
@@ -395,6 +409,10 @@ def restore_model(checkpoint, mi):
             if not hasattr(model, "set_scene_mapping"):
                 raise RuntimeError("Rebuild this checkout: projective scene traversal is missing")
             model.set_scene_mapping(mapping)
+            if "background_far_distance" in metadata:
+                if not hasattr(model, "set_background_far_distance"):
+                    raise RuntimeError("Rebuild this checkout: finite projective background traversal is missing")
+                model.set_background_far_distance(metadata["background_far_distance"])
         if "background_refinement" in metadata:
             model.background_refinement = metadata["background_refinement"]
             model.background_layers = metadata["background_layers"]

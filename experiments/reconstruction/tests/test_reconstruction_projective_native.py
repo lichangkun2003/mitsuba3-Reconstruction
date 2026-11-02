@@ -52,9 +52,18 @@ def oracle(payload, origin, direction, np, *, maxt=math.inf, max_hits=64, thresh
     pad = (grid-core)//2
     size = 2/core
     width = 2*pad/core
+    far_distance = float(md.get("background_far_distance", 0.))
+    if far_distance:
+        width /= 1-1/far_distance
     o, d = np.asarray(origin,float), np.asarray(direction,float)
     length = np.linalg.norm(d)
     d = d/length
+    # Appearance uses the world viewing direction even while geometry is
+    # intersected in a projective chart with a different local direction.
+    basis=np.array([Y00,-d[1]*Y00*math.sqrt(3),-d[2]*Y00*math.sqrt(3),-d[0]*Y00*math.sqrt(3)])
+    radiance_count=int(md.get('sh_count',1));opacity_count=int(md.get('opacity_sh_count',1))
+    radiance=state['radiance_sh'].reshape(-1,radiance_count,3)
+    opacity=state['opacity_sh'].reshape(-1,opacity_count)
     hits = []
     for row, spatial in enumerate(state["cell_indices"]):
         cell = np.array([spatial%grid,spatial//grid%grid,spatial//grid**2])
@@ -78,11 +87,18 @@ def oracle(payload, origin, direction, np, *, maxt=math.inf, max_hits=64, thresh
                 clip(high[j]-o[j],-d[j],cell[j]!=pad+core-1)
         else:
             h0, hd = sign*o[axis], sign*d[axis]
+            # Own the chart's core boundary explicitly: an inverse cell bound
+            # can round just below one and otherwise admit a parallel h=1 ray.
+            clip(h0-1,hd,True)
             qlow,qhigh = sorted((sign*low[axis],sign*high[axis]))
             min_h = width/(1+width-qlow)
             max_h = math.inf if abs(1+width-qhigh)<1e-12 else width/(1+width-qhigh)
             clip(h0-min_h,hd,abs(min_h-1)<1e-12)
-            if math.isfinite(max_h): clip(max_h-h0,-hd,True)
+            if math.isfinite(max_h):
+                outer_boundary = far_distance and math.isclose(max_h,far_distance,rel_tol=1e-12)
+                clip(max_h-h0,-hd,not outer_boundary)
+            if far_distance:
+                clip(far_distance-h0,-hd)
             for j in range(3):
                 if j==axis: continue
                 clip(o[j]-low[j]*h0,d[j]-low[j]*hd)
@@ -123,8 +139,8 @@ def oracle(payload, origin, direction, np, *, maxt=math.inf, max_hits=64, thresh
             else: p=q
             t=float((p-o)@d)
             depth=t/(t+1)
-        alpha=1/(1+math.exp(-state["opacity_sh"][row]*Y00))
-        color=np.maximum(0,state["radiance_sh"].reshape(-1,3)[row]*Y00)
+        alpha=1/(1+math.exp(-float(opacity[row]@basis[:opacity_count])))
+        color=np.maximum(0,basis[:radiance_count]@radiance[row])
         hits.append((begin,row,alpha,color,depth,star))
     hits.sort(key=lambda x:(x[0],x[1]))
     color=np.zeros(3);transmittance=1.;weights=[];depths=[];used=[]
@@ -231,7 +247,198 @@ def run_checks(mi,dr,np):
     report['changing_camera_frozen_replay']='passed'
     report.update(check_appearance_and_evidence(payload,rays,mi,dr,np))
     report.update(check_background_removal(mi,dr,np))
+    report.update(check_finite_far_boundary(mi,dr,np))
     return report
+
+
+def check_finite_far_boundary(mi,dr,np):
+    """Finite outer cube, independently clipped against each world preimage."""
+    assert int(getattr(mi.VoxelReconstruction,'projective_version',0)) >= 2, \
+        'Rebuild this checkout before testing finite projective boundaries'
+    payload=fixture(np)
+    model=restore_model(payload,mi)
+    assert model.native_background_far_distance()==0.
+    initial_revision=int(model.topology_revision)
+    model.set_background_far_distance(0.)
+    assert int(model.topology_revision)==initial_revision
+    for invalid in (-math.inf,-2.,-.1,.1,1.,math.inf,math.nan):
+        try:
+            model.set_background_far_distance(invalid)
+        except (RuntimeError,ValueError):
+            pass
+        else:
+            raise AssertionError(f'Accepted invalid far distance {invalid}')
+        assert model.native_background_far_distance()==0.
+        assert int(model.topology_revision)==initial_revision
+
+    reports={}
+    rng=np.random.default_rng(281)
+    base_rays=[((.8,0,0),(.6,0,.8)),((1.8,-.7,.2),(-.2,.8,.1)),
+               ((0,0,0),(1,1,0)),((0,0,0),(-1,-1,-1)),
+               ((1,0,0),(0,1,0)),((.13,.22,0),(0,0,1))]
+    for far in (float(np.float32(1.001)),1.125,2.5,16.):
+        payload['model_metadata']['background_far_distance']=far
+        revision=int(model.topology_revision)
+        model.set_background_far_distance(far)
+        assert model.native_background_far_distance()==far
+        assert int(model.topology_revision)==revision+1
+        model.set_background_far_distance(far)
+        assert int(model.topology_revision)==revision+1
+        rays=list(base_rays)
+        outside_indices=[]
+        # Exercise every face in both directions, start exactly on the outer
+        # cube, and travel parallel to it from inside/on/outside its boundary.
+        for axis in range(3):
+            for sign in (-1.,1.):
+                origin=np.array([.13,.22,.17]);origin[axis]=2*sign*far
+                direction=np.zeros(3);direction[axis]=-sign
+                rays.append((tuple(origin),tuple(direction)))
+                outside_indices.append(len(rays))
+                rays.append((tuple(origin),tuple(-direction)))
+                for offset in (-2e-4,0.,2e-4):
+                    boundary=origin.copy();boundary[axis]=sign*(far+offset)
+                    tangent=np.zeros(3);tangent[(axis+1)%3]=1.
+                    rays.append((tuple(boundary),tuple(tangent)))
+                    if offset>0: outside_indices.append(len(rays)-1)
+                boundary=origin.copy();boundary[axis]=sign*far
+                rays.append((tuple(boundary),tuple(direction)))
+                outside_indices.append(len(rays))
+                rays.append((tuple(boundary),tuple(-direction)))
+        rays += [(tuple(rng.uniform(-2*far,2*far,3)),tuple(rng.normal(size=3)))
+                 for _ in range(18)]
+        for maxt in (math.inf,.7,2.3):
+            ray=make_ray(mi,np,[x[0] for x in rays],[x[1] for x in rays],maxt)
+            expected=[oracle(payload,o,d,np,maxt=maxt) for o,d in rays]
+            assert all(not expected[i]['hits'] for i in outside_indices)
+            previous=None
+            for octree in (False,True):
+                result=native(model,mi,dr,ray,use_octree=octree,evidence=True)
+                rgb,alpha,hits=model.trace(ray,mi.Color3f(0),0.,64,0.,octree)
+                dr.eval(rgb,alpha,hits)
+                context=f'H={far}, maxt={maxt}, octree={octree}'
+                np.testing.assert_array_equal(np.asarray(hits),[len(e['hits']) for e in expected],err_msg=context)
+                np.testing.assert_allclose(np.asarray(rgb).T,[e['rgb'] for e in expected],atol=4e-6,rtol=3e-5,err_msg=context)
+                np.testing.assert_allclose(np.asarray(alpha),[e['alpha'] for e in expected],atol=4e-6,rtol=3e-5,err_msg=context)
+                np.testing.assert_allclose(np.asarray(result['raw_rgb']),np.asarray(rgb),atol=3e-6,err_msg=context)
+                np.testing.assert_allclose(np.asarray(result['raw_alpha']),np.asarray(alpha),atol=3e-6,err_msg=context)
+                np.testing.assert_array_equal(np.asarray(result['hit_count']),np.asarray(hits),err_msg=context)
+                np.testing.assert_allclose(np.asarray(result['distortion_loss']),[e['distortion'] for e in expected],atol=3e-6,rtol=4e-5,err_msg=context)
+                if previous is not None:
+                    for key in result['gradients']:
+                        np.testing.assert_allclose(np.asarray(result['gradients'][key]),np.asarray(previous['gradients'][key]),atol=3e-5,rtol=3e-4,err_msg=f'{context}, {key}')
+                previous=result
+        reports[f'finite_H_{far}_preimage_colors_alpha_depth_faces_boundaries']='passed'
+
+    # The nearest representable finite boundary must still fill the physical
+    # shell. This catches cancellation in 1+k-k/h when k is millions.
+    near_far=float(np.nextafter(np.float32(1.),np.float32(math.inf)))
+    payload['model_metadata']['background_far_distance']=near_far
+    model.set_background_far_distance(near_far)
+    narrow_rays=[]
+    for axis in range(3):
+        for sign in (-1.,1.):
+            origin=np.array([.13,.22,.17]);origin[axis]=0.
+            direction=np.zeros(3);direction[axis]=sign
+            narrow_rays.append((tuple(origin),tuple(direction)))
+    ray=make_ray(mi,np,[r[0] for r in narrow_rays],[r[1] for r in narrow_rays])
+    expected=[oracle(payload,o,d,np) for o,d in narrow_rays]
+    result=native(model,mi,dr,ray)
+    rgb,alpha,hits=model.trace(ray,mi.Color3f(0),0.,64)
+    dr.eval(rgb,alpha,hits)
+    np.testing.assert_array_equal(np.asarray(hits),[len(e['hits']) for e in expected])
+    np.testing.assert_allclose(np.asarray(rgb).T,[e['rgb'] for e in expected],atol=4e-6,rtol=3e-5)
+    np.testing.assert_allclose(np.asarray(alpha),[e['alpha'] for e in expected],atol=4e-6,rtol=3e-5)
+    np.testing.assert_allclose(np.asarray(result['raw_rgb']),np.asarray(rgb),atol=3e-6)
+    np.testing.assert_allclose(np.asarray(result['raw_alpha']),np.asarray(alpha),atol=3e-6)
+    np.testing.assert_allclose(np.asarray(result['distortion_loss']),[e['distortion'] for e in expected],atol=3e-6,rtol=4e-5)
+    reports['nearest_float_H_above_one_stable_mapping']='passed'
+
+    directional=copy.deepcopy(payload)
+    directional['model_metadata'].update(background_far_distance=2.5,sh_count=4,opacity_sh_count=4)
+    count=len(directional['model_state']['cell_indices'])
+    coefficients=np.array([[.6/Y00,.5/Y00,.4/Y00],[.3,.2,.1],[-.2,.1,.25],[.1,-.3,.2]])
+    directional['model_state']['radiance_sh']=np.tile(coefficients.ravel(),count)
+    directional['model_state']['opacity_sh']=np.tile([math.log(.12/.88)/Y00,.3,-.2,.1],count)
+    directional_model=restore_model(directional,mi)
+    directional_model.set_background_far_distance(2.5)
+    world_rays=base_rays+narrow_rays
+    ray=make_ray(mi,np,[r[0] for r in world_rays],[r[1] for r in world_rays])
+    expected=[oracle(directional,o,d,np) for o,d in world_rays]
+    result=native(directional_model,mi,dr,ray)
+    rgb,alpha,hits=directional_model.trace(ray,mi.Color3f(0),0.,64)
+    dr.eval(rgb,alpha,hits)
+    np.testing.assert_array_equal(np.asarray(hits),[len(e['hits']) for e in expected])
+    np.testing.assert_allclose(np.asarray(rgb).T,[e['rgb'] for e in expected],atol=4e-6,rtol=3e-5)
+    np.testing.assert_allclose(np.asarray(alpha),[e['alpha'] for e in expected],atol=4e-6,rtol=3e-5)
+    np.testing.assert_allclose(np.asarray(result['raw_rgb']),np.asarray(rgb),atol=3e-6)
+    np.testing.assert_allclose(np.asarray(result['raw_alpha']),np.asarray(alpha),atol=3e-6)
+    reports['finite_H_world_direction_radiance_and_opacity_SH']='passed'
+
+    # A local-distance change must propagate through the finite mapping's
+    # direction and inverse-depth Jacobian. Subtract the identical RGB proxy.
+    far=2.5
+    payload['model_metadata']['background_far_distance']=far
+    model.set_background_far_distance(far)
+    gradient_rays=[base_rays[0],((4.,.15,.23),(-1.,.02,.04)),
+                   ((.1,-.2,.3),(-.4,.7,-.5))]
+    checked=0;checked_background=0
+    grid=payload['model_metadata']['resolution'];core=payload['model_metadata']['core_resolution']
+    pad=(grid-core)//2
+    for origin,direction in gradient_rays:
+        ray=make_ray(mi,np,[origin],[direction])
+        on=native(model,mi,dr,ray,coefficient=.7)
+        off=native(model,mi,dr,ray,coefficient=0.)
+        expected=oracle(payload,origin,direction,np)
+        for _,row,_,_,_,star in expected['hits']:
+            if not .05<star<.95: continue
+            spatial=int(payload['model_state']['cell_indices'][row])
+            xyz=(spatial%grid,spatial//grid%grid,spatial//grid**2)
+            background=any(not pad<=c<pad+core for c in xyz)
+            for key,count in [('opacity_sh',1),('centers',3),('log_scales',3),('rotation_tangent',3)]:
+                for component in range(count):
+                    index=row*count+component;epsilon=2e-5
+                    plus=perturb(payload,key,index,epsilon,np)
+                    minus=perturb(payload,key,index,-epsilon,np)
+                    numerical=.7*(oracle(plus,origin,direction,np)['distortion']-
+                                   oracle(minus,origin,direction,np)['distortion'])/(2*epsilon)
+                    analytic=float(np.asarray(on['gradients'][key])[index]-np.asarray(off['gradients'][key])[index])
+                    np.testing.assert_allclose(analytic,numerical,atol=1.3e-5,rtol=4e-3,err_msg=f'H={far}, {key}[{index}], ray={origin,direction}')
+                    checked+=1;checked_background+=int(background)
+    assert checked>=40 and checked_background>=20,(checked,checked_background)
+    reports['finite_H_distortion_finite_differences']=checked
+    reports['finite_H_background_distortion_finite_differences']=checked_background
+
+    # The same object and buffer sizes must invalidate a frozen path when H
+    # changes. Also cover live parameter replacements inside an unchanged H.
+    replay=NativeLossReplay(dr)
+    ray=make_ray(mi,np,[base_rays[0][0],(3.,.15,.23)],[base_rays[0][1],(-1.,.02,.04)])
+    original_state=payload['model_state']
+    for far,shift in ((2.5,0.),(2.5,.07),(1.5,.07),(16.,-.03),(0.,0.),(2.5,0.)):
+        model.set_background_far_distance(far)
+        parameters={key:mi.Float(np.asarray(value,dtype=np.float32).copy())
+                    for key,value in original_state.items() if key!='cell_indices'}
+        parameters['opacity_sh']=mi.Float(np.asarray(original_state['opacity_sh']+shift,dtype=np.float32))
+        model.set_parameters(parameters)
+        reference=native(model,mi,dr,ray,evidence=True)
+        actual=native(model,mi,dr,ray,replay=replay,evidence=True)
+        for key in ('raw_rgb','raw_alpha','hit_count','distortion_loss','deletion_gain',
+                    'deletion_observed','deletion_unknown'):
+            np.testing.assert_allclose(np.asarray(actual[key]),np.asarray(reference[key]),atol=3e-6,err_msg=f'replay H={far}, {key}')
+        for key in actual['gradients']:
+            np.testing.assert_allclose(np.asarray(actual['gradients'][key]),np.asarray(reference['gradients'][key]),atol=3e-5,rtol=3e-4,err_msg=f'replay H={far}, gradient {key}')
+    assert replay.statistics()['topology_changes']==4,replay.statistics()
+    reports['finite_H_and_parameter_changes_invalidate_frozen_replay']='passed'
+
+    # Explicit H=0 reproduces an untouched legacy model bit for bit.
+    payload['model_metadata'].pop('background_far_distance')
+    legacy=restore_model(payload,mi)
+    model.set_background_far_distance(0.)
+    reference=native(legacy,mi,dr,ray,evidence=True)
+    actual=native(model,mi,dr,ray,evidence=True)
+    for key in ('raw_rgb','raw_alpha','hit_count','distortion_loss'):
+        np.testing.assert_array_equal(np.asarray(actual[key]),np.asarray(reference[key]))
+    reports['zero_H_legacy_infinite_shell_unchanged']='passed'
+    return reports
 
 
 def check_appearance_and_evidence(payload,rays,mi,dr,np):

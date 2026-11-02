@@ -45,6 +45,9 @@ class DataConfig:
     background_final_layers: int | None = 8  # Radial layers at the target core resolution; physical shell width stays fixed.
     background_layers: int | None = None  # Legacy v2/v3 checkpoint setting; new runs use background_final_layers.
     background_opacity: float = 0.5  # Initial per-voxel opacity in the complete far-field shell.
+    background_far_distance: float | None = None  # Scene-centered L-infinity radius in normalized core half extents; None estimates it.
+    background_far_percentile: float = 99.9  # Percentile of normalized far-point distances (h > 1) for the automatic estimate.
+    background_far_margin: float = 1.2  # Multiplicative margin applied to the automatic estimate.
 
 
 @dataclass
@@ -160,7 +163,7 @@ def apply_saved_background_defaults(data, entries: dict) -> None:
             data.background_final_layers = None
         if "background_layers" not in entries:
             data.background_layers = saved.get("background_layers", 8)
-    elif version in (4, 5):
+    elif version in (4, 5, 6):
         if "background_layers" not in entries:
             data.background_layers = None
         if "background_final_layers" not in entries:
@@ -217,12 +220,16 @@ def scene_background_protocol(data, render) -> dict:
     mode = saved.get("scene_mode", "bounded" if data.scene_mode == "auto" else data.scene_mode)
     if saved.get("version") == 1:
         mode = "legacy"
+    far_distance = saved.get("background_far_distance") if saved.get("version") == 6 else None
+    ray_extent = "configured far_clip"
+    if saved.get("scene_mapping") == "projective_shell":
+        ray_extent = "finite_scene_boundary" if far_distance is not None else "infinity"
     return {"requested_scene_mode": data.scene_mode, "scene_mode": mode,
             "background_linear_rgb": list(render.background),
             "background_role": "residual ray transmittance color; no environment illumination",
             "scene_mapping": saved.get("scene_mapping", "bounded"),
-            "ray_extent": ("infinity" if saved.get("scene_mapping") == "projective_shell"
-                           else "configured far_clip"),
+            "ray_extent": ray_extent,
+            "background_far_distance": far_distance,
             "initial_background_layers": (saved.get("initial_background_layers", saved.get("background_layers",
                                                 data.background_layers)) if mode == "unbounded" else None),
             "final_background_layers": (saved.get("shell_layers", data.background_final_layers)
@@ -241,6 +248,12 @@ def parse_config(workspace: Path) -> PreviewConfig:
                         help="Background layers at the target resolution (default: 8); independent of max_hits")
     parser.add_argument("--background-layers", type=int, help="Legacy v2/v3 setting; use --background-final-layers for new runs")
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
+    parser.add_argument("--background-far-distance", type=float,
+                        help="Finite scene-centered L-infinity radius H > 1, in core half extents (default: automatic)")
+    parser.add_argument("--background-far-percentile", type=float,
+                        help="Automatic far-distance point percentile in (0, 100] (default: 99.9)")
+    parser.add_argument("--background-far-margin", type=float,
+                        help="Automatic far-distance multiplier >= 1 (default: 1.2)")
     parser.add_argument("--point-cloud")
     parser.add_argument("--cameras")
     parser.add_argument("--camera-index", type=int)
@@ -267,6 +280,9 @@ def parse_config(workspace: Path) -> PreviewConfig:
         "scene_mode": ("data", "scene_mode"), "background_layers": ("data", "background_layers"),
         "background_final_layers": ("data", "background_final_layers"),
         "background_opacity": ("data", "background_opacity"),
+        "background_far_distance": ("data", "background_far_distance"),
+        "background_far_percentile": ("data", "background_far_percentile"),
+        "background_far_margin": ("data", "background_far_margin"),
         "cameras": ("data", "cameras"), "camera_index": ("data", "camera_index"),
         "reference_compositing": ("data", "reference_compositing"),
         "grid_resolution": ("model", "grid_resolution"),
@@ -299,6 +315,18 @@ def validate_config(config: PreviewConfig) -> None:
             or not math.isfinite(config.data.background_opacity)
             or not 0 < config.data.background_opacity < 1):
         raise ValueError("data.background_opacity must be finite and in (0, 1)")
+    far_distance = config.data.background_far_distance
+    if far_distance is not None and (isinstance(far_distance, bool)
+            or not isinstance(far_distance, (int, float)) or not math.isfinite(far_distance)
+            or far_distance <= 1):
+        raise ValueError("data.background_far_distance must be null or finite and greater than 1")
+    for name, valid, bounds in (
+            ("background_far_percentile", lambda value: 0 < value <= 100, "in (0, 100]"),
+            ("background_far_margin", lambda value: value >= 1, "at least 1")):
+        value = getattr(config.data, name)
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not valid(value)):
+            raise ValueError(f"data.{name} must be finite and {bounds}")
     if config.render.traversal not in ("octree", "dda"):
         raise ValueError("render.traversal must be octree or dda")
     for name in ("width", "height", "spp", "max_hits"):

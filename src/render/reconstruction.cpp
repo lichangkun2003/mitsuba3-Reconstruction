@@ -1108,11 +1108,22 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_scene_mapping(const st
     }
 }
 
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_background_far_distance(float distance) {
+    if (!std::isfinite(distance) || (distance != 0.f && distance <= 1.f))
+        Throw("VoxelReconstruction: background far distance must be zero (legacy infinity) or finite and greater than one.");
+    if (m_background_far_distance != distance) {
+        m_background_far_distance = distance;
+        ++m_topology_revision;
+    }
+}
+
 MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::ProjectiveSegment
 VoxelReconstruction<Float, Spectrum>::next_projective_segment(const Point3f &origin,
     const Vector3f &direction, const Float &maxt, const UInt32 &visited) const {
     const float half = .5f*m_size[0]*m_core_resolution;
-    const float width = float(m_resolution-m_core_resolution)/m_core_resolution;
+    const float physical_width = float(m_resolution-m_core_resolution)/m_core_resolution;
+    const float width = m_background_far_distance == 0.f ? physical_width :
+        physical_width*(m_background_far_distance/(m_background_far_distance-1.f));
     Point3f center(.5f*(m_min[0]+m_max[0]),.5f*(m_min[1]+m_max[1]),.5f*(m_min[2]+m_max[2]));
     Vector3f o=(origin-center)/half, d=direction/half;
     ProjectiveSegment best{Mask(false),origin,direction,Float(0.f),Float(0.f),
@@ -1136,6 +1147,8 @@ VoxelReconstruction<Float, Spectrum>::next_projective_segment(const Point3f &ori
             for (uint32_t j=0;j<3;++j) { clip(1.f-o[j],-d[j]);clip(1.f+o[j],d[j]); }
         } else {
             clip(sign*o[axis]-1.f,sign*d[axis],true);
+            if (m_background_far_distance != 0.f)
+                clip(m_background_far_distance-sign*o[axis],-sign*d[axis]);
             for (uint32_t j=0;j<3;++j) if (j!=axis) {
                 // Coplanar ties belong to the lower-numbered dominant axis.
                 clip(sign*o[axis]-o[j],sign*d[axis]-d[j],j<axis);
@@ -1153,7 +1166,8 @@ VoxelReconstruction<Float, Spectrum>::next_projective_segment(const Point3f &ori
             h_start=sign*p[axis];h_rate=sign*d[axis];
             Float safe_h=dr::select(valid,h_start,1.f);
             Vector3f q=p/safe_h;
-            q[axis]=sign*(1.f+width-width/safe_h);
+            q[axis]=m_background_far_distance == 0.f ? sign*(1.f+width-width/safe_h) :
+                sign*(1.f+width*((safe_h-1.f)/safe_h));
             mapped_origin=center+half*q;
             Vector3f v=(sign*o[axis])*d-o*h_rate;
             v[axis]=width*d[axis];
@@ -1257,7 +1271,9 @@ VoxelReconstruction<Float, Spectrum>::projective_hit_direction(const Point3f &or
     const Vector3f &direction,const UInt32 &id,const Mask &active) const {
     if (m_scene_mapping!="projective_shell") return direction;
     const float half=.5f*m_size[0]*m_core_resolution;
-    const float width=float(m_resolution-m_core_resolution)/m_core_resolution;
+    const float physical_width=float(m_resolution-m_core_resolution)/m_core_resolution;
+    const float width=m_background_far_distance==0.f ? physical_width :
+        physical_width*(m_background_far_distance/(m_background_far_distance-1.f));
     const uint32_t layer=(m_resolution-m_core_resolution)/2;
     Point3f center(.5f*(m_min[0]+m_max[0]),.5f*(m_min[1]+m_max[1]),.5f*(m_min[2]+m_max[2]));
     Vector3f o=(origin-center)/half,d=direction/half,result=direction;

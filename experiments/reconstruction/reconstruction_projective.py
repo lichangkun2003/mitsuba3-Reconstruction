@@ -7,10 +7,20 @@ the first dominant axis (X, then Y, then Z), exactly as native traversal does.
 from __future__ import annotations
 
 
-def projective_points(points, shell_width, np):
-    """Map normalized world points into the core and six face slabs."""
+def projective_points(points, shell_width, np, background_far_distance=0):
+    """Map world points into six slabs, optionally ending at finite max-abs H.
+
+    A zero far distance preserves the original infinite projective map. Finite
+    domains reject outside points; callers must filter them and their colors
+    together before mapping. The final rounding guard only assigns boundary
+    points to the last cell of the half-open atlas.
+    """
     if not 0 < shell_width < float("inf"):
         raise ValueError("Projective shell width must be positive and finite")
+    if (isinstance(background_far_distance, bool) or
+            not np.isfinite(background_far_distance) or
+            (background_far_distance != 0 and background_far_distance <= 1)):
+        raise ValueError("background_far_distance must be zero or finite and greater than one")
     p = np.asarray(points, dtype=np.float64)
     if p.ndim != 2 or p.shape[1] != 3 or not np.isfinite(p).all():
         raise ValueError("Projective points must be a finite Nx3 array")
@@ -18,9 +28,18 @@ def projective_points(points, shell_width, np):
     axis = np.argmax(np.abs(p), axis=1)
     dominant = np.take_along_axis(p, axis[:, None], axis=1)[:, 0]
     h = np.abs(dominant)
+    if background_far_distance and np.any(h > background_far_distance):
+        raise ValueError("Projective points exceed background_far_distance")
     ids = np.flatnonzero(h > 1.)
     q[ids] /= h[ids, None]
-    q[ids, axis[ids]] = np.sign(dominant[ids]) * (1. + shell_width - shell_width / h[ids])
+    if background_far_distance:
+        # Equivalent to 1 + k - k/h with k = width/(1 - 1/H), avoiding
+        # cancellation when H is just above the core boundary.
+        radial = 1. + shell_width * ((h[ids] - 1.) / h[ids]) / (
+            (background_far_distance - 1.) / background_far_distance)
+    else:
+        radial = 1. + shell_width - shell_width / h[ids]
+    q[ids, axis[ids]] = np.sign(dominant[ids]) * radial
     # Face and core boundary ownership is half-open in the cell grid. Keep
     # tangent coordinates on their own chart when a world point lies on a tie.
     q = q.astype(np.float32)
@@ -94,6 +113,7 @@ def refine_projective_numpy(checkpoint, config, max_active_voxels, fit_core, np)
                   for name, value in state.items()} if count else {
                       name: np.array(value, copy=True) for name, value in state.items()}
     core_metadata = dict(metadata, scene_mapping="bounded")
+    core_metadata.pop("background_far_distance", None)
     core_result = fit_core({"model_metadata": core_metadata, "model_state": core_state},
                           config, max_active_voxels - 8 * len(background))
     metadata["resolution"] *= 2
@@ -165,7 +185,9 @@ def refine_projective_device(checkpoint, config, max_active_voxels, fit_core, dr
 
     core_state = {name: take_rows(value, core_ids, len(value)//count) for name, value in state.items()} if count else state
     options = {} if before_allocate is None else {"before_allocate": core_allocation_guard}
-    core_result = fit_core({"model_metadata": dict(metadata, scene_mapping="bounded"), "model_state": core_state},
+    core_metadata = dict(metadata, scene_mapping="bounded")
+    core_metadata.pop("background_far_distance", None)
+    core_result = fit_core({"model_metadata": core_metadata, "model_state": core_state},
                           config, max_active_voxels - 8 * bg_count, dr, **options)["model_state"]
     del core_state, core_ids, inside
     metadata = next_metadata

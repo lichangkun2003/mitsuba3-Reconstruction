@@ -63,6 +63,10 @@ def device_checkpoint(model):
     if getattr(model, "scene_mapping", "") == "projective_shell":
         metadata["background_refinement"] = "preserve_physical_width"
         metadata["background_layers"] = (metadata["resolution"] - core)//2
+        if hasattr(model, "native_background_far_distance"):
+            distance = float(model.native_background_far_distance())
+            if distance:
+                metadata["background_far_distance"] = distance
     if getattr(model, "background_refinement", "") == "fixed_layers":
         metadata.update(background_refinement="fixed_layers",
                         background_layers=int(model.background_layers))

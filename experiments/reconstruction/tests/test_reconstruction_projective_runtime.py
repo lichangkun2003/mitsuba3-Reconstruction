@@ -30,6 +30,42 @@ def payload():
 
 
 class ProjectiveRuntimeTests(unittest.TestCase):
+    def test_finite_checkpoint_preserves_boundary_and_rejects_config_mismatch(self):
+        state, metadata = payload()
+        metadata["background_far_distance"] = 3.5
+        config = {"data": {"initialization": {"version": 6, "scene_mapping": "projective_shell",
+                                             "background_far_distance": 3.5}}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "finite.npz"
+            save_checkpoint(path, state, metadata, config=config)
+            saved = load_checkpoint(path)
+            with self.assertRaisesRegex(ValueError, "background_far_distance"):
+                save_checkpoint(path, state, {**metadata, "background_far_distance": 4.}, config=config)
+            # A rejected overwrite must not damage the completed checkpoint.
+            self.assertEqual(load_checkpoint(path)["model_metadata"], metadata)
+
+        def factory(resolution, lo, hi, values, sh, opacity_sh, **kwargs):
+            model = SimpleNamespace(resolution=resolution, grid_min=lo, grid_max=hi,
+                sh_count=sh, opacity_sh_count=opacity_sh, core_resolution=kwargs["core_resolution"],
+                set_scene_mapping=lambda value: None, far=0.)
+            model.set_background_far_distance = lambda value: setattr(model, "far", value)
+            model.native_background_far_distance = lambda: model.far
+            return model
+
+        runtime = SimpleNamespace(UInt32=np.asarray, Float=np.asarray,
+                                  VoxelReconstruction=SimpleNamespace(from_state=factory))
+        restored = restore_model(saved, runtime)
+        self.assertEqual(restored.far, 3.5)
+        self.assertEqual(model_metadata(restored), metadata)
+
+    def test_invalid_finite_boundary_cannot_be_saved(self):
+        state, metadata = payload()
+        for value in (None, True, 0., 1., -1., float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "background_far_distance"):
+                validate_model_state(state, {**metadata, "background_far_distance": value})
+        with self.assertRaisesRegex(ValueError, "background_far_distance"):
+            validate_model_state(state, {**metadata, "scene_mapping": "bounded", "background_far_distance": 3.})
+
     def test_checkpoint_roundtrip_activates_native_mapping(self):
         state, metadata = payload()
         with tempfile.TemporaryDirectory() as directory:

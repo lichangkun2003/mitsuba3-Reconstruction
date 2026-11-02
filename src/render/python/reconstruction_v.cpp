@@ -212,6 +212,9 @@ MI_PY_EXPORT(VoxelReconstruction) {
            "Install frozen empty-cell candidates for online RGB evidence; does not grow the model.")
         .def("clear_growth_candidates", &Model::clear_growth_candidates)
         .def("set_scene_mapping", &Model::set_scene_mapping, "mapping"_a)
+        .def("set_background_far_distance", &Model::set_background_far_distance, "distance"_a,
+             "Set the finite projective outer boundary (>1), or zero for legacy infinity.")
+        .def("native_background_far_distance", &Model::native_background_far_distance)
         .def("set_active_sh_count", &Model::set_active_sh_count, "count"_a,
              "Activate the first count radiance SH coefficients; preserve stored parameters.")
         .def("native_scene_mapping", &Model::native_scene_mapping)

@@ -90,7 +90,8 @@ class InitializationIntegrationTests(unittest.TestCase):
             result = common.initialize_model(self.config, self.scene, mi, np, prepared=prepared)
         self.assertEqual(shell.call_args.kwargs,
                          {"opacity": .5, "refinement": "preserve_physical_width", "layers": 4,
-                          "mapping": "projective_shell"})
+                          "mapping": "projective_shell",
+                          "background_far_distance": prepared["initialization"]["background_far_distance"]})
         self.assertIs(result, sentinel.colmap_model)
         mi.VoxelReconstruction.assert_not_called()
         args = mi.VoxelReconstruction.from_points.call_args.args
@@ -101,7 +102,9 @@ class InitializationIntegrationTests(unittest.TestCase):
             self.assertEqual(actual.ndim, 1)
             self.assertTrue(actual.flags.c_contiguous)
             np.testing.assert_array_equal(actual, expected.reshape(-1))
-        np.testing.assert_allclose(args[0].reshape(-1, 3)[-1], [1.028125, 0., 0.])
+        far = prepared["initialization"]["background_far_distance"]
+        np.testing.assert_allclose(args[0].reshape(-1, 3)[-1],
+                                   [1. + .03125 * .9 / (1. - 1. / far), 0., 0.])
 
     def test_final_layer_initialization_is_independent_of_ray_hit_capacity(self):
         self.config.schedule.target_resolution = 1024

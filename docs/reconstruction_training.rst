@@ -794,6 +794,9 @@ COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理�
    CONFIG.data.scene_mode = "auto"
    CONFIG.data.background_final_layers = 8
    CONFIG.data.background_opacity = 0.5
+   CONFIG.data.background_far_distance = None  # 自动估计；手动 H 必须有限且大于 1
+   CONFIG.data.background_far_percentile = 99.9
+   CONFIG.data.background_far_margin = 1.2
 
 ``background_final_layers`` 表示最终分辨率下的远景径向层数，默认 8；当前层数按
 ``background_final_layers * core_resolution / target_resolution`` 计算，必须为整数。
@@ -801,15 +804,37 @@ COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理�
 新无界初始化使用 ``scene_mapping="projective_shell"``，点云与查询射线使用同一分区投影。
 归一化核心为立方体 ``[-1,1]^3``，核心内坐标不变。外部按绝对值最大的坐标轴 ``a``
 及符号 ``sigma`` 划为六个凸区域，边界采用固定优先级唯一归属。令
-``h = sigma * p[a] >= 1``，且 ``h >= abs(p[j])`` 对另外两轴均成立，则：
+``h = max(abs(p)) = sigma * p[a] >= 1``，且 ``h >= abs(p[j])`` 对另外两轴均成立。
+新实验在有限的场景边界 ``h=H`` 结束，``H>1``；在 ``1 <= h <= H`` 内：
 
 .. math::
 
-   q_a = \sigma\left(1+W-\frac{W}{h}\right),\qquad
+   q_a = \sigma\left(1+k-\frac{k}{h}\right),\qquad
    q_j = \frac{p_j}{h}\quad(j\ne a),\qquad
+   k=\frac{W}{1-1/H},\qquad
    W=\frac{2L_{\mathrm{final}}}{R_{\mathrm{final}}}.
 
-六个无限外景区域分别映入核心六个面外侧厚度为 ``W`` 的薄板。
+六个有限外景区域分别映入核心六个面外侧厚度为 ``W`` 的薄板；主轴的正向坐标为
+``q_dom=1+k-k/h``。因此 ``h=1`` 对应内边界 ``q_dom=1``，``h=H`` 对应外边界
+``q_dom=1+W``，八层全部用于这个有限范围。最终八层在世界空间中的径向边界为：
+
+.. math::
+
+   h_i=\frac{1}{1-\frac{i}{8}(1-1/H)},\qquad i=0,1,\ldots,8.
+
+这里 ``h_0=1``、``h_8=H``。中间层继续在存储空间等宽，在世界空间中的宽度随距离增大。
+``background_far_distance=None``（JSON 为 ``null``）表示自动选择 ``H``：默认取归一化
+点云中外景点（``h>1``）的 ``h`` 的 ``99.9%`` 分位数，再乘 ``1.2`` 留出 20% 余量；
+没有外景点时使用 ``H=1.2``，点云整体仍需非空。
+这是用于分配有限背景分辨率的覆盖范围选择，不是统计离群点检测，也不保证所有场景都适合同一分位数。
+超出 ``h>H`` 的初始化点会被过滤，不会夹到最外层堆积；渲染使用相同的有限边界。
+
+手动值可写为 ``CONFIG.data.background_far_distance = 20.0``，或使用
+``--background-far-distance 20``。单位是归一化核心半宽：以场景中心为原点，沿任一坐标轴的
+最远支持距离为核心半宽的 20 倍；不是米、欧氏半径，也不是从每台相机起点计算的 ``ray.maxt``。
+自动选距可用 ``--background-far-percentile 99.9 --background-far-margin 1.2`` 调整；
+分位数必须在 ``(0,100]``，余量必须至少为 1，通常建议大于 1。手动 ``H`` 必须有限且大于 1。
+
 仅六块面薄板有效，两个或三个坐标同时处于核心范围外的边角格不初始化、不追踪。
 直接枚举 ``6 * core_resolution**2 * background_layers`` 个背景格，不枚举全 ``R³`` 网格。
 有点云种子的格保留种子颜色，其余为黑色；opacity 均设为 ``0.5``。
@@ -822,7 +847,9 @@ COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理�
 同一段内存储方向固定，但存储距离与世界深度并非线性关系。
 可视为同一世界点的两侧在不同外景薄板中采用不同坐标；跨区域时直接切换到下一段起点，
 不追踪两个存储端点间的连接线，不在无效边角空隙累积颜色。
-有限远裁剪面按世界深度裁剪；无穷远末段使用解析的有限存储终点，避免无穷坐标运算。
+新实验将世界区间限制在场景中心立方体 ``max(abs(p))<=H`` 内，末段在有限场景边界结束。
+这个场景边界不能替换成相机射线的固定距离裁剪，因为相机起点与场景中心不同。
+旧无限映射的末段仍使用解析的有限存储终点，避免无穷坐标运算。
 
 所有段共享累计颜色、透射率、命中计数和反向记录。离开一个区域不等于路径完成，
 到达所有有效区间的末尾才是正常完成；透射率或命中容量提前终止保持原有语义。
@@ -853,13 +880,18 @@ COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理�
 这会减少早期背景层数，但最终 1024／8 层的显存规模与旧固定 8 层方案相近；
 模型参数、Adam 状态及升层临时数组仍需计入，不能据此认定 40 GB 足够或消除了升层峰值。
 初始每层 opacity 为 0.5 不等于强制不透明边界：删除、连续优化、有限 ``max_hits``、
-有限远裁剪面及后续几何变化都可能留下透射率，剩余部分以黑色尾项结束。
+有限场景边界及后续几何变化都可能留下透射率，剩余部分以黑色尾项结束。
 
-新无界 COLMAP 初始化保存 ``data.initialization.version=5``、``scene_mapping="projective_shell"``、
+新无界 COLMAP 初始化保存 ``data.initialization.version=6``、``scene_mapping="projective_shell"``、
 ``background_refinement="preserve_physical_width"``、``background_final_layers`` 和
 ``initial_background_layers``。``shell_layers`` 记录最终层数，``shell_width`` 记录固定物理壳宽，
 用于恢复相同的点云压缩和相机归一化。模型 metadata 中的网格及核心分辨率随正常细分翻倍，边界不变。
-checkpoint 恢复及评价复用保存的策略；显式不一致的初始化设置会报错。
+已解析的有限边界保存在 ``data.initialization.background_far_distance``，模型 metadata 同时保存
+该边界。训练报告的 ``scene_mapping.ray_extent`` 为 ``finite_scene_boundary``，并报告解析后的 ``H``。
+checkpoint 恢复及评价复用已保存的归一化、有限边界和估计策略，不重新读取点云估计距离；
+显式不一致的初始化设置会报错。需要比较不同 ``H`` 或自动选距策略时应新开实验。
+旧 version 1–5 存档继续复用各自原来的映射，不会自动估计或加入有限边界。
+其中 version 5 保持无限分区投影 ``k=W``，报告的 ``ray_extent`` 仍为 ``infinity``。
 有界 COLMAP 保持 version 2。旧无界 version 4 保持只映射初始化点的径向语义、
 固定物理壳宽及原直线查询，不在恢复时切换成分区投影。
 旧无界 version 3 checkpoint 继续使用 ``fixed_layers``：
@@ -904,6 +936,9 @@ Adam 回归覆盖密集、设备稀疏、紧凑与参考实现。旧 Distortion�
    CONFIG.data.scene_mode = "auto"  # 合成场景有界白底；COLMAP 无界黑底
    CONFIG.data.background_final_layers = 8  # 最终层数；1024终点为2→4→8，512终点为4→8
    CONFIG.data.background_opacity = 0.5
+   CONFIG.data.background_far_distance = None  # 自动有限远边界；手动值以核心半宽为单位
+   CONFIG.data.background_far_percentile = 99.9
+   CONFIG.data.background_far_margin = 1.2
    CONFIG.data.cameras = "transforms_train.json"
    CONFIG.render.width = 800
    CONFIG.render.height = 800

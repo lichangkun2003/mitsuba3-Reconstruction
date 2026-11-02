@@ -132,7 +132,11 @@ def run_check(args, output):
     np.testing.assert_allclose(initialization["radius"], .66, atol=1e-15)
     assert initialization["shell_width"] == .5
     assert initialization["shell_layers"] == 4
-    assert initialization["version"] == 5
+    assert initialization["version"] == 6
+    assert initialization["background_far_distance"] > 1
+    for saved in (first, second, final):
+        assert saved["model_metadata"]["background_far_distance"] == initialization["background_far_distance"]
+    assert report["training_protocol"]["scene_mapping"]["ray_extent"] == "finite_scene_boundary"
     assert initialization["background_refinement"] == "preserve_physical_width"
     assert initialization["background_final_layers"] == 4
     assert initialization["initial_background_layers"] == 1
@@ -242,6 +246,7 @@ def run_check(args, output):
     return {"status": "passed", "output": str(output), "checks": [
         "COLMAP binary initialization without PLY", "fixed camera normalization and thin shell",
         "fixed physical shell: layers 1 -> 2 -> 4 and grid 6 -> 12 -> 24",
+        "finite far distance preserved through both refinements, saved rendering and resume",
         "sorted filename split: 7 train / 2 test",
         "full scaled fx/fy/cx/cy and 16x12 reference alignment", "all-view train/test evaluation",
         "global 4:3:3 SH schedule activates 1 -> 4 -> 9 coefficients across grid changes",

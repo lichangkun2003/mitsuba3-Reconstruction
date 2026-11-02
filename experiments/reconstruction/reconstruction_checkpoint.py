@@ -47,6 +47,12 @@ def _validate_model_metadata(metadata):
     mapping = metadata.get("scene_mapping", "bounded")
     if mapping not in ("bounded", "radial_seed_shell", "projective_shell"):
         raise ValueError("Unknown initialization scene_mapping")
+    if "background_far_distance" in metadata:
+        distance = metadata["background_far_distance"]
+        if (mapping != "projective_shell" or isinstance(distance, bool)
+                or not isinstance(distance, (int, float))
+                or not math.isfinite(distance) or distance <= 1):
+            raise ValueError("background_far_distance requires projective mapping and a finite value > 1")
     if mapping in ("radial_seed_shell", "projective_shell"):
         if core >= resolution or (resolution-core) % 2:
             raise ValueError("Shell metadata requires positive symmetric padding")
@@ -75,6 +81,19 @@ def _validate_model_metadata(metadata):
                 or not np.allclose(hi, [extent]*3, rtol=0, atol=1e-7)):
             raise ValueError("Shell grid bounds must preserve the normalized core")
     return resolution, core, mapping, sh, opacity_sh
+
+
+def _validate_mapping_config(metadata, config):
+    """A finite model cannot silently resume with an infinite/different atlas."""
+    initialization = (config.get("data", {}).get("initialization") or {}) if isinstance(config, dict) else {}
+    if initialization.get("scene_mapping") != "projective_shell":
+        return
+    expected = initialization.get("background_far_distance")
+    actual = metadata.get("background_far_distance")
+    if initialization.get("version") == 6 and expected is None:
+        raise ValueError("Finite projective initialization is missing background_far_distance")
+    if expected != actual:
+        raise ValueError("Checkpoint background_far_distance differs between model and initialization")
 
 
 def validate_model_state(state: dict, metadata: dict) -> None:
@@ -296,6 +315,7 @@ def save_checkpoint(path, model_state, model_metadata, *, training_state=None,
     if path.suffix.lower() != ".npz":
         raise ValueError("Checkpoint filename must end with .npz")
     state, layout = _validate_save_layout(model_state, model_metadata)
+    _validate_mapping_config(model_metadata, config)
     payload = {"model_state": state, "model_metadata": model_metadata,
                "training_state": training_state or {}, "optimizer_state": optimizer_state or {},
                "config": config or {}, "provenance": provenance or {}}
@@ -401,6 +421,7 @@ def load_checkpoint(path, expected_metadata=None) -> dict:
             "model_state", "model_metadata", "training_state", "optimizer_state", "config", "provenance"}:
         raise ValueError("Checkpoint payload is incomplete")
     validate_model_state(payload["model_state"], payload["model_metadata"])
+    _validate_mapping_config(payload["model_metadata"], payload["config"])
     if expected_metadata is not None:
         for key, expected in expected_metadata.items():
             actual = payload["model_metadata"].get(key)

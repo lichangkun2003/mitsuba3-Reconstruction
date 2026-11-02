@@ -8,7 +8,10 @@
     "images": null,
     "scene_mode": "unbounded",
     "background_final_layers": 8,
-    "background_opacity": 0.5
+    "background_opacity": 0.5,
+    "background_far_distance": null,
+    "background_far_percentile": 99.9,
+    "background_far_margin": 1.2
   },
   "model": {
     "grid_resolution": 256,

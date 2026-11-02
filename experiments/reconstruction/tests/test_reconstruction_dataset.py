@@ -8,6 +8,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -160,7 +161,7 @@ class ColmapDatasetTests(unittest.TestCase):
         prepared = self.prepare(scene_mode="unbounded", start_core_resolution=64,
                                 target_core_resolution=512, shell_layers=2)
         metadata = prepared["initialization"]
-        self.assertEqual(metadata["version"], 5)
+        self.assertEqual(metadata["version"], 6)
         self.assertEqual(metadata["scene_mode"], "unbounded")
         self.assertEqual(metadata["scene_mapping"], "projective_shell")
         self.assertEqual(metadata["background_final_layers"], 8)
@@ -176,7 +177,7 @@ class ColmapDatasetTests(unittest.TestCase):
         points, _ = dataset.read_colmap_points(self.model / "points3D.bin")
         from reconstruction_projective import projective_points
         normalized = ((points - metadata["center"]) / metadata["radius"]) @ dataset._AXES.T
-        expected = projective_points(normalized, 1/32, np)
+        expected = projective_points(normalized, 1/32, np, metadata["background_far_distance"])
         np.testing.assert_array_equal(prepared["positions"], expected)
         # Ray capacity is not involved in either the explicit shell or point map.
         other = self.prepare(scene_mode="unbounded", start_core_resolution=64,
@@ -251,7 +252,7 @@ class ColmapDatasetTests(unittest.TestCase):
         self.assertEqual(two_levels["resolution"], 264)
         self.assertEqual(two_levels["initialization"]["initial_background_layers"], 4)
 
-    def test_v5_saved_initialization_restores_and_rejects_policy_changes(self):
+    def test_v6_saved_initialization_restores_and_rejects_policy_changes(self):
         prepared = self.prepare(scene_mode="unbounded", target_core_resolution=1024,
                                 background_final_layers=8, background_opacity=.4)
         metadata = prepared["initialization"]
@@ -260,11 +261,16 @@ class ColmapDatasetTests(unittest.TestCase):
         self.assertEqual(restored["views"], prepared["views"])
         np.testing.assert_array_equal(restored["positions"], prepared["positions"])
         for options in ({"background_layers": 8}, {"background_final_layers": 4},
-                        {"background_opacity": .5}, {"scene_mode": "bounded"}):
+                        {"background_opacity": .5}, {"scene_mode": "bounded"},
+                        {"background_far_distance": 3.}, {"background_far_percentile": 99.},
+                        {"background_far_margin": 1.1}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.prepare(initialization=metadata, target_core_resolution=1024, **options)
         for key, value in (("background_refinement", "fixed_layers"), ("initial_background_layers", 8),
-                           ("shell_width", 1/16), ("shell_layers", 32), ("background_layers", 8)):
+                           ("shell_width", 1/16), ("shell_layers", 32), ("background_layers", 8),
+                           ("background_far_distance", 1.), ("background_far_distance", float("nan")),
+                           ("background_far_distance", float("inf")),
+                           ("background_far_distance", 1.00000000001)):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 self.prepare(initialization={**metadata, key: value}, target_core_resolution=1024)
         missing = dict(metadata)
@@ -278,12 +284,164 @@ class ColmapDatasetTests(unittest.TestCase):
 
     def test_v4_radial_checkpoint_keeps_original_point_mapping(self):
         fresh = self.prepare(scene_mode="unbounded", target_core_resolution=1024)
-        saved = dict(fresh["initialization"], version=4, scene_mapping="radial_seed_shell")
+        saved = {key: value for key, value in fresh["initialization"].items()
+                 if not key.startswith("background_far_")}
+        saved.update(version=4, scene_mapping="radial_seed_shell")
         restored = self.prepare(initialization=saved, target_core_resolution=1024)
         points, _ = dataset.read_colmap_points(self.model / "points3D.bin")
         expected = dataset.contract_points(points, saved["center"], saved["radius"], saved["shell_width"])
         np.testing.assert_array_equal(restored["positions"], expected)
         self.assertEqual(restored["initialization"], saved)
+
+    def test_v5_checkpoint_keeps_infinite_projective_map_and_metadata(self):
+        from reconstruction_projective import projective_points
+        fresh = self.prepare(scene_mode="unbounded")
+        saved = {key: value for key, value in fresh["initialization"].items()
+                 if not key.startswith("background_far_")}
+        saved["version"] = 5
+        restored = self.prepare(initialization=saved)
+        points, _ = dataset.read_colmap_points(self.model / "points3D.bin")
+        normalized = ((points - saved["center"]) / saved["radius"]) @ dataset._AXES.T
+        expected = projective_points(normalized, saved["shell_width"], np)
+        np.testing.assert_array_equal(restored["positions"], expected)
+        self.assertEqual(restored["initialization"], saved)
+        self.assertNotIn("background_far_distance", restored["initialization"])
+        self.assertFalse(np.array_equal(restored["positions"], fresh["positions"]))
+
+    def test_finite_far_override_cannot_migrate_saved_versions_one_through_five(self):
+        current = self.prepare(scene_mode="unbounded")["initialization"]
+        saved_four = {key: value for key, value in current.items()
+                      if not key.startswith("background_far_")}
+        saved_four.update(version=4, scene_mapping="radial_seed_shell")
+        saves = [self.prepare()["initialization"],
+                 self.legacy_unbounded(2)["initialization"],
+                 self.legacy_unbounded(3)["initialization"], saved_four,
+                 dict(saved_four, version=5, scene_mapping="projective_shell")]
+        for saved in saves:
+            with self.subTest(version=saved["version"]), self.assertRaisesRegex(ValueError, "background_far_distance"):
+                self.prepare(initialization=saved, background_far_distance=5.)
+            with self.subTest(version=saved["version"]), self.assertRaisesRegex(ValueError, "silently change"):
+                self.prepare(initialization=dict(saved, background_far_distance=5.))
+
+    def test_automatic_far_estimate_uses_far_max_abs_quantile_and_filters_outlier(self):
+        # A diagonal tests the cube metric; many near points must not influence
+        # the percentile over far points. The isolated outlier is excluded.
+        points = np.concatenate((np.zeros((20, 3)), np.full((1000, 3), 8.8), [[4400., 0., 0.]]))
+        colors = np.arange(len(points) * 3, dtype=np.float32).reshape(-1, 3) / (len(points) * 3)
+        with patch.object(dataset, "read_colmap_points", return_value=(points, colors)):
+            prepared = self.prepare(scene_mode="unbounded")
+            cameras_only = self.prepare(scene_mode="unbounded", load_points=False)
+        metadata = prepared["initialization"]
+        self.assertEqual(metadata["background_far_distance"], float(np.float32(2.4)))
+        self.assertEqual(metadata["background_far_percentile"], 99.9)
+        self.assertEqual(metadata["background_far_margin"], 1.2)
+        audit = metadata["background_far_estimation"]
+        self.assertEqual(audit["method"], "point_cloud_percentile")
+        self.assertEqual(audit["metric"], "max_abs")
+        self.assertEqual(audit["point_count"], 1021)
+        self.assertEqual(audit["far_point_count"], 1001)
+        self.assertEqual(audit["excluded_point_count"], 1)
+        self.assertAlmostEqual(audit["quantile_distance"], 2.)
+        self.assertAlmostEqual(audit["world_distance"], metadata["radius"] * metadata["background_far_distance"])
+        self.assertEqual(audit["point_source"], "sparse/0/points3D.bin")
+        np.testing.assert_array_equal(prepared["colors"], colors[:-1])
+        self.assertEqual(len(prepared["positions"]), 1020)
+        self.assertEqual(cameras_only["initialization"], metadata)
+        self.assertIsNone(cameras_only["positions"])
+        self.assertIsNone(cameras_only["colors"])
+
+    def test_no_far_points_uses_finite_fallback(self):
+        points = np.array([[0., 0., 0.], [1., 2., 3.]])
+        with patch.object(dataset, "read_colmap_points", return_value=(points, np.ones((2, 3)))):
+            prepared = self.prepare(scene_mode="unbounded", background_far_margin=2.)
+        metadata = prepared["initialization"]
+        self.assertEqual(metadata["background_far_distance"], float(np.float32(1.2)))
+        self.assertEqual(metadata["background_far_estimation"]["method"], "no_far_points")
+        self.assertIsNone(metadata["background_far_estimation"]["quantile_distance"])
+        self.assertEqual(metadata["background_far_estimation"]["far_point_count"], 0)
+
+    def test_manual_far_distance_filters_colors_and_restores_without_reading_points(self):
+        points = np.array([[0., 0., 0.], [8.8, 0., 0.], [0., 0., 44.]])
+        colors = np.eye(3, dtype=np.float32)
+        with patch.object(dataset, "read_colmap_points", return_value=(points, colors)):
+            prepared = self.prepare(scene_mode="unbounded", background_far_distance=3.00000001)
+        metadata = prepared["initialization"]
+        self.assertEqual(metadata["background_far_distance"], 3.)
+        self.assertEqual(metadata["background_far_estimation"]["method"], "manual")
+        self.assertEqual(metadata["background_far_estimation"]["excluded_point_count"], 1)
+        np.testing.assert_array_equal(prepared["colors"], colors[:2])
+        with patch.object(dataset, "read_colmap_points", side_effect=AssertionError("points were read")):
+            restored = self.prepare(initialization=metadata, load_points=False,
+                                    background_far_distance=3.00000001)
+        self.assertEqual(restored["initialization"], metadata)
+        # A replacement preferred cloud must neither change the saved source
+        # audit nor cause its far distance to be estimated again.
+        (self.root / "init_points.ply").write_text("not a PLY file")
+        with patch.object(dataset, "read_ply_points", side_effect=AssertionError("points were read")):
+            repeated = self.prepare(initialization=metadata, load_points=False)
+        self.assertEqual(repeated["initialization"], metadata)
+
+    def test_load_views_uses_saved_nondefault_far_settings_without_point_access(self):
+        from evaluate import checkpoint_data_config
+        from preview import RenderConfig
+        from reconstruction_common import load_views
+        prepared = self.prepare(scene_mode="unbounded", background_far_percentile=95.,
+                                background_far_margin=1.3)
+        metadata = copy.deepcopy(prepared["initialization"])
+        # Deliberately omit the outer DataConfig far settings: evaluation must
+        # use the saved initializer even when its defaults differ.
+        data = checkpoint_data_config({"data": {
+            "images": "images_2", "initialization": copy.deepcopy(metadata)}})
+        self.assertNotEqual(data.background_far_percentile, metadata["background_far_percentile"])
+        self.assertNotEqual(data.background_far_margin, metadata["background_far_margin"])
+        render = RenderConfig(width=16, height=12)
+        (self.root / "init_points.ply").write_text("replacement cloud must not be opened")
+        with patch.object(dataset, "read_colmap_points", side_effect=AssertionError("Point reload")), \
+                patch.object(dataset, "read_ply_points", side_effect=AssertionError("Point reload")), \
+                patch.object(dataset.np, "percentile", side_effect=AssertionError("Far distance re-estimated")), \
+                patch.object(dataset, "prepare_colmap", wraps=dataset.prepare_colmap) as prepare:
+            train = load_views(self.root, "transforms_train.json", render, np, data=data, split="train")
+            test = load_views(self.root, "transforms_test.json", render, np, data=data, split="test")
+        self.assertEqual([view["index"] for view in train], list(range(1, 8)))
+        self.assertEqual([view["index"] for view in test], [0, 8])
+        self.assertTrue(all(view["camera"]["projective_unbounded"] for view in train + test))
+        self.assertEqual(data.initialization, metadata)
+        self.assertEqual(prepare.call_count, 2)
+        for call in prepare.call_args_list:
+            self.assertIs(call.kwargs["load_points"], False)
+            for key in ("background_far_distance", "background_far_percentile", "background_far_margin"):
+                self.assertEqual(call.kwargs[key], metadata[key])
+
+    def test_finite_far_config_validation_and_float32_boundary(self):
+        for key, values in (
+                ("background_far_distance", (0., 1., -1., float("nan"), float("inf"), 1e100, True)),
+                ("background_far_percentile", (0., -1., 101., float("nan"), True)),
+                ("background_far_margin", (0., .9, float("inf"), float("nan"), True))):
+            for value in values:
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, key):
+                    self.prepare(scene_mode="unbounded", **{key: value})
+        prepared = self.prepare(scene_mode="unbounded", background_far_distance=np.nextafter(1., np.inf))
+        expected = float(np.nextafter(np.float32(1.), np.float32(np.inf)))
+        self.assertEqual(prepared["initialization"]["background_far_distance"], expected)
+        self.assertEqual(len(prepared["positions"]), 1)
+
+    def test_finite_projective_mapping_hits_far_boundary_and_rejects_outside(self):
+        from reconstruction_projective import projective_points
+        points = np.array([[.2, .3, .4], [2., 1., .5], [-4., 2., 1.]])
+        actual = projective_points(points, .25, np, 4.)
+        np.testing.assert_array_equal(actual[0], points[0].astype(np.float32))
+        np.testing.assert_allclose(actual[1], [1. + (.25 / .75) * .5, .5, .25])
+        self.assertEqual(actual[2, 0], -np.nextafter(np.float32(1.25), np.float32(0.)))
+        np.testing.assert_array_equal(actual[2, 1:], [.5, .25])
+        for value in (0., -2., 1., float("nan"), float("inf"), True):
+            if value == 0.:
+                np.testing.assert_array_equal(projective_points(points, .25, np),
+                                              projective_points(points, .25, np, value))
+            else:
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, "background_far_distance"):
+                    projective_points(points, .25, np, value)
+        with self.assertRaisesRegex(ValueError, "exceed"):
+            projective_points([[np.nextafter(4., np.inf), 0., 0.]], .25, np, 4.)
 
     def test_bounded_colmap_fits_points_without_radial_contraction(self):
         prepared = self.prepare(scene_mode="bounded")

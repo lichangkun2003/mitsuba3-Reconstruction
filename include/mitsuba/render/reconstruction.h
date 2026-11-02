@@ -61,7 +61,7 @@ public:
     /// RGB paths recompute unchanged hit appearance, reconstruct candidate
     /// transmittance, and retain only the RGB reverse suffix.
     static constexpr uint32_t path_record_layout_version = 1;
-    static constexpr uint32_t projective_version = 1;
+    static constexpr uint32_t projective_version = 2;
 
     VoxelReconstruction(const std::string &filename, uint32_t resolution,
                         const std::array<float, 3> &grid_min,
@@ -155,6 +155,11 @@ public:
     /// Mapping is model metadata, never a trainable parameter. Changing it
     /// invalidates frozen recordings through topology_revision().
     void set_scene_mapping(const std::string &mapping);
+    /// Outer projective boundary in core-half-extent units. Zero preserves the
+    /// legacy infinite shell; finite boundaries must be strictly greater than 1.
+    /// Changing the boundary invalidates frozen recordings.
+    void set_background_far_distance(float distance);
+    float native_background_far_distance() const { return m_background_far_distance; }
     /// Limit evaluated/trainable radiance coefficients without changing storage.
     void set_active_sh_count(uint32_t count);
     std::string native_scene_mapping() const { return m_scene_mapping; }
@@ -308,6 +313,7 @@ private:
     uint32_t m_resolution, m_core_resolution, m_active_count, m_sh_count, m_active_sh_count,
              m_opacity_sh_count;
     std::string m_scene_mapping = "bounded";
+    float m_background_far_distance = 0.f;
     std::array<float, 3> m_min, m_max, m_size;
     std::map<std::string, uint64_t> m_statistics;
     UIntBuffer m_cells;

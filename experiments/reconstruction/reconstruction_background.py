@@ -11,7 +11,7 @@ import math
 
 
 def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=None, layers=None,
-                                mapping="radial_seed_shell"):
+                                mapping="radial_seed_shell", background_far_distance=None):
     """Keep core seeds and fill the far shell with covering, black ellipsoids.
 
     Existing far-cell radiance is retained, but its initial geometry and opacity
@@ -30,6 +30,13 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
         raise ValueError("Unknown background refinement policy")
     if mapping not in ("radial_seed_shell", "projective_shell"):
         raise ValueError("Unknown background mapping")
+    if background_far_distance is not None:
+        if (mapping != "projective_shell" or isinstance(background_far_distance, bool)
+                or not isinstance(background_far_distance, (int, float))
+                or not math.isfinite(background_far_distance) or background_far_distance <= 1):
+            raise ValueError("background_far_distance requires projective mapping and a finite value > 1")
+        if not hasattr(model, "set_background_far_distance"):
+            raise RuntimeError("Rebuild this checkout: finite projective background traversal is missing")
     if mapping == "projective_shell" and refinement != "preserve_physical_width":
         raise ValueError("Projective charts require fixed physical shell width")
     if refinement is not None and (type(layers) is not int or layers < 1
@@ -107,6 +114,8 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
     result.scene_mapping = mapping
     if mapping == "projective_shell":
         result.set_scene_mapping(mapping)
+        if background_far_distance is not None:
+            result.set_background_far_distance(background_far_distance)
         result.background_refinement = "preserve_physical_width"
         result.background_layers = (resolution-core)//2
     elif refinement == "fixed_layers":
@@ -118,4 +127,6 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, refinement=Non
         background_refinement=refinement or "preserve_physical_width",
         color="point_seed_radiance_else_black", seed_voxels=int(model.active_voxel_count),
         initialized_voxels=count, straight_ray_forward=mapping != "projective_shell")
+    if background_far_distance is not None:
+        result.background_initialization["background_far_distance"] = float(result.native_background_far_distance())
     return result
