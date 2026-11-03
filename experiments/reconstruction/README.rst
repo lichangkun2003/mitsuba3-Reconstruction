@@ -797,6 +797,31 @@ PLY 和相机来源独立判断，因此已有导出 PLY 的 360 场景仍可使
 360 中通常对应全局索引 1，可与最终 ``train/0001.png`` 对比，
 具体索引保存在报告的 ``view_index`` 中。
 
+体素位置与尺寸的交互预览
+------------------------
+
+``visualize_voxels.py`` 将 ``model.npz`` 或升层前 checkpoint 导出为可离线打开的
+HTML。页面用线框显示实际叶体素的 AABB，支持旋转、缩放、平移、前景／背景壳选择
+与 XYZ 剖切；颜色只表示尺寸或壳层，不是重建颜色。支持有界网格与当前世界空间
+背景壳，包括同一壳内不同细分深度的叶体素。坐标使用 checkpoint 的场景坐标，
+COLMAP 场景包含初始化时的归一化。旧压缩空间模型会明确报错，避免误画成世界空间。
+
+导出只在 CPU 读取体素编号和模型元数据，不加载 SH、椭球参数、Adam 或 CUDA，
+也不执行渲染前向。全部有效叶体素都会写入 HTML；浏览器显示上限只控制绘制数量，
+页面明确列出筛选和实际显示数量。观察破洞时应先剖切／筛选，再选择全部显示，
+不要把显示抽样造成的空隙当作实际空洞。大型模型的 HTML 也会较大。
+
+在 Mitsuba 仓库根目录的 PowerShell 中执行（路径相对于当前终端目录）：
+
+.. code-block:: powershell
+
+   & "E:\lck\reconstruction\envs\mitsuba\python.exe" -u -I `
+     .\experiments\reconstruction\visualize_voxels.py `
+     --checkpoint "E:\lck\reconstruction\outputs\你的实验目录\model.npz"
+
+默认生成同目录的 ``model-voxels.html``，用浏览器打开即可。``--output`` 可指定
+输出 HTML 路径；``--overwrite`` 允许更新已有 HTML。这项工具无需重新编译 C++。
+
 360 初始化使用所有注册相机中心的均值 ``c``，以及
 ``R = 1.1 * max(||camera - c||)``；点云和相机先统一变换为 ``(p-c)/R``，
 再统一转换坐标轴为 ``(x,y,z) -> (x,z,-y)``。相机只做这一相似变换。

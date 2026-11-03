@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>体素空间查看器</title>
+<style>
+:root { color-scheme: light; font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; color: #263441; background: #edf1f5; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { display: grid; grid-template-columns: 310px minmax(0, 1fr); height: 100vh; }
+aside { background: #fff; padding: 25px 22px; overflow: auto; border-right: 1px solid #dae1e8; }
+h1 { font-size: 21px; margin: 0 0 7px; letter-spacing: -.4px; }
+.subtitle { font-size: 12px; color: #667788; line-height: 1.8; margin: 0 0 20px; }
+.source { padding: 10px 12px; background: #f3f6f9; border-radius: 7px; overflow-wrap: anywhere; font-size: 11px; line-height: 1.7; margin-bottom: 18px; }
+.section { border-top: 1px solid #e6ebef; margin-top: 17px; padding-top: 15px; }
+label { display: block; font-size: 12px; margin: 11px 0 6px; color: #445566; }
+select, input[type=number], button { font: inherit; font-size: 12px; padding: 8px 10px; border: 1px solid #cbd5df; border-radius: 6px; background: #fff; color: #263441; }
+select, input[type=number] { width: 100%; }
+input[type=range] { width: 100%; accent-color: #2878ad; margin: 5px 0; }
+input[type=checkbox] { accent-color: #2878ad; }
+button { cursor: pointer; background: #f7f9fb; }
+button:hover { background: #e7f0f7; border-color: #88aecb; }
+.buttons { display: flex; gap: 7px; margin-top: 12px; }
+.buttons button { flex: 1; }
+.muted { color: #708191; font-size: 11px; line-height: 1.7; }
+.inline { display: flex; align-items: center; gap: 7px; }
+.inline input { margin: 0; }
+.legend { height: 7px; border-radius: 5px; margin-top: 11px; background: linear-gradient(90deg,#367fbd,#45b1a9,#dfbb50,#d95b4e); }
+.ends { display: flex; justify-content: space-between; font-size: 10px; color: #667788; margin-top: 4px; }
+.metrics { display: grid; grid-template-columns: 1fr auto; row-gap: 8px; font-size: 12px; margin-top: 18px; }
+.metrics strong { font-variant-numeric: tabular-nums; }
+.warning { color: #8c591e; background: #fff4df; border: 1px solid #ead5af; padding: 10px; border-radius: 6px; font-size: 11px; line-height: 1.75; margin-top: 14px; }
+.warning:empty { display: none; }
+.viewport { position: relative; min-width: 0; min-height: 350px; overflow: hidden; background: #f4f7fa; }
+#view { width: 100%; height: 100%; display: block; touch-action: none; outline: none; }
+.topline { position: absolute; top: 18px; left: 20px; right: 20px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; pointer-events: none; font-size: 12px; color: #586c7e; }
+.badge { background: #ffffffde; border: 1px solid #dbe3ea; border-radius: 5px; padding: 7px 10px; }
+.help { position: absolute; bottom: 17px; left: 20px; right: 80px; pointer-events: none; color: #66798b; font-size: 11px; line-height: 1.8; }
+#axes { position: absolute; right: 14px; bottom: 12px; width: 70px; height: 70px; pointer-events: none; }
+#error { display: none; position: absolute; top: 25%; left: 10%; right: 10%; background: #fff; border: 1px solid #e7b1a9; color: #8e3025; padding: 22px; border-radius: 10px; line-height: 1.8; white-space: pre-wrap; }
+@media(max-width:740px) { main { grid-template-columns: 1fr; height: auto; } aside { order: 2; overflow: visible; border: 0; padding: 20px; } .viewport { height: 65vh; min-height: 400px; } .section { margin-top: 14px; } }
+</style>
+</head>
+<body>
+<main>
+<aside>
+  <h1>体素空间查看器</h1>
+  <p class="subtitle">查看叶节点的位置与真实尺寸。线框表示体素边界，颜色仅用于区分尺寸或壳层。</p>
+  <div id="source" class="source"></div>
+  <label for="region">显示区域</label>
+  <select id="region"><option value="all">前景 + 背景</option><option value="core">仅前景</option><option value="background">仅背景</option></select>
+  <label for="shell">背景壳层</label>
+  <select id="shell"><option value="all">所有壳层</option></select>
+  <label for="color">线框颜色</label>
+  <select id="color"><option value="size">按体素尺寸</option><option value="shell">按前景 / 壳层</option></select>
+  <div id="sizeLegend"><div class="legend"></div><div class="ends"><span id="minSize"></span><span id="maxSize"></span></div></div>
+  <label class="inline"><input type="checkbox" id="coreBounds" checked>显示前景区域边界（灰色）</label>
+  <div class="buttons"><button id="fitCore">聚焦前景</button><button id="fitSelection">适配所选体素</button></div>
+  <div class="section">
+    <label for="sliceAxis">剖切方向</label>
+    <select id="sliceAxis"><option value="none">不剖切</option><option value="0">X 方向</option><option value="1">Y 方向</option><option value="2">Z 方向</option></select>
+    <div id="sliceControls" hidden>
+      <label for="slicePosition">剖切位置 <span id="slicePositionText"></span></label>
+      <input id="slicePosition" type="range" min="0" max="1000" value="500">
+      <label for="sliceThickness">切片厚度 <span id="sliceThicknessText"></span></label>
+      <input id="sliceThickness" type="range" min="0" max="1000" value="0">
+      <p class="muted">保留与切片相交的完整体素；不会截短线框。厚度为零时显示与平面相交的体素。</p>
+    </div>
+  </div>
+  <div class="section">
+    <label for="budget">最多显示体素数（0 = 全部）</label>
+    <input id="budget" type="number" min="0" step="10000" value="100000">
+    <p class="muted">先筛选区域与切片，再按壳层和细分深度分组抽样。可调大上限查看全部；数量多时浏览器可能变慢。</p>
+    <div class="metrics"><span>源模型体素</span><strong id="sourceCount">—</strong><span>HTML 内含体素</span><strong id="exportCount">—</strong><span>符合筛选</span><strong id="filterCount">—</strong><span>当前显示</span><strong id="drawCount">—</strong></div>
+    <div id="warning" class="warning" role="status"></div>
+  </div>
+</aside>
+<section class="viewport">
+  <canvas id="view" tabindex="0" aria-label="可旋转缩放的三维体素线框视图"></canvas>
+  <div class="topline"><span class="badge" id="modelInfo"></span><span class="badge" id="status">正在读取体素…</span></div>
+  <canvas id="axes" width="140" height="140"></canvas>
+  <div class="help">左键拖动：旋转 · 滚轮：缩放 · 右键或 Shift + 拖动：平移<br>坐标和尺寸来自模型的世界坐标系；未使用重建图像颜色。</div>
+  <div id="error" role="alert"></div>
+</section>
+</main>
+<script id="voxel-data" type="application/json">__VOXEL_DATA_JSON__</script>
+<script>
+"use strict";
+(() => {
+  const $ = id => document.getElementById(id);
+  const api = window.voxelViewer = {ready:false, error:null, counts:{}, getStatus() {
+    return {ready:this.ready, error:this.error, counts:this.counts, selectionBounds:this.selectionBounds};
+  }};
+  const number = value => Number(value).toLocaleString("en-US");
+  const precision = value => value === 0 ? "0" : Number(value).toPrecision(4).replace(/\.0+(?=e|$)/, "");
+  function fail(error) { api.error = String(error.message || error); $("error").textContent = api.error; $("error").style.display = "block"; $("status").textContent = "无法显示"; }
+  try {
+    const data = JSON.parse($("voxel-data").textContent);
+    $("source").textContent = data.source;
+    $("modelInfo").textContent = `核心分辨率 ${data.resolution} · ${data.mapping}`;
+    $("sourceCount").textContent = number(data.total_voxels);
+    $("exportCount").textContent = number(data.exported_voxels);
+    if (data.box_stride !== 8) throw new Error("不支持的体素数据格式。");
+    let bytes = atob(data.boxes_base64);
+    const buffer = new ArrayBuffer(bytes.length), octets = new Uint8Array(buffer);
+    for (let i=0; i<bytes.length; ++i) octets[i] = bytes.charCodeAt(i);
+    bytes = null;
+    delete data.boxes_base64;
+    $("voxel-data").textContent = "";
+    const boxes = new Float32Array(buffer), count = boxes.length / 8;
+    if (!Number.isInteger(count) || count !== data.exported_voxels) throw new Error("体素数量与数据长度不一致。");
+    const canvas = $("view"), gl = canvas.getContext("webgl2", {alpha:false, antialias:true});
+    if (!gl) throw new Error("此浏览器未启用 WebGL 2。请使用启用了硬件加速的 Chrome 或 Edge 打开此文件。");
+    const coreMin = data.bounds_min, coreMax = data.bounds_max;
+    const centerOf = (lo, hi) => lo.map((v,i) => (v+hi[i])*.5);
+    const maxExtent = (lo, hi) => Math.max(hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]);
+    const totalMin = coreMin.slice(), totalMax = coreMax.slice();
+    let minSize = Infinity, maxSize = 0, maxShell = 0;
+    for (let i=0; i<count; ++i) {
+      const j=i*8;
+      for (let axis=0; axis<3; ++axis) {
+        totalMin[axis] = Math.min(totalMin[axis], boxes[j+axis]-boxes[j+3+axis]*.5);
+        totalMax[axis] = Math.max(totalMax[axis], boxes[j+axis]+boxes[j+3+axis]*.5);
+      }
+      const edge = Math.max(boxes[j+3],boxes[j+4],boxes[j+5]);
+      minSize = Math.min(minSize, edge); maxSize = Math.max(maxSize, edge); maxShell = Math.max(maxShell, boxes[j+6]);
+    }
+    if (!count) minSize = maxSize = maxExtent(coreMin,coreMax)/data.resolution;
+    $("minSize").textContent = `小 ${precision(minSize)}`; $("maxSize").textContent = `大 ${precision(maxSize)}`;
+    for (let shell=1; shell<=maxShell; ++shell) { const option = document.createElement("option"); option.value=String(shell); option.textContent=`第 ${shell} 层`; $("shell").append(option); }
+    const camera = {target:centerOf(coreMin,coreMax), distance:maxExtent(coreMin,coreMax)*2.1, yaw:.75, pitch:.48};
+    const vertex = `#version 300 es
+      precision highp float;
+      layout(location=0) in vec3 corner;
+      layout(location=1) in vec3 center;
+      layout(location=2) in vec3 size;
+      layout(location=3) in vec2 group;
+      uniform mat4 viewProjection;
+      uniform vec2 logRange;
+      uniform int colorMode;
+      out vec3 lineColor;
+      vec3 palette(float x) {
+        vec3 a=vec3(.21,.50,.74),b=vec3(.27,.69,.66),c=vec3(.87,.73,.31),d=vec3(.85,.36,.31);
+        return x<.333 ? mix(a,b,x*3.) : (x<.666 ? mix(b,c,(x-.333)*3.) : mix(c,d,(x-.666)*3.));
+      }
+      vec3 hue(float h) { return .22+.55*clamp(abs(fract(h+vec3(0.,.66667,.33333))*6.-3.)-1.,0.,1.); }
+      void main() {
+        float edge=max(size.x,max(size.y,size.z));
+        float t=clamp((log2(edge)-logRange.x)/max(logRange.y-logRange.x,.00001),0.,1.);
+        lineColor=group.x<0. ? vec3(.38,.44,.50) : (colorMode==0 ? palette(t) : hue(fract(.57+group.x*.1618)));
+        gl_Position=viewProjection*vec4(center+corner*size,1.);
+      }`;
+    const fragment = `#version 300 es
+      precision highp float;
+      in vec3 lineColor;
+      out vec4 pixel;
+      void main() { pixel=vec4(lineColor,.85); }`;
+    function shader(type, source) { const value=gl.createShader(type); gl.shaderSource(value,source); gl.compileShader(value); if(!gl.getShaderParameter(value,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(value)); return value; }
+    const program=gl.createProgram(); gl.attachShader(program,shader(gl.VERTEX_SHADER,vertex)); gl.attachShader(program,shader(gl.FRAGMENT_SHADER,fragment)); gl.linkProgram(program);
+    if(!gl.getProgramParameter(program,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+    const corners=[];
+    for(let axis=0;axis<3;axis++) for(let a=0;a<2;a++) for(let b=0;b<2;b++) for(let end=0;end<2;end++) {
+      const point=[0,0,0]; point[axis]=end-.5; point[(axis+1)%3]=a-.5; point[(axis+2)%3]=b-.5; corners.push(...point);
+    }
+    const cornerBuffer=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,cornerBuffer); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(corners),gl.STATIC_DRAW);
+    function createBoxes(initial) {
+      const vao=gl.createVertexArray(), instance=gl.createBuffer(); gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER,cornerBuffer); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,12,0);
+      gl.bindBuffer(gl.ARRAY_BUFFER,instance); gl.bufferData(gl.ARRAY_BUFFER,initial,gl.DYNAMIC_DRAW);
+      for(const [location,size,offset] of [[1,3,0],[2,3,12],[3,2,24]]) { gl.enableVertexAttribArray(location); gl.vertexAttribPointer(location,size,gl.FLOAT,false,32,offset); gl.vertexAttribDivisor(location,1); }
+      gl.bindVertexArray(null); return {vao,instance};
+    }
+    const leaves=createBoxes(new Float32Array(0));
+    const coreCenter=centerOf(coreMin,coreMax);
+    const coreBox=createBoxes(new Float32Array([...coreCenter,...coreMax.map((v,i)=>v-coreMin[i]),-1,0]));
+    const viewProjection=gl.getUniformLocation(program,"viewProjection"), logRange=gl.getUniformLocation(program,"logRange"), colorMode=gl.getUniformLocation(program,"colorMode");
+    const fov=Math.PI/4;
+    function perspective(aspect, near, far) { const f=1/Math.tan(fov/2), nf=1/(near-far); return [f/aspect,0,0,0,0,f,0,0,0,0,(far+near)*nf,-1,0,0,2*far*near*nf,0]; }
+    function viewMatrix() {
+      const sy=Math.sin(camera.yaw),cy=Math.cos(camera.yaw),sp=Math.sin(camera.pitch),cp=Math.cos(camera.pitch);
+      const right=[cy,0,-sy],up=[-sp*sy,cp,-sp*cy],back=[cp*sy,sp,cp*cy];
+      const eye=camera.target.map((v,i)=>v+back[i]*camera.distance),dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+      return [right[0],up[0],back[0],0,right[1],up[1],back[1],0,right[2],up[2],back[2],0,-dot(right,eye),-dot(up,eye),-dot(back,eye),1];
+    }
+    function multiply(a,b) { const out=new Float32Array(16); for(let c=0;c<4;c++) for(let r=0;r<4;r++) for(let k=0;k<4;k++) out[c*4+r]+=a[k*4+r]*b[c*4+k]; return out; }
+    let drawn=0, selectedBounds=null, framePending=false;
+    function axes(matrix) {
+      const c=$("axes"),ctx=c.getContext("2d"); ctx.clearRect(0,0,c.width,c.height);ctx.lineWidth=3;ctx.font="bold 18px sans-serif";
+      [["X","#ba5c54"],["Y","#5b9568"],["Z","#4e81b8"]].forEach(([label,color],axis)=>{ const x=70+matrix[axis*4]*40,y=70-matrix[axis*4+1]*40;ctx.strokeStyle=ctx.fillStyle=color;ctx.beginPath();ctx.moveTo(70,70);ctx.lineTo(x,y);ctx.stroke();ctx.fillText(label,x+4,y-4); });
+    }
+    function draw() {
+      framePending=false;
+      const ratio=Math.min(window.devicePixelRatio||1,2),w=Math.max(1,Math.round(canvas.clientWidth*ratio)),h=Math.max(1,Math.round(canvas.clientHeight*ratio));
+      if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;}
+      gl.viewport(0,0,w,h);gl.clearColor(.956,.968,.980,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+      const vm=viewMatrix(),near=Math.max(camera.distance/10000,1e-8),far=camera.distance+maxExtent(totalMin,totalMax)*4;
+      gl.useProgram(program);gl.uniformMatrix4fv(viewProjection,false,multiply(perspective(w/h,near,far),vm));gl.uniform2f(logRange,Math.log2(minSize),Math.log2(maxSize));gl.uniform1i(colorMode,$("color").value==="size"?0:1);
+      if(drawn){gl.bindVertexArray(leaves.vao);gl.drawArraysInstanced(gl.LINES,0,24,drawn);}
+      if($("coreBounds").checked){gl.bindVertexArray(coreBox.vao);gl.drawArraysInstanced(gl.LINES,0,24,1);}
+      gl.bindVertexArray(null); axes(vm);
+    }
+    function requestDraw(){if(!framePending){framePending=true;requestAnimationFrame(draw);}}
+    function fit(lo,hi){
+      camera.target=centerOf(lo,hi);
+      const radius=Math.hypot(hi[0]-lo[0],hi[1]-lo[1],hi[2]-lo[2])*.5;
+      const aspect=canvas.clientWidth/Math.max(canvas.clientHeight,1);
+      const halfFov=Math.min(fov/2,Math.atan(Math.tan(fov/2)*aspect));
+      camera.distance=Math.max(radius/Math.sin(halfFov)*1.05,1e-6);
+      requestDraw();
+    }
+    function rebuild() {
+      const region=$("region").value, shell=$("shell").value;
+      $("shell").disabled=region==="core";
+      const matchesRegion=j=>(region!=="core"||boxes[j+6]===0)&&(region!=="background"||boxes[j+6]>0)&&(region==="core"||shell==="all"||boxes[j+6]===Number(shell));
+      const lo=[Infinity,Infinity,Infinity],hi=[-Infinity,-Infinity,-Infinity];
+      for(let i=0;i<count;i++){const j=i*8;if(matchesRegion(j))for(let a=0;a<3;a++){lo[a]=Math.min(lo[a],boxes[j+a]-boxes[j+3+a]*.5);hi[a]=Math.max(hi[a],boxes[j+a]+boxes[j+3+a]*.5);}}
+      const axis=$("sliceAxis").value==="none"?-1:Number($("sliceAxis").value);
+      $("sliceControls").hidden=axis<0;
+      const rangeLo=Number.isFinite(lo[0])?lo:coreMin,rangeHi=Number.isFinite(hi[0])?hi:coreMax;
+      const extent=axis<0?0:rangeHi[axis]-rangeLo[axis],position=axis<0?0:rangeLo[axis]+extent*Number($("slicePosition").value)/1000,thickness=extent*Number($("sliceThickness").value)/1000;
+      $("slicePositionText").textContent=precision(position);$("sliceThicknessText").textContent=precision(thickness);
+      const matches=j=>matchesRegion(j)&&(axis<0||Math.abs(boxes[j+axis]-position)<=boxes[j+3+axis]*.5+thickness*.5);
+      let filtered=0;const groups=new Map(),selectedLo=[Infinity,Infinity,Infinity],selectedHi=[-Infinity,-Infinity,-Infinity];
+      for(let i=0;i<count;i++){const j=i*8;if(!matches(j))continue;filtered++;const key=boxes[j+6]*32+boxes[j+7];if(!groups.has(key))groups.set(key,{count:0,seen:0,quota:0});groups.get(key).count++;for(let a=0;a<3;a++){selectedLo[a]=Math.min(selectedLo[a],boxes[j+a]-boxes[j+3+a]*.5);selectedHi[a]=Math.max(selectedHi[a],boxes[j+a]+boxes[j+3+a]*.5);}}
+      let budget=Number($("budget").value);if(!Number.isFinite(budget)||budget<0){budget=100000;$("budget").value="100000";}budget=Math.floor(budget);
+      drawn=budget===0?filtered:Math.min(budget,filtered);
+      const list=Array.from(groups.values()),base=drawn>=list.length?1:0,remaining=drawn-base*list.length,denominator=filtered-base*list.length;
+      let assigned=0;
+      for(const group of list){const proportional=denominator?remaining*(group.count-base)/denominator:0;group.quota=base+Math.floor(proportional);group.remainder=proportional-Math.floor(proportional);assigned+=group.quota;}
+      list.sort((a,b)=>b.remainder-a.remainder);for(let i=0;i<drawn-assigned;i++)list[i].quota++;
+      const visible=new Float32Array(drawn*8);let output=0;
+      for(let i=0;i<count;i++){const j=i*8;if(!matches(j))continue;const group=groups.get(boxes[j+6]*32+boxes[j+7]);const before=Math.floor(group.seen*group.quota/group.count);group.seen++;if(Math.floor(group.seen*group.quota/group.count)>before){visible.set(boxes.subarray(j,j+8),output*8);output++;}}
+      if(output!==drawn)throw new Error("体素显示数量不一致。");
+      gl.bindBuffer(gl.ARRAY_BUFFER,leaves.instance);gl.bufferData(gl.ARRAY_BUFFER,visible,gl.DYNAMIC_DRAW);
+      selectedBounds=filtered?{min:selectedLo,max:selectedHi}:null;api.selectionBounds=selectedBounds;
+      api.counts={source:data.total_voxels,exported:count,filtered,drawn};
+      $("filterCount").textContent=number(filtered);$("drawCount").textContent=number(drawn);
+      const warnings=[];if(data.sampled)warnings.push("导出文件已经抽样，未包含源模型中的全部体素。");if(drawn<filtered)warnings.push(`当前抽样显示 ${number(drawn)} / ${number(filtered)} 个体素；可见空隙可能来自抽样，不代表模型真实空洞。`);if(!filtered)warnings.push("当前筛选条件下没有体素。请更换区域或切片位置。");
+      $("warning").textContent=warnings.join(" ");$("status").textContent=drawn<filtered?"抽样线框":"完整所选线框";$("fitSelection").disabled=!selectedBounds;
+      api.ready=true;requestDraw();
+    }
+    let rebuildTimer;
+    function scheduleRebuild(){clearTimeout(rebuildTimer);$("status").textContent="正在筛选…";rebuildTimer=setTimeout(()=>{try{rebuild();}catch(error){fail(error);}},60);}
+    $("region").addEventListener("change",()=>{if($("region").value==="all")$("shell").value="all";scheduleRebuild();});
+    $("shell").addEventListener("change",()=>{if($("shell").value!=="all")$("region").value="background";scheduleRebuild();});
+    ["sliceAxis","budget"].forEach(id=>$(id).addEventListener("change",scheduleRebuild));
+    ["slicePosition","sliceThickness"].forEach(id=>$(id).addEventListener("input",scheduleRebuild));
+    $("color").addEventListener("change",()=>{$("sizeLegend").hidden=$("color").value!=="size";requestDraw();});
+    $("coreBounds").addEventListener("change",requestDraw);
+    $("fitCore").addEventListener("click",()=>fit(coreMin,coreMax));
+    $("fitSelection").addEventListener("click",()=>{if(selectedBounds)fit(selectedBounds.min,selectedBounds.max);});
+    let pointer=null;
+    canvas.addEventListener("pointerdown",event=>{if(event.button!==0&&event.button!==2)return;pointer={id:event.pointerId,x:event.clientX,y:event.clientY,pan:event.button===2||event.shiftKey};canvas.setPointerCapture(event.pointerId);});
+    canvas.addEventListener("pointermove",event=>{if(!pointer||pointer.id!==event.pointerId)return;const dx=event.clientX-pointer.x,dy=event.clientY-pointer.y;pointer.x=event.clientX;pointer.y=event.clientY;if(pointer.pan||event.shiftKey){const scale=2*camera.distance*Math.tan(fov/2)/canvas.clientHeight,sy=Math.sin(camera.yaw),cy=Math.cos(camera.yaw),sp=Math.sin(camera.pitch),cp=Math.cos(camera.pitch),right=[cy,0,-sy],up=[-sp*sy,cp,-sp*cy];for(let a=0;a<3;a++)camera.target[a]+=scale*(-dx*right[a]+dy*up[a]);}else{camera.yaw-=dx*.006;camera.pitch=Math.max(-1.53,Math.min(1.53,camera.pitch+dy*.006));}requestDraw();});
+    const release=()=>{pointer=null;};canvas.addEventListener("pointerup",release);canvas.addEventListener("pointercancel",release);canvas.addEventListener("lostpointercapture",release);canvas.addEventListener("contextmenu",event=>event.preventDefault());
+    canvas.addEventListener("wheel",event=>{event.preventDefault();camera.distance=Math.max(maxExtent(coreMin,coreMax)*1e-7,Math.min(maxExtent(totalMin,totalMax)*1e5,camera.distance*Math.exp(Math.max(-300,Math.min(300,event.deltaY))*.0015)));requestDraw();},{passive:false});
+    canvas.addEventListener("webglcontextlost",event=>{event.preventDefault();fail("浏览器释放了图形上下文。请刷新页面，或降低最多显示体素数后重新打开。");});
+    new ResizeObserver(requestDraw).observe(canvas);
+    api.fitCore=()=>fit(coreMin,coreMax);api.fitSelection=()=>{if(selectedBounds)fit(selectedBounds.min,selectedBounds.max);};api.rebuild=rebuild;api.camera=camera;api.render=requestDraw;
+    rebuild();
+    fit(coreMin,coreMax);
+  } catch(error) { fail(error); }
+})();
+</script>
+</body>
+</html>
