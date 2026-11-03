@@ -109,30 +109,30 @@ class Proposals(unittest.TestCase):
         manager=manager_for(state,use_rgb_growth=True,growth_min_supporting_parents=26)
         self.assertEqual(len(self.compare(manager,state)['cells']),0)
 
-    def test_radial_shell_is_not_a_growth_region(self):
-        state=checkpoint([217,219,221])
-        state['model_metadata'].update(core_resolution=6,scene_mapping='radial_seed_shell')
+    def test_world_shell_is_not_a_growth_region(self):
+        state=checkpoint([384,219,221,512,513])
+        state['model_metadata'].update(core_resolution=8,scene_mapping='world_shell',background_shell_levels=8)
         manager=manager_for(state,use_rgb_growth=True,growth_min_supporting_parents=2)
         result=self.compare(manager,state)
-        self.assertNotIn(218,np.array(result['cells']))
+        self.assertNotIn(448,np.array(result['cells']))
         self.assertIn(220,np.array(result['cells']))
+        self.assertTrue(np.all(np.array(result['cells']) < 512))
+        self.assertTrue(np.all(np.array(result['parent_cells']) < 512))
         # No core proposal may re-enter a deleted shell cell, including the
         # restricted post-vote regeneration path.
-        subset=generate_growth_gpu(manager,state,10,target_cells=dr.cuda.UInt32([218,220,222]))
+        subset=generate_growth_gpu(manager,state,10,target_cells=dr.cuda.UInt32([448,220,514]))
         self.assertEqual(list(np.array(subset['cells'])),[220,220])
 
     def test_shell_majority_preserves_original_parent_ids_and_occupancy(self):
         # Almost all occupied cells are forbidden shell parents. Scatter the
         # eligible core parents among them so compact IDs cannot be used as
         # original IDs for pair matching, radiance, opacity, or rotations.
-        addresses=np.arange(512,dtype=np.uint32)
-        coordinates=np.stack((addresses%8,addresses//8%8,addresses//64),axis=1).astype(np.int64)
-        outside=np.sum((np.abs(2*coordinates+1-8)+1)**2,axis=1)>6**2
-        occupied=np.concatenate((addresses[outside],[219,221,283,285])).astype(np.uint32)
+        addresses=np.arange(512,512+448,dtype=np.uint32)
+        occupied=np.concatenate((addresses,[219,221,283,285])).astype(np.uint32)
         rng=np.random.default_rng(717023)
         rng.shuffle(occupied)
         state=checkpoint(occupied)
-        state['model_metadata'].update(core_resolution=6,scene_mapping='radial_seed_shell')
+        state['model_metadata'].update(core_resolution=8,scene_mapping='world_shell',background_shell_levels=8)
         count=len(occupied)
         state['model_state']['radiance_sh']=np.arange(count*12,dtype=np.float32)/1000
         state['model_state']['opacity_sh']=np.linspace(-3,3,count,dtype=np.float32)
@@ -163,8 +163,8 @@ class Proposals(unittest.TestCase):
 
     def test_no_eligible_parent_skips_geometry(self):
         for reason in ('shell','candidate','warmup'):
-            state=checkpoint([0,7,63,511] if reason=='shell' else [219,221])
-            state['model_metadata'].update(core_resolution=6,scene_mapping='radial_seed_shell')
+            state=checkpoint([512,513,568,959] if reason=='shell' else [219,221])
+            state['model_metadata'].update(core_resolution=8,scene_mapping='world_shell',background_shell_levels=8)
             manager=manager_for(state,use_rgb_growth=True,growth_min_supporting_parents=2)
             if reason=='candidate': manager.candidates[:]=True
             if reason=='warmup': manager.growth_wait_start[:]=10
@@ -179,13 +179,18 @@ class Proposals(unittest.TestCase):
         # unsigned high bit and the last partial word of a non-power-of-two grid.
         first=np.concatenate((np.arange(32,dtype=np.uint32),[31,32,63])).astype(np.uint32)
         second=np.array([31,32,64,69,69],dtype=np.uint32)
-        bitmap=growth_gpu._make_bitmap(70,(dr.cuda.UInt32(first),dr.cuda.UInt32(second)),dr)
+        # Out-of-grid payloads can be fixed background leaves, deleted
+        # background cooldown entries, or rejected post-vote targets.
+        outside=np.array([70,96,0xffffffff],dtype=np.uint32)
+        bitmap=growth_gpu._make_bitmap(70,(dr.cuda.UInt32(first),dr.cuda.UInt32(second),
+                                         dr.cuda.UInt32(outside)),dr)
         self.assertEqual(dr.width(bitmap),3)
         np.testing.assert_array_equal(np.array(bitmap),
             np.array([0xffffffff,0x80000001,0x21],dtype=np.uint32))
         queries=np.concatenate((np.arange(70,dtype=np.uint32),
                                 np.array([31,96,0xffffffff],dtype=np.uint32)))
-        active=np.arange(len(queries))<70
+        active=np.ones(len(queries),dtype=bool)
+        active[2]=False
         actual=growth_gpu._bitmap_contains(bitmap,dr.cuda.UInt32(queries),dr.cuda.Bool(active),dr)
         expected=np.isin(queries,np.concatenate((first,second))) & active
         np.testing.assert_array_equal(np.array(actual),expected)

@@ -27,17 +27,80 @@ class MemoryBudgetTests(unittest.TestCase):
         # Dense 4^3 grid: 8 parents plus the root, held in three arrays.
         expected = round_cuda_allocation(64 * 4) + 3 * round_cuda_allocation(9 * 4) + 4 * 64
         self.assertEqual(estimate_spatial_index_bytes(64, 4), expected)
-        self.assertEqual(estimate_spatial_index_bytes(0, 1040), 8 * 64)
+        self.assertEqual(estimate_spatial_index_bytes(0, 1000), 8 * 64)
         self.assertEqual(estimate_spatial_index_bytes(1, 1), 8 * 64)
-        # A 1040 grid has depth eleven (padded to 2048), with real-domain
-        # parent counts ceil(1040 / 2^l)^3, not a fully occupied 2048 cube.
+        # A non-power-of-two bounded grid has real-domain parent counts,
+        # not a fully occupied padded 1024 cube.
         n = 51_910_528
-        nodes = sum(min(n, ((1040 + (1 << level) - 1) >> level)**3)
-                    for level in range(1, 12))
+        nodes = sum(min(n, ((1000 + (1 << level) - 1) >> level)**3)
+                    for level in range(1, 11))
         expected = round_cuda_allocation(n * 4) + 3 * round_cuda_allocation(nodes * 4) + 4 * 64
-        self.assertEqual(estimate_spatial_index_bytes(n, 1040), expected)
-        self.assertLess(estimate_spatial_index_bytes(n, 1040),
-                        estimate_spatial_index_bytes(n, 1040, allocator_policy="power_of_two"))
+        self.assertEqual(estimate_spatial_index_bytes(n, 1000), expected)
+        self.assertLess(estimate_spatial_index_bytes(n, 1000),
+                        estimate_spatial_index_bytes(n, 1000, allocator_policy="power_of_two"))
+
+    def test_mixed_spatial_bound_covers_leaf_and_internal_edge_references(self):
+        # Independently enumerate ancestors of small actual cube shells. Their
+        # coarse leaves stay single entries; no world-root grid is allocated.
+        import itertools
+        core, shells = 4, 3
+        root = core << shells
+        depth = root.bit_length() - 1
+        offset = (root - core) // 2
+        leaves = [(offset+x, offset+y, offset+z, 0)
+                  for x, y, z in itertools.product(range(core), repeat=3)]
+        for shell in range(1, shells + 1):
+            outer = core << shell
+            side, minimum = outer//4, (root-outer)//2
+            for xyz in itertools.product(range(4), repeat=3):
+                if all(1 <= value <= 2 for value in xyz):
+                    continue
+                leaves.append((*[minimum+value*side for value in xyz], side.bit_length()-1))
+        for selected in (leaves, leaves[::3], leaves[-1:], []):
+            ancestors = {(level, x >> level, y >> level, z >> level)
+                         for x, y, z, log_size in selected
+                         for level in range(log_size+1, depth+1)}
+            nodes = len(ancestors)
+            edges = len(selected) + max(0, nodes-1)
+            for policy in ("cuda_2m", "power_of_two"):
+                rounded = lambda count: round_cuda_allocation(max(1, count)*4, policy)
+                actual = rounded(edges) + 3*rounded(nodes) + 4*rounded(1)
+                bound = estimate_spatial_index_bytes(len(selected), core,
+                    background_shell_levels=shells, allocator_policy=policy)
+                self.assertLessEqual(actual, bound)
+        self.assertLess(estimate_spatial_index_bytes(448+8, 1024,
+            background_shell_levels=8), MIB)
+
+    def test_uniform_background_spatial_bound_includes_subdivided_leaves(self):
+        import itertools
+        core, shells, subdivision = 8, 2, 2
+        root = core << shells
+        depth = root.bit_length() - 1
+        leaves = []
+        for shell in range(1, shells+1):
+            outer = core << shell
+            coarse_side, minimum = outer//4, (root-outer)//2
+            child_side = coarse_side >> subdivision
+            for xyz in itertools.product(range(4), repeat=3):
+                if all(1 <= value <= 2 for value in xyz):
+                    continue
+                for child in itertools.product(range(1 << subdivision), repeat=3):
+                    leaves.append((*[minimum+xyz[a]*coarse_side+child[a]*child_side for a in range(3)],
+                                   child_side.bit_length()-1))
+        self.assertEqual(len(leaves), 56*shells*8**subdivision)
+        ancestors = {(level, x >> level, y >> level, z >> level)
+                     for x, y, z, log_size in leaves for level in range(log_size+1, depth+1)}
+        nodes = len(ancestors)
+        actual = round_cuda_allocation((len(leaves)+nodes-1)*4) + 3*round_cuda_allocation(nodes*4) + 4*64
+        bound = estimate_spatial_index_bytes(len(leaves), core, background_shell_levels=shells,
+                                             background_subdivision_level=subdivision)
+        self.assertLessEqual(actual, bound)
+        with self.assertRaises(ValueError):
+            estimate_spatial_index_bytes(len(leaves), core, background_shell_levels=shells)
+        for invalid in (-1, 10, True):
+            with self.assertRaises(ValueError):
+                estimate_spatial_index_bytes(448, 1024, background_shell_levels=8,
+                                             background_subdivision_level=invalid)
 
     def test_spatial_bound_covers_exact_node_counts_for_small_occupancies(self):
         # Enumerate small occupancy subsets independently of Morton ordering.
@@ -55,6 +118,47 @@ class MemoryBudgetTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 estimate_spatial_index_bytes(n, size)
 
+    def test_sparse_high_address_shell_bound_counts_only_occupied_ancestors(self):
+        import itertools
+        import random
+        core, shells, subdivision = 1024, 5, 8
+        root, depth = core << shells, 15
+        offset = (root-core)//2
+        rng = random.Random(218)
+        coordinates = [xyz for xyz in itertools.product(range(4), repeat=3)
+                       if not all(1 <= axis <= 2 for axis in xyz)]
+        leaves = {(*(offset+rng.randrange(core) for _ in range(3)), 0) for _ in range(200)}
+        high_addresses = []
+        for ordinal in range(1000):
+            shell, coarse = rng.randrange(shells), rng.randrange(56)
+            xyz = coordinates[coarse]
+            child = [rng.randrange(1 << subdivision) for _ in range(3)]
+            child_side = (core << shell) >> (subdivision+1)
+            coarse_side = child_side << subdivision
+            low = (root-(core << (shell+1)))//2
+            leaves.add((*(low+xyz[a]*coarse_side+child[a]*child_side for a in range(3)),
+                        child_side.bit_length()-1))
+            morton = sum(((child[a] >> bit) & 1) << (3*bit+a)
+                         for bit in range(subdivision) for a in range(3))
+            high_addresses.append(core**3 + (shell*56+coarse)*8**subdivision + morton)
+        self.assertGreater(max(high_addresses), 2**32)
+        ancestors = {(level, x >> level, y >> level, z >> level)
+                     for x, y, z, leaf_level in leaves for level in range(leaf_level+1, depth+1)}
+        nodes = len(ancestors)
+        actual = round_cuda_allocation((len(leaves)+nodes-1)*4) + 3*round_cuda_allocation(nodes*4) + 4*64
+        bound = estimate_spatial_index_bytes(len(leaves), core, background_shell_levels=shells,
+                                             background_subdivision_level=subdivision)
+        self.assertLessEqual(actual, bound)
+        self.assertLess(bound, MIB)
+        self.assertEqual(estimate_spatial_index_bytes(0, core, background_shell_levels=shells,
+            background_subdivision_level=subdivision), 8*64)
+        # Four million sparse leaves must not be budgeted as the 4.7 billion
+        # possible background addresses in this layout.
+        self.assertLess(estimate_spatial_index_bytes(4_000_000, core, background_shell_levels=shells,
+            background_subdivision_level=subdivision), GIB)
+        self.assertLess(estimate_spatial_index_bytes(1, core, background_shell_levels=10,
+            background_subdivision_level=9), MIB)
+
     def plan(self, **overrides):
         values = dict(self.inputs(), reference_cache_mib=4096, gpu={"memory_mib": "32607"})
         values.update(overrides)
@@ -64,7 +168,7 @@ class MemoryBudgetTests(unittest.TestCase):
         report = estimate_training_memory(**self.inputs())
         c = report["components_bytes"]
         self.assertEqual(c["model_parameters"], 100 * 38 * 4)
-        self.assertEqual(c["model_cell_indices"], 100 * 4)
+        self.assertEqual(c["model_cell_indices"], 100 * 8)
         self.assertEqual(c["adam_means"] + c["adam_squared_means"], 100 * 37 * 8)
         self.assertEqual(c["adam_step_counters"], 100 * 5 * 4)
         self.assertEqual(c["gradients"], 30 * 37 * 4)
@@ -85,8 +189,8 @@ class MemoryBudgetTests(unittest.TestCase):
         fields = ("model_parameters", "model_cell_indices", "adam_means",
                   "adam_squared_means", "adam_step_counters")
         self.assertEqual(sum(report["legacy_allocated_components_bytes"][key] for key in fields),
-                         35.25 * GIB)
-        self.assertLess(sum(report["allocated_components_bytes"][key] for key in fields), 24 * GIB)
+                         35.5 * GIB)
+        self.assertLess(sum(report["allocated_components_bytes"][key] for key in fields), 25 * GIB)
         # Aggregating first would incorrectly lose individual bucket rounding.
         self.assertNotEqual(report["allocated_components_bytes"]["model_parameters"],
                             round_cuda_allocation(report["components_bytes"]["model_parameters"]))

@@ -1,7 +1,7 @@
 """Small CUDA regressions for native fixed-capacity gradient storage.
 
 Dense native gradients are the oracle. The fixtures exercise hit and near-miss
-rows, zero gradients, projective SH9, topology evidence, overflow, and frozen
+rows, zero gradients, world-shell SH9, topology evidence, overflow, and frozen
 replays with a changing number of touched voxels. No real dataset is loaded.
 """
 
@@ -24,7 +24,7 @@ from reconstruction_optimizer import FalcorOptimizer, OptimizerConfig
 from reconstruction_replay import NativeLossReplay
 from reconstruction_gradient_storage import native_gradient_result
 from test_reconstruction_replay import fixture as replay_fixture
-from test_reconstruction_projective_native import fixture as projective_fixture
+from world_shell_fixture import fixture as world_fixture
 import test_reconstruction_compact_optimizer as optimizer_tests
 import train
 
@@ -161,8 +161,8 @@ class CompactGradientTests(unittest.TestCase):
         for value in result["gradients"].values():
             np.testing.assert_array_equal(np.array(value), 0.)
 
-    def test_projective_full_sh9_core_and_background_match_dense(self):
-        payload = projective_fixture(np)
+    def test_world_shell_full_sh9_core_and_background_match_dense(self):
+        payload = world_fixture(np)
         count = len(payload["model_state"]["cell_indices"])
         old_dc = payload["model_state"]["radiance_sh"].reshape(count, 3)
         sh = np.random.default_rng(43).uniform(-.03, .03, (count, 27)).astype(np.float32)

@@ -44,7 +44,15 @@ def write_scene(dataset, np):
             rgb[:, :, 1] = np.arange(12, dtype=np.uint8)[:, None] * 10 + index * 3
             rgb[:, :, 2] = 90 + index * 7
             Image.fromarray(rgb).save(images / f"view-{index:02d}.png")
-    points = [(-.05, .02, -1.7), (.15, .04, -1.73), (0., 0., 4.), (.3, -.2, 6.)]
+    # One exterior point lies inside the finite root, the other beyond it.
+    # Keep its x/z world coordinates inside its sparse leaf, rather than on
+    # the shared faces, and within both train and held-out camera images.
+    points = [(-.05, .02, -1.7), (.15, .04, -1.73), (.25, -.25, 1.), (.3, -.2, 6.)]
+    point = np.asarray(points[2])
+    for index in range(9):
+        camera_point = point - [(index - 4) * .15, 0., -2.]
+        pixel = np.array([7., 8.5]) * camera_point[:2] / camera_point[2] + [8.75, 5.25]
+        assert camera_point[2] > 0 and np.all(pixel > 1) and np.all(pixel < [15, 11])
     with (model / "points3D.bin").open("wb") as stream:
         stream.write(struct.pack("<Q", len(points)))
         for index, point in enumerate(points):
@@ -60,13 +68,13 @@ def run_check(args, output):
     write_scene(dataset, np)
     full = output / "full"
     config = {
-        "data": {"dataset": str(dataset), "background_final_layers": 4},
-        "model": {"grid_resolution": 4, "sh_count": 9, "opacity_sh_count": 1,
-                  "background_use_ellipsoid": args.background_use_ellipsoid},
-        "render": {"width": 93, "height": 97, "spp": 1, "max_hits": 2},
+        "data": {"dataset": str(dataset), "background_shell_levels": 3,
+                 "background_initial_resolution": args.background_initial_resolution},
+        "model": {"grid_resolution": 4, "sh_count": 9, "opacity_sh_count": 1},
+        "render": {"width": 93, "height": 97, "spp": 1, "max_hits": 128},
         "runtime": {"build_dir": args.build_dir, "gpu": args.gpu},
         "training": {"rgb_only": True, "num_epochs": 3, "chunk_size": 0,
-                     "sh_degree_progression": True, "sh_degree_weights": [4, 3, 3],
+                     "sh_degree_progression": True, "sh_degree_weights": [8, 0, 2],
                      "sync_view_checks": args.sync_view_checks,
                      "save_count": 3, "profile_views": 0, "profile_interval_epochs": 0,
                      "output": str(full)},
@@ -96,15 +104,15 @@ def run_check(args, output):
     final = load_checkpoint(full / "model.npz")
     report = json.loads((full / "training-report.json").read_text(encoding="utf-8"))
     assert report["training_status"] == report["evaluation"]["status"] == "passed"
-    assert report["training_protocol"]["scene_mapping"]["name"] == "projective_shell"
+    assert report["training_protocol"]["scene_mapping"]["name"] == "world_shell"
     assert "s=t/(t+core_half_extent)" in report["training_protocol"]["distortion"]["depth"]
-    assert report["initial_render"]["resolution"] == 6
+    assert report["initial_render"]["resolution"] == 4
     assert report["initial_render"]["view_index"] == 1  # Global index 0 belongs to the held-out split.
     assert (report["initial_render"]["width"], report["initial_render"]["height"]) == (16, 12)
     assert {path.name for path in full.glob("*.npz")} == {first_path.name, second_path.name, "model.npz"}
     assert report["checkpoint_epochs"] == [1, 2]
     assert set(report["level_renders"]) == {"4", "8"}
-    for core, storage, epoch, saved in ((4, 6, 1, first), (8, 12, 2, second)):
+    for core, storage, epoch, saved in ((4, 4, 1, first), (8, 8, 2, second)):
         rendered = report["level_renders"][str(core)]
         assert rendered["status"] == "passed"
         assert rendered["core_resolution"] == core and rendered["resolution"] == storage
@@ -116,33 +124,53 @@ def run_check(args, output):
         assert saved["training_state"]["completed_epochs"] == epoch
         assert saved["training_state"]["pending_epoch_transition"] is True
         assert saved["optimizer_state"] and saved["training_state"]["topology_state"]
-    assert final["model_metadata"]["resolution"] == 24
+    assert final["model_metadata"]["resolution"] == 16
     assert final["model_metadata"]["core_resolution"] == 16
-    assert final["model_metadata"]["scene_mapping"] == "projective_shell"
-    assert final["model_metadata"]["background_refinement"] == "preserve_physical_width"
-    assert final["model_metadata"]["background_layers"] == 4
+    assert final["model_metadata"]["scene_mapping"] == "world_shell"
+    assert final["model_metadata"]["background_refinement"] == "uniform"
+    initialization = final["config"]["data"]["initialization"]
+    initial_subdivision = initialization["background_subdivision_level"]
+    assert initial_subdivision == args.background_initial_resolution.bit_length() - 2
+    assert final["model_metadata"]["background_subdivision_level"] == initial_subdivision + 2
+    assert final["model_metadata"]["background_shell_levels"] == 3
     assert tuple(final["config"]["render"]["background"]) == (0., 0., 0.)
     assert first["training_state"]["global_step"] == 7
     assert final["training_state"]["global_step"] == 21
     assert final["training_state"]["completed_epochs"] == 3
-    np.testing.assert_array_equal(final["model_metadata"]["grid_min"], [-1.5] * 3)
-    np.testing.assert_array_equal(final["model_metadata"]["grid_max"], [1.5] * 3)
-    initialization = final["config"]["data"]["initialization"]
+    np.testing.assert_array_equal(final["model_metadata"]["grid_min"], [-1.] * 3)
+    np.testing.assert_array_equal(final["model_metadata"]["grid_max"], [1.] * 3)
     assert first["config"]["data"]["initialization"] == initialization
     np.testing.assert_allclose(initialization["center"], [0., 0., -2.], atol=1e-15)
     np.testing.assert_allclose(initialization["radius"], .66, atol=1e-15)
-    assert initialization["shell_width"] == .5
-    assert initialization["shell_layers"] == 4
-    assert initialization["version"] == 6
-    assert initialization["background_far_distance"] > 1
-    for saved in (first, second, final):
-        assert saved["model_metadata"]["background_far_distance"] == initialization["background_far_distance"]
-        assert saved["model_metadata"].get("background_use_ellipsoid", True) is args.background_use_ellipsoid
-        assert saved["config"]["model"]["background_use_ellipsoid"] is args.background_use_ellipsoid
-    assert report["training_protocol"]["scene_mapping"]["ray_extent"] == "finite_scene_boundary"
-    assert initialization["background_refinement"] == "preserve_physical_width"
-    assert initialization["background_final_layers"] == 4
-    assert initialization["initial_background_layers"] == 1
+    assert initialization["background_shell_levels"] == 3
+    assert initialization["version"] == 8
+    assert initialization["world_shell_version"] == 5
+    assert initialization["background_color_initialization"]["colored_points"] == 1
+    assert initialization["background_color_initialization"]["colored_voxels"] == 1
+    initial_background_count = initialization["background_voxels"]
+    for stage, saved in enumerate((first, second, final)):
+        subdivision = initial_subdivision + stage
+        assert saved["model_metadata"]["background_shell_levels"] == 3
+        assert saved["model_metadata"]["background_subdivision_level"] == subdivision
+        core = saved["model_metadata"]["core_resolution"]
+        ids = saved["model_state"]["cell_indices"]
+        background_ids = ids[ids >= core ** 3] - core ** 3
+        assert 0 < len(background_ids) <= 168 * 8**subdivision
+        assert len(np.unique(background_ids)) == len(background_ids)
+        assert np.all(background_ids < 168 * 8**subdivision)
+        assert saved["model_metadata"]["background_geometry"] == "ellipsoid"
+        assert ids.dtype == np.dtype(np.uint64)
+        assert saved["model_metadata"]["world_shell_version"] == 5
+        if stage == 0:
+            assert len(background_ids) == initial_background_count
+            if initial_subdivision == 0:
+                assert initial_background_count == 168
+                np.testing.assert_array_equal(np.sort(background_ids), np.arange(168))
+            else:
+                assert initialization["background_initialization"] == "point_cloud_sparse"
+                assert initial_background_count == initialization["background_color_initialization"]["colored_voxels"]
+    assert report["training_protocol"]["scene_mapping"]["ray_extent"] == "finite_world_root"
+    assert initialization["background_refinement"] == "uniform"
     assert initialization["background_opacity"] == .5
     assert not (dataset / "init_points.ply").exists()
     history = [json.loads(line) for line in (full / "training.jsonl").read_text().splitlines()]
@@ -153,19 +181,19 @@ def run_check(args, output):
         assert row["mean_dssim_loss"] > 0 if args.dssim_weight else row["mean_dssim_loss"] == 0
     assert final["config"]["gradient"]["dssim_loss_weight"] == args.dssim_weight
     assert report["training_protocol"]["dssim"]["enabled"] == (args.dssim_weight > 0)
-    assert [row["training_resolution"] for row in history] == [6, 12, 24]
-    assert [row["active_sh_count"] for row in history] == [1, 4, 9]
-    assert [row["active_sh_degree"] for row in history] == [0, 1, 2]
+    assert [row["training_resolution"] for row in history] == [4, 8, 16]
+    assert [row["active_sh_count"] for row in history] == [1, 1, 9]
+    assert [row["active_sh_degree"] for row in history] == [0, 0, 2]
     assert history[0]["topology"]["refined"] is True
     assert history[1]["topology"]["refined"] is True
     assert final["model_state"]["radiance_sh"].size > 0
-    for saved, active in ((first, 1), (second, 4), (final, 9)):
+    for saved, active in ((first, 1), (second, 1), (final, 9)):
         metadata, state = saved["model_metadata"], saved["model_state"]
         count = len(state["cell_indices"])
         assert state["radiance_sh"].size == count * metadata["sh_count"] * 3
         assert metadata["active_sh_count"] == active
         assert saved["config"]["training"]["sh_degree_progression"] is True
-        assert list(saved["config"]["training"]["sh_degree_weights"]) == [4, 3, 3]
+        assert list(saved["config"]["training"]["sh_degree_weights"]) == [8, 0, 2]
         assert saved["optimizer_state"]["radiance_degree_steps"] is True
         clocks = saved["optimizer_state"]["groups"]["radiance_sh"]["steps"].reshape(count, 3)
         assert np.any(clocks[:, :{1: 1, 4: 2, 9: 3}[active]] > 0)
@@ -176,7 +204,10 @@ def run_check(args, output):
             for field in ("mean", "squared_mean"):
                 moments = saved["optimizer_state"]["groups"]["radiance_sh"][field].reshape(count, 9, 3)
                 np.testing.assert_array_equal(moments[:, active:], 0)
-    assert np.any(second["model_state"]["radiance_sh"].reshape(-1, 9, 3)[:, 1:4] != 0)
+    final_core = final["model_state"]["cell_indices"] < 16**3
+    final_coefficients = final["model_state"]["radiance_sh"].reshape(-1, 9, 3)
+    for region in (final_core, ~final_core):
+        assert np.any(final_coefficients[region, 1:] != 0)
     assert not np.array_equal(first["model_state"]["radiance_sh"], final["model_state"]["radiance_sh"])
 
     # Standalone evaluation must render the saved stage, not enable all SH
@@ -191,7 +222,7 @@ def run_check(args, output):
              "--gpu", str(args.gpu)], f"evaluate-stage-{core}")
         stage_report = json.loads((stage_output / "evaluation-report.json").read_text(encoding="utf-8"))
         assert stage_report["status"] == "passed"
-        assert stage_report["scene_background"]["background_use_ellipsoid"] is args.background_use_ellipsoid
+        assert stage_report["scene_background"]["background_geometry"] == "ellipsoid"
         assert stage_report["checkpoint"]["model_metadata"]["active_sh_count"] == saved["model_metadata"]["active_sh_count"]
         stage_image = stage_report["splits"]["train"]["views"][0]["prediction"]
         with Image.open(stage_image) as reproduced, Image.open(report["level_renders"][str(core)]["image"]) as original:
@@ -202,7 +233,7 @@ def run_check(args, output):
 
     evaluation = json.loads((full / "evaluation-report.json").read_text(encoding="utf-8"))
     assert evaluation["status"] == "passed"
-    assert evaluation["scene_background"]["background_use_ellipsoid"] is args.background_use_ellipsoid
+    assert evaluation["scene_background"]["background_geometry"] == "ellipsoid"
     assert (evaluation["render"]["width"], evaluation["render"]["height"]) == (16, 12)
     for split, expected in (("train", list(range(1, 8))), ("test", [0, 8])):
         result = evaluation["splits"][split]
@@ -236,7 +267,7 @@ def run_check(args, output):
         assert resume_report["trained_epochs_this_run"] == 3 - resume_epoch
         resumed_history = [json.loads(line) for line in Path(resume_report["history_file"]).read_text().splitlines()]
         assert [row["epoch"] for row in resumed_history] == list(range(resume_epoch + 1, 4))
-        assert [row["active_sh_count"] for row in resumed_history] == [1, 4, 9][resume_epoch:]
+        assert [row["active_sh_count"] for row in resumed_history] == [1, 1, 9][resume_epoch:]
         for key, value in final["model_state"].items():
             np.testing.assert_allclose(recovered["model_state"][key], value, atol=2e-6, rtol=2e-6,
                                        err_msg=f"resumed from epoch {resume_epoch}, model {key}")
@@ -249,13 +280,13 @@ def run_check(args, output):
         for split, count in (("train", 7), ("test", 2)):
             assert resume_evaluation["splits"][split]["aggregate"]["view_count"] == count
     return {"status": "passed", "output": str(output), "checks": [
-        "COLMAP binary initialization without PLY", "fixed camera normalization and thin shell",
-        "fixed physical shell: layers 1 -> 2 -> 4 and grid 6 -> 12 -> 24",
-        "finite far distance preserved through both refinements, saved rendering and resume",
-        "background hit mode preserved through both refinements, saved rendering and resume",
+        "COLMAP binary initialization without PLY", "fixed camera normalization and world-space cube shells",
+        f"core 4 -> 8 -> 16; fitted background ellipsoids at subdivision {initial_subdivision} -> {initial_subdivision+1} -> {initial_subdivision+2}",
+        "world-space root and leaf layout preserved through refinements and resume",
+        "background ellipsoid rendering preserved in saved evaluation and resume",
         "sorted filename split: 7 train / 2 test",
         "full scaled fx/fy/cx/cy and 16x12 reference alignment", "all-view train/test evaluation",
-        "global 4:3:3 SH schedule activates 1 -> 4 -> 9 coefficients across grid changes",
+        "global 8:0:2 SH schedule activates foreground/background anisotropy together after refinement",
         "inactive SH coefficients, moments and per-degree clocks remain zero",
         "saved stage rendering reproduces pre-refinement images",
         "both SH transitions resume with identical model, Adam, RNG and initialization metadata"]}
@@ -268,7 +299,8 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--dssim-weight", type=float, default=0.)
     parser.add_argument("--distortion-weight", type=float, default=.1)
-    parser.add_argument("--background-use-ellipsoid", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--background-initial-resolution", type=int, choices=(2, 4), default=2,
+                        help="2: legacy dense S0; 4: point-occupied sparse S1, both with two refinements")
     parser.add_argument("--sync-view-checks", action="store_true")
     args = parser.parse_args()
     root = workspace_path(args.output_dir, WORKSPACE)

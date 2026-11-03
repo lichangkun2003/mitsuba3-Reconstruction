@@ -143,16 +143,14 @@ CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
 CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再解码；渲染与损失仍在线性空间。
 CONFIG.data.scene_mode = "auto"  # 合成场景：有界白色背景；COLMAP：无界远景层、无白色背景尾项。
-CONFIG.data.background_final_layers = 8  # 最终远景层数；1024 终点按 2→4→8 层细分，物理范围不变。
+CONFIG.data.background_shell_levels = 5  # 每壳初始56叶；新实验随前景升层同步八分裂。
 CONFIG.data.background_opacity = 0.5  # 远景新生体素 opacity；允许后续优化和删除。
-CONFIG.data.background_far_distance = None  # 自动估计场景中心有限远边界 H；手动值以核心半宽为单位。
-CONFIG.data.background_far_percentile = 99.9  # 归一化外景点（h>1）的 L∞ 距离分位数。
-CONFIG.data.background_far_margin = 1.2  # 自动边界在该分位数上额外留 20% 余量。
 
 CONFIG.render.width = 800
 CONFIG.render.height = 800
 CONFIG.render.spp = 1  # 训练固定每视角 1 spp；多 spp 出图使用评价脚本。
 CONFIG.render.traversal = "octree"  # 默认八叉占用树跳过空区域；"dda" 仅用于对照。
+CONFIG.render.max_hits = 128  # 背景同步细分后需要更多射线命中记录；训练与评价共用。
 CONFIG.training.rgb_only = True  # 参考 alpha 仅用于读图时合成 RGB，不进入训练或生长投票。
 CONFIG.model.opacity_sh_count = 1  # 仅优化 DC logit；opacity = sigmoid(Y0 * b0)。
 CONFIG.gradient.alpha_loss_weight = 0.
@@ -257,20 +255,9 @@ def parse_arguments():
     parser.add_argument("--dataset")
     parser.add_argument("--scene-mode", choices=("auto", "bounded", "unbounded"),
                         help="auto: bounded synthetic / unbounded COLMAP; override for a new scene")
-    parser.add_argument("--background-final-layers", type=int,
-                        help="Radial background layers at the target resolution (default: 8); independent of max_hits")
-    parser.add_argument("--background-layers", type=int, help="Legacy v2/v3 setting; use --background-final-layers for new runs")
+    parser.add_argument("--background-shell-levels", type=int,
+                        help="Fixed world-space cubical shells, each with 56 leaves (default: 5)")
     parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
-    parser.add_argument("--background-use-ellipsoid", action=argparse.BooleanOptionalAction, default=None,
-                        help="Projective far field: use ellipsoids (default); --no-background-use-ellipsoid uses occupied cells")
-    parser.add_argument("--background-layered-sampling", action=argparse.BooleanOptionalAction, default=None,
-                        help="Query each projective background layer once; requires --no-background-use-ellipsoid")
-    parser.add_argument("--background-far-distance", type=float,
-                        help="Finite scene-centered L-infinity radius H > 1, in core half extents (default: automatic)")
-    parser.add_argument("--background-far-percentile", type=float,
-                        help="Automatic far-distance point percentile in (0, 100] (default: 99.9)")
-    parser.add_argument("--background-far-margin", type=float,
-                        help="Automatic far-distance multiplier >= 1 (default: 1.2)")
     parser.add_argument("--output-dir", help="Override automatic outputs/SCENE-MM.DD-Eindex/training; on resume the default reuses the checkpoint's experiment")
     parser.add_argument("--build-dir")
     parser.add_argument("--gpu", type=int, help="Local physical index; ignored under Slurm")
@@ -311,14 +298,8 @@ def apply_arguments(config, args, values):
         (getattr(args, "level_weights", None), "schedule", "level_weights"),
         (args.dataset, "data", "dataset"), (args.output_dir, "training", "output"),
         (getattr(args, "scene_mode", None), "data", "scene_mode"),
-        (getattr(args, "background_layers", None), "data", "background_layers"),
-        (getattr(args, "background_final_layers", None), "data", "background_final_layers"),
+        (getattr(args, "background_shell_levels", None), "data", "background_shell_levels"),
         (getattr(args, "background_opacity", None), "data", "background_opacity"),
-        (getattr(args, "background_use_ellipsoid", None), "model", "background_use_ellipsoid"),
-        (getattr(args, "background_layered_sampling", None), "model", "background_layered_sampling"),
-        (getattr(args, "background_far_distance", None), "data", "background_far_distance"),
-        (getattr(args, "background_far_percentile", None), "data", "background_far_percentile"),
-        (getattr(args, "background_far_margin", None), "data", "background_far_margin"),
         (args.build_dir, "runtime", "build_dir"), (args.gpu, "runtime", "gpu"),
         (args.chunk_size, "training", "chunk_size"),
         (getattr(args, "sampling_workers", None), "training", "sampling_workers"),
@@ -378,7 +359,25 @@ def apply_arguments(config, args, values):
 
 def validate(config):
     validate_config(PreviewConfig(data=config.data, model=config.model, render=config.render, runtime=config.runtime))
+    if config.render.max_hits > 128:
+        raise ValueError("Training render.max_hits must be an integer in [1, 128]")
     validate_sh_schedule(config)
+    if config.data.background_refinement == "adaptive":
+        if not config.training.rgb_only or not config.topology.gpu_topology:
+            raise ValueError("Adaptive background training requires RGB-only GPU topology")
+        for name in ("background_refine_interval", "background_refine_max_new_leaves",
+                     "background_max_active_voxels", "background_growth_max_candidates"):
+            if type(getattr(config.topology, name)) is not int or getattr(config.topology, name) < 1:
+                raise ValueError(f"topology.{name} must be a positive integer")
+        if not 0 < config.topology.background_refine_fraction <= 1:
+            raise ValueError("topology.background_refine_fraction must be in (0, 1]")
+        if (not math.isfinite(config.topology.background_refine_pixel_threshold)
+                or config.topology.background_refine_pixel_threshold <= 0):
+            raise ValueError("topology.background_refine_pixel_threshold must be finite and positive")
+        if config.data.background_initial_leaf_budget > config.topology.background_max_active_voxels:
+            raise ValueError("Initial background budget exceeds its active leaf cap")
+        if config.data.background_initial_leaf_budget > config.topology.max_active_voxels:
+            raise ValueError("Initial background budget exceeds the total active leaf cap")
     if config.schedule.enabled:
         level_budgets(config.schedule.start_resolution, config.schedule.target_resolution,
                       config.schedule.total_epochs, config.schedule.level_weights)
@@ -650,8 +649,10 @@ def model_index_bytes(model, allocator_policy=None):
                     ("octree_normal_parent_nodes", "octree_candidate_parent_nodes"))):
         # Native statistics expose logical sizes. Each tree owns three node
         # arrays and one leaf array; an empty tree retains scalar sentinels.
+        mixed = int(getattr(model, "native_background_shell_levels", lambda: 0)()) > 0
         return sum(3 * round_cuda_allocation(max(1, int(nodes)) * 4, allocator_policy)
-                   + round_cuda_allocation(max(1, int(leaves)) * 4, allocator_policy)
+                   + round_cuda_allocation(max(1, int(leaves) +
+                       (max(0, int(nodes) - 1) if mixed else 0)) * 4, allocator_policy)
                    for nodes, leaves in (
                        (statistics["octree_normal_parent_nodes"], model.active_voxel_count),
                        (statistics["octree_candidate_parent_nodes"], model.growth_candidate_count)))
@@ -735,7 +736,9 @@ def prepare_refinement_memory(config, model, optimizer, cache, native_replay, re
     policy = report["cuda_allocator"]["policy"]
     metadata = request["model_metadata"]
     index_bound = estimate_spatial_index_bytes(request["active_voxels"], metadata["resolution"],
-                                              allocator_policy=policy)
+        allocator_policy=policy, background_shell_levels=metadata.get("background_shell_levels", 0),
+        background_subdivision_level=metadata.get("background_subdivision_level", 0),
+        background_adaptive=metadata.get("background_refinement") == "adaptive")
     ordinary = training_memory_plan(config, model, report, view_count, world_size=world_size,
         active_voxels=request["active_voxels"], known_index_bytes=index_bound)
     transition = plan_refinement_memory(request, gpu=report.get("gpu"),
@@ -772,7 +775,10 @@ def prepare_topology_commit_memory(config, model, optimizer, cache, native_repla
     count, metadata = int(request["active_voxels"]), request["model_metadata"]
     ordinary = training_memory_plan(config, model, report, view_count, world_size=world_size,
         active_voxels=count, known_index_bytes=estimate_spatial_index_bytes(
-            count, metadata["resolution"], allocator_policy=policy))
+            count, metadata["resolution"], allocator_policy=policy,
+            background_shell_levels=metadata.get("background_shell_levels", 0),
+            background_subdivision_level=metadata.get("background_subdivision_level", 0),
+            background_adaptive=metadata.get("background_refinement") == "adaptive"))
     live = refinement_memory_snapshot(report.get("gpu"))
     # Adam remaps and model materialization retire one field at a time. The
     # largest destination is one SH field, not the difference in row counts.
@@ -917,11 +923,11 @@ def resolve_resume_reference_compositing(config, checkpoint, overrides):
 
 
 def require_background_rgb_deletion(config, native_model_type):
-    """Reject stale native builds that silently omit projective shell votes."""
-    projective = (config.data.initialization or {}).get("scene_mapping") == "projective_shell"
-    if (projective and config.topology.enable_deletion and config.topology.use_rgb_deletion
+    """Reject stale native builds that omit world-space background votes."""
+    world_shell = (config.data.initialization or {}).get("scene_mapping") == "world_shell"
+    if (world_shell and config.topology.enable_deletion and config.topology.use_rgb_deletion
             and getattr(native_model_type, "background_rgb_deletion_version", 0) < 1):
-        raise RuntimeError("Projective background RGB deletion requires native "
+        raise RuntimeError("World-shell background RGB deletion requires native "
                            "background_rgb_deletion_version >= 1; incrementally rebuild "
                            "this Mitsuba source checkout and restart training")
 
@@ -944,6 +950,8 @@ def settings(config):
         transmittance_threshold=config.render.transmittance_threshold,
         max_hits=config.render.max_hits, entry_offset_fraction=config.render.entry_offset_fraction,
         use_octree=config.render.traversal == "octree")
+    if getattr(config, "_collect_adaptive_priority", False):
+        result["collect_adaptive_priority"] = True
     return result
 
 
@@ -1068,6 +1076,11 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
                 dr.scatter(target, result[name], indices)
         for key, value in result["gradients"].items():
             accumulator["gradients"][key] = accumulator["gradients"].get(key, 0) + value
+        if native_settings.get("collect_adaptive_priority", False):
+            if "adaptive_priority" not in result:
+                raise RuntimeError("Adaptive subdivision statistics require rebuilding this checkout")
+            accumulator["adaptive_priority"] = accumulator.get("adaptive_priority", 0) + result["adaptive_priority"]
+            finite &= dr.all(dr.isfinite(result["adaptive_priority"]))
         for key in ("appearance_valid", "geometry_valid", "background_carve_valid"):
             accumulator[key] = accumulator.get(key, 0) + result[key]
         for key in ("foreground_evidence", "background_evidence"):
@@ -1313,8 +1326,6 @@ def prepare_training_output(config, resume_path=None, checkpoint_config=None):
 
 def normalized_algorithm_group(name, values):
     """Compare legacy saves with explicit defaults, without changing algorithms."""
-    if name == "model" and values is not None:
-        return {"background_use_ellipsoid": True, "background_layered_sampling": False, **values}
     if name == "render" and values is not None:
         # Traversal is an acceleration choice and can change on resume; it does
         # not change leaf shading, gradients, candidate evidence, or sampling.
@@ -1322,16 +1333,9 @@ def normalized_algorithm_group(name, values):
     if name == "data" and values is not None:
         # Omitted/None COLMAP options are identical for historical synthetic runs.
         normalized = {"reference_compositing": "linear", "scene_mode": "auto",
-            "background_layers": 8, "background_final_layers": None, "background_opacity": .5,
-            "background_far_distance": None, "background_far_percentile": 99.9, "background_far_margin": 1.2, **{
+            "background_shell_levels": 5, "background_initial_resolution": 2, "background_opacity": .5, **{
             key: value for key, value in values.items()
             if key not in ("images", "initialization") or value is not None}}
-        # The saved initializer determines which layer parameter is meaningful.
-        # Preserve historical comparisons without silently changing its policy.
-        if (values.get("initialization") or {}).get("version") in (4, 5, 6):
-            normalized.pop("background_layers", None)
-        elif normalized["background_final_layers"] is None:
-            normalized.pop("background_final_layers")
         return normalized
     defaults = {"topology": TopologySettings, "gradient": GradientSettings}
     if values is not None and name in defaults:
@@ -1546,8 +1550,7 @@ def run_training(distributed=None):
             # Fields introduced after a checkpoint must use their legacy
             # dataclass defaults, not the latest experiment's CONFIG switches.
             saved_data = checkpoint["config"].get("data", {})
-            config.data = (DataConfig() if (saved_data.get("initialization") or {}).get("version") in (4, 5, 6)
-                           else DataConfig(background_layers=8, background_final_layers=None))
+            config.data = DataConfig()
             config.render = RenderConfig()
             config.model = ModelConfig()
             config.topology = TopologySettings()
@@ -1593,6 +1596,8 @@ def run_training(distributed=None):
                         raise ValueError("Resume output belongs to a different configuration; choose a new --output-dir")
         validate_traversal(config.render, mi, report)
         world_size = distributed.world_size if distributed is not None else 1
+        if config.data.background_refinement == "adaptive" and world_size != 1:
+            raise ValueError("Adaptive background training currently requires a single GPU")
         sampling_workers = (min(config.training.sampling_workers, report["cpu_threads"]["actual"])
                             if world_size == 1 else 0)
         view_batch_mode = world_size > 1
@@ -1733,36 +1738,35 @@ def run_training(distributed=None):
             raise ValueError("D-SSIM requires a complete image at the dataset resolution; set training.chunk_size=0")
         report["scene_background"] = scene_background_protocol(config.data, config.render, config.model)
         report["training_protocol"]["reference_background"] = list(config.render.background)
-        if (config.data.initialization or {}).get("scene_mapping") == "projective_shell":
-            background_depth = (
-                "core ellipsoid quadratic minimum / background inverse-depth layer midpoint world-shell intersection; "
-                if config.model.background_layered_sampling else
-                "core ellipsoid quadratic minimum / background occupied-cell segment midpoint mapped to world ray distance t; ")
+        if (config.data.initialization or {}).get("scene_mapping") == "world_shell":
+            from reconstruction_world_shell import world_shell_metadata_geometry
+            background_ellipsoid = world_shell_metadata_geometry(config.data.initialization) == "ellipsoid"
             report["training_protocol"]["distortion"]["depth"] = (
-                ("hard-hit ellipsoid quadratic minimum mapped back to world ray distance t; "
-                 if config.model.background_use_ellipsoid else
-                 background_depth) +
-                "s=t/(t+core_half_extent), t measured from ray origin")
+                ("core/background clipped ellipsoid quadratic minimum; " if background_ellipsoid else
+                 "core ellipsoid quadratic minimum / background world-leaf segment midpoint; ")
+                + "s=t/(t+core_half_extent), t measured from ray origin")
             report["training_protocol"]["scene_mapping"] = {
-                "name": "projective_shell",
-                "native_version": getattr(mi.VoxelReconstruction, "projective_version", 0),
-                "background_use_ellipsoid": config.model.background_use_ellipsoid,
-                "background_layered_sampling": config.model.background_layered_sampling,
-                "background_sampling": report["scene_background"]["background_sampling"],
-                "background_layered_sampling_version": getattr(
-                    mi.VoxelReconstruction, "background_layered_sampling_version", 0),
-                "background_geometry": report["scene_background"]["background_geometry"],
-                "background_geometry_version": getattr(mi.VoxelReconstruction, "background_geometry_version", 0),
-                "background_geometry_optimization": config.model.background_use_ellipsoid,
-                "ray_extent": report["scene_background"]["ray_extent"],
-                "background_far_distance": report["scene_background"]["background_far_distance"],
-                "segments": "analytic world-region intervals; same color/transmittance/hit capacity across charts",
-                "background_growth": False,
+                "name": "world_shell",
+                "native_version": getattr(mi.VoxelReconstruction, "world_shell_version", 0),
+                "background_shell_levels": config.data.background_shell_levels,
+                "background_initial_leaf_count": config.data.initialization["background_voxels"],
+                "background_initial_resolution": config.data.background_initial_resolution,
+                "background_geometry": "leaf-clipped ellipsoids" if background_ellipsoid else "world-space cubical leaves",
+                "background_geometry_optimization": background_ellipsoid,
+                "ray_extent": "finite_world_root",
+                "segments": "mixed-depth leaf AABB intervals; one contribution per intersected leaf",
+                "background_refinement": config.data.initialization.get("background_refinement", "fixed"),
+                "background_opacity_refinement": ("same_fitted_child_rule_as_foreground" if background_ellipsoid
+                                                  else "halve_optical_depth_for_uniform_children"),
+                "background_growth": config.data.background_refinement == "adaptive" and config.topology.enable_growth,
+                "background_max_resolution": config.data.background_max_resolution if config.data.background_refinement == "adaptive" else None,
                 "background_rgb_deletion": rgb_deletion_enabled,
                 "background_rgb_deletion_version": getattr(
                     mi.VoxelReconstruction, "background_rgb_deletion_version", 0),
                 "background_rgb_deletion_scope": "all levels; same complete-ray RGB votes and confirmation as core",
-                "background_opacity_deletion": "configured finest level only; existing warmup and confirmation windows",
+                "background_opacity_deletion": ("all levels; existing warmup and confirmation windows"
+                    if config.data.background_refinement == "adaptive" else
+                    "configured finest level only; existing warmup and confirmation windows"),
             }
         views = (prepared["views"] if prepared is not None else
                  load_views(dataset, config.data.cameras, config.render, np))
@@ -2074,8 +2078,11 @@ def run_training(distributed=None):
         emit("Starting training; first kernels may require JIT compilation", flush=True)
         end_epoch = (min(config.training.num_epochs, completed + args.stop_after_epochs)
                      if args.stop_after_epochs is not None else config.training.num_epochs)
+        from reconstruction_adaptive_training import AdaptiveBackgroundController
+        adaptive_background = AdaptiveBackgroundController(config, topology, views, dr)
         for epoch in range(completed, end_epoch):
             started = time.perf_counter()
+            config._collect_adaptive_priority = adaptive_background.begin_epoch(model, epoch + 1)
             previous_sh_count = int(getattr(model, "active_sh_count", model.sh_count))
             active_sh_count = apply_sh_schedule(model, config, epoch)
             if active_sh_count != previous_sh_count:
@@ -2109,7 +2116,7 @@ def run_training(distributed=None):
             if not primary and (previous_growth_count or rgb_growth_requested):
                 native_replay.clear()
                 if rgb_growth_requested:
-                    model.set_growth_candidates({key: mi.UInt32(value) if key == "cell_indices" else mi.Float(value)
+                    model.set_growth_candidates({key: mi.UInt64(value) if key == "cell_indices" else mi.Float(value)
                                                  for key, value in growth_payload.items()})
                 else:
                     model.clear_growth_candidates()
@@ -2186,6 +2193,7 @@ def run_training(distributed=None):
                             native_replay=native_replay, collective=collective, alpha_on_device=True,
                             loss_components=loss_components, deferred_checks=deferred_checks)
                         gradients_done = time.perf_counter()
+                        adaptive_background.observe(gradients)
                         if primary and rgb_growth_requested:
                             topology.observe_rgb_growth(model, gradients, view_id=int(index), epoch=epoch,
                                                         pixel_count=ray_count)
@@ -2284,7 +2292,13 @@ def run_training(distributed=None):
                 # after the model clears them. Release before commit/remapping.
                 native_replay.clear()
                 topology_cache_prepare_seconds = release_topology_cache(model, dr)
+            if adaptive_background.collecting:
+                native_replay.clear()
+                optimizer.clear_replay()
+                release_topology_cache(model, dr)
             new_state, event = topology.finish_epoch(model, optimizer, epoch+1) if primary else (None, None)
+            if primary:
+                new_state, event = adaptive_background.finish(model, optimizer, epoch + 1, new_state, event)
             topology.before_refine_checkpoint = None
             if new_state is not None:
                 # finish_epoch already migrated Adam; the old model can no
@@ -2327,7 +2341,8 @@ def run_training(distributed=None):
                 configure_training_memory(config, model, gpu_reference_cache, report, len(views),
                                           world_size=world_size, emit=emit)
                 event["refinement_cache_release_seconds"] = release_topology_cache(model, dr)
-            elif topology_evidence_finished or event.get("deleted", 0) or event.get("grown", 0):
+            elif (topology_evidence_finished or event.get("deleted", 0) or event.get("grown", 0)
+                  or event.get("background_refined", False)):
                 configure_training_memory(config, model, gpu_reference_cache, report, len(views),
                                           world_size=world_size, emit=emit)
                 event["topology_cache_release_seconds"] = release_topology_cache(model, dr)

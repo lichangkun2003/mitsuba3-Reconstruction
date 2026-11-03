@@ -46,6 +46,8 @@ class InitializationIntegrationTests(unittest.TestCase):
 
     def native(self):
         factory = Mock(return_value=sentinel.synthetic_model)
+        factory.cell_index_bits = 64
+        factory.world_shell_version = 5
         factory.from_points.return_value = sentinel.colmap_model
         return SimpleNamespace(VoxelReconstruction=factory)
 
@@ -78,75 +80,109 @@ class InitializationIntegrationTests(unittest.TestCase):
         self.assertEqual(views[0]["camera"]["camera_angle_x"], .7)
         self.assertNotIn("fx", views[0]["camera"])
 
-    def test_colmap_initialization_passes_contracted_arrays_and_core_to_native(self):
+    def test_colmap_initialization_passes_core_arrays_and_uniform_shell_policy_to_native(self):
         prepared = common.prepare_dataset(self.config, np)
         self.assertEqual((self.config.render.width, self.config.render.height), (16, 12))
         self.assertEqual(self.config.data.initialization, prepared["initialization"])
-        self.assertEqual(prepared["initialization"]["shell_layers"], self.config.data.background_final_layers)
-        self.assertEqual((prepared["resolution"], prepared["core_resolution"]), (264, 256))
+        self.assertEqual(prepared["initialization"]["background_shell_levels"], self.config.data.background_shell_levels)
+        self.assertEqual(prepared["initialization"]["world_shell_version"], 5)
+        self.assertEqual(prepared["initialization"]["background_geometry"], "ellipsoid")
+        self.assertEqual((prepared["resolution"], prepared["core_resolution"]), (256, 256))
         mi = self.native()
         with patch.dict(sys.modules, {"drjit": SimpleNamespace()}), patch(
                 "reconstruction_background.initialize_background_model", return_value=sentinel.colmap_model) as shell:
             result = common.initialize_model(self.config, self.scene, mi, np, prepared=prepared)
-        self.assertEqual(shell.call_args.kwargs,
-                         {"opacity": .5, "refinement": "preserve_physical_width", "layers": 4,
-                          "mapping": "projective_shell",
-                          "background_far_distance": prepared["initialization"]["background_far_distance"]})
+        options = dict(shell.call_args.kwargs)
+        np.testing.assert_array_equal(options.pop("background_colors"), prepared["background_colors"])
+        np.testing.assert_array_equal(options.pop("background_point_counts"), prepared["background_point_counts"])
+        self.assertEqual(options, {"opacity": .5, "shell_levels": 5,
+                                   "background_refinement": "uniform", "background_geometry": "ellipsoid",
+                                   "background_points": None, "background_subdivision_level": 0,
+                                   "adaptive_background": None})
         self.assertIs(result, sentinel.colmap_model)
         mi.VoxelReconstruction.assert_not_called()
         args = mi.VoxelReconstruction.from_points.call_args.args
-        self.assertEqual(args[2:], (264, [-1.03125] * 3, [1.03125] * 3,
+        self.assertEqual(args[2:], (256, [-1.] * 3, [1.] * 3,
                                     self.config.model.sh_count, self.config.model.opacity_sh_count, 256))
         for actual, expected in zip(args[:2], (prepared["positions"], prepared["colors"])):
             self.assertEqual(actual.dtype, np.dtype(np.float32))
             self.assertEqual(actual.ndim, 1)
             self.assertTrue(actual.flags.c_contiguous)
             np.testing.assert_array_equal(actual, expected.reshape(-1))
-        far = prepared["initialization"]["background_far_distance"]
-        np.testing.assert_allclose(args[0].reshape(-1, 3)[-1],
-                                   [1. + .03125 * .9 / (1. - 1. / far), 0., 0.])
+        np.testing.assert_allclose(args[0].reshape(-1, 3), [[1. / 4.4, 2. / 4.4, 0.]])
 
     def test_final_layer_initialization_is_independent_of_ray_hit_capacity(self):
         self.config.schedule.target_resolution = 1024
         prepared = []
-        for max_hits in (1, 16, 32):
+        for max_hits in (1, 16, 24, 32, 64, 128):
             config = copy.deepcopy(self.config)
             config.render.max_hits = max_hits
             prepared.append(common.prepare_dataset(config, np))
         for value in prepared:
-            self.assertEqual(value["resolution"], 260)
-            self.assertEqual(value["grid_max"], [65/64]*3)
-            self.assertEqual(value["initialization"]["initial_background_layers"], 2)
+            self.assertEqual(value["resolution"], 256)
+            self.assertEqual(value["grid_max"], [1.]*3)
+            self.assertEqual(value["initialization"]["background_shell_levels"], 5)
             np.testing.assert_array_equal(value["positions"], prepared[0]["positions"])
 
-    def test_saved_legacy_config_keeps_original_layout(self):
+    def test_background_resolution_128_passes_sparse_six_level_initialization(self):
+        baseline = common.prepare_dataset(copy.deepcopy(self.config), np)
+        self.config.data.background_initial_resolution = 128
+        prepared = common.prepare_dataset(self.config, np)
+        metadata = prepared["initialization"]
+        self.assertEqual(metadata["world_shell_version"], 5)
+        self.assertEqual(metadata["background_initial_resolution"], 128)
+        self.assertEqual(metadata["background_subdivision_level"], 6)
+        self.assertEqual(metadata["background_initialization"], "point_cloud_sparse")
+        self.assertEqual(metadata["background_voxels"], 2)
+        self.assertIsNone(prepared["background_colors"])
+        self.assertIsNone(prepared["background_point_counts"])
+        background = prepared["background_points"]
+        self.assertEqual(background["cell_indices"].dtype, np.dtype(np.uint64))
+        self.assertEqual(background["background_subdivision_level"], 6)
+        self.assertEqual(len(background["cell_indices"]), 2)
+        np.testing.assert_array_equal(prepared["positions"], baseline["positions"])
+        np.testing.assert_array_equal(prepared["colors"], baseline["colors"])
+        mi = self.native()
+        with patch.dict(sys.modules, {"drjit": SimpleNamespace()}), patch(
+                "reconstruction_background.initialize_background_model", return_value=sentinel.colmap_model) as shell:
+            result = common.initialize_model(self.config, self.scene, mi, np, prepared=prepared)
+        self.assertIs(result, sentinel.colmap_model)
+        options = shell.call_args.kwargs
+        self.assertIs(options["background_points"], background)
+        self.assertEqual(options["background_subdivision_level"], 6)
+        self.assertEqual(options["background_refinement"], "uniform")
+        self.assertEqual(options["background_geometry"], "ellipsoid")
+        self.assertIsNone(options["background_colors"])
+        self.assertIsNone(options["background_point_counts"])
+
+    def test_training_hit_budget_accepts_24_and_checks_native_upper_limit(self):
+        import train
+        for hits in (1, 16, 24, 32, 64, 128):
+            config = copy.deepcopy(train.CONFIG)
+            config.render.max_hits = hits
+            train.validate(config)
+        for hits in (0, -1, 129, 256, 24.5, True):
+            config = copy.deepcopy(train.CONFIG)
+            config.render.max_hits = hits
+            with self.assertRaisesRegex(ValueError, "max_hits"):
+                train.validate(config)
+
+    def test_saved_legacy_config_is_rejected_before_initialization(self):
         import preview
         import train
-        from reconstruction_dataset import prepare_colmap
-        legacy = prepare_colmap(self.scene, shell_layers=16)["initialization"]
-        legacy.update(version=3, scene_mode="unbounded", scene_mapping="radial_seed_shell",
-                      background_refinement="fixed_layers", background_layers=8,
-                      background_opacity=.5, shell_layers=8)
+        legacy = {"version": 3, "scene_mode": "unbounded", "scene_mapping": "radial_seed_shell"}
         entries = {"data": {"dataset": str(self.scene), "initialization": legacy}}
         for update in (train.update, preview.update_config):
             with self.subTest(loader=update.__module__):
-                config = TrainConfig()
-                update(config, entries)
-                self.assertIsNone(config.data.background_final_layers)
-                restored = common.prepare_dataset(config, np)
-                self.assertEqual(restored["resolution"], 272)
-                self.assertEqual(restored["grid_max"], [1.0625]*3)
-                self.assertEqual(restored["initialization"], legacy)
-                config.data.background_final_layers = 8
-                with self.assertRaisesRegex(ValueError, "original background_layers"):
-                    common.prepare_dataset(config, np)
+                with self.assertRaisesRegex(ValueError, "Legacy compressed"):
+                    update(TrainConfig(), entries)
 
     def test_fixed_resolution_uses_same_core_spacing_and_full_final_shell(self):
         self.config.schedule.enabled = False
         self.config.model.grid_resolution = 256
         prepared = common.prepare_dataset(self.config, np)
-        self.assertEqual((prepared["resolution"], prepared["core_resolution"]), (272, 256))
-        self.assertEqual(prepared["grid_max"], [1.0625] * 3)
+        self.assertEqual((prepared["resolution"], prepared["core_resolution"]), (256, 256))
+        self.assertEqual(prepared["grid_max"], [1.] * 3)
         self.assertEqual((2 * prepared["grid_max"][0]) / prepared["resolution"], 2 / 256)
 
     def test_train_test_views_reuse_saved_transform_and_matching_reference_names(self):
@@ -187,12 +223,25 @@ class InitializationIntegrationTests(unittest.TestCase):
     def test_resume_preparation_does_not_load_or_recontract_points(self):
         common.prepare_dataset(self.config, np)
         saved = copy.deepcopy(self.config.data.initialization)
-        with patch("reconstruction_dataset.read_colmap_points", side_effect=AssertionError("resume read points")), \
-                patch("reconstruction_dataset.contract_points", side_effect=AssertionError("resume recompressed points")):
+        with patch("reconstruction_dataset.read_colmap_points", side_effect=AssertionError("resume read points")):
             resumed = common.prepare_dataset(self.config, np, load_points=False)
         self.assertIsNone(resumed["positions"])
         self.assertIsNone(resumed["colors"])
+        self.assertIsNone(resumed["background_colors"])
+        self.assertIsNone(resumed["background_point_counts"])
         self.assertEqual(resumed["initialization"], saved)
+
+    def test_legacy_world_shell_resume_keeps_occupied_cell_geometry(self):
+        from reconstruction_world_shell import world_shell_metadata_geometry
+        common.prepare_dataset(self.config, np)
+        self.config.data.initialization["world_shell_version"] = 2
+        self.config.data.initialization.pop("background_geometry")
+        saved = copy.deepcopy(self.config.data.initialization)
+        with patch("reconstruction_dataset.read_colmap_points", side_effect=AssertionError("resume read points")):
+            resumed = common.prepare_dataset(self.config, np, load_points=False)
+        self.assertEqual(resumed["initialization"], saved)
+        self.assertNotIn("background_geometry", resumed["initialization"])
+        self.assertEqual(world_shell_metadata_geometry(resumed["initialization"]), "occupied_cell")
 
     def test_full_intrinsics_drive_pixel_rays_near_origin_and_far_range(self):
         render = RenderConfig(width=10, height=6, near_clip=.03, far_clip=9.5)
@@ -220,10 +269,10 @@ class InitializationIntegrationTests(unittest.TestCase):
     def test_coarse_snapshot_follows_core_and_ignores_shell_padding(self):
         manager = SimpleNamespace(
             schedule=SimpleNamespace(enabled=True, start_resolution=256, target_resolution=512),
-            resolution=272, core_resolution=256, level_start_epoch=0, level_budget=600)
+            resolution=256, core_resolution=256, level_start_epoch=0, level_budget=600)
         self.assertFalse(is_coarse_training_end(manager, 599))
         self.assertTrue(is_coarse_training_end(manager, 600))
-        manager.resolution, manager.core_resolution = 544, 512
+        manager.resolution, manager.core_resolution = 512, 512
         manager.level_start_epoch, manager.level_budget = 600, 400
         self.assertFalse(is_coarse_training_end(manager, 1000))
 

@@ -42,39 +42,25 @@ def _validate_model_metadata(metadata):
     required = {"resolution", "grid_min", "grid_max", "sh_count", "opacity_sh_count"}
     if not required.issubset(metadata):
         raise ValueError(f"Missing model metadata: {sorted(required - metadata.keys())}")
-    resolution = _integer(metadata["resolution"], "resolution", 1, 1040)
-    core = _integer(metadata.get("core_resolution", resolution), "core_resolution", 1, min(resolution, 1024))
+    from reconstruction_world_shell import (reject_removed_background_fields, validate_world_shell_layout,
+                                            world_shell_metadata_layout)
+    resolution = _integer(metadata["resolution"], "resolution", 1, 1024)
+    core = _integer(metadata.get("core_resolution", resolution), "core_resolution", 1, 1024)
     mapping = metadata.get("scene_mapping", "bounded")
-    if mapping not in ("bounded", "radial_seed_shell", "projective_shell"):
-        raise ValueError("Unknown initialization scene_mapping")
-    if "background_use_ellipsoid" in metadata:
-        if type(metadata["background_use_ellipsoid"]) is not bool or mapping != "projective_shell":
-            raise ValueError("background_use_ellipsoid requires projective mapping and a boolean")
-    if "background_layered_sampling" in metadata:
-        layered = metadata["background_layered_sampling"]
-        if type(layered) is not bool or mapping != "projective_shell":
-            raise ValueError("background_layered_sampling requires projective mapping and a boolean")
-        if layered and metadata.get("background_use_ellipsoid", True):
-            raise ValueError("background_layered_sampling requires background_use_ellipsoid=false")
-    if "background_far_distance" in metadata:
-        distance = metadata["background_far_distance"]
-        if (mapping != "projective_shell" or isinstance(distance, bool)
-                or not isinstance(distance, (int, float))
-                or not math.isfinite(distance) or distance <= 1):
-            raise ValueError("background_far_distance requires projective mapping and a finite value > 1")
-    if mapping in ("radial_seed_shell", "projective_shell"):
-        if core >= resolution or (resolution-core) % 2:
-            raise ValueError("Shell metadata requires positive symmetric padding")
-    policy = metadata.get("background_refinement")
-    if policy is not None or "background_layers" in metadata:
-        if not ((mapping == "radial_seed_shell" and policy == "fixed_layers") or
-                (mapping == "projective_shell" and policy == "preserve_physical_width")):
-            raise ValueError("Background refinement metadata disagrees with the scene mapping")
-        layers = _integer(metadata.get("background_layers"), "background_layers", 1)
-        if resolution != core + 2 * layers:
-            raise ValueError("Background layer metadata must match grid padding")
-    if mapping == "projective_shell" and policy != "preserve_physical_width":
-        raise ValueError("Projective mapping requires preserve_physical_width refinement metadata")
+    if mapping not in ("bounded", "world_shell"):
+        raise ValueError("Legacy compressed scene mappings are unsupported; start a new world_shell reconstruction")
+    reject_removed_background_fields(metadata)
+    if core != resolution:
+        raise ValueError("The stored resolution must equal the core resolution; compressed grid padding is unsupported")
+    if mapping == "world_shell":
+        mode, subdivision = world_shell_metadata_layout(metadata)
+        validate_world_shell_layout(core, metadata.get("background_shell_levels"),
+                                    metadata["grid_min"], metadata["grid_max"], subdivision)
+        if mode == "adaptive":
+            _integer(metadata.get("background_max_depth", 9), "background_max_depth", 0, 9)
+    elif any(name in metadata for name in ("background_shell_levels", "background_refinement",
+                                           "background_subdivision_level", "world_shell_version", "background_geometry")):
+        raise ValueError("Bounded models cannot contain background shell metadata")
     sh = _integer(metadata["sh_count"], "sh_count", 1, 16)
     if "active_sh_count" in metadata:
         _integer(metadata["active_sh_count"], "active_sh_count", 1, sh)
@@ -84,35 +70,48 @@ def _validate_model_metadata(metadata):
             or hi.dtype.kind not in "iuf" or not np.isfinite(lo).all()
             or not np.isfinite(hi).all() or not (lo < hi).all()):
         raise ValueError("grid_min/grid_max must contain three finite, increasing bounds")
-    if mapping in ("radial_seed_shell", "projective_shell"):
-        extent = resolution / metadata["core_resolution"]
-        if (not np.allclose(lo, [-extent]*3, rtol=0, atol=1e-7)
-                or not np.allclose(hi, [extent]*3, rtol=0, atol=1e-7)):
-            raise ValueError("Shell grid bounds must preserve the normalized core")
     return resolution, core, mapping, sh, opacity_sh
 
 
 def _validate_mapping_config(metadata, config):
-    """A finite model cannot silently resume with an infinite/different atlas."""
-    if (metadata.get("scene_mapping") == "projective_shell"
-            and isinstance(config, dict) and "model" in config):
-        expected_mode = config["model"].get("background_use_ellipsoid", True)
-        if (type(expected_mode) is not bool
-                or expected_mode != metadata.get("background_use_ellipsoid", True)):
-            raise ValueError("Checkpoint background_use_ellipsoid differs between model and configuration")
-        expected_layered = config["model"].get("background_layered_sampling", False)
-        if (type(expected_layered) is not bool
-                or expected_layered != metadata.get("background_layered_sampling", False)):
-            raise ValueError("Checkpoint background_layered_sampling differs between model and configuration")
-    initialization = (config.get("data", {}).get("initialization") or {}) if isinstance(config, dict) else {}
-    if initialization.get("scene_mapping") != "projective_shell":
+    """Reject a checkpoint/configuration mismatch before restoring device arrays."""
+    if not isinstance(config, dict):
         return
-    expected = initialization.get("background_far_distance")
-    actual = metadata.get("background_far_distance")
-    if initialization.get("version") == 6 and expected is None:
-        raise ValueError("Finite projective initialization is missing background_far_distance")
-    if expected != actual:
-        raise ValueError("Checkpoint background_far_distance differs between model and initialization")
+    from reconstruction_world_shell import (reject_removed_background_fields, world_shell_metadata_layout,
+                                            world_shell_metadata_geometry, background_initial_subdivision)
+    data = config.get("data", {})
+    model = config.get("model", {})
+    reject_removed_background_fields(data)
+    reject_removed_background_fields(model)
+    initialization = data.get("initialization") or {}
+    actual = metadata.get("scene_mapping", "bounded")
+    if initialization:
+        expected = initialization.get("scene_mapping", "bounded")
+        if expected not in ("bounded", "world_shell") or expected != actual:
+            raise ValueError("Checkpoint scene_mapping differs between model and initialization")
+    if actual != "world_shell":
+        return
+    levels = metadata["background_shell_levels"]
+    if "background_shell_levels" in data and data["background_shell_levels"] != levels:
+        raise ValueError("Checkpoint background_shell_levels differs between model and configuration")
+    if metadata.get("background_refinement") == "adaptive" and "background_max_resolution" in data:
+        resolution = _integer(data["background_max_resolution"], "background_max_resolution", 2, 1024)
+        if resolution & (resolution - 1) or resolution.bit_length() - 2 != metadata.get("background_max_depth", 9):
+            raise ValueError("Checkpoint background_max_depth differs from data.background_max_resolution")
+    if initialization:
+        mode, _ = world_shell_metadata_layout(metadata)
+        initial_mode, initial_subdivision = world_shell_metadata_layout(initialization)
+        initial_resolution = initialization.get("background_initial_resolution", 2)
+        expected_initial = (0 if mode == "adaptive" else background_initial_subdivision(initial_resolution,
+            initialization.get("start_core_resolution", metadata.get("core_resolution", metadata["resolution"]))))
+        if (initialization.get("version") not in (7, 8, 9)
+                or initialization.get("background_shell_levels") != levels
+                or initial_mode != mode or initial_subdivision != expected_initial
+                or (mode != "adaptive" and data.get("background_initial_resolution", 2) != initial_resolution)
+                or ("background_refinement" in data and data["background_refinement"] != mode)
+                or world_shell_metadata_geometry(initialization) != world_shell_metadata_geometry(metadata)
+                or (initialization.get("version") == 7 and initial_mode != "fixed")):
+            raise ValueError("Checkpoint world shell layout differs between model and initialization")
 
 
 def validate_model_state(state: dict, metadata: dict) -> None:
@@ -126,18 +125,19 @@ def validate_model_state(state: dict, metadata: dict) -> None:
     cells = arrays["cell_indices"]
     if cells.ndim != 1 or cells.dtype.kind not in "ui":
         raise ValueError("cell_indices must be a flat integer array")
-    if np.any(cells < 0) or np.any(cells >= resolution ** 3):
-        raise ValueError("cell_indices contains an index outside the grid")
-    if np.unique(cells).size != cells.size:
-        raise ValueError("cell_indices must be unique")
-    if mapping == "projective_shell":
-        padding = (resolution - core) // 2
-        outside = np.zeros(cells.size, dtype=np.uint8)
-        for stride in (1, resolution, resolution * resolution):
-            coordinate = cells // stride % resolution
-            outside += ((coordinate < padding) | (coordinate >= padding + core))
-        if np.any(outside > 1):
-            raise ValueError("Projective voxels must belong to the core or one face slab, not atlas corners")
+    extent = resolution ** 3 + (56 * metadata["background_shell_levels"]
+        * 8 ** metadata.get("background_subdivision_level", 0) if mapping == "world_shell" else 0)
+    if metadata.get("background_refinement") == "adaptive":
+        from reconstruction_world_shell import ADAPTIVE_TAG, adaptive_decode_numpy, validate_adaptive_cells_numpy
+        validate_adaptive_cells_numpy(cells, core, metadata["background_shell_levels"], np)
+        _, depth, _ = adaptive_decode_numpy(cells[cells >= ADAPTIVE_TAG], metadata["background_shell_levels"], np)
+        if np.any(depth > metadata.get("background_max_depth", 9)):
+            raise ValueError("Adaptive leaf depth exceeds background_max_depth")
+    else:
+        if np.any(cells < 0) or np.any(cells >= extent):
+            raise ValueError("cell_indices contains an index outside the foreground/shell address space")
+        if np.unique(cells).size != cells.size:
+            raise ValueError("cell_indices must be unique")
     count = cells.size
     widths = {"centers": 3, "log_scales": 3, "rotations": 4,
               "radiance_sh": 3 * sh, "opacity_sh": opacity_sh}
@@ -188,7 +188,12 @@ def _validate_save_layout(model_state, metadata):
         dtype, shape = _array_description(state[name])
         if shape != (count * width,) or dtype.kind != "f":
             raise ValueError(f"{name} must be a flat floating array of length {count * width}")
-    return state, (resolution, core, mapping)
+    extent = resolution ** 3 + (56 * metadata["background_shell_levels"]
+        * 8 ** metadata.get("background_subdivision_level", 0) if mapping == "world_shell" else 0)
+    if metadata.get("background_refinement") == "adaptive":
+        return state, (resolution, core, mapping, 2**64, metadata["background_shell_levels"],
+                       metadata.get("background_max_depth", 9))
+    return state, (resolution, core, mapping, extent)
 
 
 def _array_chunks(value, *, alignment=1):
@@ -223,14 +228,18 @@ def _array_chunks(value, *, alignment=1):
 class _CellValidation:
     """Exact uniqueness with a disk-backed bitset, including unordered cells.
 
-    The largest supported grid needs 134 MiB of mapped address bits. Sorting
+    Address bits use a disk-backed mapping, including subdivided shells. Sorting
     and all index temporaries cover at most one export chunk, never N rows.
     """
 
     def __init__(self, layout, directory):
-        self.resolution, self.core, self.mapping = layout
+        self.resolution, self.core, self.mapping, self.extent = layout[:4]
+        self.adaptive_levels = layout[4] if len(layout) > 4 else None
+        self.adaptive_max_depth = layout[5] if len(layout) > 5 else 9
         self.directory = directory
         self.stream = self.seen = None
+        self.runs = []
+        self.interval_runs = []
 
     def __enter__(self):
         return self
@@ -241,24 +250,80 @@ class _CellValidation:
             self.seen = None
         if self.stream is not None:
             self.stream.close()
+        for stream, _, _, _ in self.runs:
+            stream.close()
+        self.runs.clear()
+        for stream, _, _, _ in self.interval_runs:
+            stream.close()
+        self.interval_runs.clear()
+
+    def check_adaptive(self, chunk, np):
+        from reconstruction_world_shell import ADAPTIVE_TAG, adaptive_decode_numpy, adaptive_intervals_numpy
+        tagged = chunk >= ADAPTIVE_TAG
+        if np.any(chunk[~tagged] >= self.core ** 3) or np.any(chunk < 0):
+            raise ValueError("Adaptive models cannot contain legacy shell cell addresses")
+        _, depth, _ = adaptive_decode_numpy(chunk[tagged], self.adaptive_levels, np)
+        if np.any(depth > self.adaptive_max_depth):
+            raise ValueError("Adaptive leaf depth exceeds background_max_depth")
+        start, end = adaptive_intervals_numpy(chunk[tagged], self.adaptive_levels, np)
+        if not len(start):
+            return
+        order = np.argsort(start)
+        intervals = np.column_stack((start[order], end[order]))
+        if np.any(intervals[1:, 0] < intervals[:-1, 1]):
+            raise ValueError("Adaptive cell_indices must be unique and have no ancestor/descendant overlap")
+        lower, upper = int(intervals[0, 0]), int(intervals[-1, 1])
+        for stream, count, first, last in self.interval_runs:
+            if upper <= first or lower >= last:
+                continue
+            previous = np.memmap(stream, mode="r", dtype=np.uint64, shape=(count, 2))
+            try:
+                index = np.searchsorted(previous[:, 0], intervals[:, 0])
+                before, after = index > 0, index < count
+                if (np.any(previous[index[before] - 1, 1] > intervals[before, 0])
+                        or np.any(previous[index[after], 0] < intervals[after, 1])):
+                    raise ValueError("Adaptive cell_indices must be unique and have no ancestor/descendant overlap")
+            finally:
+                previous._mmap.close()
+        stream = tempfile.TemporaryFile(mode="w+b", dir=self.directory)
+        stream.write(intervals.tobytes())
+        stream.flush()
+        self.interval_runs.append((stream, len(intervals), lower, upper))
 
     def check(self, chunk):
         import numpy as np
 
-        extent = self.resolution ** 3
-        if np.any(chunk < 0) or np.any(chunk >= extent):
+        extent = self.extent
+        if self.adaptive_levels is not None:
+            self.check_adaptive(chunk, np)
+        elif np.any(chunk < 0) or np.any(chunk >= extent):
             raise ValueError("cell_indices contains an index outside the grid")
-        ordered = np.sort(np.asarray(chunk, dtype=np.uint32))
+        ordered = np.sort(np.asarray(chunk, dtype=np.uint64))
         if np.any(ordered[1:] == ordered[:-1]):
             raise ValueError("cell_indices must be unique")
-        if self.mapping == "projective_shell":
-            padding = (self.resolution - self.core) // 2
-            outside = np.zeros(ordered.size, dtype=np.uint8)
-            for stride in (1, self.resolution, self.resolution * self.resolution):
-                coordinate = ordered // stride % self.resolution
-                outside += (coordinate < padding) | (coordinate >= padding + self.core)
-            if np.any(outside > 1):
-                raise ValueError("Projective voxels must belong to the core or one face slab, not atlas corners")
+        if extent > 2 ** 32:
+            # Sparse high-address layouts must not allocate a bitset over the
+            # logical world. Keep sorted, bounded runs on disk and check only
+            # overlapping ranges. This remains exact for unordered exports.
+            if not len(ordered):
+                return
+            lower, upper = int(ordered[0]), int(ordered[-1])
+            for stream, count, first_cell, last_cell in self.runs:
+                if upper < first_cell or lower > last_cell:
+                    continue
+                previous = np.memmap(stream, mode="r", dtype=np.uint64, shape=(count,))
+                try:
+                    indices = np.searchsorted(previous, ordered)
+                    inside = indices < count
+                    if np.any(previous[indices[inside]] == ordered[inside]):
+                        raise ValueError("cell_indices must be unique")
+                finally:
+                    previous._mmap.close()
+            stream = tempfile.TemporaryFile(mode="w+b", dir=self.directory)
+            stream.write(ordered.tobytes())
+            stream.flush()
+            self.runs.append((stream, len(ordered), lower, upper))
+            return
         if self.seen is None:
             self.stream = tempfile.TemporaryFile(mode="w+b", dir=self.directory)
             size = (extent + 7) // 8

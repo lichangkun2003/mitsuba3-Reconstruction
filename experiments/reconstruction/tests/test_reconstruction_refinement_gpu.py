@@ -78,14 +78,24 @@ def geometry_cases(dr, np):
     cfg = replace(schedule, parent_opacity_threshold=.6)
     data = fixture(np)
     compare(refine_state(data, cfg), refine_state_gpu(data, cfg), dr, np)
-    # Repeated levels preserve child-major ordering and shell/core metadata.
+    # Repeated core refinements keep fixed background rows and their appearance.
     data = fixture(np, count=7, sh=4, opacity=1)
-    data["model_metadata"].update(core_resolution=4, scene_mapping="radial_seed_shell")
+    data["model_metadata"].update(core_resolution=8, scene_mapping="world_shell",
+                                  background_shell_levels=3, grid_max=[6., 4., 7.])
+    data["model_state"]["cell_indices"][-2:] = [512, 512+3*56-1]
+    background_before = {name: value.reshape(7, -1)[-2:].copy()
+                         for name, value in data["model_state"].items() if name != "cell_indices"}
     reference, actual = data, data
     for _ in range(2):
         reference = refine_state(reference, schedule)
         actual = refine_state_gpu(actual, schedule)
         compare(reference, actual, dr, np)
+        resolution = reference["model_metadata"]["resolution"]
+        cells = reference["model_state"]["cell_indices"]
+        background = cells >= resolution**3
+        np.testing.assert_array_equal(cells[background], [resolution**3, resolution**3+3*56-1])
+        for name, values in background_before.items():
+            np.testing.assert_array_equal(reference["model_state"][name].reshape(len(cells), -1)[background], values)
     # Large positive/negative logits exercise the existing optical-depth limits.
     data = fixture(np, count=5, opacity=1)
     data["model_state"]["opacity_sh"][:] = [-1000., -50., 0., 50., 1000.]

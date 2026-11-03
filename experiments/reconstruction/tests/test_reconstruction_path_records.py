@@ -21,11 +21,11 @@ from preview import RuntimeConfig
 from reconstruction_common import initialize_runtime, restore_model
 from reconstruction_replay import NativeLossReplay
 from test_reconstruction_distortion import fixture as core_fixture
-from test_reconstruction_projective_native import fixture as shell_fixture, make_ray
+from world_shell_fixture import fixture as shell_fixture, make_ray
 
 
-def expanded_fixture(np, *, projective):
-    checkpoint = shell_fixture(np) if projective else core_fixture(np)
+def expanded_fixture(np, *, world_shell):
+    checkpoint = shell_fixture(np) if world_shell else core_fixture(np)
     count = len(checkpoint["model_state"]["cell_indices"])
     old = checkpoint["model_state"]["radiance_sh"].reshape(count, 3)
     coefficients = np.random.default_rng(850).normal(0, .07, (count, 9, 3))
@@ -39,10 +39,10 @@ def expanded_fixture(np, *, projective):
     return checkpoint
 
 
-def inputs(mi, np, *, projective, width=17, height=13):
+def inputs(mi, np, *, world_shell, width=17, height=13):
     rng = np.random.default_rng(956)
     count = width * height
-    if projective:
+    if world_shell:
         origins = rng.uniform(-2.5, 2.5, (count, 3))
         directions = rng.normal(size=(count, 3))
         origins[:4] = [[0, 0, 0], [3, .15, .23], [1, 0, 0], [-3, -.3, .2]]
@@ -92,16 +92,16 @@ def compare(expected, actual, np):
 
 def run_checks(mi, dr, np):
     checks = 0
-    for projective in (False, True):
-        payload = expanded_fixture(np, projective=projective)
+    for world_shell in (False, True):
+        payload = expanded_fixture(np, world_shell=world_shell)
         model = restore_model(payload, mi)
-        if not projective:
+        if not world_shell:
             proposal = copy.deepcopy(core_fixture(np, 1)["model_state"])
             proposal["cell_indices"][:] = 53
             proposal["radiance_sh"] = payload["model_state"]["radiance_sh"][:27].copy()
             model.set_growth_candidates({name: (mi.UInt32(value) if name == "cell_indices" else mi.Float(value))
                                          for name, value in proposal.items()})
-        ray, target = inputs(mi, np, projective=projective)
+        ray, target = inputs(mi, np, world_shell=world_shell)
         scenarios = [
             {},
             {"compact_gradient_capacity": float(model.active_voxel_count)},
@@ -130,14 +130,14 @@ def run_checks(mi, dr, np):
                 compare(old, new, np)
                 checks += 1
         assert replay.statistics()["replays"] >= 3
-    return {"core_projective_SH1_SH9_record_layout_differentials": checks,
+    return {"core_world_shell_SH1_SH9_record_layout_differentials": checks,
             "forward_and_integer_counters": "exact", "status": "passed"}
 
 
 def memory_sample(mi, dr, np, layout, *, frozen=False):
     width, height = 1559, 1039
-    model = restore_model(expanded_fixture(np, projective=False), mi)
-    ray, target = inputs(mi, np, projective=False, width=width, height=height)
+    model = restore_model(expanded_fixture(np, world_shell=False), mi)
+    ray, target = inputs(mi, np, world_shell=False, width=width, height=height)
     dr.eval(ray, target)
     dr.sync_thread()
     dr.flush_malloc_cache()

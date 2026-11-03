@@ -33,7 +33,7 @@ def _loss_component_names(accumulator):
         raise ValueError("Loss component reductions require both RGB and distortion loss sums")
     return tuple(name for name in LOSS_COMPONENT_KEYS if name in accumulator)
 
-_NCCL_FLOAT32, _NCCL_UINT32 = 7, 3
+_NCCL_FLOAT32, _NCCL_UINT32, _NCCL_UINT64 = 7, 3, 5
 _NCCL_SUM, _NCCL_MAX, _NCCL_MIN = 0, 2, 3
 
 
@@ -127,7 +127,7 @@ class NcclCollective:
                          else WorkerContext(rank, world_size, connection, 1))
         required = ("_reconstruction_cuda_context", "_reconstruction_cuda_push_context",
                     "_reconstruction_cuda_pop_context", "_reconstruction_float_buffer_info",
-                    "_reconstruction_uint_buffer_info")
+                    "_reconstruction_uint_buffer_info", "_reconstruction_cell_buffer_info")
         if any(not hasattr(mi, name) for name in required):
             raise RuntimeError("NCCL source bindings are unavailable; rebuild this Mitsuba checkout")
         self.device = dict(mi._reconstruction_cuda_context())
@@ -545,13 +545,16 @@ class NcclCollective:
         self._stats["batches"] = self._stats.get("batches", 0) + 1
         return result, loss, finite
 
-    def broadcast_arrays(self, fields, *, root, uint_keys=()):
+    def broadcast_arrays(self, fields, *, root, uint_keys=(), cell_keys=()):
         """Broadcast one camera's GPU arrays, preserving its separate vote.
 
-        All ranks pass the same names, array lengths and ``uint_keys``. Only
+        All ranks pass the same names, array lengths, ``uint_keys`` and
+        ``cell_keys``. Only
         ``root`` supplies meaningful contents; other ranks may reuse local
         evidence buffers or zero placeholders. Integer counters must be listed
-        in ``uint_keys``; remaining fields are float32. No image/evidence data
+        in ``uint_keys``. Model cell addresses use uint64 and must be named
+        ``cell_indices`` or listed in ``cell_keys`` when a nested state uses
+        anonymous names; remaining fields are float32. No image/evidence data
         is transferred through CPU memory, and no raw evidence is summed across
         cameras. This operation cannot be recorded inside ``dr.freeze``.
         """
@@ -560,16 +563,24 @@ class NcclCollective:
         if type(root) is not int or not 0 <= root < self.world_size:
             raise ValueError("Broadcast source rank must fit within the world size")
         uint_keys = set(uint_keys)
-        if not uint_keys.issubset(fields) or any(not isinstance(name, str) for name in fields):
-            raise ValueError("Broadcast fields must be named arrays, including every uint_key")
+        cell_keys = set(cell_keys)
+        if (not (uint_keys | cell_keys).issubset(fields)
+                or any(not isinstance(name, str) for name in fields)):
+            raise ValueError("Broadcast fields must be named arrays, including every uint_key and cell_key")
+        if "cell_indices" in fields:
+            cell_keys.add("cell_indices")
         if not fields:
             return {}
         started = time.perf_counter()
         dr, mi = self.dr, self.mi
         result, operations = {}, []
         for name in sorted(fields):
-            dtype = _NCCL_UINT32 if name in uint_keys else _NCCL_FLOAT32
-            array_type = mi.UInt32 if dtype == _NCCL_UINT32 else mi.Float
+            if name in cell_keys:
+                dtype, array_type = _NCCL_UINT64, mi.UInt64
+            elif name in uint_keys:
+                dtype, array_type = _NCCL_UINT32, mi.UInt32
+            else:
+                dtype, array_type = _NCCL_FLOAT32, mi.Float
             source = array_type(fields[name])
             if self.world_size == 1:
                 result[name] = source
@@ -587,8 +598,12 @@ class NcclCollective:
             width = int(dr.width(source))
             if not width:
                 continue
-            info = (mi._reconstruction_float_buffer_info if dtype == _NCCL_FLOAT32
-                    else mi._reconstruction_uint_buffer_info)
+            if dtype == _NCCL_UINT64:
+                info = mi._reconstruction_cell_buffer_info
+            elif dtype == _NCCL_UINT32:
+                info = mi._reconstruction_uint_buffer_info
+            else:
+                info = mi._reconstruction_float_buffer_info
             source_info, destination_info = info(source), info(destination)
             if int(source_info["size"]) != width or int(destination_info["size"]) != width:
                 raise RuntimeError("NCCL broadcast pointer metadata does not match the allocated array")
@@ -607,7 +622,9 @@ class NcclCollective:
                 dr.sync_thread()
             self._stats["broadcasts"] = self._stats.get("broadcasts", 0) + 1
             self._stats["calls"] += len(descriptors)
-            self._stats["payload_bytes"] += sum(width * 4 for _, _, width, _ in descriptors)
+            self._stats["payload_bytes"] += sum(
+                width * (8 if dtype == _NCCL_UINT64 else 4)
+                for _, _, width, dtype in descriptors)
             self._stats["seconds"] += time.perf_counter() - started
             return result
         except BaseException:

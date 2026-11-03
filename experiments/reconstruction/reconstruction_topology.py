@@ -19,6 +19,10 @@ from reconstruction_sh_schedule import sh_model_metadata
 BACKGROUND_RGB_DELETION_VERSION = 1
 
 
+class NoRepresentableChildren(RuntimeError):
+    """A valid parent batch has no child ellipsoids accepted by the fitter."""
+
+
 @dataclass
 class TopologySettings:
     enable_deletion: bool = True
@@ -80,6 +84,12 @@ class TopologySettings:
     max_active_voxels: int = 67108864
     # CUDA RGB lifecycle; False retains the NumPy reference implementation.
     gpu_topology: bool = True
+    background_refine_interval: int = 10
+    background_refine_max_new_leaves: int = 100000
+    background_refine_pixel_threshold: float = 8.0
+    background_refine_fraction: float = .05
+    background_max_active_voxels: int = 4000000
+    background_growth_max_candidates: int = 200000
 
 
 @dataclass
@@ -199,24 +209,15 @@ def model_checkpoint(model, fields=None) -> dict:
     core_resolution = int(getattr(model, "core_resolution", model.resolution))
     if core_resolution != metadata["resolution"]:
         metadata["core_resolution"] = core_resolution
-    if getattr(model, "scene_mapping", "") in ("radial_seed_shell", "projective_shell"):
-        metadata["scene_mapping"] = model.scene_mapping
-    if getattr(model, "scene_mapping", "") == "projective_shell":
-        metadata["background_refinement"] = "preserve_physical_width"
-        metadata["background_layers"] = (metadata["resolution"] - core_resolution)//2
-        if (hasattr(model, "native_background_use_ellipsoid")
-                and not model.native_background_use_ellipsoid()):
-            metadata["background_use_ellipsoid"] = False
-        if (hasattr(model, "native_background_layered_sampling")
-                and model.native_background_layered_sampling()):
-            metadata["background_layered_sampling"] = True
-        if hasattr(model, "native_background_far_distance"):
-            distance = float(model.native_background_far_distance())
-            if distance:
-                metadata["background_far_distance"] = distance
-    if getattr(model, "background_refinement", "") == "fixed_layers":
-        metadata.update(background_refinement="fixed_layers",
-                        background_layers=int(model.background_layers))
+    if getattr(model, "scene_mapping", "") == "world_shell":
+        metadata.update(scene_mapping="world_shell", core_resolution=core_resolution,
+                        world_shell_version=int(getattr(model, "world_shell_version", 2)),
+                        background_refinement=getattr(model, "background_refinement", "fixed"),
+                        background_geometry=("ellipsoid" if getattr(model, "native_background_use_ellipsoid", lambda: False)() else "occupied_cell"),
+                        background_subdivision_level=int(getattr(model, "native_background_subdivision_level", lambda: 0)()),
+                        background_shell_levels=int(model.native_background_shell_levels()))
+        if metadata["background_refinement"] == "adaptive":
+            metadata["background_max_depth"] = int(getattr(model, "background_max_depth", 9))
     return {
         "model_state": {name: np.array(value, copy=True) for name, value in snapshot.items()},
         "model_metadata": metadata,
@@ -276,43 +277,19 @@ def _addresses(cells, resolution):
     return cells[:, 0] + resolution * (cells[:, 1] + resolution * cells[:, 2])
 
 
-def _growth_core_radius_squared(metadata):
-    """Twice-cell-unit core radius squared, or None for unrestricted growth.
-
-    A radial far shell starts filled and may be pruned. Only cells whose entire
-    AABB lies inside the unit core sphere may supply parents or receive growth.
-    Integer coordinates make CPU/GPU classification exact, including boundary
-    cells. The explicit tag leaves historical point-only shells unchanged.
-    """
-    if metadata.get("scene_mapping") != "radial_seed_shell":
-        return None
-    resolution = int(metadata["resolution"])
-    core = int(metadata.get("core_resolution", resolution))
-    if not 0 < core < resolution or (resolution - core) % 2:
-        raise ValueError("Radial shell growth requires a centered integer core")
-    return core * core
-
-
 def _growth_coordinates_allowed(coordinates, metadata, np):
+    """Growth is restricted to the core address cube, never fixed background."""
     resolution = int(metadata["resolution"])
-    allowed = np.all((coordinates >= 0) & (coordinates < resolution), axis=1)
-    if metadata.get("scene_mapping") == "projective_shell":
-        core = int(metadata["core_resolution"])
-        pad = (resolution - core) // 2
-        return allowed & np.all((coordinates >= pad) & (coordinates < pad + core), axis=1)
-    radius_squared = _growth_core_radius_squared(metadata)
-    if radius_squared is not None:
-        farthest = np.abs(2 * coordinates + 1 - resolution) + 1
-        allowed &= np.sum(farthest * farthest, axis=1) <= radius_squared
-    return allowed
+    return np.all((coordinates >= 0) & (coordinates < resolution), axis=1)
 
 
 def _matching_growth_pairs(current, pending, np):
-    """Exact membership of two uint32 cell addresses without Python tuples."""
-    # Cell addresses come from the native model's uint32 cell_indices. Packing
-    # both into uint64 is bijective, including addresses above signed int32.
+    """Exact membership of two full UInt64 addresses without truncation."""
     def keys(batch):
-        return (batch["parent_cells"].astype(np.uint64) << np.uint64(32)) | batch["cells"].astype(np.uint64)
+        result = np.empty(len(batch["cells"]), dtype=[("parent", "u8"), ("cell", "u8")])
+        result["parent"] = batch["parent_cells"]
+        result["cell"] = batch["cells"]
+        return result
 
     allowed, proposed = keys(current), keys(pending)
     allowed.sort()
@@ -428,22 +405,18 @@ def _closest_box(metric, lower, upper, np, inverse=None):
 def refine_state(checkpoint: dict, config: CoarseToFineConfig, max_active_voxels=67108864) -> dict:
     """Port of Shader/RefineGrid.cs.slang, retaining only fitted child volumes."""
     import numpy as np
-    if checkpoint["model_metadata"].get("scene_mapping") == "projective_shell":
-        from reconstruction_projective import refine_projective_numpy
-        return refine_projective_numpy(checkpoint, config, max_active_voxels, refine_state, np)
+    if checkpoint["model_metadata"].get("scene_mapping") == "world_shell":
+        from reconstruction_world_refinement import refine_world_numpy
+        return refine_world_numpy(checkpoint, config, max_active_voxels, refine_state, np)
     state, metadata = checkpoint["model_state"], dict(checkpoint["model_metadata"])
-    fixed_shell = metadata.get("background_refinement") == "fixed_layers"
-    if fixed_shell:
-        from reconstruction_shell_refinement import fixed_shell_metadata, remap_children_numpy
-        next_metadata = fixed_shell_metadata(metadata)
-    else:
-        next_metadata = dict(metadata, resolution=metadata["resolution"] * 2)
-        if "core_resolution" in metadata:
-            next_metadata["core_resolution"] *= 2
+    next_metadata = dict(metadata, resolution=metadata["resolution"] * 2)
+    if "core_resolution" in metadata:
+        next_metadata["core_resolution"] *= 2
     n = len(state["cell_indices"])
     if n == 0:
         return {"model_metadata": next_metadata,
-                "model_state": {key: np.array(value, copy=True) for key, value in state.items()}}
+                "model_state": {key: np.array(value, dtype=np.uint64 if key == "cell_indices" else None,
+                                               copy=True) for key, value in state.items()}}
     center, axes, rotation, quaternion, size, metric, extent = _geometry(state, metadata, np)
     inverse_metric = np.linalg.inv(metric)
     old_cells = _coordinates(state["cell_indices"], metadata["resolution"], np)
@@ -508,25 +481,16 @@ def refine_state(checkpoint: dict, config: CoarseToFineConfig, max_active_voxels
                            child_center[ids], np.log(axes[ids] * lo[ids, None])))
     count = sum(len(block[0]) for block in blocks)
     if count == 0:
-        raise RuntimeError("Refinement produced no representable children; preserve the old grid")
-    if not fixed_shell and count > max_active_voxels:
+        raise NoRepresentableChildren("Refinement produced no representable children; preserve the old grid")
+    if count > max_active_voxels:
         raise RuntimeError("Refinement exceeds max_active_voxels")
     parent_ids = np.concatenate([block[0] for block in blocks])
     geometry = {
-        "cell_indices": np.concatenate([block[1] for block in blocks]).astype(np.uint32),
+        "cell_indices": np.concatenate([block[1] for block in blocks]).astype(np.uint64),
         "centers": np.concatenate([block[2] for block in blocks]).astype(np.float32).ravel(),
         "log_scales": np.concatenate([block[3] for block in blocks]).astype(np.float32).ravel(),
         "rotations": quaternion[parent_ids].astype(np.float32).ravel(),
     }
-    if fixed_shell:
-        geometry = remap_children_numpy(
-            metadata, geometry["cell_indices"], geometry["centers"], geometry["log_scales"],
-            geometry["rotations"], parent_ids)
-        parent_ids = geometry.pop("parents")
-        inherit_shell = geometry.pop("inherit_shell")
-        count = len(parent_ids)
-        if count > max_active_voxels:
-            raise RuntimeError("Refinement exceeds max_active_voxels")
     if "active_sh_count" in metadata:
         # The global SH schedule can cross a spatial refinement boundary while
         # degree one is already trained. Preserve learned and dormant storage;
@@ -546,11 +510,6 @@ def refine_state(checkpoint: dict, config: CoarseToFineConfig, max_active_voxels
         small = np.maximum(tau, 1e-30)
         child_logit = np.where(tau > 15, tau, np.where(tau < 1e-4, np.log(small), np.log(np.expm1(np.minimum(tau, 15)))))
         new_opacity[:, 0] = np.minimum(child_logit, parent_logit) / y0
-    if fixed_shell:
-        # The shell keeps its radial count: do not attenuate its per-hit
-        # opacity as though two optical-depth layers had been introduced.
-        new_radiance[inherit_shell] = radiance[parent_ids[inherit_shell]]
-        new_opacity[inherit_shell] = opacity[parent_ids[inherit_shell]]
     return {"model_metadata": next_metadata, "model_state": {
         **geometry,
         "radiance_sh": new_radiance.ravel(), "opacity_sh": new_opacity.ravel(),
@@ -625,13 +584,11 @@ class TopologyManager:
         self.view_count = int(view_count)
         self.opacity_warmup, self.opacity_ramp = int(opacity_warmup), int(opacity_ramp)
         self.resolution = int(model.resolution)
-        # The enclosing grid includes any contracted shell. Scheduling refers
-        # to the core diameter, while every address and geometric operation
-        # continues to use the actual enclosing grid resolution.
+        # Scheduling and growth addresses refer to the core. World-space
+        # background leaves use a separate fixed address range above core^3.
         self.core_resolution = int(getattr(model, "core_resolution", model.resolution))
-        self.background_refinement = getattr(model, "background_refinement", "")
         self.scene_mapping = getattr(model, "scene_mapping", "bounded")
-        self.background_layers = int(getattr(model, "background_layers", 0))
+        self.background_refinement = getattr(model, "background_refinement", "fixed")
         self._model_opacity_sh_count = getattr(model, "opacity_sh_count", None)
         self.level_start_epoch = 0
         # A checkpoint can already be at 512/1024 while its three weights still
@@ -660,6 +617,8 @@ class TopologyManager:
         self._device_statistics["deletion_opacity_readback_bytes"] = 0
         self.before_refine_checkpoint = None
         self.completed_windows = 0
+        if self.background_refinement == "adaptive" and int(model.active_voxel_count) > self.settings.max_active_voxels:
+            raise ValueError("Initial/restored model exceeds topology.max_active_voxels")
         self._validate()
         self._initialize_lifecycle(int(model.active_voxel_count))
 
@@ -669,12 +628,7 @@ class TopologyManager:
             raise ValueError("Topology requires core resolution <= 1024 and grid resolution <= 1040")
         if self.core_resolution not in self.budgets:
             raise ValueError("Topology epoch budgets do not contain the current core resolution")
-        if self.background_refinement == "fixed_layers":
-            if self.background_layers < 1 or self.resolution != self.core_resolution + 2*self.background_layers:
-                raise ValueError("Fixed shell requires a consistent core and background layer count")
-            target_grid = schedule.target_resolution + 2*self.background_layers
-        else:
-            target_grid = self.resolution * schedule.target_resolution / self.core_resolution
+        target_grid = self.resolution * schedule.target_resolution / self.core_resolution
         if schedule.enabled and (schedule.target_resolution > 1024 or target_grid > 1040):
             raise ValueError("Coarse-to-fine exceeds core 1024 or enclosing grid 1040")
         if not 1 <= self.view_count <= 32767:
@@ -899,6 +853,9 @@ class TopologyManager:
                 else self.settings.growth_fine_warmup_epochs)
 
     def _generate_growth(self, checkpoint, boundary):
+        if checkpoint["model_metadata"].get("background_refinement") == "adaptive":
+            from reconstruction_adaptive_growth import generate_adaptive_growth_numpy
+            return generate_adaptive_growth_numpy(self, checkpoint, boundary)
         np, cfg = self.np, self.settings
         state, metadata = checkpoint["model_state"], checkpoint["model_metadata"]
         n, resolution = len(state["cell_indices"]), metadata["resolution"]
@@ -1020,7 +977,7 @@ class TopologyManager:
             for name in ("centers", "log_scales", "rotations"):
                 pending[name] = pending[name].astype(np.float32)
             pending["candidate_state"] = {
-                "cell_indices": pending["cells"].astype(np.uint32),
+                "cell_indices": pending["cells"].astype(np.uint64),
                 **{name: pending[name].reshape(-1).copy() for name in
                    ("centers", "log_scales", "rotations", "radiance_sh", "opacity_sh")}}
             initialize_statistics(pending, np)
@@ -1248,7 +1205,7 @@ class TopologyManager:
         low = coefficients.astype(np.float64) < coefficient_threshold
         mature = ((self.growth_birth == 0) |
                   (boundary - self.growth_birth >= cfg.deletion_protection_epochs))
-        if self.scene_mapping == "projective_shell" and not self._background_deletion_allowed():
+        if self.scene_mapping == "world_shell" and not self._background_deletion_allowed():
             mature &= self._core_region_numpy(model)
         qualified = low & mature
         previous = self.low_opacity_deletion_streak.copy()
@@ -1278,12 +1235,11 @@ class TopologyManager:
 
     def _background_deletion_allowed(self):
         """Only low-opacity cleanup at the configured finest core level."""
-        return not self.schedule.enabled or self.core_resolution >= self.schedule.target_resolution
+        return (self.background_refinement == "adaptive" or not self.schedule.enabled
+                or self.core_resolution >= self.schedule.target_resolution)
 
     def _core_region_numpy(self, model):
-        from reconstruction_projective import core_mask_numpy
-        return core_mask_numpy(model.snapshot()["cell_indices"], self.resolution,
-                               self.core_resolution, self.np)
+        return self.np.asarray(model.snapshot()["cell_indices"]) < self.core_resolution ** 3
 
     def _growth_world_points(self, pending, metadata):
         """Reuse the seven frozen proposal samples across views, never evidence.
@@ -1539,8 +1495,17 @@ class TopologyManager:
         ranking = np.lexsort((selected["cells"], -gains))
         winners = ranking[:capacity]
         selected = {key: value[winners] for key, value in selected.items()}
+        if checkpoint["model_metadata"].get("background_refinement") == "adaptive" and len(winners):
+            from reconstruction_adaptive_growth import filter_nonoverlapping_growth_numpy
+            keep = filter_nonoverlapping_growth_numpy(selected["cells"], checkpoint["model_metadata"], np)
+            selected = {key: value[keep] for key, value in selected.items()}
+            background = selected["cells"] >= (1 << 63)
+            remaining = max(0, cfg.background_max_active_voxels - int(np.count_nonzero(
+                checkpoint["model_state"]["cell_indices"] >= (1 << 63))))
+            keep = ~background | (np.cumsum(background) <= remaining)
+            selected = {key: value[keep] for key, value in selected.items()}
         detail["capacity_rejected"] = len(ranking) - len(winners)
-        detail["selected_candidates"] = len(winners)
+        detail["selected_candidates"] = len(selected["cells"])
         return checkpoint, selected
 
     def finish_epoch(self, model, optimizer, completed_epochs: int):
@@ -1597,7 +1562,8 @@ class TopologyManager:
             self._growth_world_cache = None
             self._growth_device = None
             self._rgb_growth_device = None
-            optimizer.remap(np.empty(0, dtype=np.uint32), self.count)
+            optimizer.remap(replacement.pop("refinement_background_rows",
+                                           np.empty(0, dtype=np.uint32)), self.count)
             event.update(refined=True, resolution=self.resolution, active_voxel_count=self.count)
             if self.core_resolution != self.resolution:
                 event["core_resolution"] = self.core_resolution
@@ -1612,7 +1578,7 @@ class TopologyManager:
         periodic = boundary >= first and (boundary - first) % cfg.deletion_interval == 0
         legacy_delete = (self.candidates if not cfg.use_rgb_deletion and
                          (periodic or final) and self.collect_deletion(boundary) else None)
-        if legacy_delete is not None and self.scene_mapping == "projective_shell":
+        if legacy_delete is not None and self.scene_mapping == "world_shell":
             legacy_delete = legacy_delete & self._core_region_numpy(model)
         masks = [mask for mask in (rgb_delete, legacy_delete, opacity_delete) if mask is not None]
         delete = np.logical_or.reduce(masks) if masks else None
@@ -1685,7 +1651,7 @@ class TopologyManager:
                     radiance[:, 0] = state["radiance_sh"].reshape(self.count, metadata["sh_count"], 3)[parents, 0]
                     opacity = _growth_opacity_coefficients(
                         state, metadata, parents, cfg, np)
-                new = {"cell_indices": selected["cells"].astype(np.uint32), "centers": selected["centers"],
+                new = {"cell_indices": selected["cells"].astype(np.uint64), "centers": selected["centers"],
                        "log_scales": selected["log_scales"], "rotations": selected["rotations"],
                        "radiance_sh": radiance, "opacity_sh": opacity}
                 for name, values in new.items():
@@ -1816,7 +1782,7 @@ class TopologyManager:
         background_version = state.get("background_rgb_deletion_version", 0)
         if type(background_version) is not int or not 0 <= background_version <= BACKGROUND_RGB_DELETION_VERSION:
             raise ValueError("Unsupported background RGB deletion version")
-        reset_background_window = (self.scene_mapping == "projective_shell" and
+        reset_background_window = (self.scene_mapping == "world_shell" and
             state["settings"].get("use_rgb_deletion", False) and background_version == 0)
         if (state["settings"].get("use_rgb_growth", False) and
                 state.get("rgb_growth_evidence_version") != RGB_GROWTH_EVIDENCE_VERSION):

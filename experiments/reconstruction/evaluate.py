@@ -261,8 +261,7 @@ def resolve_reference_compositing(config, checkpoint_config):
 def checkpoint_data_config(saved):
     """Reuse the exact initialization transform for every evaluation split."""
     saved_data = saved.get("data", {})
-    data = (preview.DataConfig() if (saved_data.get("initialization") or {}).get("version") in (4, 5, 6)
-            else preview.DataConfig(background_layers=8, background_final_layers=None))
+    data = preview.DataConfig()
     allowed = {item.name for item in fields(data)}
     for key, value in saved.get("data", {}).items():
         if key not in allowed:
@@ -472,9 +471,7 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
             "seeding": "deterministic per split and view", "legacy_preview_pixel_sampling_ignored": render.pixel_sampling}
         report["metric_protocol"]["background_linear_rgb"] = list(render.background)
         report["scene_background"] = preview.scene_background_protocol(
-            checkpoint_data_config(saved), render, preview.ModelConfig(
-                background_use_ellipsoid=checkpoint["model_metadata"].get("background_use_ellipsoid", True),
-                background_layered_sampling=checkpoint["model_metadata"].get("background_layered_sampling", False)))
+            checkpoint_data_config(saved), render, checkpoint["model_metadata"])
         model = common.restore_model(checkpoint, mi)
         report["model_statistics"] = model.statistics()
         for split in config.splits:
@@ -693,9 +690,7 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
         }
         report["metric_protocol"]["background_linear_rgb"] = list(render.background)
         report["scene_background"] = preview.scene_background_protocol(
-            checkpoint_data_config(saved), render, preview.ModelConfig(
-                background_use_ellipsoid=checkpoint["model_metadata"].get("background_use_ellipsoid", True),
-                background_layered_sampling=checkpoint["model_metadata"].get("background_layered_sampling", False)))
+            checkpoint_data_config(saved), render, checkpoint["model_metadata"])
         model = common.restore_model(checkpoint, mi)
         report["model_statistics"] = model.statistics()
         (output / "evaluation-config.json").write_text(json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8")

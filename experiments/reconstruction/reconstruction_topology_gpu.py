@@ -58,25 +58,16 @@ def device_checkpoint(model):
     core = int(getattr(model, "core_resolution", model.resolution))
     if core != metadata["resolution"]:
         metadata["core_resolution"] = core
-    if getattr(model, "scene_mapping", "") in ("radial_seed_shell", "projective_shell"):
-        metadata["scene_mapping"] = model.scene_mapping
-    if getattr(model, "scene_mapping", "") == "projective_shell":
-        metadata["background_refinement"] = "preserve_physical_width"
-        metadata["background_layers"] = (metadata["resolution"] - core)//2
-        if (hasattr(model, "native_background_use_ellipsoid")
-                and not model.native_background_use_ellipsoid()):
-            metadata["background_use_ellipsoid"] = False
-        if (hasattr(model, "native_background_layered_sampling")
-                and model.native_background_layered_sampling()):
-            metadata["background_layered_sampling"] = True
-        if hasattr(model, "native_background_far_distance"):
-            distance = float(model.native_background_far_distance())
-            if distance:
-                metadata["background_far_distance"] = distance
-    if getattr(model, "background_refinement", "") == "fixed_layers":
-        metadata.update(background_refinement="fixed_layers",
-                        background_layers=int(model.background_layers))
-    return {"model_state": {key: (dr.cuda.UInt32 if key == "cell_indices" else dr.cuda.Float32)(value)
+    if getattr(model, "scene_mapping", "") == "world_shell":
+        metadata.update(scene_mapping="world_shell", core_resolution=core,
+                        world_shell_version=int(getattr(model, "world_shell_version", 2)),
+                        background_refinement=getattr(model, "background_refinement", "fixed"),
+                        background_geometry=("ellipsoid" if getattr(model, "native_background_use_ellipsoid", lambda: False)() else "occupied_cell"),
+                        background_subdivision_level=int(getattr(model, "native_background_subdivision_level", lambda: 0)()),
+                        background_shell_levels=int(model.native_background_shell_levels()))
+        if metadata["background_refinement"] == "adaptive":
+            metadata["background_max_depth"] = int(getattr(model, "background_max_depth", 9))
+    return {"model_state": {key: (dr.cuda.UInt64 if key == "cell_indices" else dr.cuda.Float32)(value)
                             for key, value in model.snapshot().items()},
             "model_metadata": metadata}
 
@@ -172,6 +163,7 @@ class GPUTopologyLifecycle:
         self.manager, self.dr, self.mi = manager, dr, mi
         self.Float = dr.cuda.Float32
         self.UInt = dr.cuda.UInt32
+        self.Cell = dr.cuda.UInt64
         self.Byte = dr.cuda.UInt8
         self.Int64 = dr.int64_array_t(self.UInt)
         self.Epoch = dr.int32_array_t(self.UInt) if compact_epoch_fields_safe(manager) else self.Int64
@@ -182,7 +174,7 @@ class GPUTopologyLifecycle:
             for name in ("growth_birth", "growth_wait_start", "deletion_eligible",
                          "rgb_deletion_streak", "low_opacity_deletion_streak")}
         self.candidates = self.Bool(manager.candidates)
-        self.cooldown_cells = self.UInt(list(manager.cooldown))
+        self.cooldown_cells = self.Cell(list(manager.cooldown))
         self.cooldown_expiry = self.Int64(list(manager.cooldown.values()))
         for name in ("pending_growth", "pending_rgb_deletion"):
             pending = getattr(manager, name)
@@ -193,12 +185,13 @@ class GPUTopologyLifecycle:
         np, dr = self.manager.np, self.dr
         for name, value in list(pending.items()):
             if isinstance(value, np.ndarray):
-                cls = (self.UInt if np.issubdtype(value.dtype, np.integer) else
+                cls = (self.Cell if name in ("cells", "parent_cells", "cell_indices") else
+                       self.UInt if np.issubdtype(value.dtype, np.integer) else
                        self.Double if value.dtype == np.float64 else self.Float)
                 pending[name] = cls(value.reshape(-1))
         if "candidate_state" in pending:
             pending["candidate_state"] = {
-                name: (self.UInt if name == "cell_indices" else self.Float)(value.reshape(-1)
+                name: (self.Cell if name == "cell_indices" else self.Float)(value.reshape(-1)
                        if isinstance(value, np.ndarray) else value)
                 for name, value in pending["candidate_state"].items()}
 
@@ -241,6 +234,7 @@ class GPUTopologyLifecycle:
             checkpoint = device_checkpoint(model)
             timings["snapshot"] = time.perf_counter() - started
             started = time.perf_counter()
+            m.growth_generation_stage_seconds = {}
             pending = generate_growth_gpu(m, checkpoint, boundary,
                 eligible=self.eligible(boundary), cooldown_cells=self.forbidden(boundary))
             # Compact dynamic allocations in generation already establish the
@@ -248,6 +242,8 @@ class GPUTopologyLifecycle:
             dr.eval(*[v for v in pending.values() if dr.is_array_v(type(v))])
             dr.sync_thread()
             timings["candidate_generation"] = time.perf_counter() - started
+            timings.update({"generation_" + name: seconds for name, seconds in
+                            m.growth_generation_stage_seconds.items()})
             started = time.perf_counter()
             count = len(pending["cells"])
             # CPU reference freezes geometry to float32 before installing the
@@ -460,10 +456,8 @@ class GPUTopologyLifecycle:
         coefficient_threshold = math.log(threshold / (1. - threshold)) * (2. * math.sqrt(math.pi))
         low = self.Double(coefficients) < coefficient_threshold if m.count else dr.empty(self.Bool, 0)
         mature = self.mature(boundary)
-        if m.scene_mapping == "projective_shell" and not m._background_deletion_allowed():
-            from reconstruction_projective import core_mask_device
-            mature &= core_mask_device(self.UInt(model.snapshot()["cell_indices"]),
-                                       m.resolution, m.core_resolution, dr)
+        if m.scene_mapping == "world_shell" and not m._background_deletion_allowed():
+            mature &= self.Cell(model.snapshot()["cell_indices"]) < m.core_resolution ** 3
         qualified = low & mature
         selected, detail = self.confirmation(qualified, boundary, opacity=True)
         detail.update(status="complete", threshold=threshold, tested_voxels=m.count,
@@ -523,14 +517,9 @@ class GPUTopologyLifecycle:
         if not n:
             detail["geometry_rejected"] = detail["rgb_qualified"]
             return None
-        keys = (U64(current["cells"]) << 32) | U64(current["parent_cells"])
-        query = (U64(targets) << 32) | U64(take_rows(p["parent_cells"], ids))
-        lo, hi = dr.zeros(self.UInt, len(ids)), dr.full(self.UInt, n, len(ids))
-        for _ in range(n.bit_length()):
-            mid = (lo + hi) // 2
-            less = (mid < n) & (dr.gather(U64, keys, mid, mid < n) < query)
-            lo, hi = dr.select(less, mid + 1, lo), dr.select(less, hi, mid)
-        matches = (lo < n) & (dr.gather(U64, keys, lo, lo < n) == query)
+        from reconstruction_growth_filter import match_growth_pairs_gpu
+        matches, lo = match_growth_pairs_gpu(current["cells"], current["parent_cells"],
+            targets, take_rows(p["parent_cells"], ids), dr)
         positions = dr.compress(matches)
         ids = take_rows(ids, positions)
         detail["geometry_revalidated"] = len(ids)
@@ -547,6 +536,19 @@ class GPUTopologyLifecycle:
         detail["same_cell_rejected"] = len(ids) - len(per_cell)
         ids, gains, cells, parent_ids = [take_rows(v, per_cell) for v in (ids, gains, cells, parent_ids)]
         ranking = dr.argsort(gains, descending=True)  # equal gain keeps cell order
+        if checkpoint["model_metadata"].get("background_refinement") == "adaptive":
+            from reconstruction_adaptive_growth import filter_nonoverlapping_growth_gpu
+            # Candidates at different depths must not overlap each other.
+            keep = filter_nonoverlapping_growth_gpu(cells, checkpoint["model_metadata"], dr)
+            allowed = dr.zeros(self.Bool, len(cells))
+            dr.scatter(allowed, True, keep)
+            ranking = take_rows(ranking, dr.compress(dr.gather(self.Bool, allowed, ranking)))
+            existing = checkpoint["model_state"]["cell_indices"]
+            bg_count = int(dr.count(existing >= (1 << 63))[0])
+            bg_capacity = max(0, cfg.background_max_active_voxels - bg_count)
+            ranked_bg = take_rows(cells, ranking) >= (1 << 63)
+            bg_rank = dr.cumsum(self.UInt(ranked_bg))
+            ranking = take_rows(ranking, dr.compress(~ranked_bg | (bg_rank <= bg_capacity)))
         capacity = max(0, cfg.max_active_voxels - m.count)
         winner_positions = take_rows(ranking, dr.arange(self.UInt, min(len(ranking), capacity)))
         # The original commit path applies np.unique(cells) before appending.
@@ -617,21 +619,39 @@ class GPUTopologyLifecycle:
         m.resolution = replacement["model_metadata"]["resolution"]
         m.core_resolution = replacement["model_metadata"].get("core_resolution", m.resolution)
         m.level_start_epoch = boundary
-        # Host lifecycle arrays remain empty placeholders until serialization.
-        # Allocate actual new-row fields directly on the GPU; old row histories
-        # are discarded at refinement just as in the NumPy implementation.
+        background_rows = replacement.pop("refinement_background_rows",
+                                          dr.empty(self.UInt, 0))
+        preserve_background = (replacement["model_metadata"].get(
+            "background_refinement") == "adaptive")
+        # Foreground children start with the existing level-reset policy.
+        # Adaptive background leaves are unchanged by core refinement, so
+        # their maturity and deletion evidence must survive the row reorder.
         m._initialize_lifecycle(0)
         m.count = len(replacement["model_state"]["cell_indices"])
-        self.fields = {name: dr.zeros(type(value), m.count) for name, value in self.fields.items()}
-        self.candidates = dr.zeros(self.Bool, m.count)
-        self.cooldown_cells = dr.empty(self.UInt, 0)
-        self.cooldown_expiry = dr.empty(self.Int64, 0)
+        if preserve_background and len(background_rows):
+            index = dr.arange(self.UInt, m.count)
+            retained = index < len(background_rows)
+            source = dr.gather(self.UInt, background_rows, index, retained)
+            self.fields = {name: dr.gather(type(value), value, source, retained)
+                           for name, value in self.fields.items()}
+            self.candidates = dr.gather(self.Bool, self.candidates, source, retained)
+        else:
+            self.fields = {name: dr.zeros(type(value), m.count) for name, value in self.fields.items()}
+            self.candidates = dr.zeros(self.Bool, m.count)
+        if preserve_background and len(self.cooldown_cells):
+            from reconstruction_world_shell import ADAPTIVE_TAG
+            keep = dr.compress(self.cooldown_cells >= ADAPTIVE_TAG)
+            self.cooldown_cells = take_rows(self.cooldown_cells, keep)
+            self.cooldown_expiry = take_rows(self.cooldown_expiry, keep)
+        else:
+            self.cooldown_cells = dr.empty(self.Cell, 0)
+            self.cooldown_expiry = dr.empty(self.Int64, 0)
         m.completed_windows = 0
         m.cooldown = {}
         m.pending_growth = None
         m._growth_world_cache = m._growth_device = m._rgb_growth_device = None
         m._gpu_lifecycle = self
-        optimizer.remap(dr.empty(self.UInt, 0), m.count)
+        optimizer.remap(background_rows, m.count)
         dr.eval(*self.fields.values(), self.candidates)
         event.update(refined=True, resolution=m.resolution, active_voxel_count=m.count,
                      refinement_backend="cuda", refinement_stage_seconds={
@@ -659,6 +679,12 @@ class GPUTopologyLifecycle:
         mapping = getattr(model, "scene_mapping", "")
         if mapping:
             metadata["scene_mapping"] = mapping
+        if mapping == "world_shell":
+            metadata["world_shell_version"] = int(getattr(model, "world_shell_version", 2))
+            metadata["background_shell_levels"] = int(model.native_background_shell_levels())
+            metadata["background_subdivision_level"] = int(getattr(model, "native_background_subdivision_level", lambda: 0)())
+            metadata["background_refinement"] = getattr(model, "background_refinement", "fixed")
+            metadata["background_geometry"] = "ellipsoid" if model.native_background_use_ellipsoid() else "occupied_cell"
         return guard(model, optimizer, {"stage": stage, "active_voxels": int(count), "count": int(count),
             "exact_count": True, "old_voxels": int(model.active_voxel_count),
             "current_voxels": int(self.manager.count), "added_voxels": int(added),
@@ -823,7 +849,7 @@ class GPUTopologyLifecycle:
         expiry = device_array_source(self.cooldown_expiry, dr=self.dr)
         cooldown = {}
         step = min(cells.max_chunk_elements, expiry.max_chunk_elements,
-                   max(1, CHUNK_BYTES // (np.dtype(np.uint32).itemsize + np.dtype(np.int64).itemsize)))
+                   max(1, CHUNK_BYTES // (np.dtype(np.uint64).itemsize + np.dtype(np.int64).itemsize)))
         for start in range(0, len(self.cooldown_cells), step):
             count = min(step, len(self.cooldown_cells) - start)
             cell_chunk = cells.read_chunk(start, count)

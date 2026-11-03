@@ -19,9 +19,9 @@ from test_reconstruction_collective import _fixture, _accumulator
 
 
 class RGBDeletionDriverTests(unittest.TestCase):
-    def test_projective_background_deletion_requires_updated_native_build(self):
+    def test_world_shell_background_deletion_requires_updated_native_build(self):
         config = copy.deepcopy(train.CONFIG)
-        config.data.initialization = {"scene_mapping": "projective_shell"}
+        config.data.initialization = {"scene_mapping": "world_shell"}
         for native in (SimpleNamespace(), SimpleNamespace(background_rgb_deletion_version=0)):
             with self.assertRaisesRegex(RuntimeError, "background_rgb_deletion_version"):
                 train.require_background_rgb_deletion(config, native)

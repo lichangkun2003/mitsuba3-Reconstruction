@@ -21,7 +21,7 @@ from reconstruction_topology_gpu import (
 class NumPyDr:
     """Array casts only; constructing the real lifecycle needs no GPU runtime."""
 
-    cuda = SimpleNamespace(Float32=np.float32, UInt32=np.uint32, UInt8=np.uint8)
+    cuda = SimpleNamespace(Float32=np.float32, UInt32=np.uint32, UInt64=np.uint64, UInt8=np.uint8)
     int64_array_t = staticmethod(lambda dtype: np.int64)
     int32_array_t = staticmethod(lambda dtype: np.int32)
     float64_array_t = staticmethod(lambda dtype: np.float64)
@@ -92,6 +92,14 @@ def lifecycle(state):
 
 
 class EpochStorageTests(unittest.TestCase):
+    def test_cooldown_addresses_preserve_high_bits_and_core_aliases(self):
+        state = manager()
+        state.cooldown = {74: 1050, 2 ** 32 + 74: 1100}
+        device = lifecycle(state)
+        self.assertEqual(device.cooldown_cells.dtype, np.dtype(np.uint64))
+        np.testing.assert_array_equal(device.cooldown_cells, np.array([74, 2 ** 32 + 74], np.uint64))
+        np.testing.assert_array_equal(device.cooldown_expiry, [1050, 1100])
+
     def test_ordinary_run_uses_signed_int32_and_preserves_protection(self):
         state = manager()
         device = lifecycle(state)

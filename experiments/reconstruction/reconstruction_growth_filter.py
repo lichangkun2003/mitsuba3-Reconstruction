@@ -20,8 +20,10 @@ def match_growth_parents(current, pending):
     import numpy as np
 
     def keys(batch):
-        return ((batch["parent_cells"].astype(np.uint64) << np.uint64(32)) |
-                batch["cells"].astype(np.uint64))
+        result = np.empty(len(batch["cells"]), dtype=[("cell", "u8"), ("parent", "u8")])
+        result["cell"] = np.asarray(batch["cells"], dtype=np.uint64)
+        result["parent"] = np.asarray(batch["parent_cells"], dtype=np.uint64)
+        return result
 
     allowed, proposed = keys(current), keys(pending)
     order = np.argsort(allowed, kind="stable")
@@ -32,6 +34,31 @@ def match_growth_parents(current, pending):
     return keep, current["parent_ids"][order[locations[keep]]]
 
 
+def growth_pair_order_gpu(cells, parents, dr):
+    """Stable lexicographic order of two full UInt64 addresses."""
+    C, U = dr.cuda.UInt64, dr.cuda.UInt32
+    order = dr.argsort(C(parents))
+    return dr.gather(U, order, dr.argsort(dr.gather(C, C(cells), order)))
+
+
+def match_growth_pairs_gpu(cells, parents, query_cells, query_parents, dr):
+    """Return query-aligned (membership, source row), without 128-bit packing."""
+    C, U, B = dr.cuda.UInt64, dr.cuda.UInt32, dr.cuda.Bool
+    count, width = dr.width(cells), dr.width(query_cells)
+    if not count:
+        return dr.zeros(B, width), dr.zeros(U, width)
+    order = growth_pair_order_gpu(cells, parents, dr)
+    cells, parents = dr.gather(C, C(cells), order), dr.gather(C, C(parents), order)
+    qc, qp = C(query_cells), C(query_parents)
+    def less(i):
+        cell, parent = dr.gather(C, cells, i), dr.gather(C, parents, i)
+        return (cell < qc) | ((cell == qc) & (parent < qp))
+    index = dr.binary_search(0, count, less)
+    safe = dr.minimum(index, count-1)
+    found = (index < count) & (dr.gather(C, cells, safe) == qc) & (dr.gather(C, parents, safe) == qp)
+    return found, dr.gather(U, order, safe)
+
+
 def generate_growth_for_targets(manager, checkpoint, boundary, target_cells):
     """Return current candidates for target cells without scanning all geometry.
 
@@ -40,6 +67,9 @@ def generate_growth_for_targets(manager, checkpoint, boundary, target_cells):
     still contribute to the support threshold. Sorting each offset's parent IDs
     preserves the full generator's deterministic proposal order and winner.
     """
+    if checkpoint["model_metadata"].get("background_refinement") == "adaptive":
+        from reconstruction_adaptive_growth import generate_adaptive_growth_numpy
+        return generate_adaptive_growth_numpy(manager, checkpoint, boundary, target_cells)
     from reconstruction_topology import (
         _addresses, _contact, _coordinates, _geometry, _growth_coordinates_allowed,
         _neighbor_offsets)

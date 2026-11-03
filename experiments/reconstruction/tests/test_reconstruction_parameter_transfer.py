@@ -6,15 +6,18 @@ import argparse
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from preview import RuntimeConfig
 from reconstruction_common import initialize_runtime, restore_model
-from reconstruction_memory import TrainingMemoryError
+from reconstruction_memory import TrainingMemoryError, MIB, round_cuda_allocation
 from reconstruction_optimizer import FalcorOptimizer
 from reconstruction_parameter_transfer import DeferredRemapField
 import test_reconstruction_optimization as original_tests
@@ -27,7 +30,115 @@ def float_values(size):
     return bits.view(np.float32)
 
 
+class CPUUInt32(np.ndarray):
+    scalar_dtype = np.uint32
+    var_type = "uint32"
+
+    def __new__(cls, value):
+        return np.asarray(value, dtype=cls.scalar_dtype).view(cls)
+
+
+class CPUUInt64(CPUUInt32):
+    scalar_dtype = np.uint64
+    var_type = "uint64"
+
+
+class CPUDevice:
+    """Small NumPy oracle for exact host staging; never initializes a backend."""
+    VarType = SimpleNamespace(Float32="float32", UInt32="uint32", Int32="int32", UInt64="uint64")
+    depth_v = staticmethod(lambda _: 1)
+    type_v = staticmethod(lambda array_type: array_type.var_type)
+    width = staticmethod(len)
+    uint32_array_t = staticmethod(lambda _: CPUUInt32)
+    arange = staticmethod(lambda array_type, count: array_type(np.arange(count)))
+    opaque = staticmethod(lambda array_type, value: array_type([value]))
+    empty = staticmethod(lambda array_type, count: array_type(np.empty(count, array_type.scalar_dtype)))
+    eval = staticmethod(lambda *args: None)
+    sync_thread = staticmethod(lambda: None)
+    flush_malloc_cache = staticmethod(lambda: None)
+    select = staticmethod(lambda active, a, b: type(a)(np.where(active, a, b)))
+
+    @staticmethod
+    def gather(array_type, source, indices, active=True):
+        indices = np.asarray(indices, np.int64)
+        active = np.broadcast_to(np.asarray(active, bool), indices.shape)
+        result = array_type(np.zeros(indices.shape, array_type.scalar_dtype))
+        result[active] = np.asarray(source)[indices[active]]
+        return result
+
+    @staticmethod
+    def scatter(target, values, indices):
+        target[np.asarray(indices, np.int64)] = values
+
+
+def uint64_case():
+    source = np.array([0, 2**32-1, 2**32+1, 10_000_000_000,
+                       2**53+1, 2**63+7, 2**64-1, 73_000_000_001], np.uint64)
+    append = np.array([2**64-2, 2**53+9, 0, 11_000_000_000], np.uint64)
+    survivors = np.array([3, 0, 2], np.uint32)
+    expected = np.concatenate((source.reshape(4, 2)[survivors].ravel(), append))
+    return source, append, survivors, expected
+
+
+class ParameterTransferCPUTests(unittest.TestCase):
+    def test_uint64_ram_and_disk_staging_preserve_bits_and_eight_byte_strides(self):
+        source, append, survivors, expected = uint64_case()
+        for disk in (False, True):
+            with self.subTest(disk=disk), tempfile.TemporaryDirectory(prefix="cell64-staging-") as directory:
+                seen = []
+                with patch("reconstruction_parameter_transfer.available_host_memory",
+                           return_value=0 if disk else 10 * 1024**3):
+                    plan = DeferredRemapField(CPUUInt64(source), CPUUInt32(survivors), 2, 5,
+                        append=CPUUInt64(append), dr=CPUDevice(), chunk_bytes=24,
+                        allocation_guard=seen.append, scratch_directory=directory)
+                    actual = plan.materialize()
+                np.testing.assert_array_equal(actual, expected)
+                self.assertEqual(actual.dtype, np.dtype(np.uint64))
+                self.assertEqual(plan.statistics["bytes"], expected.nbytes)
+                self.assertEqual(plan.statistics["element_bytes"], 8)
+                self.assertEqual(plan.statistics["storage"], "disk" if disk else "ram")
+                self.assertEqual(seen, [round_cuda_allocation(expected.nbytes) + 64 * MIB])
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_uint64_zero_newborns_and_guard_diagnostics_use_payload_byte_width(self):
+        source, _, survivors, _ = uint64_case()
+        plan = DeferredRemapField(CPUUInt64(source), CPUUInt32(survivors), 2, 5,
+                                  dr=CPUDevice(), chunk_bytes=24, allocation_guard=lambda _: None)
+        result = plan.materialize()
+        np.testing.assert_array_equal(result[-4:], np.zeros(4, np.uint64))
+        def refuse(_):
+            raise TrainingMemoryError({"reason": "synthetic CPU refusal"})
+        plan = DeferredRemapField(CPUUInt64(source), CPUUInt32(survivors), 2, 5,
+                                  dr=CPUDevice(), allocation_guard=refuse)
+        with self.assertRaises(TrainingMemoryError) as error:
+            plan.materialize()
+        self.assertEqual(error.exception.plan["staged_field_bytes"], 80)
+
+    def test_cell_payload_precision_does_not_widen_row_indices(self):
+        for survivors in (CPUUInt64([0]),):
+            with self.assertRaisesRegex(TypeError, "row indices.*UInt32"):
+                DeferredRemapField(CPUUInt64([2**40]), survivors, 1, 1, dr=CPUDevice())
+        with self.assertRaisesRegex(ValueError, "indices must fit UInt32"):
+            DeferredRemapField(CPUUInt64([2**40]), CPUUInt32([0]), 1, 2**32, dr=CPUDevice())
+        with self.assertRaisesRegex(ValueError, "one field element"):
+            DeferredRemapField(CPUUInt64([2**40]), CPUUInt32([0]), 1, 1, dr=CPUDevice(), chunk_bytes=4)
+
+
 class ParameterTransferTests(unittest.TestCase):
+    def test_uint64_high_address_field_matches_host_bits_with_ram_and_disk_staging(self):
+        source, append, survivors, expected = uint64_case()
+        for disk in (False, True):
+            with self.subTest(disk=disk), tempfile.TemporaryDirectory(prefix="cell64-cuda-staging-") as directory:
+                with patch("reconstruction_parameter_transfer.available_host_memory",
+                           return_value=0 if disk else 10 * 1024**3):
+                    plan = DeferredRemapField(mi.UInt64(source), mi.UInt32(survivors), 2, 5,
+                        append=mi.UInt64(append), dr=dr, chunk_bytes=24, scratch_directory=directory)
+                    actual = np.asarray(plan.materialize())
+                self.assertEqual(actual.dtype, np.dtype(np.uint64))
+                np.testing.assert_array_equal(actual, expected)
+                self.assertEqual(plan.statistics["bytes"], expected.nbytes)
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_deletion_reorder_and_append_match_host_bits_across_chunk_boundaries(self):
         width, old_count = 27, 7
         source = float_values(width * old_count)
@@ -124,7 +235,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", default=RuntimeConfig().build_dir)
     parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--cpu-only", action="store_true")
     args = parser.parse_args()
+    cpu = unittest.TextTestRunner(verbosity=2).run(
+        unittest.defaultTestLoader.loadTestsFromTestCase(ParameterTransferCPUTests))
+    if args.cpu_only or not cpu.wasSuccessful():
+        return 0 if cpu.wasSuccessful() else 1
     global mi, dr, np
     with tempfile.TemporaryDirectory(prefix="mitsuba-parameter-transfer-") as directory:
         report = {}

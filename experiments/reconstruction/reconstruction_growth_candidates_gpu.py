@@ -111,32 +111,37 @@ def contact_gpu(center, metric, offset, depth, dr):
 
 
 def membership_gpu(values, queries, dr):
-    """Exact sorted membership; uint32 addresses, no dense grid allocation."""
-    U = dr.cuda.UInt32
+    """Exact sorted membership of full cell addresses, without a dense grid."""
+    C = dr.cuda.UInt64
     if not dr.width(values):
         return dr.zeros(dr.cuda.Bool, dr.width(queries))
-    ordered = dr.sort(U(values))
+    ordered = dr.sort(C(values))
+    queries = C(queries)
     count = dr.width(ordered)
-    index = dr.binary_search(0, count, lambda i: dr.gather(U, ordered, i) < queries)
-    return (index < count) & (dr.gather(U, ordered, dr.minimum(index, count-1)) == queries)
+    index = dr.binary_search(0, count, lambda i: dr.gather(C, ordered, i) < queries)
+    return (index < count) & (dr.gather(C, ordered, dr.minimum(index, count-1)) == queries)
 
 
 def _make_bitmap(cell_count, sources, dr):
-    """One exact occupancy bit per cell; duplicate writers combine with OR."""
-    U = dr.cuda.UInt32
+    """One bit per core cell; fixed background IDs are outside this domain."""
+    U, C = dr.cuda.UInt32, dr.cuda.UInt64
     bitmap = dr.zeros(U, (cell_count + 31) // 32)
     for source in sources:
         if dr.width(source):
-            cells = U(source)
+            wide = C(source)
+            in_core = wide < cell_count
+            # Mask before narrowing: far shell IDs can alias occupied core IDs
+            # in their low 32 bits, but must never enter the core bitmap.
+            cells = U(dr.select(in_core, wide, 0))
             dr.scatter_reduce(dr.ReduceOp.Or, bitmap,
-                              U(1) << (cells & 31), cells >> 5)
+                              U(1) << (cells & 31), cells >> 5, in_core)
     dr.eval(bitmap)
     return bitmap
 
 
 def _bitmap_contains(bitmap, cells, active, dr):
     U = dr.cuda.UInt32
-    word = dr.gather(U, bitmap, cells >> 5, active)
+    word = dr.gather(U, bitmap, cells >> 5, active & ((cells >> 5) < dr.width(bitmap)))
     return (word & (U(1) << (cells & 31))) != 0
 
 
@@ -188,10 +193,12 @@ def _neighbor_mask(cells, offset, resolution, blocked, selected_targets,
 def _exposed_parent_ids(occupied, eligible, resolution, blocked, selected_targets,
                         offsets, region_allowed, dr):
     """Discard only parents that cannot propose any legal requested empty cell."""
-    I, B = dr.cuda.Int32, dr.cuda.Bool
-    cells = [I(occupied % resolution), I(occupied // resolution % resolution),
-             I(occupied // (resolution * resolution))]
-    allowed = B(eligible) & region_allowed(cells)
+    U, I, B = dr.cuda.UInt32, dr.cuda.Int32, dr.cuda.Bool
+    in_core = occupied < resolution ** 3
+    addresses = U(dr.select(in_core, occupied, 0))
+    cells = [I(addresses % resolution), I(addresses // resolution % resolution),
+             I(addresses // (resolution * resolution))]
+    allowed = B(eligible) & in_core & region_allowed(cells)
     exposed = dr.zeros(B, dr.width(occupied))
     for offset in offsets:
         # A single accumulated mask, not a direction-by-full-model table.
@@ -283,7 +290,9 @@ def _parent_batch(state, metadata, parent_ids, blocked, selected_targets,
     """Two compactions per bounded parent batch, with unchanged FP64 contact math."""
     U, D = dr.cuda.UInt32, dr.cuda.Float64
     resolution = metadata['resolution']
-    parent_cells = dr.gather(U, state['cell_indices'], parent_ids)
+    # parent_ids came from _exposed_parent_ids, which proves core membership
+    # using UInt64 before any conversion to the compact growth address type.
+    parent_cells = U(dr.gather(dr.cuda.UInt64, state['cell_indices'], parent_ids))
     parent_count = dr.width(parent_ids)
     # Full batches retain constant (usually power-of-two) division. A changing
     # tail size must not become a new divisor literal in every contact kernel.
@@ -338,15 +347,21 @@ def generate_growth_gpu(manager, checkpoint, boundary, target_cells=None, *,
     # Keep geometric threshold decisions in FP64 with fast math disabled,
     # instead of silently using the renderer's float32 arithmetic.
     with dr.scoped_set_flag(dr.JitFlag.FastMath, False):
+        if checkpoint['model_metadata'].get('background_refinement') == 'adaptive':
+            from reconstruction_adaptive_growth import generate_adaptive_growth_gpu
+            return generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells,
+                eligible=eligible, cooldown_cells=cooldown_cells,
+                parent_batch_size=parent_batch_size, dr=dr)
         return _generate(manager, checkpoint, boundary, target_cells, eligible,
                          cooldown_cells, parent_batch_size, dr)
 
 
 def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_cells,
-              parent_batch_size, dr):
+              parent_batch_size, dr, minimum_support=None, geometry_only=False):
     U, I, D, F, B = dr.cuda.UInt32, dr.cuda.Int32, dr.cuda.Float64, dr.cuda.Float32, dr.cuda.Bool
+    C = dr.cuda.UInt64
     state, metadata, cfg = checkpoint['model_state'], checkpoint['model_metadata'], manager.settings
-    state = {k: U(v) if k == 'cell_indices' else F(v) for k, v in state.items()}
+    state = {k: C(v) if k == 'cell_indices' else F(v) for k, v in state.items()}
     # A memory-limited prune keeps parameter fields in the original row order
     # until the old native model can retire. Occupancy and result parent IDs
     # still use the compact surviving-row order; only parameter reads remap.
@@ -360,7 +375,7 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
         result = {k: dr.empty(U if k in ('parent_ids','parent_cells','cells','geometric_support') else D, 0)
                   for k in ('parent_ids','parent_cells','cells','geometric_support','centers','log_scales','rotations')}
         result.update(boundary=boundary,resolution=resolution,seen_views=set(),foreground=U([]),background=U([]))
-        result['candidate_state'] = {k: dr.empty(U if k=='cell_indices' else F, 0) for k in state}
+        result['candidate_state'] = {k: dr.empty(C if k=='cell_indices' else F, 0) for k in state}
         result.update(radiance_sh=F([]),opacity_sh=F([]))
         return result
     if not dr.width(occupied) or (target_cells is not None and not dr.width(target_cells)):
@@ -370,22 +385,11 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
         eligible = ~B(manager.candidates) & ((wait == 0) |
             ((boundary >= wait-1) & (boundary-(wait-1) >= cfg.growth_wait_epochs)))
     if cooldown_cells is None:
-        cooldown_cells = U([cell for cell, expiry in manager.cooldown.items() if boundary < expiry])
-    from reconstruction_topology import _growth_core_radius_squared
-    radius_squared = _growth_core_radius_squared(metadata)
+        cooldown_cells = C([cell for cell, expiry in manager.cooldown.items() if boundary < expiry])
     def region_allowed(coordinates):
         allowed = dr.full(B, True, dr.width(coordinates[0]))
         for c in coordinates:
             allowed &= (c >= 0) & (c < resolution)
-        if metadata.get("scene_mapping") == "projective_shell":
-            core = int(metadata["core_resolution"])
-            pad = (resolution - core) // 2
-            for c in coordinates:
-                allowed &= (c >= pad) & (c < pad + core)
-        if radius_squared is not None:
-            farthest_squared = sum((dr.abs(2*c + 1 - resolution) + 1)**2
-                                   for c in coordinates)
-            allowed &= farthest_squared <= radius_squared
         return allowed
 
     evidence = cfg.use_growth_evidence or cfg.use_rgb_growth
@@ -448,7 +452,8 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
         counts = dr.zeros(U, dr.width(starts))
         dr.scatter_reduce(dr.ReduceOp.Add, counts, U(1), groups)
         support = dr.gather(U, counts, groups)
-        keep = dr.compress(support >= max(1, min(26, cfg.growth_min_supporting_parents))) if evidence else index
+        threshold = max(1, min(26, cfg.growth_min_supporting_parents)) if minimum_support is None else minimum_support
+        keep = dr.compress(support >= threshold) if evidence else index
         geometric_support = dr.gather(U, support, keep) if dr.width(keep) else U([])
         dr.eval(keep, geometric_support)
         del support, groups, starts, counts, first, index
@@ -461,8 +466,13 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
     n = dr.width(result['cells'])
     result.update(boundary=boundary, resolution=resolution, seen_views=set(),
                   foreground=dr.zeros(U,n), background=dr.zeros(U,n))
+    if geometry_only:
+        # Adaptive growth merges core and shell support first. Materializing
+        # SH for the unfiltered core stream would allocate it twice and retain
+        # radiance for single-parent targets that are subsequently rejected.
+        return result
     if not n:
-        result['candidate_state'] = {k: dr.empty(U if k=='cell_indices' else F, 0) for k in state}
+        result['candidate_state'] = {k: dr.empty(C if k=='cell_indices' else F, 0) for k in state}
         result.update(radiance_sh=F([]),opacity_sh=F([]))
         return result
     from reconstruction_topology import validate_growth_opacity
@@ -487,7 +497,7 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
     for channel in range(3):
         dr.scatter(radiance,dr.gather(F,state['radiance_sh'],
              parameter_ids*metadata['sh_count']*3+channel),index*metadata['sh_count']*3+channel)
-    result['candidate_state'] = dict(cell_indices=result['cells'],
+    result['candidate_state'] = dict(cell_indices=C(result['cells']),
         centers=F(result['centers']),log_scales=F(result['log_scales']),rotations=F(result['rotations']),
         radiance_sh=radiance,opacity_sh=opacity)
     result.update(radiance_sh=radiance,opacity_sh=opacity)

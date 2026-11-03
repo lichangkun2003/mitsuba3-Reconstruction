@@ -212,12 +212,10 @@ def check_compact_storage_scaling(mi, dr, np):
     maximum, reports = 0., []
     # Check the small model first: an old binary must fail before constructing
     # resolution=1024, whose historical dense leaf index alone used 4 GiB.
-    for resolution in (64, 256, 1024, 1040):
+    for resolution in (64, 256, 1024):
         coordinates = [(resolution-1, resolution-1, resolution-1), (0, 0, resolution-1),
                        (resolution//2, resolution//2, resolution//2), (resolution-1, 0, 0)]
         checkpoint = payload(np, resolution, coordinates)
-        if resolution > 1024:
-            checkpoint["model_metadata"]["core_resolution"] = 1024
         model = restore_model(checkpoint, mi)
         statistics = compact_storage(model, len(coordinates))
         reports.append({"resolution": resolution, **statistics})
@@ -241,8 +239,6 @@ def check_compact_storage_scaling(mi, dr, np):
             host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., True), dr, np),
             np, f"compact_sparse_trace_{resolution}"))
         empty_checkpoint = payload(np, resolution, [])
-        if resolution > 1024:
-            empty_checkpoint["model_metadata"]["core_resolution"] = 1024
         empty = restore_model(empty_checkpoint, mi)
         compact_storage(empty, 0)
         empty_result, error = compare_loss(empty, ray, mi, dr, np, f"compact_empty_{resolution}")
@@ -252,24 +248,25 @@ def check_compact_storage_scaling(mi, dr, np):
     first = reports[0]["spatial_index_allocated_bytes"] + reports[0]["octree_allocated_bytes"]
     last = reports[-1]["spatial_index_allocated_bytes"] + reports[-1]["octree_allocated_bytes"]
     assert last <= 16*max(first, 1), ("Storage followed grid volume instead of sparse occupancy", reports)
-    return {"check": "compact_sparse_storage_to_1040_preserves_unsorted_rows_and_empty_models",
+    return {"check": "compact_sparse_storage_to_1024_preserves_unsorted_rows_and_empty_models",
             "storage": reports, "max_absolute_error": maximum, "status": "passed"}
 
 
 def check_core_1024_shell_storage(mi, dr, np):
-    """Exercise all three coordinate bits above 1023, including Morton bit 32."""
-    resolution = 1040
+    """Exercise all eight root octants in the 54-bit world-shell Morton grid."""
+    resolution = 1024
     # All eight combinations are necessary: a truncated Morton sort can alias
     # or misorder upper-z leaves even if one isolated high-address leaf works.
-    coordinates = [(5 + 1024*(bits & 1), 7 + 1024*((bits >> 1) & 1),
-                    11 + 1024*((bits >> 2) & 1)) for bits in (7, 0, 4, 1, 6, 2, 5, 3)]
+    coordinates = [(5 + 512*(bits & 1), 7 + 512*((bits >> 1) & 1),
+                    11 + 512*((bits >> 2) & 1)) for bits in (7, 0, 4, 1, 6, 2, 5, 3)]
     checkpoint = payload(np, resolution, coordinates)
-    checkpoint["model_metadata"]["core_resolution"] = 1024
+    checkpoint["model_metadata"].update(core_resolution=1024, scene_mapping="world_shell",
+                                        background_shell_levels=8, background_refinement="fixed")
     model = restore_model(checkpoint, mi)
     storage = compact_storage(model, len(coordinates))
-    assert storage["octree_levels"] == 11
-    assert int(model.core_resolution) == 1024 and int(model.resolution) == 1040
-    xy = [(5, 7), (1029, 7), (5, 1031), (1029, 1031)]
+    assert storage["octree_levels"] == 18
+    assert int(model.core_resolution) == int(model.resolution) == 1024
+    xy = [(5, 7), (517, 7), (5, 519), (517, 519)]
     origins = [[x+.5, y+.5, -1.] for x, y in xy] + \
               [[x+.5, y+.5, resolution+1.] for x, y in xy] + [[20.5, 20.5, -1.]]
     directions = [[0., 0., 1.]]*4 + [[0., 0., -1.]]*4 + [[0., 0., 1.]]
@@ -286,13 +283,13 @@ def check_core_1024_shell_storage(mi, dr, np):
             expected.append(.35*colors[rows[0]] + .65*.35*colors[rows[1]] + .65**2)
     expected.append(np.ones(3))
     np.testing.assert_allclose(baseline["raw_rgb"], np.asarray(expected).T,
-                               rtol=3e-5, atol=3e-6, err_msg="Independent 33-bit Morton leaf-ID oracle")
+                               rtol=3e-5, atol=3e-6, err_msg="Independent 54-bit Morton leaf-ID oracle")
     assert np.any(np.abs(baseline["gradients.radiance_sh"]) > 0)
     baseline_trace = host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., True), dr, np)
     maximum = max(maximum, compare(baseline_trace,
         host(model.trace(ray, mi.Color3f(1.), 1e-5, 16, 0., False), dr, np), np, "core1024_trace"))
 
-    proposal_coordinates = [(1029, 1031, 1024), (5, 7, 1024), (1029, 1031, 1024)]
+    proposal_coordinates = [(517, 519, 512), (5, 7, 512), (517, 519, 512)]
     proposals = state(np, resolution, proposal_coordinates, opacity=.25)
     model.set_growth_candidates(device_state(proposals, mi))
     compact_storage(model, len(coordinates) + 2)
@@ -314,21 +311,22 @@ def check_core_1024_shell_storage(mi, dr, np):
         inserted_result = host(inserted_model.loss_and_grad(*inputs(mi, ray), settings()), dr, np)
         expected_gains.append(float(np.sum(baseline["rgb_loss"] - inserted_result["rgb_loss"])))
     np.testing.assert_allclose(with_candidates["growth_gain"], expected_gains,
-                               rtol=3e-5, atol=3e-6, err_msg="33-bit candidate insertion oracle")
+                               rtol=3e-5, atol=3e-6, err_msg="54-bit candidate insertion oracle")
     model.clear_growth_candidates()
     maximum = max(maximum, compare(baseline,
         host(model.loss_and_grad(*inputs(mi, ray), settings()), dr, np), np, "core1024_overlay_clear"))
 
-    # Point initialization and checkpoint construction must enforce the same
-    # distinction between core resolution and padded storage resolution.
+    # World root size changes independently of core cell IDs and point loading.
     positions = np.asarray(coordinates, np.float32).reshape(-1) + np.float32(.5)
     point_model = mi.VoxelReconstruction.from_points(positions, np.full_like(positions, .5),
-        resolution, [0.]*3, [float(resolution)]*3, 1, 1, core_resolution=1024)
-    assert int(point_model.resolution) == 1040 and int(point_model.core_resolution) == 1024
+        resolution, [0.]*3, [float(resolution)]*3, 1, 1, core_resolution=1024,
+        background_shell_levels=8)
+    assert int(point_model.resolution) == int(point_model.core_resolution) == 1024
+    assert point_model.native_background_shell_levels() == 8
     np.testing.assert_array_equal(np.sort(np.asarray(point_model.snapshot()["cell_indices"])),
                                   np.sort(checkpoint["model_state"]["cell_indices"]))
     rejected = []
-    for actual, core in ((1041, 1024), (1040, 1025), (1040, 0), (512, 1024)):
+    for actual, core in ((1041, 1024), (1040, 1024), (1040, 1025), (1040, 0), (512, 1024)):
         bad = payload(np, actual, [(0, 0, 0)])
         if core:
             bad["model_metadata"]["core_resolution"] = core
@@ -344,7 +342,7 @@ def check_core_1024_shell_storage(mi, dr, np):
                 rejected.append([constructor, actual, core])
             else:
                 raise AssertionError(f"Invalid core/storage resolution accepted: {constructor}, {actual}, {core}")
-    return {"check": "core1024_storage1040_33bit_morton_hits_gradients_and_candidates",
+    return {"check": "core1024_world_root_54bit_morton_hits_gradients_and_candidates",
             "storage": storage, "rejected_resolutions": rejected,
             "max_absolute_error": maximum, "status": "passed"}
 

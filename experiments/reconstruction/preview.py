@@ -27,6 +27,10 @@ import traceback
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from reconstruction_color import reference_from_bitmap, validate_reference_compositing
+from reconstruction_world_shell import (reject_removed_background_fields, validate_shell_levels,
+                                        validate_world_shell_layout, world_shell_ray_maxt,
+                                        world_shell_metadata_layout, world_shell_metadata_geometry,
+                                        background_initial_subdivision)
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 WORKSPACE = REPOSITORY.parent
@@ -42,12 +46,13 @@ class DataConfig:
     images: str | None = None  # COLMAP image folder; None selects the scene's downsampled images.
     initialization: dict | None = None  # Resolved COLMAP normalization/shell, persisted for resume/evaluation.
     scene_mode: str = "auto"  # auto: synthetic bounded, COLMAP unbounded; explicit override supported.
-    background_final_layers: int | None = 8  # Radial layers at the target core resolution; physical shell width stays fixed.
-    background_layers: int | None = None  # Legacy v2/v3 checkpoint setting; new runs use background_final_layers.
-    background_opacity: float = 0.5  # Initial per-voxel opacity in the complete far-field shell.
-    background_far_distance: float | None = None  # Scene-centered L-infinity radius in normalized core half extents; None estimates it.
-    background_far_percentile: float = 99.9  # Percentile of normalized far-point distances (h > 1) for the automatic estimate.
-    background_far_margin: float = 1.2  # Multiplicative margin applied to the automatic estimate.
+    background_shell_levels: int = 5  # World-space cube shells, initially 56 leaves per shell.
+    background_initial_resolution: int = 2  # Relative to core extent; >2 seeds only point-occupied leaves.
+    background_opacity: float = 0.5
+    background_refinement: str = "uniform"  # Historical checkpoints retain uniform refinement.
+    background_initial_leaf_budget: int = 200000
+    background_initial_pixel_threshold: float = 32.0
+    background_max_resolution: int = 512  # Finest first-shell edge relative to the core extent.
 
 
 @dataclass
@@ -59,8 +64,7 @@ class ModelConfig:
     opacity_threshold: float = 0.05
     sh_count: int = 9  # Coefficient counts, not SH degrees.
     opacity_sh_count: int = 9
-    background_use_ellipsoid: bool = True  # Projective far field: False uses occupied cells directly.
-    background_layered_sampling: bool = False  # One occupied-cell query per inverse-depth layer midpoint.
+
 
 
 @dataclass
@@ -155,21 +159,25 @@ def workspace_path(value: str | Path, workspace: Path) -> Path:
 
 
 def apply_saved_background_defaults(data, entries: dict) -> None:
-    """Do not inherit new layer defaults when loading a saved initializer."""
+    """Restore shell settings and explicitly reject removed compression."""
+    reject_removed_background_fields(entries)
     saved = entries.get("initialization")
     if not isinstance(saved, dict):
         return
-    version = saved.get("version")
-    if version in (1, 2, 3):
-        if "background_final_layers" not in entries:
-            data.background_final_layers = None
-        if "background_layers" not in entries:
-            data.background_layers = saved.get("background_layers", 8)
-    elif version in (4, 5, 6):
-        if "background_layers" not in entries:
-            data.background_layers = None
-        if "background_final_layers" not in entries:
-            data.background_final_layers = saved.get("background_final_layers", 8)
+    if saved.get("scene_mapping") not in ("bounded", "world_shell"):
+        raise ValueError("Legacy compressed initialization is unsupported; start a new world_shell reconstruction")
+    if saved.get("scene_mapping") == "world_shell":
+        world_shell_metadata_layout(saved)
+        if "background_shell_levels" not in entries:
+            data.background_shell_levels = saved["background_shell_levels"]
+        if "background_opacity" not in entries:
+            data.background_opacity = saved["background_opacity"]
+        if "background_initial_resolution" not in entries:
+            data.background_initial_resolution = saved.get("background_initial_resolution", 2)
+        for name in ("background_refinement", "background_initial_leaf_budget",
+                     "background_initial_pixel_threshold", "background_max_resolution"):
+            if name not in entries and name in saved:
+                setattr(data, name, saved[name])
 
 
 def update_config(config: PreviewConfig, values: dict) -> None:
@@ -178,6 +186,8 @@ def update_config(config: PreviewConfig, values: dict) -> None:
         raise ValueError("Configuration must contain only data/model/render/output/runtime groups")
     for group_name, entries in values.items():
         group = getattr(config, group_name)
+        if isinstance(entries, dict):
+            reject_removed_background_fields(entries)
         allowed = {item.name for item in fields(group)}
         if not isinstance(entries, dict) or set(entries) - allowed:
             raise ValueError(f"Unknown or malformed configuration fields in {group_name}")
@@ -199,11 +209,8 @@ def resolve_scene_background(config, dataset_type: str) -> str:
     if dataset_type not in ("synthetic", "colmap"):
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
     saved = config.data.initialization
-    if saved is not None and saved.get("version") == 1:
-        if mode != "auto":
-            raise ValueError("Legacy version-1 initialization cannot be reinterpreted with a scene_mode override; "
-                             "resume/evaluate with its saved background or start a new reconstruction")
-        return "legacy"
+    if saved is not None and saved.get("scene_mapping") not in ("bounded", "world_shell"):
+        raise ValueError("Legacy compressed initialization is unsupported; start a new world_shell reconstruction")
     resolved = ("bounded" if dataset_type == "synthetic" else "unbounded") if mode == "auto" else mode
     if saved is not None:
         saved_mode = saved.get("scene_mode")
@@ -217,37 +224,35 @@ def resolve_scene_background(config, dataset_type: str) -> str:
 
 
 def scene_background_protocol(data, render, model=None) -> dict:
-    """Describe the actual compositing setting without resolving or changing it."""
+    """Describe shell geometry and the current subdivision independently of the tail color."""
     saved = data.initialization or {}
     mode = saved.get("scene_mode", "bounded" if data.scene_mode == "auto" else data.scene_mode)
-    if saved.get("version") == 1:
-        mode = "legacy"
-    far_distance = saved.get("background_far_distance") if saved.get("version") == 6 else None
-    ray_extent = "configured far_clip"
-    if saved.get("scene_mapping") == "projective_shell":
-        ray_extent = "finite_scene_boundary" if far_distance is not None else "infinity"
-    background_use_ellipsoid = True if model is None else model.background_use_ellipsoid
-    layered = False if model is None else model.background_layered_sampling
-    background_geometry = (("ellipsoid" if background_use_ellipsoid else "occupied_cell")
-                           if saved.get("scene_mapping") == "projective_shell" else "not_applicable")
+    mapping = saved.get("scene_mapping", "bounded")
+    levels = saved.get("background_shell_levels", data.background_shell_levels) if mapping == "world_shell" else 0
+    layout = saved
+    if isinstance(model, dict) and model.get("scene_mapping") == "world_shell":
+        layout = model
+    elif hasattr(model, "native_background_subdivision_level"):
+        layout = dict(background_refinement=getattr(model, "background_refinement", "fixed"),
+                      background_subdivision_level=int(model.native_background_subdivision_level()),
+                      background_geometry=("ellipsoid" if model.native_background_use_ellipsoid() else "occupied_cell"),
+                      world_shell_version=getattr(model, "world_shell_version", 2))
+    refinement, subdivision = world_shell_metadata_layout(layout) if levels else (None, 0)
     return {"requested_scene_mode": data.scene_mode, "scene_mode": mode,
             "background_linear_rgb": list(render.background),
             "background_role": "residual ray transmittance color; no environment illumination",
-            "scene_mapping": saved.get("scene_mapping", "bounded"),
-            "background_use_ellipsoid": background_use_ellipsoid,
-            "background_layered_sampling": layered,
-            "background_sampling": (("layer_midpoint" if layered else "cell_traversal")
-                                    if saved.get("scene_mapping") == "projective_shell" else "not_applicable"),
-            "background_geometry": background_geometry,
-            "ray_extent": ray_extent,
-            "background_far_distance": far_distance,
-            "initial_background_layers": (saved.get("initial_background_layers", saved.get("background_layers",
-                                                data.background_layers)) if mode == "unbounded" else None),
-            "final_background_layers": (saved.get("shell_layers", data.background_final_layers)
-                                        if mode == "unbounded" else None),
-            "background_refinement": (saved.get("background_refinement", "preserve_physical_width")
-                                      if mode == "unbounded" else None),
-            "initial_background_opacity": data.background_opacity if mode == "unbounded" else None}
+            "scene_mapping": mapping, "background_shell_levels": levels,
+            "background_initial_voxels": saved.get("background_voxels", 56 * levels),
+            "background_initial_resolution": saved.get("background_initial_resolution", 2) if levels else None,
+            "background_leaf_capacity": 56 * levels * 8 ** subdivision,
+            "background_subdivision_level": subdivision,
+            "world_shell_version": layout.get("world_shell_version", 1) if levels else None,
+            "background_geometry": world_shell_metadata_geometry(layout) if levels else "not_applicable",
+            "background_sampling": "world_leaf_traversal" if levels else "not_applicable",
+            "ray_extent": "finite_world_root" if levels else "configured far_clip",
+            "root_half_extent": 2 ** levels if levels else None,
+            "background_refinement": refinement,
+            "initial_background_opacity": data.background_opacity if levels else None}
 
 
 def parse_config(workspace: Path) -> PreviewConfig:
@@ -255,20 +260,9 @@ def parse_config(workspace: Path) -> PreviewConfig:
     parser.add_argument("--config", help="JSON config, relative to the workspace parent")
     parser.add_argument("--dataset")
     parser.add_argument("--scene-mode", choices=("auto", "bounded", "unbounded"))
-    parser.add_argument("--background-final-layers", type=int,
-                        help="Background layers at the target resolution (default: 8); independent of max_hits")
-    parser.add_argument("--background-layers", type=int, help="Legacy v2/v3 setting; use --background-final-layers for new runs")
-    parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
-    parser.add_argument("--background-use-ellipsoid", action=argparse.BooleanOptionalAction, default=None,
-                        help="Projective far field: use ellipsoids (default); --no-background-use-ellipsoid uses occupied cells")
-    parser.add_argument("--background-layered-sampling", action=argparse.BooleanOptionalAction, default=None,
-                        help="Query each projective background layer once; requires --no-background-use-ellipsoid")
-    parser.add_argument("--background-far-distance", type=float,
-                        help="Finite scene-centered L-infinity radius H > 1, in core half extents (default: automatic)")
-    parser.add_argument("--background-far-percentile", type=float,
-                        help="Automatic far-distance point percentile in (0, 100] (default: 99.9)")
-    parser.add_argument("--background-far-margin", type=float,
-                        help="Automatic far-distance multiplier >= 1 (default: 1.2)")
+    parser.add_argument("--background-shell-levels", type=int,
+                        help="Fixed world-space cube shells, 56 leaves each (default: 5)")
+    parser.add_argument("--background-opacity", type=float, help="Initial background leaf opacity (default: 0.5)")
     parser.add_argument("--point-cloud")
     parser.add_argument("--cameras")
     parser.add_argument("--camera-index", type=int)
@@ -292,14 +286,9 @@ def parse_config(workspace: Path) -> PreviewConfig:
         update_config(config, json.loads(workspace_path(args.config, workspace).read_text(encoding="utf-8")))
     mapping = {
         "dataset": ("data", "dataset"), "point_cloud": ("data", "point_cloud"),
-        "scene_mode": ("data", "scene_mode"), "background_layers": ("data", "background_layers"),
-        "background_final_layers": ("data", "background_final_layers"),
+        "scene_mode": ("data", "scene_mode"),
+        "background_shell_levels": ("data", "background_shell_levels"),
         "background_opacity": ("data", "background_opacity"),
-        "background_use_ellipsoid": ("model", "background_use_ellipsoid"),
-        "background_layered_sampling": ("model", "background_layered_sampling"),
-        "background_far_distance": ("data", "background_far_distance"),
-        "background_far_percentile": ("data", "background_far_percentile"),
-        "background_far_margin": ("data", "background_far_margin"),
         "cameras": ("data", "cameras"), "camera_index": ("data", "camera_index"),
         "reference_compositing": ("data", "reference_compositing"),
         "grid_resolution": ("model", "grid_resolution"),
@@ -323,27 +312,35 @@ def validate_config(config: PreviewConfig) -> None:
         raise ValueError("data.initialization must be resolved initialization metadata or null")
     if config.data.scene_mode not in ("auto", "bounded", "unbounded"):
         raise ValueError("data.scene_mode must be auto, bounded or unbounded")
-    for name in ("background_final_layers", "background_layers"):
+    validate_shell_levels(config.data.background_shell_levels)
+    if config.data.background_refinement not in ("fixed", "uniform", "adaptive"):
+        raise ValueError("data.background_refinement must be fixed, uniform, or adaptive")
+    for name in ("background_initial_leaf_budget", "background_max_resolution"):
         value = getattr(config.data, name)
-        if value is not None and (type(value) is not int or value < 1):
-            raise ValueError(f"data.{name} must be a positive integer or null")
+        if type(value) is not int or value < 1:
+            raise ValueError(f"data.{name} must be a positive integer")
+    maximum = config.data.background_max_resolution
+    if maximum < 2 or maximum > 1024 or maximum & (maximum - 1):
+        raise ValueError("data.background_max_resolution must be a power of two in [2, 1024]")
+    if (not math.isfinite(config.data.background_initial_pixel_threshold)
+            or config.data.background_initial_pixel_threshold <= 0):
+        raise ValueError("data.background_initial_pixel_threshold must be finite and positive")
+    if config.data.background_refinement == "adaptive":
+        if config.data.background_initial_leaf_budget < 56 * config.data.background_shell_levels:
+            raise ValueError("Adaptive background budget must cover every coarse shell leaf")
+        if config.data.background_initial_resolution != 2:
+            raise ValueError("Adaptive background starts from coarse shells: set background_initial_resolution=2")
+    if config.data.scene_mode == "unbounded":
+        background_initial_subdivision(config.data.background_initial_resolution, config.model.grid_resolution)
+    apply_saved_background_defaults(config.data, {"initialization": config.data.initialization,
+                                                "background_shell_levels": config.data.background_shell_levels,
+                                                "background_initial_resolution": config.data.background_initial_resolution,
+                                                "background_opacity": config.data.background_opacity})
     if (isinstance(config.data.background_opacity, bool)
             or not isinstance(config.data.background_opacity, (int, float))
             or not math.isfinite(config.data.background_opacity)
             or not 0 < config.data.background_opacity < 1):
         raise ValueError("data.background_opacity must be finite and in (0, 1)")
-    far_distance = config.data.background_far_distance
-    if far_distance is not None and (isinstance(far_distance, bool)
-            or not isinstance(far_distance, (int, float)) or not math.isfinite(far_distance)
-            or far_distance <= 1):
-        raise ValueError("data.background_far_distance must be null or finite and greater than 1")
-    for name, valid, bounds in (
-            ("background_far_percentile", lambda value: 0 < value <= 100, "in (0, 100]"),
-            ("background_far_margin", lambda value: value >= 1, "at least 1")):
-        value = getattr(config.data, name)
-        if (isinstance(value, bool) or not isinstance(value, (int, float))
-                or not math.isfinite(value) or not valid(value)):
-            raise ValueError(f"data.{name} must be finite and {bounds}")
     if config.render.traversal not in ("octree", "dda"):
         raise ValueError("render.traversal must be octree or dda")
     for name in ("width", "height", "spp", "max_hits"):
@@ -363,16 +360,8 @@ def validate_config(config: PreviewConfig) -> None:
     if not 0 <= config.render.transmittance_threshold < 1:
         raise ValueError("transmittance_threshold must be in [0, 1)")
     model = config.model
-    if type(model.background_use_ellipsoid) is not bool:
-        raise ValueError("model.background_use_ellipsoid must be a boolean")
-    if type(model.background_layered_sampling) is not bool:
-        raise ValueError("model.background_layered_sampling must be a boolean")
-    if model.background_layered_sampling:
-        if model.background_use_ellipsoid:
-            raise ValueError("background_layered_sampling requires background_use_ellipsoid=false")
-        mapping = (config.data.initialization or {}).get("scene_mapping")
-        if config.data.scene_mode == "bounded" or mapping not in (None, "projective_shell"):
-            raise ValueError("background_layered_sampling requires projective mapping")
+    if config.data.scene_mode == "unbounded":
+        validate_world_shell_layout(model.grid_resolution, config.data.background_shell_levels)
     if not isinstance(model.grid_resolution, int) or not 1 <= model.grid_resolution <= 1024:
         raise ValueError("grid_resolution must be an integer in [1, 1024]")
     if not math.isfinite(model.bounds_padding) or model.bounds_padding <= 0:
@@ -579,7 +568,7 @@ def generate_rays(config: RenderConfig, camera: dict, offset, mi, dr):
                     + vertical * mi.Vector3f(camera["up"]))
     origin = mi.Point3f(camera["position"]) + config.near_clip * unnormalized
     ray = mi.Ray3f(origin, dr.normalize(unnormalized))
-    ray.maxt = (float("inf") if camera.get("projective_unbounded", False) else
+    ray.maxt = (world_shell_ray_maxt(ray, camera, mi, dr) if "world_shell_root_min" in camera else
                 (config.far_clip - config.near_clip) * dr.norm(unnormalized))
     return ray
 

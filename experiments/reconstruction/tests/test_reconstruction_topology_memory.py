@@ -27,14 +27,19 @@ class CommitGuardTests(unittest.TestCase):
         cfg = SimpleNamespace(growth_freeze_last_epochs=0, growth_rgb_normalization="observed",
             use_low_opacity_deletion=False, deletion_warmup_epochs=0, deletion_freeze_last_epochs=0,
             deletion_cooldown_epochs=5)
-        manager = SimpleNamespace(settings=cfg, before_refine_checkpoint=None, resolution=6,
+        manager = SimpleNamespace(settings=cfg, before_refine_checkpoint=None, resolution=4,
             core_resolution=4, level_budget=100, level_start_epoch=0, growth_warmup=0, count=4,
             schedule=SimpleNamespace(enabled=False, total_epochs=100),
             growth_frozen=lambda _: False, deletion_frozen=lambda _: False,
             _growth_due=lambda _: grow, _rgb_deletion_due=lambda _: delete,
             pending_growth=None, pending_rgb_deletion=None)
-        model = SimpleNamespace(resolution=6, core_resolution=4, active_voxel_count=4,
-            sh_count=9, opacity_sh_count=1, active_sh_count=1, scene_mapping="projective_shell",
+        model = SimpleNamespace(resolution=4, core_resolution=4, active_voxel_count=4,
+            sh_count=9, opacity_sh_count=1, active_sh_count=1, scene_mapping="world_shell",
+            background_shell_levels=8,
+            world_shell_version=4, cell_index_bits=64,
+            native_background_shell_levels=lambda: 8,
+            native_background_subdivision_level=lambda: 0,
+            native_background_use_ellipsoid=lambda: False,
             clear_growth_candidates=lambda: calls.append("clear_growth"))
         optimizer = SimpleNamespace(count=4, clear_replay=Mock(),
             remap=Mock(side_effect=AssertionError("Optimizer must not migrate before guard accepts")))
@@ -43,9 +48,9 @@ class CommitGuardTests(unittest.TestCase):
         lifecycle.dr = SimpleNamespace(eval=lambda *_: calls.append("evaluate_decisions"),
             compress=lambda value: np.flatnonzero(value).astype(np.uint32),
             arange=Mock(side_effect=AssertionError("No append rows before guard accepts")))
-        lifecycle.UInt, lifecycle.Bool, lifecycle.Int64 = np.uint32, np.bool_, np.int64
+        lifecycle.UInt, lifecycle.Cell, lifecycle.Bool, lifecycle.Int64 = np.uint32, np.uint64, np.bool_, np.int64
         lifecycle.fields = {}
-        lifecycle.cooldown_cells = np.empty(0, np.uint32)
+        lifecycle.cooldown_cells = np.empty(0, np.uint64)
         lifecycle.cooldown_expiry = np.empty(0, np.int64)
         lifecycle.evaluate_rgb_deletion = Mock(return_value=np.array([False, True, False, True]) if delete else None)
         lifecycle.evaluate_opacity = Mock(return_value=None)

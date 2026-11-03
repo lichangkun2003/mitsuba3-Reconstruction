@@ -125,7 +125,7 @@ PatchMatch 会继续缺失的深度图。修改输入或算法选项时需用另
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 新实验默认在前 80% 的训练轮数只开启辐射颜色的 0 阶，在最后 20% 同时开启 1、2 阶。
-前景和 projective 背景共用同一阶数调度，方向性颜色使用世界空间射线方向。
+前景和世界空间背景共用同一阶数调度，方向性颜色使用世界空间射线方向。
 这里的三组是 ``l=0、1、2``，各有 ``1、3、5`` 个基函数；累计开启数为
 ``1、4、9``。每个系数包含 RGB 三个颜色分量，因此完整颜色参数仍为每体素 27 个数。
 opacity 始终保持原来的单个 DC logit，不参与这个颜色阶数调度。
@@ -217,15 +217,8 @@ checkpoint 缺字段时的兼容值。该项从第一轮开始生效，升层时
 由于每个点位于自己的网格段内，命中顺序同时是非递减深度顺序。
 网格整体等比例缩放时，归一化深度差保持不变；它不是无界场景的深度收缩方案。
 
-新 ``projective_shell`` 无界模式使用世界射线深度的有界参数
-``s_i = t_i / (t_i + core_half_extent)``，其中 ``t_i`` 从当前世界射线原点起算，
-``core_half_extent`` 是核心立方体的半边长。这里的 ``t_i`` 仍对应当前映射体素段内
-二次型最小点；当 ``model.background_use_ellipsoid=false`` 时，远景改用射线在当前占用格中
-正长度裁剪段的中点。启用下述逐层单次查询时，远景深度改为该层固定采样壳面的世界交点。
-深度始终相对于原始世界射线起点；它不是各段重新从零开始的局部长度。
-跨区域的坐标跳转不增加深度，反向包含该参数对存储段长度的链式因子。
-这一深度单位与旧 ``D_grid`` 归一化不同；相同 lambda 的正则强度不能直接视为等价，
-旧 checkpoint 保持旧定义，新模式应新开实验。
+``world_shell`` 无界模式使用世界射线深度 ``s=t/(t+core_half_extent)``。
+前景深度取椭球二次型最小点，背景取实际叶盒相交段中点；背景深度不产生几何梯度。
 
 RGB-only 的每像素目标为：
 
@@ -796,194 +789,121 @@ COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理�
 .. code-block:: python
 
    CONFIG.data.scene_mode = "auto"
-   CONFIG.data.background_final_layers = 8
+   CONFIG.data.background_shell_levels = 5
    CONFIG.data.background_opacity = 0.5
-   CONFIG.data.background_far_distance = None  # 自动估计；手动 H 必须有限且大于 1
-   CONFIG.data.background_far_percentile = 99.9
-   CONFIG.data.background_far_margin = 1.2
-   CONFIG.model.background_use_ellipsoid = True  # False：仅分区投影远景直接使用占用格
 
-``background_final_layers`` 表示最终分辨率下的远景径向层数，默认 8；当前层数按
-``background_final_layers * core_resolution / target_resolution`` 计算，必须为整数。
-它不与 ``render.max_hits`` 关联；后者默认 16，限制整条射线的命中数，包含近景与背景。
-新无界初始化使用 ``scene_mapping="projective_shell"``，点云与查询射线使用同一分区投影。
-归一化核心为立方体 ``[-1,1]^3``，核心内坐标不变。外部按绝对值最大的坐标轴 ``a``
-及符号 ``sigma`` 划为六个凸区域，边界采用固定优先级唯一归属。令
-``h = max(abs(p)) = sigma * p[a] >= 1``，且 ``h >= abs(p[j])`` 对另外两轴均成立。
-新实验在有限的场景边界 ``h=H`` 结束，``H>1``；在 ``1 <= h <= H`` 内：
+无界场景使用 ``scene_mapping="world_shell"``。核心范围沿用相机位姿确定的立方体，
+仅做统一平移、旋转和缩放，不压缩坐标。核心内点云初始化前景椭球；核心外点不压到边界。
 
-.. math::
+``background_shell_levels`` 可取 1..10，默认 5。设核心盒半边长为 R，第 k 个壳覆盖
+半边长从 ``2**(k-1)*R`` 到 ``2**k*R`` 的立方体之差。每壳外盒分成 ``4**3`` 格，
+扣除中心 ``2**3`` 格，初始化 56 个立方体叶子；默认共 280 个背景叶子。
+这是有厚度的世界空间体积，叶子边长随壳序号翻倍，没有逆深度映射或壳面采样。
 
-   q_a = \sigma\left(1+k-\frac{k}{h}\right),\qquad
-   q_j = \frac{p_j}{h}\quad(j\ne a),\qquad
-   k=\frac{W}{1-1/H},\qquad
-   W=\frac{2L_{\mathrm{final}}}{R_{\mathrm{final}}}.
+``data.background_initial_resolution`` 按核心盒边长 ``2R`` 定义第一壳的初始体素边长。
+设该值为 B，则第一壳边长为 ``2R/B``，每往外一壳边长翻倍、体积增为8倍。
+兼容的 ``background_refinement="uniform"`` 配置可使用 ``B=128``，随前景 ``256→512→1024`` 同步变为 ``128→256→512``。
+此时只分配核心外点云实际占用的叶子，空区域不分配，几何复用原生点云协方差椭球拟合。
+opacity 使用 ``background_opacity``，不受点云密度影响；没有点云覆盖的背景不会被自动填满。
+初始 B 必须为不超过前景初始分辨率和512的2次幂；省略时 B=2，保留原来的56叶/壳初始化。
 
-六个有限外景区域分别映入核心六个面外侧厚度为 ``W`` 的薄板；主轴的正向坐标为
-``q_dom=1+k-k/h``。因此 ``h=1`` 对应内边界 ``q_dom=1``，``h=H`` 对应外边界
-``q_dom=1+W``，八层全部用于这个有限范围。最终八层在世界空间中的径向边界为：
+B=2 的兼容模式初始化时所有背景叶子都分配为非空。
+点云中落入各背景叶盒的点仅用于颜色：逐点将 sRGB 转为线性 RGB，再取叶内均值，
+写入 radiance 的 DC 系数（均值除以 Y00），高阶系数初始为零。没有点的背景叶子
+同样保留，颜色先为黑色并在训练中优化。核心内点只参与前景初始化，根盒之外的点
+不参与背景均值；边界采用与叶盒一致的左闭右开规则。前景仍只初始化点云占用体素。
 
-.. math::
+前景和背景共用紧密存储的混合深度八叉树。内部节点只保存索引，渲染参数保存在叶子。
+查询在任意深度遇到占用叶子即返回该叶子及其大小。光线与真实叶盒求交，一次处理完整
+相交段，再从出口进入下一叶子；不能按前景小格重复累积背景叶子的透明度。
+一条光线可以经过同一背景壳内的多个叶子，不再使用“每层只查询一次”。
 
-   h_i=\frac{1}{1-\frac{i}{8}(1-1/H)},\qquad i=0,1,\ldots,8.
+背景和前景都使用叶盒裁剪的椭球，优化中心、尺度、旋转、opacity 和 radiance SH。
+稀疏背景按点云拟合椭球；B=2 的兼容模式使用覆盖整个叶盒的外接球。粗叶中心以各自叶盒的
+局部坐标保存，尺度及梯度使用该叶的真实世界尺寸。背景仍是每次命中的离散 alpha，
+没有替换成角点密度积分。Distortion 使用裁剪段内椭球二次型最小点的世界距离。
+前景和背景共用世界方向 SH、整条光线的 ``max_hits`` 与透射率早停。
+``max_hits`` 限制叶子命中数，不等于壳数量；多个叶子或前景命中也会消耗该容量。
+训练支持 ``1..128`` 的任意整数（包括24），不要求2的幂；超出范围会在加载模型前报错。
+增大预算同时增加命中记录工作区及反向遍历开销，达到预算时会停止查询后续叶子。
 
-这里 ``h_0=1``、``h_8=H``。中间层继续在存储空间等宽，在世界空间中的宽度随距离增大。
-``background_far_distance=None``（JSON 为 ``null``）表示自动选择 ``H``：默认取归一化
-点云中外景点（``h>1``）的 ``h`` 的 ``99.9%`` 分位数，再乘 ``1.2`` 留出 20% 余量；
-没有外景点时使用 ``H=1.2``，点云整体仍需非空。
-这是用于分配有限背景分辨率的覆盖范围选择，不是统计离群点检测，也不保证所有场景都适合同一分位数。
-超出 ``h>H`` 的初始化点会被过滤，不会夹到最外层堆积；渲染使用相同的有限边界。
+``uniform`` 模式前景按照现有 epoch 预算从 256 升至 512、1024，每次升层同时把每个存活背景叶子
+均匀分成八个候选子立方体，并按前景规则拟合父椭球在各子盒内的几何；不与父椭球
+相交或无法拟合的子叶不分配。B=2 的八壳背景容量上限为 ``448 -> 3584 -> 28672``，实际数量
+可更小。子叶继承全部 radiance SH，并像前景新子体素一样重置 Adam 状态。
+SH 激活仍按全局训练进度进行：``sh_degree_weights=[8,0,2]`` 时前 80% 只有 DC，
+最后 20% 前景、背景一起开启一阶和二阶；1500 轮对应第 1201 轮开始启用全部9系数。
+背景不做邻居生长或回填。现有 RGB 删除规则仍适用于背景，低 opacity 删除仍只在
+最高前景分辨率启用，因此已删除的父叶子不会因升层重新生成。
 
-手动值可写为 ``CONFIG.data.background_far_distance = 20.0``，或使用
-``--background-far-distance 20``。单位是归一化核心半宽：以场景中心为原点，沿任一坐标轴的
-最远支持距离为核心半宽的 20 倍；不是米、欧氏半径，也不是从每台相机起点计算的 ``ray.maxt``。
-自动选距可用 ``--background-far-percentile 99.9 --background-far-margin 1.2`` 调整；
-分位数必须在 ``(0,100]``，余量必须至少为 1，通常建议大于 1。手动 ``H`` 必须有限且大于 1。
+保持现有逐叶 alpha 渲染，新椭球背景的 opacity 拟合与前景使用相同的
+``opacity_optical_depth_scale``。旧占用盒检查点继续使用半光学厚度分裂规则。
+子叶外观是近似继承，没有改成按光线长度积分的密度场。训练和评价沿用配置的
+``max_hits``；命中记录工作区随预算增加，显存计划也按实际预算计算。
+H 个背景壳时，前景叶子相对根的深度是 ``H+log2(core_resolution)``，根深度记为 0；
+默认五壳对应 13→14→15。逻辑根网格不会被展开为密集数组。
 
-仅六块面薄板有效，两个或三个坐标同时处于核心范围外的边角格不初始化、不追踪。
-直接枚举 ``6 * core_resolution**2 * background_layers`` 个背景格，不枚举全 ``R³`` 网格。
-有点云种子的格保留种子颜色，其余为黑色；opacity 均设为 ``0.5``。
-默认模式下，初始椭球覆盖各自格子，防止仅填满格子编号却在初始椭球之间留下缝隙。
-核心点云体素保留原有几何初始化规则。
+背景逻辑容量为 ``56*H*8**S``，B对应初始 ``S=log2(B)-1``。
+B=128 的初始 S=6，两次细分后 S=8；稀疏存储按实际占用叶子分配，不展开这个逻辑容量。
+增加 H 扩大覆盖距离，增加 S 提高已有壳的空间分辨率；以上是兼容的统一背景细分模式。
+模型的核心地址为 ``[0,N**3)``；背景地址为 ``N**3+(56*k+j)*8**S+child_morton``，
+j 按外盒 x、y、z 顺序枚举并跳过中央八格。子码使用 S 层 xyz 位交织的 Morton 编码。
+核心和背景仍共用一棵混合深度树，背景细分不会展开整个逻辑根网格。
 
-远景椭球开关
-~~~~~~~~~~~~
+COLMAP 初始化版本为8，新保存格式使用 ``world_shell_version=5``、``background_geometry="ellipsoid"``、
+``background_refinement="uniform"``、初始 ``background_subdivision_level`` 和背景分辨率、
+相机归一化、核心边界和壳数量；模型 checkpoint 保存当前 S。
+体素空间地址使用 UInt64；活跃行号、树节点及梯度索引仍为 UInt32。高位地址验证、
+拓扑更新、分块转存和恢复不会把空间地址截断到32位，检查点也不按完整世界容量分配位图。
+旧 version7 的世界空间固定背景模型继续按 ``fixed,S=0`` 评估和恢复，
+不会在恢复时悄悄改成均匀细分；旧 world_shell_version 1/2 缺少几何字段时，明确恢复
+为 ``occupied_cell`` 并冻结其几何。新格式记录几何语义，防止旧模型被静默改成椭球。
+旧压缩/投影 checkpoint 及其参数会明确报错，不按新坐标静默解释。旧配置中的
+``background_final_layers``、有限远距离及背景椭球/逐层采样开关均已移除；
+新配置使用 ``background_shell_levels`` 或命令行 ``--background-shell-levels``。
+有界场景继续使用原有初始化与叶内渲染。
 
-``model.background_use_ellipsoid`` 默认 ``true``，保持现有远景椭球行为。
-将 JSON 的该字段设为 ``false``，或在 ``preview.py`` / ``train.py`` 命令末尾附加
-``--no-background-use-ellipsoid``，可对照直接占用格的远景。``--background-use-ellipsoid``
-显式恢复椭球模式；命令行优先于 JSON，JSON 必须使用布尔值，不能用 ``0``、``1`` 或字符串。
-启用下述逐层单次查询时，将实验 JSON 的该字段设为 ``false``。
-若实验配置已经开启逐层采样，恢复椭球对照时须同时传入 ``--no-background-layered-sampling``。
+自适应背景
+~~~~~~~~~~
 
-该开关仅作用于 ``projective_shell`` 的远景，核心以及旧径向映射仍使用椭球。
-关闭后，在旧的逐格查询模式下，射线遍历到 occupied cell 且与该格相交的裁剪段长度大于零，就产生一次命中，
-不再检查远景椭球覆盖。该命中继续使用原有 SH 颜色和 opacity，SH 方向仍为世界观察方向。
-这里的固定 alpha 表示每次命中提供离散 opacity，不按穿格长度换算密度；opacity 仍可学习，
-并非固定为初始化的 ``0.5``。不增加射线采样点，不改变有限远边界 ``H`` 或黑色残余尾项。
-远景中心、尺度和旋转停止优化，Distortion 使用上述占用格裁剪段中点；核心几何仍可优化。
+当前 bicycle JSON 显式使用 ``data.background_refinement="adaptive"``。
+前景保持点云稀疏初始化和 ``256→512→1024`` 的升层预算；背景不随前景整体分裂。
+背景从每壳56个完整粗格开始，按训练相机投影尺寸预细分到
+``background_initial_leaf_budget=200000`` 上限，初始投影阈值32像素。
+点云仅初始化叶内平均线性RGB；没有点的背景叶仍分配，初始颜色为线性灰色0.5。
+``background_initial_resolution=2`` 表示预细分前的粗壳，不是全部背景最终固定为2。
+``background_max_resolution=512`` 限制第一壳局部最细边长为 ``2R/512``，越外层按壳尺度增大。
 
-两种模式继续共享整条射线的 ``max_hits`` 和透射率阈值，因此命中容量仍可能在抵达最后一层
-前截断。直接占用格可能增加实际命中数，不能把远景层数等同于可记录的命中数。
-RGB 删除仍由实际渲染贡献计算完整射线的删除收益，继续使用现有删除频率、warmup、
-保护期、冻结期和连续确认规则；该开关不增加额外删除。
-几何参数及 Adam 状态仍保留在模型中，不能据此承诺降低显存。
+训练在独立的背景细分窗口收集完整训练集的 ``sum(abs(alpha*dL/dalpha))``，
+结合投影尺寸和真实椭球/子格相交数量排序。只拟合选中父叶；未选叶的参数和Adam保留，
+完全无法拟合子叶的父叶也保留。统计不包含distortion梯度，以免正则本身驱动细分。
+投影门槛和优化信号都覆盖全部训练视角；叶盒投影按稳定叶地址缓存，
+仅新增叶重新计算。限量候选再用当前椭球的裁剪包围盒复核投影尺寸。
+训练路径的投影在GPU上分批计算全部相机，保留FP64计算、最终float32分数及原可见性规则。
+选中父叶直接调用GPU椭球拟合器，每批最多4096个父叶；全SH和几何不再往返CPU。
+排序及少量地址分组仍在CPU完成，初始化和CPU参考实现保留原路径。
+拟合前按全部候选子叶的保守上界预检一次显存，提交前按实际数量再检查一次，
+不在每个小批次重复清理缓存或查询设备。每次细分记录筛选、拟合和状态迁移的分项耗时。
+背景在每个前景层级都参与RGB删除和低opacity删除，仍遵守原有暖身、保护和连续确认窗口。
+邻格生长支持不同叶尺寸、壳边界和核心接口，冷却及占用检查均覆盖完整空间区间。
+候选生成的动态批次偏移、二分查找边界和展开长度使用设备标量，避免拓扑变化时
+把新数组长度反复编译为不同内核；候选顺序、数量限制和几何判断保持不变。
+``epoch_growth_prepare_stage_seconds`` 中的 ``generation_*`` 项进一步区分前景、
+混合叶索引、背景候选、合并筛选和外观准备；它们是主机墙钟计时，未额外增加设备同步。
 
-原生接口为 ``set_background_use_ellipsoid(bool)``，当前状态可从
-``native_background_use_ellipsoid`` 读取，关闭模式要求重新编译到
-``mi.VoxelReconstruction.background_geometry_version >= 1``。
-配置、训练／预览报告和 checkpoint 保存所选模式；模型 metadata 在关闭时保存
-``background_use_ellipsoid=false``，开启时可省略以兼容旧存档。
-旧 checkpoint 缺失此字段按 ``true`` 恢复，续训不允许切换模式；两种模式的对照应新开实验。
+默认每10轮检查背景细分（与普通生长/删除错开一轮），每轮最多增加10万叶子，
+最多选择背景叶子的5%，背景总上限400万。细分前检查实际子叶数量与设备显存，
+超预算则保持现有模型继续训练，不强制达到512。背景生长提案另有20万条上限。
+完整图像路径记录、参考缓存、前景和临时内存仍计入显存预检；叶子上限不是实测峰值保证。
 
-数值边界：现有单精度世界分段在极端薄壳（例如 ``H=nextafter(float32(1), +inf)``）下，
-部分斜射线或较远起点的区域入口、出口可能舍入到同一个世界距离，导致整段不可见。
-这是两种命中模式共用的原有分段精度限制，本开关不扩展其精度范围；默认自动远边界不会取到该极限。
-纯体素的格边界检查使用局部世界距离，不用固定 epsilon 丢弃短交段。
+新背景地址保存粗格编号和带终止位的Morton路径，每个叶子独立表达深度；
+前景升层不重解释背景地址。叶参数保持紧密数组，树只提供实际大小的叶查询。
+保存和恢复同时检查重复地址与父子覆盖冲突。旧版本1..4仍按原布局读取，
+不能直接用旧统一背景检查点切换为自适应训练；切换模式应新开实验。
+椭球分裂仍采用现有近似几何/opacity继承，不等价于SVRaster角点密度插值，
+细分瞬间的渲染可能变化，需要随后优化。当前自适应训练使用单GPU RGB拓扑。
 
-逐层单次查询
-~~~~~~~~~~~~
-
-启用该模式时，在实验配置中同时设置 ``model.background_use_ellipsoid=false`` 和
-``model.background_layered_sampling=true``。保留现有分区投影、有限边界、SH 系数和层数安排，
-每个背景径向层只查询一个地址；核心继续使用原有椭球和八叉树／DDA。
-若当前有 ``L`` 层，第 ``i`` 层的采样壳面位于映射径向坐标的中点：
-
-.. math::
-
-   u_i=\frac{i+1/2}{L},\qquad
-   h_i=\frac{1}{1-u_i(1-1/H)},\qquad i=0,\ldots,L-1.
-
-无限远兼容模式令 ``1/H=0``。用原始世界射线与 ``max(abs(p))=h_i`` 求交，
-取该立方体的正向出口，将交点按原映射转换为面和格地址，读取一个体素的 opacity 和 SH。
-查询地址由射线和固定层深度决定；地址不存在时，该层无贡献，直接进入下一层，
-不会横向寻找其他占用格。六面共用同一层编号，面接缝按固定轴优先级归属。
-当前 COLMAP 归一化使所有注册相机位于核心盒子内，每层只有一个向前出口。
-对于核心外的自定义相机，本模式仍只取出口，不表达同层近侧入口的遮挡。
-
-每层最多合成一次 ``T * alpha * radiance``，仍是可学习的离散 alpha，
-不按穿越体素的长度换算密度。远景几何梯度保持关闭，Distortion 使用采样点的世界深度。
-固定采样地址被删除后，该层变为空，不会露出同层后备体素，因此完整路径的已有 RGB 删除
-反事实仍适用；未被查询的体素不能获得该射线的删除证据。
-
-保持原来的全射线 ``max_hits`` 和透射率早停规则；它们仍可能在所有层查询之前终止光线。
-这里保证每层至多查询一次，不保证每条射线都会访问全部层。没有扩大反向命中记录缓冲区，
-也没有改变背景参数及 Adam 存储。256 → 512 → 1024 仍对应 2 → 4 → 8 个背景径向层。
-
-新模式写入 checkpoint 的 ``background_layered_sampling=true``，缺失时按 ``false``
-恢复旧的逐格行为，不能用修改 JSON 的方式将旧 checkpoint 静默切换到新渲染语义。
-原生接口是 ``set_background_layered_sampling(bool)`` 与
-``native_background_layered_sampling()``，要求重新编译到
-``mi.VoxelReconstruction.background_layered_sampling_version >= 1``。
-该模式仅适用于无椭球的 ``projective_shell`` 远景。
-原生逐层游标支持最多 31 层；当前配置的最终 8 层位于此范围内。
-
-旧逐格查询的射线路径
-~~~~~~~~~~~~~~~~~~~~
-
-相机射线始终是世界直线 ``p(t)=o+t*d``。先用区域的线性不等式求出世界深度区间，
-按世界 ``t`` 排序；映射后每个区间是一条精确直线段，使用八叉树／DDA 遍历；
-默认在叶子中与椭球求交，关闭远景椭球时在远景叶子中直接使用正长度占用段。
-不通过固定小步长近似曲线，不在每个体素重新选取区域。
-同一段内存储方向固定，但存储距离与世界深度并非线性关系。
-可视为同一世界点的两侧在不同外景薄板中采用不同坐标；跨区域时直接切换到下一段起点，
-不追踪两个存储端点间的连接线，不在无效边角空隙累积颜色。
-新实验将世界区间限制在场景中心立方体 ``max(abs(p))<=H`` 内，末段在有限场景边界结束。
-这个场景边界不能替换成相机射线的固定距离裁剪，因为相机起点与场景中心不同。
-旧无限映射的末段仍使用解析的有限存储终点，避免无穷坐标运算。
-
-所有段共享累计颜色、透射率、命中计数和反向记录。离开一个区域不等于路径完成，
-到达所有有效区间的末尾才是正常完成；透射率或命中容量提前终止保持原有语义。
-椭球模式各段使用自己的存储方向计算硬命中、near-miss 和几何反向，SH 外观继续使用原世界观察方向。
-体素、椭球半轴和旋转定义在存储空间；外景存储椭球映回世界一般不再是普通椭球。
-该映射参考 `MERF 的分区投影收缩 <https://creiser.github.io/merf/>`_，
-薄板宽度、离散 opacity 和截断椭球属于当前模型的适配。
-
-外景所有层级都不生长；生长的父体与目标均限制在核心格中。
-外景在所有层级参与完整射线的 RGB 删除投票，沿用核心的删除频率及连续确认规则。
-外景低 opacity 分支仅在达到目标核心分辨率后删除，默认阈值 ``0.1``，
-并保留 warmup、保护期及连续确认规则。核心保持现有 RGB／低 opacity 删除规则。
-区域身份按静态格子及核心索引范围确定，不随椭球中心的连续优化移动。
-内景和外景 RGB 拓扑证据均使用包含所有实际贡献的完整射线后缀。
-
-新无界实验从核心分辨率 256 开始，可选择终点 512 或 1024。最终远景 8 层时：
-
-* 终点 1024：背景层数为 2 → 4 → 8，实际网格为 260 → 520 → 1040；
-  网格各轴边界始终为 ``[-65/64, 65/64]``，物理壳宽始终为 ``1/64``。
-* 终点 512：背景层数为 4 → 8，实际网格为 264 → 528；
-  网格各轴边界始终为 ``[-33/32, 33/32]``，物理壳宽始终为 ``1/32``。
-
-核心继续八子格拟合；新投影模式的远景保留已有父格的八个子格，
-不因核心拟合器的几何失败筛选提前删除背景。体素边长相同；不径向重压缩，也不裁掉外层。
-背景继承可产生相对子格越界的中心，以子格裁剪贡献；不能在首次 Adam 更新时立即按核心
-中心边界重新夹紧。参数和 opacity 继承仍是离散近似，不保证升层前后渲染完全一致。
-每次升层后继续执行原有 warmup，不重新初始化完整壳层。
-仅已有父格提供子格，不从空壳回填。
-这会减少早期背景层数，但最终 1024／8 层的显存规模与旧固定 8 层方案相近；
-模型参数、Adam 状态及升层临时数组仍需计入，不能据此认定 40 GB 足够或消除了升层峰值。
-初始每层 opacity 为 0.5 不等于强制不透明边界：删除、连续优化、有限 ``max_hits``、
-有限场景边界及后续几何变化都可能留下透射率，剩余部分以黑色尾项结束。
-
-新无界 COLMAP 初始化保存 ``data.initialization.version=6``、``scene_mapping="projective_shell"``、
-``background_refinement="preserve_physical_width"``、``background_final_layers`` 和
-``initial_background_layers``。``shell_layers`` 记录最终层数，``shell_width`` 记录固定物理壳宽，
-用于恢复相同的点云压缩和相机归一化。模型 metadata 中的网格及核心分辨率随正常细分翻倍，边界不变。
-已解析的有限边界保存在 ``data.initialization.background_far_distance``，模型 metadata 同时保存
-该边界。训练报告的 ``scene_mapping.ray_extent`` 为 ``finite_scene_boundary``，并报告解析后的 ``H``。
-checkpoint 恢复及评价复用已保存的归一化、有限边界和估计策略，不重新读取点云估计距离；
-显式不一致的初始化设置会报错。需要比较不同 ``H`` 或自动选距策略时应新开实验。
-旧 version 1–5 存档继续复用各自原来的映射，不会自动估计或加入有限边界。
-其中 version 5 保持无限分区投影 ``k=W``，报告的 ``ray_extent`` 仍为 ``infinity``。
-有界 COLMAP 保持 version 2。旧无界 version 4 保持只映射初始化点的径向语义、
-固定物理壳宽及原直线查询，不在恢复时切换成分区投影。
-旧无界 version 3 checkpoint 继续使用 ``fixed_layers``：
-各级层数固定，升层时压缩并合并背景。旧 version 2 保持原始物理壳宽，其 ``background_layers``
-表示初始层数，之后随分辨率翻倍。这些旧字段不会被重新解释为最终层数；
-新的实验使用 ``--background-final-layers``，比较新策略应新开实验。
-旧 version 1 checkpoint 保留原来的相机、点云压缩、网格和已保存背景，不会自动铺满远景、
-改为黑底或应用新的远景生长限制。比较新初始化应从新实验开始。
-
-分区投影涉及原生遍历、梯度和模型状态，必须增量编译 C++ 后新开实验。
+本改动包含 C++ 树索引和遍历，需编译后新开实验。
 可在 Windows 仓库根目录执行：
 
 .. code-block:: powershell
@@ -992,7 +912,7 @@ checkpoint 恢复及评价复用已保存的归一化、有限边界和估计策
    if ($LASTEXITCODE -ne 0) { throw "编译失败" }
    & ..\envs\mitsuba\python.exe -u -I experiments/reconstruction/train.py `
      --dataset datasets/bicycle --scene-mode unbounded `
-     --background-final-layers 8 --background-opacity 0.5 --gpu 0 --epochs 1500 `
+     --background-shell-levels 5 --background-opacity 0.5 --gpu 0 --epochs 1500 `
      --target-resolution 1024 --level-weights 4 3 3
 
 若使用 venv，将解释器路径换为 ``..\envs\mitsuba\Scripts\python.exe``。
@@ -1016,11 +936,8 @@ Adam 回归覆盖密集、设备稀疏、紧凑与参考实现。旧 Distortion�
    CONFIG.data.dataset = "datasets/lego"  # 切换场景就在这里改，例如 datasets/ficus
    CONFIG.data.point_cloud = "init_points.ply"
    CONFIG.data.scene_mode = "auto"  # 合成场景有界白底；COLMAP 无界黑底
-   CONFIG.data.background_final_layers = 8  # 最终层数；1024终点为2→4→8，512终点为4→8
+   CONFIG.data.background_shell_levels = 5  # 每壳初始56叶，随前景升层八分裂
    CONFIG.data.background_opacity = 0.5
-   CONFIG.data.background_far_distance = None  # 自动有限远边界；手动值以核心半宽为单位
-   CONFIG.data.background_far_percentile = 99.9
-   CONFIG.data.background_far_margin = 1.2
    CONFIG.data.cameras = "transforms_train.json"
    CONFIG.render.width = 800
    CONFIG.render.height = 800
@@ -2178,7 +2095,7 @@ CUDA 设备，N>1 时需要上述 NCCL 库。通信检查通过后再运行短�
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --worker-timeout 600 \
      --dataset datasets/bicycle --scene-mode unbounded \
-     --background-final-layers 8 --background-opacity 0.5 \
+     --background-shell-levels 5 --background-opacity 0.5 \
      --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
      --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
@@ -2196,7 +2113,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
 
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train.py \
      --dataset datasets/bicycle --scene-mode unbounded \
-     --background-final-layers 8 --background-opacity 0.5 \
+     --background-shell-levels 5 --background-opacity 0.5 \
      --epochs 1500 --stop-after-epochs 10 --chunk-size 0 \
      --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages
@@ -2213,7 +2130,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
    "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/train_multigpu.py \
      --worker-timeout 600 \
      --dataset datasets/bicycle --scene-mode unbounded \
-     --background-final-layers 8 --background-opacity 0.5 --epochs 1500 --chunk-size 0 \
+     --background-shell-levels 5 --background-opacity 0.5 --epochs 1500 --chunk-size 0 \
      --traversal octree --distortion-weight 0.1 --freeze-native --gpu-topology \
      --profile-views 0 --profile-interval-epochs 0 --no-profile-stages \
      --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 0
@@ -2263,34 +2180,21 @@ GPU 升层
 默认 RGB GPU topology 的升层通过 ``reconstruction_refinement_gpu.refine_state_gpu``
 直接处理父模型设备缓冲。它保持 NumPy ``refine_state`` 的 FP64 几何、归一四元数、
 父 opacity 筛选、有限盒内拟合、18 轮二分及 preferred center。
-有界、旧 version 4 无界及旧固定物理壳宽模型按子格编号优先、父体素原顺序压紧，
-核心／实际网格分辨率元数据同步翻倍，物理边界不变；DC 颜色继承及光学厚度衰减规则保持不变。
-新无界实验的最终层数在初始化时决定起始壳宽，因此普通细分自然得到 2 → 4 → 8
-或 4 → 8 层；不运行径向映射、同格合并或外层裁剪。
+前景按子格编号优先、父体素原顺序生成拟合子格，核心分辨率翻倍，世界边界不变。
+DC 颜色继承及光学厚度衰减规则保持不变；渐进 SH 开启时保留全部已存系数。
+``fixed`` 和 ``adaptive`` 背景叶子不参与前景升层的拟合和细分，直接保留其全部参数；
+仅旧 ``fixed`` 地址需要更新核心基址，自适应背景地址不变。``uniform`` 模式仍同步细分背景。
+替换数组将背景行放在前面，通过原行号迁移背景 Adam 时钟及动量；前景子格沿用重新初始化
+优化器状态的规则。只保留未删除的背景叶子，不重新生成整壳。
 
-新 version 5 ``projective_shell`` 核心沿用上述拟合，外景保留每个已有父格的八个子格，
-不通过拟合失败删除背景；继承其存储空间椭球几何及外观，子格裁剪各自贡献。
-CPU 与 GPU 使用相同的核心／六面薄板分类及继承规则，元数据中的映射模式随替换保留。
-
-旧 version 3、标有 ``background_refinement="fixed_layers"`` 的无界模型仍使用原恢复策略。
-它先使用同一个八子格拟合器。
-对拟合后中心半径 ``r > 1`` 的子体素，保持径向方向 ``n``，将中心映射为
-``F(x) = n * (1 + (r - 1) / 2)``，并用该映射的局部 Jacobian 变换椭球几何支持范围。
-同一目标格中的子体素按映射后体积加权合并中心，沿代表坐标的三个轴估计合并后的支持范围；
-以映射后体积最大的代表子体素所对应的父体素，继承其全部颜色 SH 和 opacity 系数。
-内部子体素保留原细分继承行为。核心分辨率翻倍、远景层数保持不变，实际网格边界随壳层变薄更新，
-保存的初始化相机归一化不改变。
-
-该旧策略的径向映射是下一层的近似几何及外观初始化，不保证合并椭球包含各输入椭球的完整并集，
-也不保证升层前后图像或透射率一致。它不会重新初始化远景。
-只有已有拟合子体素提供支持，空壳不回填；每个新层级仍按原配置 warmup，再继续生长和删除。
-不生成完整八倍父 SH 临时表，最终子体素数量确定后才分配颜色与 opacity 缓冲。
-拟合临时数组先于映射工作区释放，排序数组在归约完成后释放，降低升层时的显存重叠。
+CPU 与 GPU 采用相同规则。核心拟合临时数组在出现更大的外观数组前释放，
+最终外观数量确定后才分配 SH 与 opacity，并在实际分配前检查显存预算。
 
 完全处于父椭球内的子格，直接使用原 CPU 代码在拟合末尾采用的解析覆盖结果，
 跳过其结果会被覆盖的二分；其判定与最终模型规则没有改变。边界子格仍完整执行原拟合。
 没有可表示子体素或超过 ``max_active_voxels`` 时拒绝替换并保留旧模型。
-空模型同样按保存的升层策略更新元数据并保留空数组。新生命周期与 Adam 按旧规则清零，原生占据索引和
+空模型同样按保存的升层策略更新元数据并保留空数组。前景新叶的生命周期与 Adam 按旧规则清零；
+未变的自适应背景保留生命周期、删除冷却和 Adam。原生占据索引和
 八叉树在 GPU 重建。数量压紧及错误标量允许少量同步，GPU 升层拟合本身不整表回读父模型。
 
 ``--no-gpu-topology`` 保留 NumPy 对照。训练入口在升层前保存完整 checkpoint，

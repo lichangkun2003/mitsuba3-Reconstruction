@@ -101,11 +101,12 @@ struct CompactReconstructionTree {
                parent = dr::full<UIntBuffer>(UINT32_MAX, 1);
     uint32_t root = 0, depth = 0, padded_resolution = 1,
              node_count = 0, leaf_count = 0, resolution = 1;
+    bool mixed_layout = false;
 
     DRJIT_STRUCT(CompactReconstructionTree, leaf_ids, masks, child_base, parent)
 
     void clear(uint32_t grid_resolution) {
-        if (!grid_resolution || uint64_t(grid_resolution) * grid_resolution * grid_resolution > UINT32_MAX)
+        if (!grid_resolution || grid_resolution > (1u << 21))
             throw std::runtime_error("Compact reconstruction tree: invalid grid resolution");
         resolution = grid_resolution;
         padded_resolution = 1;
@@ -115,6 +116,7 @@ struct CompactReconstructionTree {
             ++depth;
         }
         root = node_count = leaf_count = 0;
+        mixed_layout = false;
         leaf_ids = dr::full<IntBuffer>(-1, 1);
         masks = child_base = dr::zeros<UIntBuffer>(1);
         parent = dr::full<UIntBuffer>(UINT32_MAX, 1);
@@ -127,6 +129,8 @@ struct CompactReconstructionTree {
     /// Only topology lengths/validation flags cross the host boundary. Build a
     /// replacement first, so malformed input cannot partially overwrite a tree.
     void build(const UIntBuffer &cells, const IntBuffer &payload, uint32_t grid_resolution) {
+        if (!grid_resolution || uint64_t(grid_resolution) * grid_resolution * grid_resolution > UINT32_MAX)
+            throw std::runtime_error("Compact reconstruction tree: invalid grid resolution");
         CompactReconstructionTree replacement;
         replacement.clear(grid_resolution);
         if (cells.size() != payload.size() || cells.size() > uint64_t(UINT32_MAX))
@@ -196,6 +200,150 @@ struct CompactReconstructionTree {
         *this = std::move(replacement);
     }
 
+    /** Build nonoverlapping dyadic leaves without expanding coarse cells.
+     *
+     * Coordinates are minimum corners in finest-grid units; log_size is the
+     * base-two logarithm of the leaf side length in those units. A mixed node
+     * uses mask bits 16..23 to mark terminal children. Its compact child segment
+     * in leaf_ids contains either a payload or an internal node index. Thus
+     * parent still indexes internal nodes only, and lookup retains the same
+     * nearest-internal-ancestor cache as the uniform tree.
+     */
+    void build_mixed(const UIntBuffer &x, const UIntBuffer &y, const UIntBuffer &z,
+                     const UIntBuffer &log_size, const IntBuffer &payload,
+                     uint32_t grid_resolution) {
+        CompactReconstructionTree replacement;
+        replacement.clear(grid_resolution);
+        replacement.mixed_layout = true;
+        const size_t count = x.size();
+        if (y.size() != count || z.size() != count || log_size.size() != count ||
+            payload.size() != count || count > uint64_t(UINT32_MAX))
+            throw std::runtime_error("Compact reconstruction tree: invalid mixed leaf array sizes");
+        if (!count) {
+            *this = std::move(replacement);
+            return;
+        }
+        if (!dr::slice(dr::all(log_size <= replacement.depth)))
+            throw std::runtime_error("Compact reconstruction tree: mixed leaf size exceeds the root");
+        UIntBuffer side = UIntBuffer(1u) << log_size;
+        UIntBuffer alignment = side - 1u;
+        if (!dr::slice(dr::all((x < grid_resolution) & (y < grid_resolution) &
+                              (z < grid_resolution) &
+                              (side <= grid_resolution - x) &
+                              (side <= grid_resolution - y) &
+                              (side <= grid_resolution - z) &
+                              (((x | y | z) & alignment) == 0u) & (payload != -1))))
+            throw std::runtime_error("Compact reconstruction tree: mixed leaves must be aligned and in bounds; payloads must be nonempty");
+
+        KeyBuffer leaf_keys = reconstruction_tree_detail::morton(x, y, z);
+        UIntBuffer permutation = reconstruction_tree_detail::order<UIntBuffer>(leaf_keys, 3u * replacement.depth);
+        leaf_keys = dr::gather<KeyBuffer>(leaf_keys, permutation);
+        UIntBuffer leaf_sizes = dr::gather<UIntBuffer>(log_size, permutation);
+        IntBuffer payloads = dr::gather<IntBuffer>(payload, permutation);
+        UIntBuffer ordinal = dr::arange<UIntBuffer>(count);
+        KeyBuffer ends = leaf_keys + (KeyBuffer(1u) << KeyBuffer(3u * leaf_sizes));
+        KeyBuffer previous_end = dr::gather<KeyBuffer>(ends, ordinal - 1u, ordinal > 0u);
+        if (!dr::slice(dr::all((ordinal == 0u) | (leaf_keys >= previous_end))))
+            throw std::runtime_error("Compact reconstruction tree: mixed leaves must not overlap");
+        replacement.leaf_count = uint32_t(count);
+        dr::eval(leaf_keys, leaf_sizes, payloads);
+
+        std::vector<IntBuffer> edge_levels;
+        std::vector<UIntBuffer> level_masks, level_bases, level_parents;
+        KeyBuffer previous_keys;
+        UIntBuffer previous_masks;
+        uint32_t previous_count = 0, previous_offset = 0, total_nodes = 0, total_edges = 0;
+        for (uint32_t level = 0; level <= replacement.depth; ++level) {
+            UIntBuffer selected = dr::compress(leaf_sizes == level);
+            const uint32_t terminal_count = uint32_t(selected.size());
+            if (!terminal_count && !previous_count)
+                continue;
+            const uint64_t combined_count = uint64_t(terminal_count) + previous_count;
+            if (combined_count > UINT32_MAX)
+                throw std::runtime_error("Compact reconstruction tree: too many mixed child entries");
+            const uint32_t child_count = uint32_t(combined_count);
+            KeyBuffer keys;
+            IntBuffer values;
+            UIntBuffer descendants, terminal;
+            if (terminal_count) {
+                keys = dr::gather<KeyBuffer>(leaf_keys, selected) >> (3u * level);
+                values = dr::gather<IntBuffer>(payloads, selected);
+                descendants = dr::select(values >= 0, UIntBuffer(1u), UIntBuffer(1u << 8));
+                terminal = dr::full<UIntBuffer>(1u, terminal_count);
+            } else {
+                keys = previous_keys;
+                values = IntBuffer(dr::arange<UIntBuffer>(previous_count) + previous_offset);
+                descendants = previous_masks;
+                terminal = dr::zeros<UIntBuffer>(previous_count);
+            }
+            if (previous_count && terminal_count) {
+                // Both inputs are sorted. A radix permutation is only needed
+                // at levels where terminal leaves join an existing subtree.
+                keys = dr::concat(keys, previous_keys);
+                values = dr::concat(values, IntBuffer(dr::arange<UIntBuffer>(previous_count) + previous_offset));
+                descendants = dr::concat(descendants, previous_masks);
+                terminal = dr::concat(terminal, dr::zeros<UIntBuffer>(previous_count));
+                UIntBuffer sorted = reconstruction_tree_detail::order<UIntBuffer>(keys, 3u * (replacement.depth - level));
+                keys = dr::gather<KeyBuffer>(keys, sorted);
+                values = dr::gather<IntBuffer>(values, sorted);
+                descendants = dr::gather<UIntBuffer>(descendants, sorted);
+                terminal = dr::gather<UIntBuffer>(terminal, sorted);
+            }
+            if (level == replacement.depth) {
+                if (terminal_count) {
+                    // A single root-sized leaf has no internal ancestors.
+                    replacement.leaf_ids = values;
+                    dr::eval(replacement.leaf_ids);
+                }
+                break;
+            }
+
+            UIntBuffer child_rows = dr::arange<UIntBuffer>(child_count);
+            KeyBuffer parent_keys = keys >> 3,
+                      preceding = dr::gather<KeyBuffer>(parent_keys, child_rows - 1u, child_rows > 0u);
+            auto starts = (child_rows == 0u) | (parent_keys != preceding);
+            UIntBuffer first = dr::compress(starts);
+            const uint32_t node_count = uint32_t(first.size());
+            if (uint64_t(total_nodes) + node_count > UINT32_MAX ||
+                uint64_t(total_edges) + child_count > UINT32_MAX)
+                throw std::runtime_error("Compact reconstruction tree: too many mixed nodes or edges");
+            UIntBuffer parent_rows = dr::prefix_sum(UIntBuffer(starts), false) - 1u;
+            UIntBuffer child_bit = UIntBuffer(1u) << UIntBuffer(keys & KeyBuffer(7u));
+            UIntBuffer flags = dr::select((descendants & 0xffu) != 0u, child_bit, UIntBuffer(0u)) |
+                               dr::select((descendants & 0xff00u) != 0u, child_bit << 8, UIntBuffer(0u)) |
+                               dr::select(terminal != 0u, child_bit << 16, UIntBuffer(0u));
+            UIntBuffer node_masks = dr::zeros<UIntBuffer>(node_count);
+            dr::scatter_reduce(ReduceOp::Or, node_masks, flags, parent_rows);
+            if (previous_count) {
+                UIntBuffer links = dr::empty<UIntBuffer>(previous_count);
+                dr::scatter(links, parent_rows + total_nodes,
+                            UIntBuffer(values) - previous_offset, terminal == 0u);
+                dr::eval(links);
+                level_parents.back() = std::move(links);
+            }
+            UIntBuffer bases = first + total_edges;
+            previous_keys = dr::gather<KeyBuffer>(parent_keys, first);
+            dr::eval(values, node_masks, bases, previous_keys);
+            edge_levels.push_back(values);
+            level_masks.push_back(node_masks);
+            level_bases.push_back(bases);
+            level_parents.push_back(dr::full<UIntBuffer>(UINT32_MAX, node_count));
+            replacement.root = previous_offset = total_nodes;
+            previous_count = node_count;
+            total_nodes += node_count;
+            total_edges += child_count;
+            previous_masks = node_masks & 0xffffu;
+        }
+        replacement.node_count = total_nodes;
+        if (total_nodes) {
+            replacement.leaf_ids = reconstruction_tree_detail::flatten<IntBuffer, UIntBuffer>(edge_levels, total_edges);
+            replacement.masks = reconstruction_tree_detail::flatten<UIntBuffer, UIntBuffer>(level_masks, total_nodes);
+            replacement.child_base = reconstruction_tree_detail::flatten<UIntBuffer, UIntBuffer>(level_bases, total_nodes);
+            replacement.parent = reconstruction_tree_detail::flatten<UIntBuffer, UIntBuffer>(level_parents, total_nodes);
+        }
+        *this = std::move(replacement);
+    }
+
     /// Look up the current DDA cell, retaining its nearest internal ancestor.
     /// A miss returns the largest missing child containing this cell. The caller
     /// keeps its existing boundary/tie handling when advancing over that block.
@@ -210,6 +358,13 @@ struct CompactReconstructionTree {
                     (x < int32_t(resolution)) & (y < int32_t(resolution)) & (z < int32_t(resolution));
         if (!leaf_count)
             return {Int(-1), dr::select(live, UInt(depth), UInt(0u))};
+        if (mixed_layout && !node_count) {
+            node = dr::select(live, UInt(0u), node);
+            level = dr::select(live, UInt(depth), level);
+            anchor = dr::select(live, Key(0u), anchor);
+            return {dr::select(live, dr::gather<Int>(leaf_ids, UInt(0u), live), Int(-1)),
+                    dr::select(live, UInt(depth), UInt(0u))};
+        }
         if (!depth) {
             node = dr::select(live, UInt(0u), node);
             level = dr::select(live, UInt(0u), level);
@@ -243,8 +398,8 @@ struct CompactReconstructionTree {
             dr::make_tuple(current_node, current_level, result, skip, running),
             [](const UInt &, const UInt &, const Int &, const UInt &, const Mask &run) -> Mask { return run; },
             [&](UInt &n, UInt &l, Int &value, UInt &missing_level, Mask &run) {
-                UInt bits = dr::gather<UInt>(masks, n, run);
-                bits = (bits | (bits >> 8)) & 0xffu;
+                UInt flags = dr::gather<UInt>(masks, n, run);
+                UInt bits = (flags | (flags >> 8)) & 0xffu;
                 UInt shift = l - 1u;
                 UInt child = ((UInt(x) >> shift) & 1u) |
                              (((UInt(y) >> shift) & 1u) << 1) |
@@ -253,10 +408,12 @@ struct CompactReconstructionTree {
                 Mask occupied = run & ((bits & bit) != 0u);
                 missing_level = dr::select(run & !occupied, l - 1u, missing_level);
                 UInt address = dr::gather<UInt>(child_base, n, occupied) + dr::popcnt(bits & (bit - 1u));
-                Mask leaf = occupied & (l == 1u);
-                value = dr::select(leaf, dr::gather<Int>(leaf_ids, address, leaf), value);
-                Mask descend = occupied & (l > 1u);
-                n = dr::select(descend, address, n);
+                Mask leaf = occupied & (mixed_layout ? ((flags & (bit << 16)) != 0u) : (l == 1u));
+                Int entry = dr::gather<Int>(leaf_ids, address, mixed_layout ? occupied : leaf);
+                value = dr::select(leaf, entry, value);
+                missing_level = dr::select(leaf, l - 1u, missing_level);
+                Mask descend = occupied & !leaf;
+                n = dr::select(descend, mixed_layout ? UInt(entry) : address, n);
                 l -= dr::select(descend, UInt(1u), UInt(0u));
                 run = descend;
             }, "Compact reconstruction tree descend");

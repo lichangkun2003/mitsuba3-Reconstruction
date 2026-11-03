@@ -210,34 +210,48 @@ class FalcorOptimizer:
         return self.dr.gather(type(value), value, index)
 
     def _background_components(self, model, cells, ids=None):
-        """Background geometry may extend beyond its child leaf after subdivision."""
-        if getattr(model, "scene_mapping", "bounded") != "projective_shell":
+        """Identify legacy occupied-box rows that retain their original geometry."""
+        if self._background_use_ellipsoid(model):
             return False
         dr, mi = self.dr, self.mi
         if ids is not None:
-            cells = dr.gather(mi.UInt32, cells, ids)
-        resolution, core = int(model.resolution), int(model.core_resolution)
-        padding = (resolution - core) // 2
-        exterior = mi.Bool(False)
-        for stride in (1, resolution, resolution * resolution):
-            coordinate = cells // stride % resolution
-            exterior |= (coordinate < padding) | (coordinate >= padding + core)
+            cells = dr.gather(type(cells), cells, ids)
+        exterior = cells >= int(model.core_resolution) ** 3
         return self._expand(exterior, 3)
 
     @staticmethod
     def _background_use_ellipsoid(model):
-        getter = getattr(model, "native_background_use_ellipsoid", None)
-        return bool(getter() if callable(getter)
-                    else getattr(model, "background_use_ellipsoid", True))
+        return (getattr(model, "scene_mapping", "bounded") != "world_shell"
+                or bool(model.native_background_use_ellipsoid()))
 
     def _geometry_valid(self, model, cells, geometry):
         """Occupied background cells freeze geometry and its accumulated Adam state."""
-        if (getattr(model, "scene_mapping", "bounded") != "projective_shell"
-                or self._background_use_ellipsoid(model)):
+        if self._background_use_ellipsoid(model):
             return geometry
-        from reconstruction_projective import core_mask_device
-        core = core_mask_device(cells, int(model.resolution), int(model.core_resolution), self.dr)
+        core = cells < int(model.core_resolution) ** 3
         return self.dr.select(core, geometry, 0)
+
+    def _leaf_component_sizes(self, model, cells, ids=None):
+        """World edge length for each parameter component, including coarse shells."""
+        dr, mi = self.dr, self.mi
+        if ids is not None:
+            cells = dr.gather(type(cells), cells, ids)
+        count = dr.width(cells)
+        lane = dr.arange(mi.UInt32, count * 3)
+        size = dr.gather(mi.Float, mi.Float(list(model.voxel_size)), lane % 3)
+        if getattr(model, "scene_mapping", "bounded") == "world_shell":
+            if getattr(model, "background_refinement", "fixed") == "adaptive":
+                rows = ids if ids is not None else dr.arange(mi.UInt32, count)
+                actual = model.leaf_sizes(rows)
+                return dr.select(lane % 3 == 0, self._expand(actual[0], 3),
+                    dr.select(lane % 3 == 1, self._expand(actual[1], 3), self._expand(actual[2], 3)))
+            core = int(model.core_resolution)
+            subdivision = int(model.native_background_subdivision_level())
+            exterior = cells >= core ** 3
+            shell = dr.select(exterior, cells - core ** 3, 0) // (56 * 8 ** subdivision)
+            multiplier = dr.select(exterior, (core * .5 / 2 ** subdivision) * dr.exp2(mi.Float(shell)), 1.)
+            size *= self._expand(multiplier, 3)
+        return size
 
     def _adam(self, name, gradient, valid, lr, lr_scale=1., *, state=None, count=None):
         dr, mi, cfg = self.dr, self.mi, self.config
@@ -378,7 +392,8 @@ class FalcorOptimizer:
                self.radiance_degree_steps, tuple(float(v) for v in model.voxel_size),
                getattr(model, "scene_mapping", "bounded"),
                self._background_use_ellipsoid(model),
-               bool(getattr(model, "native_background_layered_sampling", lambda: False)()),
+               int(getattr(model, "native_background_shell_levels", lambda: 0)()),
+               int(getattr(model, "native_background_subdivision_level", lambda: 0)()),
                int(getattr(model, "core_resolution", model.resolution)),
                tuple(sorted((name, value) for name, value in settings.items()
                             if name != "gradient_factor")), guarded)
@@ -518,7 +533,7 @@ class FalcorOptimizer:
                 updated = dr.clip(updated, dr.select(exterior, dr.minimum(old, .01), .01),
                                   dr.select(exterior, dr.maximum(old, .99), .99))
             elif name == "log_scales":
-                voxel_size = dr.gather(mi.Float, mi.Float(list(model.voxel_size)), lane % 3)
+                voxel_size = self._leaf_component_sizes(model, snapshot["cell_indices"], ids)
                 lower = dr.maximum(voxel_size * 1e-4, 1e-8)
                 upper = dr.maximum(voxel_size * cfg.max_scale_voxels, lower)
                 exterior = self._background_components(model, snapshot["cell_indices"], ids)
@@ -608,9 +623,7 @@ class FalcorOptimizer:
                 updated = dr.clip(updated, dr.select(exterior, dr.minimum(old, .01), .01),
                                   dr.select(exterior, dr.maximum(old, .99), .99))
             elif name == "log_scales":
-                size = mi.Float(list(model.voxel_size))
-                axis = dr.arange(mi.UInt32, self.count * 3) % 3
-                voxel_size = dr.gather(mi.Float, size, axis)
+                voxel_size = self._leaf_component_sizes(model, snapshot["cell_indices"])
                 lower = dr.maximum(voxel_size * 1e-4, 1e-8)
                 upper = dr.maximum(voxel_size * cfg.max_scale_voxels, lower)
                 exterior = self._background_components(model, snapshot["cell_indices"])

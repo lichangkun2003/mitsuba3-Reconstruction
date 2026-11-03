@@ -86,39 +86,72 @@ class CheckpointTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "centers"):
             checkpoint.save_checkpoint(self.path, invalid, self.metadata)
 
-    def test_fixed_eight_layer_1024_model_round_trip_and_metadata_guards(self):
-        extent = 1040/1024
-        metadata = dict(self.metadata, resolution=1040, core_resolution=1024,
-                        grid_min=[-extent]*3, grid_max=[extent]*3,
-                        scene_mapping="radial_seed_shell", background_refinement="fixed_layers",
-                        background_layers=8)
+    def test_fixed_world_shell_1024_model_round_trip_and_metadata_guards(self):
+        metadata = dict(self.metadata, resolution=1024, core_resolution=1024,
+                        grid_min=[-1.]*3, grid_max=[1.]*3,
+                        scene_mapping="world_shell", background_refinement="fixed",
+                        background_shell_levels=8)
         checkpoint.save_checkpoint(self.path, self.model, metadata)
         self.assertEqual(checkpoint.load_checkpoint(self.path)["model_metadata"], metadata)
-        for changes in ({"background_layers": 4}, {"background_layers": True},
+        for changes in ({"background_shell_levels": 0}, {"background_shell_levels": True},
                         {"background_refinement": "unknown"}, {"core_resolution": 1025},
-                        {"resolution": 1041}, {"scene_mapping": "bounded"}):
+                        {"resolution": 1040}, {"scene_mapping": "bounded"}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 checkpoint.validate_model_state(self.model, {**metadata, **changes})
-        legacy = dict(metadata, resolution=544, core_resolution=512,
-                      grid_min=[-544/512]*3, grid_max=[544/512]*3)
-        legacy.pop("background_refinement")
-        legacy.pop("background_layers")
-        checkpoint.save_checkpoint(self.path, self.model, legacy)
-        self.assertEqual(checkpoint.load_checkpoint(self.path)["model_metadata"], legacy)
 
-    def test_fixed_layer_metadata_survives_model_restore_and_resave(self):
+    def test_fixed_shell_metadata_survives_model_restore_and_resave(self):
         from reconstruction_common import restore_model, model_metadata
-        metadata = dict(self.metadata, resolution=1040, core_resolution=1024,
-                        grid_min=[-1040/1024]*3, grid_max=[1040/1024]*3,
-                        scene_mapping="radial_seed_shell", background_refinement="fixed_layers",
-                        background_layers=8)
+        metadata = dict(self.metadata, resolution=1024, core_resolution=1024,
+                        grid_min=[-1.]*3, grid_max=[1.]*3,
+                        scene_mapping="world_shell", background_refinement="fixed",
+                        background_shell_levels=8)
         def from_state(resolution, lo, hi, state, sh, opacity_sh, **kwargs):
-            return SimpleNamespace(resolution=resolution, grid_min=lo, grid_max=hi,
-                                   sh_count=sh, opacity_sh_count=opacity_sh, **kwargs)
-        mi = SimpleNamespace(UInt32=lambda v: v, Float=lambda v: v,
-                             VoxelReconstruction=SimpleNamespace(from_state=from_state))
+            result = SimpleNamespace(resolution=resolution, grid_min=lo, grid_max=hi,
+                                     sh_count=sh, opacity_sh_count=opacity_sh,
+                                     world_shell_version=5, cell_index_bits=64,
+                                     snapshot=lambda: state, **kwargs)
+            result.native_background_shell_levels = lambda: result.background_shell_levels
+            result.native_background_subdivision_level = lambda: result.background_subdivision_level
+            result.native_background_use_ellipsoid = lambda: result.background_use_ellipsoid
+            result.set_background_use_ellipsoid = lambda enabled: setattr(result, "background_use_ellipsoid", enabled)
+            result.native_background_adaptive = lambda: getattr(result, "background_adaptive", False)
+            result.set_world_shells = lambda levels, subdivision=0, adaptive=False: None
+            return result
+        native = SimpleNamespace(from_state=from_state, set_world_shells=lambda levels, subdivision=0: None,
+                                 world_shell_version=5, cell_index_bits=64,
+                                 native_background_shell_levels=lambda: 8,
+                                 native_background_subdivision_level=lambda: 0,
+                                 native_background_use_ellipsoid=lambda: True,
+                                 set_background_use_ellipsoid=lambda enabled: None)
+        mi = SimpleNamespace(UInt64=lambda v: np.asarray(v, np.uint64),
+                             UInt32=lambda v: np.asarray(v, np.uint32), Float=lambda v: v,
+                             VoxelReconstruction=native)
         restored = restore_model({"model_metadata": metadata, "model_state": self.model}, mi)
-        self.assertEqual(model_metadata(restored), metadata)
+        self.assertFalse(restored.native_background_use_ellipsoid())
+        self.assertEqual(model_metadata(restored), {**metadata, "world_shell_version": 5,
+            "background_subdivision_level": 0, "background_geometry": "occupied_cell"})
+        metadata.update(world_shell_version=2, background_subdivision_level=2,
+                        background_refinement="uniform")
+        restored = restore_model({"model_metadata": metadata, "model_state": self.model}, mi)
+        self.assertFalse(restored.native_background_use_ellipsoid())
+        upgraded = {**metadata, "world_shell_version": 5, "background_geometry": "occupied_cell"}
+        self.assertEqual(model_metadata(restored), upgraded)
+        # Resaving marks the new schema explicitly without changing old box semantics.
+        checkpoint.save_checkpoint(self.path, self.model, model_metadata(restored))
+        self.assertEqual(checkpoint.load_checkpoint(self.path)["model_metadata"], upgraded)
+        for version in (3, 4, 5):
+            for geometry in ("ellipsoid", "occupied_cell"):
+                current = {**upgraded, "world_shell_version": version, "background_geometry": geometry}
+                checkpoint.save_checkpoint(self.path, self.model, current)
+                restored = restore_model(checkpoint.load_checkpoint(self.path), mi)
+                self.assertEqual(restored.native_background_use_ellipsoid(), geometry == "ellipsoid")
+                self.assertEqual(model_metadata(restored), {**current, "world_shell_version": 5})
+        high_metadata = {**upgraded, "background_subdivision_level": 8, "background_geometry": "ellipsoid"}
+        high_state = {**self.model, "cell_indices": np.array([2 ** 32 + 17, 17], np.uint64)}
+        restored = restore_model({"model_metadata": high_metadata, "model_state": high_state}, mi)
+        np.testing.assert_array_equal(restored.snapshot()["cell_indices"], high_state["cell_indices"])
+        self.assertEqual(restored.snapshot()["cell_indices"].dtype, np.dtype(np.uint64))
+        self.assertEqual(model_metadata(restored), high_metadata)
 
     def test_failed_first_save_leaves_no_checkpoint(self):
         with patch.object(checkpoint.os, "replace", side_effect=OSError("simulated replacement failure")):
@@ -293,6 +326,44 @@ class CheckpointTests(unittest.TestCase):
                 self.assertEqual(self.path.read_bytes(), old)
                 self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
+    def test_uint64_sparse_cells_round_trip_and_cross_chunk_duplicates(self):
+        import reconstruction_export as export
+        metadata = dict(self.metadata, resolution=1024, core_resolution=1024,
+            scene_mapping="world_shell", world_shell_version=4, background_shell_levels=8,
+            background_subdivision_level=8, background_refinement="uniform", background_geometry="ellipsoid")
+        cells = np.array([2 ** 32 + 17, 17, 2 ** 33 - 1, 2 ** 32 + 3,
+                          2 ** 32 + 64, 2 ** 30 - 1, 2 ** 32 + 33, 2 ** 32 + 65], np.uint64)
+        count = len(cells)
+        model = {"cell_indices": cells, "centers": np.zeros(count * 3, np.float32),
+                 "log_scales": np.zeros(count * 3, np.float32),
+                 "rotations": np.tile(np.array([1, 0, 0, 0], np.float32), count),
+                 "radiance_sh": np.zeros(count * 3, np.float32), "opacity_sh": np.zeros(count, np.float32)}
+        calls = []
+        streamed = {name: self.source(value, calls if name == "cell_indices" else None)
+                    for name, value in model.items()}
+        with patch.object(export, "CHUNK_BYTES", 16), patch.object(np, "memmap", wraps=np.memmap) as mapping:
+            checkpoint.save_checkpoint(self.path, streamed, metadata)
+            self.assertEqual(calls, [(0, 2), (2, 2), (4, 2), (6, 2)])
+            # Storage is proportional to these eight sparse rows, not the
+            # logical address extent (which would need a 1 GiB bitset).
+            self.assertTrue(mapping.call_args_list)
+            for call in mapping.call_args_list:
+                mapped_bytes = math.prod(call.kwargs["shape"]) * np.dtype(call.kwargs["dtype"]).itemsize
+                self.assertLessEqual(mapped_bytes, cells.nbytes)
+        restored = checkpoint.load_checkpoint(self.path)
+        self.assertEqual(restored["model_metadata"], metadata)
+        np.testing.assert_array_equal(restored["model_state"]["cell_indices"], cells)
+        self.assertEqual(restored["model_state"]["cell_indices"].dtype, np.dtype(np.uint64))
+        old = self.path.read_bytes()
+        for last, message in ((int(cells[0]), "unique"), (2 ** 33, "outside")):
+            invalid = cells.copy()
+            invalid[-1] = last
+            with patch.object(export, "CHUNK_BYTES", 16), self.assertRaisesRegex(ValueError, message):
+                checkpoint.save_checkpoint(self.path,
+                    {**model, "cell_indices": self.source(invalid)}, metadata)
+            self.assertEqual(self.path.read_bytes(), old)
+            self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
     def test_streamed_empty_model_and_source_chunk_contract(self):
         from reconstruction_export import ArraySource
         empty = {key: self.source(np.empty(0, value.dtype)) for key, value in self.model.items()}
@@ -305,16 +376,18 @@ class CheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "chunk"):
                 checkpoint.save_checkpoint(self.path, {**self.model, "centers": source}, self.metadata)
 
-    def test_stream_preserves_projective_cell_region_validation(self):
-        metadata = dict(self.metadata, resolution=4, core_resolution=2,
-                        grid_min=[-2.] * 3, grid_max=[2.] * 3,
-                        scene_mapping="projective_shell", background_layers=1,
-                        background_refinement="preserve_physical_width")
-        valid = np.array([21, 20], np.uint32)  # core (1,1,1), face (0,1,1).
-        checkpoint.save_checkpoint(self.path, {**self.model, "cell_indices": self.source(valid)}, metadata)
-        for cells in (np.array([21, 0], np.uint32), np.array([21, 16], np.uint32)):
-            with self.subTest(cells=cells), self.assertRaisesRegex(ValueError, "atlas corners"):
-                checkpoint.save_checkpoint(self.path, {**self.model, "cell_indices": self.source(cells)}, metadata)
+    def test_stream_preserves_world_shell_address_validation(self):
+        metadata = dict(self.metadata, resolution=4, core_resolution=4,
+                        grid_min=[-1.]*3, grid_max=[1.]*3,
+                        scene_mapping="world_shell", background_shell_levels=1,
+                        background_refinement="fixed")
+        valid = dict(self.model)
+        valid["cell_indices"] = np.asarray([64, 119], np.uint32)
+        checkpoint.save_checkpoint(self.path, valid, metadata)
+        np.testing.assert_array_equal(checkpoint.load_checkpoint(self.path)["model_state"]["cell_indices"], valid["cell_indices"])
+        invalid = dict(valid, cell_indices=np.asarray([64, 120], np.uint32))
+        with self.assertRaisesRegex(ValueError, "outside"):
+            checkpoint.save_checkpoint(self.path, invalid, metadata)
 
     def test_small_source_limit_keeps_quaternion_validation_across_chunks(self):
         from reconstruction_export import ArraySource

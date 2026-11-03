@@ -7,8 +7,8 @@ Only epoch boundaries/checkpoints materialize device statistics on the host.
 from __future__ import annotations
 
 
-# Version 3 retains every parent proposal and shares ray records by target cell.
-RGB_GROWTH_EVIDENCE_VERSION = 3
+# Version 4 retains 64-bit adaptive target addresses and records proposal heads.
+RGB_GROWTH_EVIDENCE_VERSION = 4
 
 RGB_STAT_FIELDS = ("gain_sum", "raw_gain_sum", "support_views", "conflict_views",
                    "observed_views", "unknown_views", "invalid_views",
@@ -19,7 +19,7 @@ def upload_rgb_growth_candidates(model, state):
     """Upload portable checkpoint/broadcast arrays to the current native variant."""
     if type(model).__module__.split(".")[0] == "mitsuba":
         import mitsuba as mi
-        state = {name: (mi.UInt32(value) if name == "cell_indices" else mi.Float(value))
+        state = {name: (mi.UInt64(value) if name == "cell_indices" else mi.Float(value))
                  for name, value in state.items()}
     model.set_growth_candidates(state)
 

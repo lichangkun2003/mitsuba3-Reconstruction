@@ -114,40 +114,41 @@ class GrowthFilterTests(unittest.TestCase):
         chosen = np.flatnonzero((pending["cells"] == 74) & (pending["parent_cells"] == 73))[0]
         np.testing.assert_array_equal(actual["centers"][0], pending["centers"][chosen])
 
-    def test_radial_background_never_supplies_parents_or_targets(self):
-        # Core radius is three cell widths. Parent x=1 intersects the shell;
-        # x=3 and x=5 are core cells. The shell must not count as the second
-        # supporting parent for x=2, while the interior hole x=4 stays legal.
-        state = checkpoint([217, 219, 221])
-        state["model_metadata"].update(core_resolution=6)
+    def test_world_background_never_supplies_parents_or_targets(self):
+        # Background ID 512 is not a finest-grid parent at z=8. It must not
+        # provide a second supporter for the boundary target 448; the ordinary
+        # interior target 220 still has parents 219 and 221.
+        state = checkpoint([384, 219, 221, 512, 513])
+        state["model_metadata"].update(core_resolution=8, scene_mapping="world_shell",
+                                       background_shell_levels=8)
         manager = manager_for(state, growth_min_supporting_parents=2)
-        legacy = full_generate(manager, state, 10)
-        self.assertIn(218, legacy["cells"])
-        state["model_metadata"]["scene_mapping"] = "radial_seed_shell"
         restricted = full_generate(manager, state, 10)
-        self.assertNotIn(218, restricted["cells"])
+        self.assertNotIn(448, restricted["cells"])
         self.assertIn(220, restricted["cells"])
         for name in ("cells", "parent_cells"):
             coordinates = topology._coordinates(restricted[name], 8, np)
             self.assertTrue(np.all(topology._growth_coordinates_allowed(
                 coordinates, state["model_metadata"], np)), name)
-        self.assert_subset_equivalence(manager, state, np.arange(512))
-        self.assert_subset_equivalence(manager, state, [218, 220, 222])
-        self.assertEqual(len(self.assert_subset_equivalence(manager, state, [222])["cells"]), 0)
+        self.assert_subset_equivalence(manager, state, np.arange(960))
+        self.assert_subset_equivalence(manager, state, [448, 220, 514])
+        self.assertEqual(len(self.assert_subset_equivalence(manager, state, [514])["cells"]), 0)
 
-    def test_radial_growth_region_follows_refinement(self):
-        state = checkpoint([217, 219, 221])
-        state["model_metadata"].update(core_resolution=6, scene_mapping="radial_seed_shell")
+    def test_world_growth_region_follows_core_refinement_with_fixed_background(self):
+        state = checkpoint([384, 219, 221, 512, 513])
+        state["model_metadata"].update(core_resolution=8, scene_mapping="world_shell",
+                                       background_shell_levels=8)
         refined = topology.refine_state(state, topology.CoarseToFineConfig())
-        self.assertEqual(refined["model_metadata"]["scene_mapping"], "radial_seed_shell")
-        self.assertEqual(topology._growth_core_radius_squared(refined["model_metadata"]), 144)
+        self.assertEqual(refined["model_metadata"]["scene_mapping"], "world_shell")
+        self.assertEqual(refined["model_metadata"]["resolution"], 16)
+        background = refined["model_state"]["cell_indices"] >= 16 ** 3
+        np.testing.assert_array_equal(refined["model_state"]["cell_indices"][background], [4096, 4097])
         manager = manager_for(refined, growth_min_supporting_parents=1)
         result = full_generate(manager, refined, 10)
         for name in ("cells", "parent_cells"):
             coordinates = topology._coordinates(result[name], 16, np)
             self.assertTrue(np.all(topology._growth_coordinates_allowed(
                 coordinates, refined["model_metadata"], np)), name)
-        self.assert_subset_equivalence(manager, refined, np.arange(16 ** 3))
+        self.assert_subset_equivalence(manager, refined, np.arange(16 ** 3 + 448))
 
     def test_current_contact_wait_and_deleted_parent_are_rechecked(self):
         state = checkpoint([73, 75])

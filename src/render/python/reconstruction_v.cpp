@@ -60,6 +60,13 @@ MI_PY_EXPORT(VoxelReconstruction) {
         result["dtype"] = "uint32";
         return result;
     }, "value"_a.noconvert());
+    m.def("_reconstruction_cell_buffer_info", [](typename Model::CellBuffer &value) {
+        nb::dict result;
+        result["pointer"] = (uintptr_t) value.data();
+        result["size"] = dr::width(value);
+        result["dtype"] = "uint64";
+        return result;
+    }, "value"_a.noconvert());
     m.def("_reconstruction_optimizer_update_scope_end", [](const std::vector<uint64_t> &handles) {
         for (uint64_t handle : handles)
             jit_var_unstash_ref(handle);
@@ -75,24 +82,32 @@ MI_PY_EXPORT(VoxelReconstruction) {
         .def_static("from_points", [](const PointArray &positions, const PointArray &colors,
                  uint32_t resolution, const std::array<float, 3> &grid_min,
                  const std::array<float, 3> &grid_max, uint32_t sh_count,
-                 uint32_t opacity_sh_count, uint32_t core_resolution) {
+                 uint32_t opacity_sh_count, uint32_t core_resolution, uint32_t background_shell_levels,
+                 uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive) {
             if (!positions.size() || positions.size() % 3 || colors.size() != positions.size())
                 throw nb::value_error("from_points(): expected nonempty flat XYZ and RGB arrays of equal length");
             nb::gil_scoped_release release;
             return new Model(positions.data(), colors.data(), positions.size() / 3,
                              resolution, grid_min, grid_max, sh_count, opacity_sh_count,
-                             core_resolution);
+                             core_resolution, background_shell_levels, background_subdivision_level,
+                             background_use_ellipsoid, background_adaptive);
         }, "positions"_a.noconvert(), "colors"_a.noconvert(), "resolution"_a,
            "grid_min"_a, "grid_max"_a, "sh_count"_a = 9, "opacity_sh_count"_a = 9,
-           "core_resolution"_a = 0, nb::rv_policy::take_ownership,
+           "core_resolution"_a = 0, "background_shell_levels"_a = 0, "background_subdivision_level"_a = 0,
+           "background_use_ellipsoid"_a = true, "background_adaptive"_a = false, nb::rv_policy::take_ownership,
            "Initialize from flat CPU float32 XYZ and sRGB arrays in the renderer frame.")
         .def_static("from_state", [](uint32_t resolution,
                  const std::array<float, 3> &grid_min,
                  const std::array<float, 3> &grid_max, const nb::dict &state,
-                 uint32_t sh_count, uint32_t opacity_sh_count, uint32_t core_resolution) {
+                 uint32_t sh_count, uint32_t opacity_sh_count, uint32_t core_resolution, uint32_t background_shell_levels,
+                 uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive) {
             if (!state.contains("cell_indices"))
                 throw nb::value_error("from_state(): missing cell_indices");
-            auto cells = nb::cast<typename Model::UIntBuffer>(state["cell_indices"]);
+            typename Model::CellBuffer cells;
+            if (nb::isinstance<typename Model::UIntBuffer>(state["cell_indices"]))
+                cells = typename Model::CellBuffer(nb::cast<typename Model::UIntBuffer>(state["cell_indices"]));
+            else
+                cells = nb::cast<typename Model::CellBuffer>(state["cell_indices"]);
             std::map<std::string, typename Model::FloatBuffer> parameters;
             for (auto item : state) {
                 std::string key = nb::cast<std::string>(item.first);
@@ -100,9 +115,11 @@ MI_PY_EXPORT(VoxelReconstruction) {
                     parameters[key] = nb::cast<typename Model::FloatBuffer>(item.second);
             }
             return new Model(resolution, grid_min, grid_max, cells,
-                             parameters, sh_count, opacity_sh_count, core_resolution);
+                             parameters, sh_count, opacity_sh_count, core_resolution, background_shell_levels,
+                             background_subdivision_level, background_use_ellipsoid, background_adaptive);
         }, "resolution"_a, "grid_min"_a, "grid_max"_a, "state"_a,
-           "sh_count"_a = 9, "opacity_sh_count"_a = 9, "core_resolution"_a = 0,
+           "sh_count"_a = 9, "opacity_sh_count"_a = 9, "core_resolution"_a = 0, "background_shell_levels"_a = 0, "background_subdivision_level"_a = 0,
+           "background_use_ellipsoid"_a = true, "background_adaptive"_a = false,
            nb::rv_policy::take_ownership)
         .def("set_parameters", &Model::set_parameters, "parameters"_a,
              "Replace continuous parameter buffers atomically after shape/finite validation.")
@@ -200,7 +217,11 @@ MI_PY_EXPORT(VoxelReconstruction) {
         .def("set_growth_candidates", [](Model &model, const nb::dict &state) {
             if (!state.contains("cell_indices"))
                 throw nb::value_error("set_growth_candidates(): missing cell_indices");
-            auto cells = nb::cast<typename Model::UIntBuffer>(state["cell_indices"]);
+            typename Model::CellBuffer cells;
+            if (nb::isinstance<typename Model::UIntBuffer>(state["cell_indices"]))
+                cells = typename Model::CellBuffer(nb::cast<typename Model::UIntBuffer>(state["cell_indices"]));
+            else
+                cells = nb::cast<typename Model::CellBuffer>(state["cell_indices"]);
             std::map<std::string, typename Model::FloatBuffer> parameters;
             for (auto item : state) {
                 std::string key = nb::cast<std::string>(item.first);
@@ -212,15 +233,15 @@ MI_PY_EXPORT(VoxelReconstruction) {
            "Install frozen empty-cell candidates for online RGB evidence; does not grow the model.")
         .def("clear_growth_candidates", &Model::clear_growth_candidates)
         .def("set_scene_mapping", &Model::set_scene_mapping, "mapping"_a)
-        .def("set_background_far_distance", &Model::set_background_far_distance, "distance"_a,
-             "Set the finite projective outer boundary (>1), or zero for legacy infinity.")
-        .def("native_background_far_distance", &Model::native_background_far_distance)
-        .def("set_background_use_ellipsoid", &Model::set_background_use_ellipsoid, "enabled"_a,
-             "Use ellipsoids for projective background hits, or fixed occupied-cell coverage when false.")
+        .def("set_world_shells", &Model::set_world_shells, "levels"_a, "subdivision_level"_a = 0, "adaptive"_a = false,
+             "Set nested world-space cube shells and their Morton-child subdivision level.")
+        .def("native_background_shell_levels", &Model::native_background_shell_levels)
+        .def("native_background_subdivision_level", &Model::native_background_subdivision_level)
+        .def("native_background_adaptive", &Model::native_background_adaptive)
+        .def("leaf_sizes", &Model::leaf_sizes, "ids"_a,
+             "World-space XYZ leaf dimensions for UInt32 active row IDs; invalid IDs return zero.")
+        .def("set_background_use_ellipsoid", &Model::set_background_use_ellipsoid, "enabled"_a)
         .def("native_background_use_ellipsoid", &Model::native_background_use_ellipsoid)
-        .def("set_background_layered_sampling", &Model::set_background_layered_sampling, "enabled"_a,
-             "Use one fixed outgoing shell sample per projective background layer.")
-        .def("native_background_layered_sampling", &Model::native_background_layered_sampling)
         .def("set_active_sh_count", &Model::set_active_sh_count, "count"_a,
              "Activate the first count radiance SH coefficients; preserve stored parameters.")
         .def("native_scene_mapping", &Model::native_scene_mapping)
@@ -307,12 +328,11 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("rgb_growth_version") = nb::int_(Model::rgb_growth_version);
     cls.attr("rgb_deletion_version") = nb::int_(Model::rgb_deletion_version);
     cls.attr("background_rgb_deletion_version") = nb::int_(Model::background_rgb_deletion_version);
-    cls.attr("background_geometry_version") = nb::int_(Model::background_geometry_version);
-    cls.attr("background_layered_sampling_version") = nb::int_(Model::background_layered_sampling_version);
+    cls.attr("world_shell_version") = nb::int_(Model::world_shell_version);
+    cls.attr("cell_index_bits") = nb::int_(Model::cell_index_bits);
     cls.attr("distortion_version") = nb::int_(Model::distortion_version);
     cls.attr("dssim_version") = nb::int_(Model::dssim_version);
     cls.attr("sh_schedule_version") = nb::int_(Model::sh_schedule_version);
-    cls.attr("projective_version") = nb::int_(Model::projective_version);
     cls.attr("octree_version") = nb::int_(Model::octree_version);
     cls.attr("optimizer_device_version") = nb::int_(Model::optimizer_device_version);
     cls.attr("compact_optimizer_version") = nb::int_(Model::compact_optimizer_version);

@@ -38,9 +38,9 @@ def check_points(mi, dr, np, directory):
     lo, hi = [-1.25] * 3, [1.25] * 3
     ply_model = mi.VoxelReconstruction(str(path), 10, lo, hi, .05, 9, 1)
     point_model = mi.VoxelReconstruction.from_points(
-        positions.ravel(), colors.ravel(), 10, lo, hi, 9, 1, core_resolution=8)
+        positions.ravel(), colors.ravel(), 10, lo, hi, 9, 1, core_resolution=10)
     assert ply_model.core_resolution == ply_model.resolution == 10
-    assert point_model.core_resolution == 8 and point_model.resolution == 10
+    assert point_model.core_resolution == point_model.resolution == 10
     assert point_model.active_voxel_count == ply_model.active_voxel_count == 2
     for name, value in ply_model.snapshot().items():
         np.testing.assert_array_equal(np.array(value), np.array(point_model.snapshot()[name]),
@@ -50,10 +50,25 @@ def check_points(mi, dr, np, directory):
     assert (stats["input_points"], stats["invalid_points"], stats["outside_points"],
             stats["colored_points"]) == (6, 1, 1, 3)
     restored = mi.VoxelReconstruction.from_state(
-        10, lo, hi, point_model.snapshot(), 9, 1, core_resolution=8)
-    assert restored.core_resolution == 8
+        10, lo, hi, point_model.snapshot(), 9, 1, core_resolution=10)
+    assert restored.core_resolution == 10
     for name, value in restored.snapshot().items():
         np.testing.assert_array_equal(np.array(value), np.array(point_model.snapshot()[name]))
+    # World shells enlarge the traversal root without padding or changing
+    # foreground cell IDs. Point initialization itself creates core rows only.
+    world = mi.VoxelReconstruction.from_points(
+        positions.ravel(), colors.ravel(), 8, [-1.]*3, [1.]*3, 9, 1,
+        core_resolution=8, background_shell_levels=8)
+    assert world.core_resolution == world.resolution == 8
+    assert world.native_background_shell_levels() == 8
+    assert world.native_scene_mapping() == "world_shell"
+    assert np.all(np.array(world.snapshot()["cell_indices"]) < 8**3)
+    restored_world = mi.VoxelReconstruction.from_state(
+        8, [-1.]*3, [1.]*3, world.snapshot(), 9, 1,
+        core_resolution=8, background_shell_levels=8)
+    assert restored_world.native_background_shell_levels() == 8
+    for name, value in restored_world.snapshot().items():
+        np.testing.assert_array_equal(np.array(value), np.array(world.snapshot()[name]))
     for make_invalid in (
         lambda: mi.VoxelReconstruction.from_points(
             positions.ravel(), colors.ravel()[:-1], 10, lo, hi),
@@ -61,6 +76,8 @@ def check_points(mi, dr, np, directory):
             positions.ravel(), colors.ravel(), 10, lo, hi, core_resolution=11),
         lambda: mi.VoxelReconstruction.from_state(
             10, lo, hi, point_model.snapshot(), 9, 1, core_resolution=11),
+        lambda: mi.VoxelReconstruction.from_points(
+            positions.ravel(), colors.ravel(), 10, lo, hi, core_resolution=8),
         lambda: mi.VoxelReconstruction.from_points(
             positions.ravel().astype(np.float64), colors.ravel(), 10, lo, hi),
     ):
@@ -70,7 +87,7 @@ def check_points(mi, dr, np, directory):
             pass
         else:
             raise AssertionError("Invalid point initialization was accepted")
-    return {"variant": mi.variant(), "ply_parity": "exact", "core_restore": "passed",
+    return {"variant": mi.variant(), "ply_parity": "exact", "world_shell_restore": "passed",
             "input_validation": "passed"}
 
 

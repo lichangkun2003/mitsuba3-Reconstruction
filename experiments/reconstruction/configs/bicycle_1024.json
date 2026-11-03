@@ -7,11 +7,13 @@
     "reference_compositing": "srgb",
     "images": null,
     "scene_mode": "unbounded",
-    "background_final_layers": 8,
-    "background_opacity": 0.5,
-    "background_far_distance": null,
-    "background_far_percentile": 99.9,
-    "background_far_margin": 1.2
+    "background_shell_levels": 5,
+    "background_initial_resolution": 2,
+    "background_refinement": "adaptive",
+    "background_initial_leaf_budget": 200000,
+    "background_initial_pixel_threshold": 32.0,
+    "background_max_resolution": 512,
+    "background_opacity": 0.5
   },
   "model": {
     "grid_resolution": 256,
@@ -28,8 +30,7 @@
     "bounds_padding": 1.02,
     "opacity_threshold": 0.05,
     "sh_count": 9,
-    "opacity_sh_count": 1,
-    "background_use_ellipsoid": true
+    "opacity_sh_count": 1
   },
   "render": {
     "width": 800,
@@ -41,7 +42,7 @@
     "far_clip": 1000.0,
     "entry_offset_fraction": 1e-06,
     "transmittance_threshold": 0.01,
-    "max_hits": 16,
+    "max_hits": 32,
     "traversal": "octree"
   },
   "runtime": {
@@ -154,7 +155,13 @@
     "evidence_interval": 5,
     "deletion_interval": 10,
     "max_active_voxels": 67108864,
-    "gpu_topology": true
+    "gpu_topology": true,
+    "background_refine_interval": 10,
+    "background_refine_max_new_leaves": 100000,
+    "background_refine_pixel_threshold": 8.0,
+    "background_refine_fraction": 0.05,
+    "background_max_active_voxels": 4000000,
+    "background_growth_max_candidates": 200000
   },
   "schedule": {
     "enabled": true,

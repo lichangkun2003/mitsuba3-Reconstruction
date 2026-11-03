@@ -18,7 +18,7 @@ import numpy as np
 
 from reconstruction_collective import (
     GRADIENT_KEYS, MAX_COUNTER_KEYS, SUM_COUNTER_KEYS, NcclCollective,
-    _NCCL_FLOAT32, _NCCL_MAX, _NCCL_MIN, _NCCL_SUM,
+    _NCCL_FLOAT32, _NCCL_MAX, _NCCL_MIN, _NCCL_SUM, _NCCL_UINT32, _NCCL_UINT64,
 )
 
 
@@ -28,6 +28,10 @@ def _float(value):
 
 def _uint(value):
     return np.atleast_1d(np.asarray(value, dtype=np.uint32))
+
+
+def _cell(value):
+    return np.atleast_1d(np.asarray(value, dtype=np.uint64))
 
 
 class _Dr:
@@ -47,7 +51,7 @@ class _Dr:
 
     @staticmethod
     def empty(array_type, size):
-        return np.empty(size, dtype=np.float32 if array_type is _float else np.uint32)
+        return np.empty(size, dtype={_float: np.float32, _uint: np.uint32, _cell: np.uint64}[array_type])
 
     @staticmethod
     def eval(*args):
@@ -91,7 +95,7 @@ class _Lib:
         assert self.grouped
         assert source != destination, "NCCL must write into a fresh receiving allocation"
         assert stream == 77
-        ctype = ctypes.c_float if dtype == _NCCL_FLOAT32 else ctypes.c_uint32
+        ctype = {_NCCL_FLOAT32: ctypes.c_float, _NCCL_UINT32: ctypes.c_uint32}[dtype]
         source_array = np.ctypeslib.as_array((ctype * count).from_address(source))
         destination_array = np.ctypeslib.as_array((ctype * count).from_address(destination))
         # Deliberately different peer values catch SUM versus MAX mistakes.
@@ -109,7 +113,8 @@ class _Lib:
     def ncclBroadcast(self, source, destination, count, dtype, root, comm, stream):
         assert self.grouped and stream == 77
         assert (source == destination) == (root == 0), "Source-rank broadcasts should retain their existing buffer"
-        ctype = ctypes.c_float if dtype == _NCCL_FLOAT32 else ctypes.c_uint32
+        ctype = {_NCCL_FLOAT32: ctypes.c_float, _NCCL_UINT32: ctypes.c_uint32,
+                 _NCCL_UINT64: ctypes.c_uint64}[dtype]
         source_array = np.ctypeslib.as_array((ctype * count).from_address(source))
         destination_array = np.ctypeslib.as_array((ctype * count).from_address(destination))
         # Fake root-specific values ensure evidence from different cameras is
@@ -124,13 +129,16 @@ class _Lib:
 
 
 def _fixture(world_size=2):
-    def info(value):
-        return {"pointer": value.ctypes.data, "size": value.size}
+    def info(value, dtype):
+        assert value.dtype == dtype, "Pointer metadata must match the native field type"
+        return {"pointer": value.ctypes.data, "size": value.size, "dtype": str(value.dtype)}
 
     collective = NcclCollective.__new__(NcclCollective)
     collective.mi = SimpleNamespace(
-        Float=_float, UInt32=_uint, Bool=lambda value: np.asarray(value, dtype=np.bool_),
-        _reconstruction_float_buffer_info=info, _reconstruction_uint_buffer_info=info,
+        Float=_float, UInt32=_uint, UInt64=_cell, Bool=lambda value: np.asarray(value, dtype=np.bool_),
+        _reconstruction_float_buffer_info=lambda value: info(value, np.float32),
+        _reconstruction_uint_buffer_info=lambda value: info(value, np.uint32),
+        _reconstruction_cell_buffer_info=lambda value: info(value, np.uint64),
         _reconstruction_cuda_push_context=lambda context: None,
         _reconstruction_cuda_pop_context=lambda: None,
     )
@@ -156,7 +164,57 @@ def _accumulator(count):
     return result
 
 
+def _check_cell_broadcasts():
+    # Anonymous keys are used by replica state packing. Direct snapshot fields
+    # also work, including callers that previously listed cells as uint_keys.
+    high_cells = _cell([2 ** 32 + 17, 10_000_000_011, 2 ** 53 + 1,
+                        2 ** 63 + 7, 2 ** 64 - 32])
+    for cell_name in ("cell_indices", "0"):
+        for root in (0, 1):
+            collective = _fixture()
+            fields = {cell_name: high_cells.copy(), "steps": _uint([7, 11]),
+                      "radiance_sh": _float([.25, -.5, 1.])}
+            cell_keys = (cell_name,) if cell_name == "0" else ()
+            uint_keys = ("steps", cell_name) if cell_name == "cell_indices" else ("steps",)
+            result = collective.broadcast_arrays(fields, root=root, uint_keys=uint_keys,
+                                                 cell_keys=cell_keys)
+            np.testing.assert_array_equal(result[cell_name], high_cells + np.uint64(root * 10))
+            assert result[cell_name].dtype == np.uint64
+            assert result["steps"].dtype == np.uint32
+            assert result["radiance_sh"].dtype == np.float32
+            np.testing.assert_array_equal(result["steps"], fields["steps"] + root * 10)
+            np.testing.assert_array_equal(result["radiance_sh"], fields["radiance_sh"] + root * 10)
+            assert (result[cell_name].ctypes.data == fields[cell_name].ctypes.data) == (root == 0)
+            assert sorted(collective._lib.broadcast_calls) == sorted([
+                (5, _NCCL_UINT64, root), (2, _NCCL_UINT32, root), (3, _NCCL_FLOAT32, root)])
+            assert collective.statistics()["payload_bytes"] == 5 * 8 + 2 * 4 + 3 * 4
+            assert collective.dr.syncs == 1
+
+    single = _fixture(1)
+    edge_cells = _cell([2 ** 64 - 1, 2 ** 53 + 1, 0])
+    result = single.broadcast_arrays({"cell_indices": edge_cells}, root=0)
+    np.testing.assert_array_equal(result["cell_indices"], edge_cells)
+    assert result["cell_indices"].dtype == np.uint64
+    assert single.statistics()["payload_bytes"] == 0 and single.dr.syncs == 0
+
+    legacy = _fixture(1).broadcast_arrays({"cell_indices": _uint([0, 123])}, root=0)
+    np.testing.assert_array_equal(legacy["cell_indices"], _cell([0, 123]))
+    assert legacy["cell_indices"].dtype == np.uint64
+
+    empty = _fixture()
+    result = empty.broadcast_arrays({"0": _cell([])}, root=0, cell_keys=("0",))
+    assert result["0"].dtype == np.uint64 and result["0"].size == 0
+    assert not empty._lib.broadcast_calls and empty.dr.syncs == 0
+    try:
+        empty.broadcast_arrays({"gain": _float([1.])}, root=0, cell_keys=("missing",))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Missing uint64 fields must be rejected before NCCL launch")
+
+
 def main():
+    _check_cell_broadcasts()
     collective = _fixture()
     source = _accumulator(3)
     raw, alpha = np.array([0., .2, .9, 0.], dtype=np.float32), np.array([.1, 0., 0., .8], dtype=np.float32)
@@ -275,7 +333,8 @@ def main():
     print({"status": "passed", "scope": "CPU mock only", "checks": [
         "sum_gradients_and_validity", "max_evidence", "finite_min", "loss_sum",
         "fresh_receive_buffers", "optional_images", "single_sync", "empty_topology",
-        "packed_distortion_component_sums", "reject_invalid_shapes", "statistics"]})
+        "packed_distortion_component_sums", "uint64_cell_broadcasts", "anonymous_uint64_buffers",
+        "uint32_counters_unchanged", "reject_invalid_shapes", "statistics"]})
 
 
 if __name__ == "__main__":

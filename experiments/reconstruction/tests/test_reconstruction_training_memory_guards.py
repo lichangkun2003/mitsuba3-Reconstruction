@@ -36,7 +36,7 @@ def configuration():
 def model(*, compact_records=True):
     value = SimpleNamespace(active_voxel_count=51_910_528, sh_count=9,
         opacity_sh_count=1, compact_gradient_version=1, core_resolution=512,
-        resolution=520, statistics=lambda: {
+        resolution=512, scene_mapping="world_shell", background_shell_levels=8, statistics=lambda: {
             "octree_allocated_bytes": 17 * MIB,
             "spatial_index_allocated_bytes": 29 * MIB,
             "other_counter": 900_000_000})
@@ -51,12 +51,13 @@ def report():
 
 
 def request():
-    return {"stage": "projective_model", "active_voxels": 51_910_528,
+    return {"stage": "world_model", "active_voxels": 51_910_528,
         "exact_count": True, "allocation_voxels": 51_910_528,
-        "old_voxels": 6_488_816, "existing_child_count": 1_578_880,
-        "background_child_count": 50_331_648,
-        "model_metadata": {"resolution": 1040, "sh_count": 9,
-                           "opacity_sh_count": 1}}
+        "old_voxels": 6_488_816, "existing_child_count": 51_910_080,
+        "background_child_count": 448,
+        "model_metadata": {"resolution": 1024, "sh_count": 9,
+                           "opacity_sh_count": 1, "scene_mapping": "world_shell",
+                           "background_shell_levels": 8}}
 
 
 class Cache:
@@ -191,8 +192,9 @@ class TrainingMemoryGuardTests(unittest.TestCase):
                 result = train.prepare_refinement_memory(config, current, optimizer, cache, replay,
                     state, 255, proposed, dr)
                 self.assertIs(result, state["refinement_memory_plans"][-1])
-            index.assert_called_once_with(proposed["active_voxels"], 1040,
-                                          allocator_policy="cuda_2m")
+            index.assert_called_once_with(proposed["active_voxels"], 1024,
+                                          allocator_policy="cuda_2m", background_shell_levels=8,
+                                          background_subdivision_level=0)
         self.assertEqual(events, ["native.clear", "optimizer.clear_replay", "cache.clear",
                                    "sync", "flush", "training.plan", "transition.plan"])
         self.assertEqual(len(state["refinement_memory_plans"]), 1)
@@ -232,7 +234,7 @@ class TrainingMemoryGuardTests(unittest.TestCase):
                              flush_malloc_cache=lambda: events.append("flush"))
         count = 1_000_001
         proposed = {"stage": stage, "active_voxels": count,
-            "model_metadata": {"resolution": 1040, "sh_count": 9, "opacity_sh_count": 1},
+            "model_metadata": {"resolution": 1024, "sh_count": 9, "opacity_sh_count": 1},
             "selected_count": 19, "survivor_count": count - 19}
         proposed_before = copy.deepcopy(proposed)
         field_bytes = 104 * MIB
@@ -264,7 +266,8 @@ class TrainingMemoryGuardTests(unittest.TestCase):
                 result = train.prepare_topology_commit_memory(config, current, optimizer, cache,
                     replay, state, 255, proposed, dr)
                 self.assertIs(result, state["topology_commit_memory_plans"][-1])
-            index.assert_called_once_with(count, 1040, allocator_policy="cuda_2m")
+            index.assert_called_once_with(count, 1024, allocator_policy="cuda_2m", background_shell_levels=0,
+                                          background_subdivision_level=0)
         self.assertEqual(events, ["native.clear", "optimizer.clear_replay", "cache.clear",
                                   "sync", "flush", "sync", "training.plan"])
         self.assertEqual(len(state["topology_commit_memory_plans"]), 1)
@@ -310,7 +313,7 @@ class TrainingMemoryGuardTests(unittest.TestCase):
         current.active_voxel_count = 50_407_562
         proposed = {"stage": "growth_commit", "active_voxels": 50_407_564,
             "old_voxels": 50_407_562, "added": 2, "deleted": 0,
-            "model_metadata": {"resolution": 1040, "sh_count": 9, "opacity_sh_count": 1}}
+            "model_metadata": {"resolution": 1024, "sh_count": 9, "opacity_sh_count": 1}}
         events = []
         optimizer = SimpleNamespace(clear_replay=lambda: None)
         replay = SimpleNamespace(clear=lambda: None)

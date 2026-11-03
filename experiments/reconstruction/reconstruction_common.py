@@ -10,7 +10,10 @@ import sys
 
 from reconstruction_color import reference_from_bitmap, validate_reference_compositing
 from reconstruction_sh_schedule import restore_sh_state, sh_model_metadata
-from reconstruction_background import require_layered_background
+from reconstruction_world_shell import (configure_world_shell_model, require_world_shell_native,
+                                        validate_world_shell_layout, world_shell_ray_maxt,
+                                        world_shell_metadata_layout, world_shell_metadata_geometry,
+                                        WORLD_SHELL_VERSION)
 
 from preview import (
     REPOSITORY, WORKSPACE, PreviewConfig, RenderConfig, RuntimeConfig, configure_drjit_threads,
@@ -93,8 +96,10 @@ def _colmap_views(prepared, render):
             near_clip=render.near_clip, far_clip=render.far_clip,
             entry_offset_fraction=render.entry_offset_fraction,
             ray_origin="near plane; camera_position + near_clip * unnormalized_direction")
-        view["camera"]["projective_unbounded"] = (
-            prepared["initialization"].get("scene_mapping") == "projective_shell")
+        if prepared["initialization"].get("scene_mapping") == "world_shell":
+            extent = 2 ** prepared["initialization"]["background_shell_levels"]
+            view["camera"].update(world_shell_root_min=[-extent] * 3,
+                                  world_shell_root_max=[extent] * 3)
     return prepared["views"]
 
 
@@ -118,27 +123,13 @@ def prepare_dataset(config, np, *, load_points=True):
     schedule = getattr(config, "schedule", None)
     start = schedule.start_resolution if schedule and schedule.enabled else config.model.grid_resolution
     target = schedule.target_resolution if schedule and schedule.enabled else start
-    options = {}
-    if mode == "legacy":
-        options["shell_layers"] = config.data.initialization["shell_layers"]
-    else:
-        options.update(scene_mode=mode, background_opacity=config.data.background_opacity)
-        saved = config.data.initialization
-        if mode == "unbounded" and (saved is None or saved.get("version") in (4, 5, 6)):
-            if config.data.background_layers is not None:
-                raise ValueError("New unbounded runs use data.background_final_layers / --background-final-layers; "
-                                 "background_layers is only for legacy v2/v3 initializations")
-            options["background_final_layers"] = config.data.background_final_layers
-        else:
-            if mode == "unbounded" and config.data.background_final_layers is not None:
-                raise ValueError("Saved v2/v3 initialization must keep its original background_layers; "
-                                 "start a new run to use background_final_layers")
-            options["background_layers"] = config.data.background_layers
-        if mode == "unbounded":
-            options["background_far_distance"] = config.data.background_far_distance
-            if saved is None or saved.get("version") == 6:
-                options["background_far_percentile"] = config.data.background_far_percentile
-                options["background_far_margin"] = config.data.background_far_margin
+    options = dict(scene_mode=mode, background_opacity=config.data.background_opacity,
+                   background_shell_levels=config.data.background_shell_levels,
+                   background_initial_resolution=config.data.background_initial_resolution,
+                   background_refinement=config.data.background_refinement,
+                   background_initial_leaf_budget=config.data.background_initial_leaf_budget,
+                   background_initial_pixel_threshold=config.data.background_initial_pixel_threshold,
+                   background_max_resolution=config.data.background_max_resolution)
     prepared = prepare_colmap(dataset, split=_colmap_split(config.data.cameras), images_dir=config.data.images,
         point_cloud=config.data.point_cloud, initialization=config.data.initialization,
         start_core_resolution=start, target_core_resolution=target,
@@ -151,38 +142,34 @@ def prepare_dataset(config, np, *, load_points=True):
 
 def initialize_model(config, dataset, mi, np, *, prepared=None):
     mapping = prepared["initialization"].get("scene_mapping") if prepared is not None else "bounded"
-    require_layered_background(mi.VoxelReconstruction, mapping,
-                              config.model.background_use_ellipsoid, config.model.background_layered_sampling)
+    if mapping not in ("bounded", "world_shell"):
+        raise ValueError("Compressed scene mappings are no longer supported")
+    if mapping == "world_shell":
+        require_world_shell_native(mi.VoxelReconstruction)
     if prepared is not None:
         if not hasattr(mi.VoxelReconstruction, "from_points"):
             raise RuntimeError("Rebuild this checkout: in-memory point-cloud initialization is missing")
-        mapping = prepared["initialization"].get("scene_mapping")
-        if mapping == "projective_shell" and not hasattr(mi.VoxelReconstruction, "set_scene_mapping"):
-            raise RuntimeError("Rebuild this checkout: projective scene traversal is missing")
-        if (mapping == "projective_shell" and not config.model.background_use_ellipsoid
-                and not hasattr(mi.VoxelReconstruction, "set_background_use_ellipsoid")):
-            raise RuntimeError("Rebuild this checkout: background geometry selection is missing")
         model = mi.VoxelReconstruction.from_points(
             np.ascontiguousarray(prepared["positions"], dtype=np.float32).reshape(-1),
             np.ascontiguousarray(prepared["colors"], dtype=np.float32).reshape(-1),
             prepared["resolution"], prepared["grid_min"], prepared["grid_max"],
             config.model.sh_count, config.model.opacity_sh_count, prepared["core_resolution"])
-        if mapping in ("radial_seed_shell", "projective_shell"):
+        if mapping == "world_shell":
             import drjit as dr
             from reconstruction_background import initialize_background_model
-            options = {"mapping": mapping} if mapping == "projective_shell" else {}
-            if mapping == "projective_shell" and not config.model.background_use_ellipsoid:
-                options["background_use_ellipsoid"] = False
-            if config.model.background_layered_sampling:
-                options["background_layered_sampling"] = True
-            if "background_far_distance" in prepared["initialization"]:
-                options["background_far_distance"] = prepared["initialization"]["background_far_distance"]
-            return initialize_background_model(model, mi, dr, np,
+            result = initialize_background_model(model, mi, dr, np,
                 opacity=prepared["initialization"]["background_opacity"],
-                refinement=prepared["initialization"].get("background_refinement"),
-                layers=prepared["initialization"].get("initial_background_layers",
-                                                    prepared["initialization"].get("background_layers")),
-                **options)
+                shell_levels=prepared["initialization"]["background_shell_levels"],
+                background_refinement=prepared["initialization"].get("background_refinement", "fixed"),
+                background_geometry=world_shell_metadata_geometry(prepared["initialization"]),
+                background_colors=prepared.get("background_colors"),
+                background_point_counts=prepared.get("background_point_counts"),
+                background_points=prepared.get("background_points"),
+                adaptive_background=prepared.get("adaptive_background"),
+                background_subdivision_level=prepared["initialization"].get("background_subdivision_level", 0))
+            if getattr(result, "background_refinement", "fixed") == "adaptive":
+                result.background_max_depth = config.data.background_max_resolution.bit_length() - 2
+            return result
         return model
     lo, hi = np.asarray(config.model.bounds_min), np.asarray(config.model.bounds_max)
     center, half = (lo + hi) / 2, (hi - lo) / 2 * config.model.bounds_padding
@@ -202,14 +189,13 @@ def load_views(dataset: Path, cameras_file: str, render: RenderConfig, np, *,
             raise ValueError("COLMAP views require the model's saved initialization metadata")
         if split is None:
             split = _colmap_split(cameras_file)
-        far_options = ({key: initialization[key] for key in (
-            "background_far_distance", "background_far_percentile", "background_far_margin")}
-            if initialization.get("version") == 6 else {})
         prepared = prepare_colmap(dataset, split=split, images_dir=data.images,
             initialization=initialization,
             start_core_resolution=initialization["start_core_resolution"],
-            target_core_resolution=initialization["target_core_resolution"],
-            shell_layers=initialization["shell_layers"], load_points=False, **far_options)
+            target_core_resolution=initialization["target_core_resolution"], load_points=False,
+            **{name: initialization[name] for name in (
+                "background_initial_leaf_budget", "background_initial_pixel_threshold",
+                "background_max_resolution") if name in initialization})
         return _colmap_views(prepared, render)
     document = json.loads((dataset / cameras_file).read_text(encoding="utf-8"))
     frames = document.get("frames", [])
@@ -328,7 +314,7 @@ def generate_ray_batch(render, camera, indices, offsets, mi, dr, *, prepared_cam
     direction = values["forward"] + horizontal * values["right"] + vertical * values["up"]
     ray = mi.Ray3f(values["position"] + render.near_clip * direction,
                   dr.normalize(direction))
-    ray.maxt = (float("inf") if camera.get("projective_unbounded", False) else
+    ray.maxt = (world_shell_ray_maxt(ray, camera, mi, dr) if "world_shell_root_min" in camera else
                 (render.far_clip - render.near_clip) * dr.norm(direction))
     return ray
 
@@ -386,62 +372,61 @@ def render_view(model, render, camera, spp, seed, chunk_size, mi, dr, np):
 
 def model_metadata(model) -> dict:
     metadata = {"resolution": int(model.resolution), "grid_min": list(model.grid_min),
-            "grid_max": list(model.grid_max), "sh_count": int(model.sh_count),
-            "opacity_sh_count": int(model.opacity_sh_count)}
+                "grid_max": list(model.grid_max), "sh_count": int(model.sh_count),
+                "opacity_sh_count": int(model.opacity_sh_count)}
     metadata.update(sh_model_metadata(model))
     core = int(getattr(model, "core_resolution", model.resolution))
     if core != metadata["resolution"]:
         metadata["core_resolution"] = core
     mapping = getattr(model, "scene_mapping", "bounded")
-    if mapping in ("radial_seed_shell", "projective_shell"):
-        metadata["scene_mapping"] = mapping
-        if (mapping == "projective_shell" and hasattr(model, "native_background_use_ellipsoid")
-                and not model.native_background_use_ellipsoid()):
-            metadata["background_use_ellipsoid"] = False
-        if (mapping == "projective_shell" and hasattr(model, "native_background_layered_sampling")
-                and model.native_background_layered_sampling()):
-            metadata["background_layered_sampling"] = True
-        if mapping == "projective_shell" and hasattr(model, "native_background_far_distance"):
-            distance = float(model.native_background_far_distance())
-            if distance:
-                metadata["background_far_distance"] = distance
-        if hasattr(model, "background_refinement"):
-            metadata["background_refinement"] = model.background_refinement
-            metadata["background_layers"] = int(model.background_layers)
+    if mapping not in ("bounded", "world_shell"):
+        raise ValueError("Compressed scene mappings are no longer supported")
+    levels = int(model.native_background_shell_levels()) if hasattr(model, "native_background_shell_levels") else 0
+    if levels or mapping == "world_shell":
+        require_world_shell_native(model)
+        subdivision = int(model.native_background_subdivision_level())
+        refinement = getattr(model, "background_refinement", "fixed")
+        geometry = "ellipsoid" if model.native_background_use_ellipsoid() else "occupied_cell"
+        world_shell_metadata_layout(dict(world_shell_version=WORLD_SHELL_VERSION,
+                                          background_refinement=refinement,
+                                          background_geometry=geometry,
+                                          background_subdivision_level=subdivision))
+        validate_world_shell_layout(core, levels, model.grid_min, model.grid_max, subdivision)
+        metadata.update(core_resolution=core, scene_mapping="world_shell",
+                        background_shell_levels=levels, background_refinement=refinement,
+                        background_geometry=geometry,
+                        background_subdivision_level=subdivision, world_shell_version=WORLD_SHELL_VERSION)
+        if refinement == "adaptive":
+            metadata["background_max_depth"] = int(getattr(model, "background_max_depth", 9))
     return metadata
 
 
 def restore_model(checkpoint, mi):
+    from reconstruction_checkpoint import _validate_model_metadata
     metadata = checkpoint["model_metadata"]
-    require_layered_background(mi.VoxelReconstruction, metadata.get("scene_mapping", "bounded"),
-                              metadata.get("background_use_ellipsoid", True),
-                              metadata.get("background_layered_sampling", False))
-    state = {key: (mi.UInt32(value) if key == "cell_indices" else mi.Float(value))
-             for key, value in checkpoint["model_state"].items()}
+    _validate_model_metadata(metadata)
+    mapping = metadata.get("scene_mapping", "bounded")
     options = ({"core_resolution": metadata["core_resolution"]} if "core_resolution" in metadata else {})
+    if mapping == "world_shell":
+        require_world_shell_native(mi.VoxelReconstruction)
+        options["background_shell_levels"] = metadata["background_shell_levels"]
+        refinement, subdivision = world_shell_metadata_layout(metadata)
+        options["background_subdivision_level"] = subdivision
+        geometry = world_shell_metadata_geometry(metadata)
+        options["background_use_ellipsoid"] = geometry == "ellipsoid"
+        options["background_adaptive"] = refinement == "adaptive"
+    state = {key: (mi.UInt64(value) if key == "cell_indices" else mi.Float(value))
+             for key, value in checkpoint["model_state"].items()}
     model = mi.VoxelReconstruction.from_state(metadata["resolution"], metadata["grid_min"],
         metadata["grid_max"], state, metadata["sh_count"], metadata["opacity_sh_count"], **options)
     restore_sh_state(model, metadata)
-    mapping = metadata.get("scene_mapping", "bounded")
-    if mapping in ("radial_seed_shell", "projective_shell"):
-        model.scene_mapping = mapping
-        if mapping == "projective_shell":
-            if not hasattr(model, "set_scene_mapping"):
-                raise RuntimeError("Rebuild this checkout: projective scene traversal is missing")
-            model.set_scene_mapping(mapping)
-            if not metadata.get("background_use_ellipsoid", True):
-                if not hasattr(model, "set_background_use_ellipsoid"):
-                    raise RuntimeError("Rebuild this checkout: background geometry selection is missing")
-                model.set_background_use_ellipsoid(False)
-            if metadata.get("background_layered_sampling", False):
-                model.set_background_layered_sampling(True)
-            if "background_far_distance" in metadata:
-                if not hasattr(model, "set_background_far_distance"):
-                    raise RuntimeError("Rebuild this checkout: finite projective background traversal is missing")
-                model.set_background_far_distance(metadata["background_far_distance"])
-        if "background_refinement" in metadata:
-            model.background_refinement = metadata["background_refinement"]
-            model.background_layers = metadata["background_layers"]
+    if mapping == "world_shell":
+        configure_world_shell_model(model, metadata["background_shell_levels"],
+                                    background_refinement=refinement,
+                                    background_geometry=geometry,
+                                    background_subdivision_level=subdivision)
+        if refinement == "adaptive":
+            model.background_max_depth = int(metadata.get("background_max_depth", 9))
     return model
 
 

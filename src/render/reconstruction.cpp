@@ -15,37 +15,6 @@ NAMESPACE_BEGIN(mitsuba)
 
 namespace {
 
-/// Stable row permutation, using the same small-bucket radix kernels as
-/// Dr.Jit's argsort(). No permutation or cell array crosses the device boundary.
-template <typename UInt> UInt reconstruction_cell_order(const UInt &cells) {
-    const size_t count = cells.size();
-    if (count <= 1)
-        return dr::arange<UInt>(count);
-    if constexpr (dr::is_jit_v<UInt>) {
-        using Index = dr::detached_t<UInt>;
-        Index ordinal = dr::detach<false>(cells), order = dr::arange<Index>(count);
-        constexpr uint32_t radix_bits = Index::Backend == JitBackend::LLVM ? 11u : 8u;
-        for (uint32_t shift = 0; shift < 32; shift += radix_bits) {
-            uint32_t bits = std::min(radix_bits, 32u - shift), buckets = 1u << bits;
-            Index digit = (ordinal >> shift) & (buckets - 1);
-            dr::eval(digit, ordinal, order);
-            auto *permutation = (uint32_t *) jit_malloc(Index::Backend, count * sizeof(uint32_t));
-            jit_block_mkperm(Index::Backend, digit.data(), uint32_t(count), uint32_t(count),
-                             buckets, permutation, nullptr);
-            Index perm = Index::map_(permutation, count, true);
-            ordinal = dr::gather<Index>(ordinal, perm);
-            order = dr::gather<Index>(order, perm);
-        }
-        return UInt(order);
-    } else {
-        std::vector<uint32_t> order(count);
-        std::iota(order.begin(), order.end(), 0u);
-        std::stable_sort(order.begin(), order.end(),
-            [&](uint32_t a, uint32_t b) { return cells.entry(a) < cells.entry(b); });
-        return dr::load<UInt>(order.data(), count);
-    }
-}
-
 /// Diagnostic-only barriers and nested history regions. The disabled path must
 /// neither change evaluation nor read a clock or alter the caller's JIT flags.
 template <bool IsJit> class ReconstructionStageProfiler {
@@ -165,14 +134,15 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     const float *positions, const float *colors, size_t point_count,
     uint32_t resolution, const std::array<float, 3> &grid_min,
     const std::array<float, 3> &grid_max, uint32_t sh_count,
-    uint32_t opacity_sh_count, uint32_t core_resolution)
+    uint32_t opacity_sh_count, uint32_t core_resolution, uint32_t background_shell_levels,
+    uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive)
     : m_resolution(resolution), m_core_resolution(core_resolution ? core_resolution : resolution),
       m_active_count(0), m_sh_count(sh_count), m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count),
       m_min(grid_min), m_max(grid_max) {
     if (resolution < 1 || resolution > max_grid_resolution ||
-        m_core_resolution > max_core_resolution || m_core_resolution > resolution)
-        Throw("VoxelReconstruction.from_points(): storage resolution must be in [1, 1040], "
-              "with core resolution in [1, 1024] not exceeding storage.");
+        m_core_resolution > max_core_resolution || m_core_resolution != resolution)
+        Throw("VoxelReconstruction.from_points(): core resolution must be in [1, 1024], "
+              "with core_resolution equal to resolution; compressed layouts are unsupported.");
     if (sh_count < 1 || sh_count > 16 || opacity_sh_count < 1 || opacity_sh_count > 16)
         Throw("VoxelReconstruction.from_points(): SH coefficient counts must be in [1, 16].");
     for (size_t axis = 0; axis < 3; ++axis) {
@@ -180,6 +150,13 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
             m_max[axis] <= m_min[axis])
             Throw("VoxelReconstruction.from_points(): grid bounds must be finite and increasing.");
         m_size[axis] = (m_max[axis] - m_min[axis]) / float(resolution);
+    }
+    m_background_subdivision_level = background_subdivision_level;
+    m_background_adaptive = background_adaptive;
+    m_background_use_ellipsoid = background_use_ellipsoid;
+    if (background_shell_levels) {
+        m_background_shell_levels = background_shell_levels;
+        m_scene_mapping = "world_shell";
     }
     initialize_seeds(reconstruction::load_points(positions, colors, point_count,
         {resolution, resolution, resolution}, m_min, m_size));
@@ -200,7 +177,7 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::initialize_seeds(
     const size_t n = m_active_count;
     const uint32_t sh_count = m_sh_count,
                    opacity_sh_count = m_opacity_sh_count;
-    std::vector<uint32_t> cells(n);
+    std::vector<uint64_t> cells(n);
     std::vector<float> centers(n * 3), scales(n * 3), rotations(n * 4),
         radiance(n * sh_count * 3, 0.f), opacity(n * opacity_sh_count, 0.f);
     constexpr float y00 = 0.28209479177387814f;
@@ -215,7 +192,7 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::initialize_seeds(
         for (size_t a = 0; a < 4; ++a)
             rotations[i * 4 + a] = seed.rotation[a];
     }
-    m_cells = dr::load<UIntBuffer>(cells.data(), cells.size());
+    m_cells = dr::load<CellBuffer>(cells.data(), cells.size());
     m_centers = dr::load<FloatBuffer>(centers.data(), centers.size());
     m_log_scales = dr::load<FloatBuffer>(scales.data(), scales.size());
     m_rotations = dr::load<FloatBuffer>(rotations.data(), rotations.size());
@@ -226,15 +203,16 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::initialize_seeds(
 
 MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     uint32_t resolution, const std::array<float, 3> &grid_min,
-    const std::array<float, 3> &grid_max, const UIntBuffer &cells,
+    const std::array<float, 3> &grid_max, const CellBuffer &cells,
     const std::map<std::string, FloatBuffer> &parameters,
-    uint32_t sh_count, uint32_t opacity_sh_count, uint32_t core_resolution)
+    uint32_t sh_count, uint32_t opacity_sh_count, uint32_t core_resolution, uint32_t background_shell_levels,
+    uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive)
     : m_resolution(resolution), m_core_resolution(core_resolution ? core_resolution : resolution),
       m_active_count((uint32_t) cells.size()),
       m_sh_count(sh_count), m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count),
       m_min(grid_min), m_max(grid_max) {
-    if (!resolution || resolution > max_grid_resolution ||
-        m_core_resolution > max_core_resolution || m_core_resolution > resolution ||
+    if (!resolution || resolution > max_grid_resolution || cells.size() > size_t(INT32_MAX) ||
+        m_core_resolution > max_core_resolution || m_core_resolution != resolution ||
         sh_count < 1 || sh_count > 16 || opacity_sh_count < 1 || opacity_sh_count > 16)
         Throw("VoxelReconstruction.from_state(): invalid grid, occupancy, or SH counts.");
     for (size_t a = 0; a < 3; ++a) {
@@ -242,11 +220,18 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
             Throw("VoxelReconstruction.from_state(): invalid bounds.");
         m_size[a] = (m_max[a] - m_min[a]) / float(resolution);
     }
+    m_background_subdivision_level = background_subdivision_level;
+    m_background_adaptive = background_adaptive;
+    m_background_use_ellipsoid = background_use_ellipsoid;
+    if (background_shell_levels) {
+        m_background_shell_levels = background_shell_levels;
+        m_scene_mapping = "world_shell";
+    }
     for (const auto *key : {"centers", "log_scales", "rotations", "radiance_sh", "opacity_sh"})
         if (parameters.find(key) == parameters.end())
             Throw("VoxelReconstruction.from_state(): missing %s.", key);
     if (!m_active_count) {
-        m_cells = dr::zeros<UIntBuffer>(0);
+        m_cells = dr::zeros<CellBuffer>(0);
         set_parameters(parameters);
         m_statistics = {{"restored_voxels", 0}};
         rebuild_octree();
@@ -275,8 +260,8 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::update_spatial_statistics(
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::rebuild_octree() {
     // Payload rows preserve parameter/Adam order, irrespective of Morton order.
     // Validation and sorting only touch occupied leaves, never resolution^3.
-    m_tree.build(m_cells, IntBuffer(dr::arange<UIntBuffer>(m_active_count)), m_resolution);
-    m_growth_tree.clear(m_resolution);
+    build_world_tree(m_tree, m_cells, IntBuffer(dr::arange<UIntBuffer>(m_active_count)));
+    m_growth_tree.clear(root_resolution());
     update_spatial_statistics();
     ++m_topology_revision;
 }
@@ -288,7 +273,7 @@ VoxelReconstruction<Float, Spectrum>::octree_boundary_times(
     Vector3f result;
     for (uint32_t axis = 0; axis < 3; ++axis) {
         Float face = Float(cell[axis]) + dr::select(step[axis] > 0, 1.f, 0.f);
-        Float plane = dr::fmadd(face, m_size[axis], m_min[axis]);
+        Float plane = dr::fmadd(face-float(core_offset()), tree_cell_size(axis), m_min[axis]);
         result[axis] = dr::select(step[axis] != 0,
             (plane - origin[axis]) * inv_d[axis], dr::Infinity<Float>);
     }
@@ -321,7 +306,7 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::advance_empty_block(
     Vector3i lo, hi, remaining;
     for (uint32_t axis = 0; axis < 3; ++axis) {
         lo[axis] = Int32((UInt32(cell[axis]) >> log_size) << log_size);
-        hi[axis] = dr::minimum(lo[axis] + size - 1, int(m_resolution) - 1);
+        hi[axis] = dr::minimum(lo[axis] + size - 1, int(root_resolution()) - 1);
         remaining[axis] = dr::select(step[axis] > 0, hi[axis] - cell[axis],
                            dr::select(step[axis] < 0, cell[axis] - lo[axis], 0));
     }
@@ -723,17 +708,13 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                     if (!group.geometry)
                         result = clean(result);
                     else if (centers) {
-                        Mask inherited=(m_scene_mapping=="projective_shell") && !projective_core_ids(ids,active);
-                        result = dr::clip(result,dr::select(inherited,dr::minimum(old,.01f),.01f),
-                            dr::select(inherited,dr::maximum(old,.99f),.99f));
+                        result = dr::clip(result,.01f,.99f);
                     }
                     else if (scales) {
-                        const float lower = std::max(m_size[component] * 1e-4f, 1e-8f);
-                        const float upper = std::max(m_size[component] * max_scale, lower);
-                        Float limit=dr::log(Float(upper));
-                        if (m_scene_mapping=="projective_shell")
-                            limit=dr::select(!projective_core_ids(ids,active),dr::maximum(limit,old),limit);
-                        result = dr::clip(clean(result), dr::log(Float(lower)), limit);
+                        Float size = leaf_size(ids, active)[component];
+                        Float lower = dr::maximum(size * 1e-4f, 1e-8f);
+                        Float upper = dr::maximum(size * max_scale, lower);
+                        result = dr::clip(clean(result), dr::log(lower), dr::log(upper));
                     }
                     return result;
                 };
@@ -778,10 +759,9 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                             UInt32 input_row = compact_indices ? s.ordinal : ids;
                             if (compact_indices)
                                 active &= dr::gather<UInt32>(validity, input_row, active) > 0u;
-                            // Geometry is fixed for voxel backgrounds, including
-                            // externally supplied gradients and retained moments.
-                            if (group.geometry && !m_background_use_ellipsoid)
-                                active &= projective_core_ids(ids, active);
+                            // Legacy occupied-cell backgrounds retain fixed geometry.
+                            if (group.geometry && m_background_shell_levels && !m_background_use_ellipsoid)
+                                active &= core_ids(ids, active);
                             auto clocks = clock_biases(clock_target, ids, active);
                             Float scale = row_scale(input_row, active);
                             std::array<Float, 3> rotation_delta;
@@ -839,8 +819,8 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                             UInt32 input_row = compact_indices ? s.ordinal : ids;
                             if (compact_indices)
                                 active &= dr::gather<UInt32>(validity, input_row, active) > 0u;
-                            if (group.geometry && !m_background_use_ellipsoid)
-                                active &= projective_core_ids(ids, active);
+                            if (group.geometry && m_background_shell_levels && !m_background_use_ellipsoid)
+                                active &= core_ids(ids, active);
                             auto clocks = clock_biases(scalar_clock.size() ? scalar_clock : s.clock, ids, active);
                             Float scale = row_scale(input_row, active);
                             std::array<Float, 3> rotation_delta;
@@ -967,19 +947,20 @@ VoxelReconstruction<Float, Spectrum>::optimizer_update_scope_begin(
 
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::clear_growth_candidates() {
     if (m_growth_count) {
-        m_growth_tree.clear(m_resolution);
+        m_growth_tree.clear(root_resolution());
         update_spatial_statistics();
         ++m_topology_revision;
     }
     m_growth_count = 0;
-    m_growth_cells = m_growth_next = dr::zeros<UIntBuffer>(1);
+    m_growth_cells = dr::zeros<CellBuffer>(1);
+    m_growth_next = dr::zeros<UIntBuffer>(1);
     m_growth_centers = m_growth_log_scales = m_growth_rotations =
         m_growth_radiance = m_growth_opacity = dr::zeros<FloatBuffer>(1);
 }
 
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_growth_candidates(
-    const UIntBuffer &cells, const std::map<std::string, FloatBuffer> &parameters) {
-    const size_t count = cells.size();
+    const CellBuffer &cell_indices, const std::map<std::string, FloatBuffer> &parameters) {
+    const size_t count = cell_indices.size();
     if (count > size_t(INT32_MAX) - 1)
         Throw("VoxelReconstruction.set_growth_candidates(): too many candidates.");
     const std::map<std::string, size_t> sizes = {
@@ -999,18 +980,17 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_growth_candidates(
         Throw("VoxelReconstruction.set_growth_candidates(): parameters must be finite.");
     // Check the complete transaction before restoring/replacing the old overlay.
     // Negative entries are hypothetical cells and remain genuinely unoccupied.
-    const size_t total = size_t(m_resolution)*m_resolution*m_resolution;
     // A target cell may have several parent-specific shapes and appearances.
     // Keep all original row IDs, chaining siblings in input order. Only the
     // unique cell heads are scattered into the overlay, avoiding scatter races.
-    if (count && !dr::slice(dr::all(cells < uint32_t(total))))
-        Throw("VoxelReconstruction.set_growth_candidates(): cells must be in bounds.");
+    validate_cells(cell_indices);
+    CellBuffer cells(cell_indices);
     if (count && m_active_count) {
         UIntBuffer node(m_tree.root), level(m_tree.depth);
         dr::uint64_array_t<UIntBuffer> anchor(0);
+        auto decoded=decode_cells(cells);
         auto [ids, unused_skip] = m_tree.template lookup<UIntBuffer, IntBuffer>(
-            IntBuffer(cells % m_resolution), IntBuffer((cells / m_resolution) % m_resolution),
-            IntBuffer(cells / (m_resolution * m_resolution)), node, level, anchor,
+            IntBuffer(decoded[0]), IntBuffer(decoded[1]), IntBuffer(decoded[2]), node, level, anchor,
             dr::mask_t<UIntBuffer>(true));
         auto occupied = ids >= 0;
         if (dr::slice(dr::any(occupied)))
@@ -1018,23 +998,23 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_growth_candidates(
     }
     // Keep independent buffer references alive even when the caller reuses its
     // dictionary. All accesses are detached, and no gradients target proposals.
-    UIntBuffer new_cells = dr::zeros<UIntBuffer>(1), new_heads = dr::zeros<UIntBuffer>(1),
-               new_next = dr::zeros<UIntBuffer>(1);
+    CellBuffer new_cells = dr::zeros<CellBuffer>(1);
+    UIntBuffer new_heads = dr::zeros<UIntBuffer>(1), new_next = dr::zeros<UIntBuffer>(1);
     if (count) {
         UIntBuffer rows = dr::arange<UIntBuffer>(count),
-                   order = reconstruction_cell_order(cells),
-                   ordered_cells = dr::gather<UIntBuffer>(cells, order),
-                   previous_cell = dr::gather<UIntBuffer>(ordered_cells, rows - 1, rows > 0);
+                   order = reconstruction_tree_detail::order<UIntBuffer>(cells,64u);
+        CellBuffer ordered_cells = dr::gather<CellBuffer>(cells, order),
+                   previous_cell = dr::gather<CellBuffer>(ordered_cells, rows - 1, rows > 0);
         auto group_start = (rows == 0) | (ordered_cells != previous_cell);
         // Scatter heads into ORIGINAL row order before compacting: even the
         // order of unique cells stays identical to the previous CPU builder.
         UIntBuffer head_flags = dr::zeros<UIntBuffer>(count);
         dr::scatter(head_flags, UIntBuffer(group_start), order);
         new_heads = dr::compress(head_flags != 0);
-        new_cells = dr::gather<UIntBuffer>(cells, new_heads);
+        new_cells = dr::gather<CellBuffer>(cells, new_heads);
         auto has_following = rows + 1 < uint32_t(count);
-        UIntBuffer following_cell = dr::gather<UIntBuffer>(ordered_cells, rows + 1, has_following),
-                   following_row = dr::gather<UIntBuffer>(order, rows + 1, has_following);
+        CellBuffer following_cell = dr::gather<CellBuffer>(ordered_cells, rows + 1, has_following);
+        UIntBuffer following_row = dr::gather<UIntBuffer>(order, rows + 1, has_following);
         new_next = dr::empty<UIntBuffer>(count);
         dr::scatter(new_next,
                     dr::select(has_following & (following_cell == ordered_cells),
@@ -1045,11 +1025,25 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_growth_candidates(
     // failed transaction must leave both the old candidates and replay intact.
     SpatialTree new_tree;
     if (count)
-        new_tree.build(new_cells, -2 - IntBuffer(new_heads), m_resolution);
+        build_world_tree(new_tree, CellBuffer(new_cells), -2 - IntBuffer(new_heads));
+    if (count && m_active_count && m_background_shell_levels) {
+        // The first lookup rejects a proposal contained by an existing leaf.
+        // This converse check rejects a coarse proposal containing a finer leaf
+        // away from its minimum corner. Dyadic overlap always has one of these
+        // two containment directions; no corner sampling is sufficient.
+        auto decoded=decode_cells(m_cells);
+        UIntBuffer node(new_tree.root), level(new_tree.depth);
+        dr::uint64_array_t<UIntBuffer> anchor(0);
+        auto [ids, unused_skip]=new_tree.template lookup<UIntBuffer,IntBuffer>(
+            IntBuffer(decoded[0]),IntBuffer(decoded[1]),IntBuffer(decoded[2]),
+            node,level,anchor,dr::mask_t<UIntBuffer>(true));
+        if(dr::slice(dr::any(ids<=-2)))
+            Throw("VoxelReconstruction.set_growth_candidates(): target overlaps an occupied descendant.");
+    }
     clear_growth_candidates();
     if (!count)
         return;
-    m_growth_cells = std::move(new_cells);
+    m_growth_cells = std::move(cells);
     m_growth_next = std::move(new_next);
     m_growth_centers = dr::detach(parameters.at("centers"));
     m_growth_log_scales = dr::detach(parameters.at("log_scales"));
@@ -1099,340 +1093,266 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_active_sh_count(uint32
 }
 
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_scene_mapping(const std::string &mapping) {
-    if (mapping != "bounded" && mapping != "radial_seed_shell" && mapping != "projective_shell")
-        Throw("VoxelReconstruction: unknown scene mapping '%s'.", mapping.c_str());
-    if (m_background_layered_sampling && mapping != "projective_shell")
-        Throw("VoxelReconstruction: disable layered background sampling before changing the projective mapping.");
-    if (mapping == "projective_shell") {
-        if (m_resolution <= m_core_resolution || (m_resolution-m_core_resolution)%2)
-            Throw("VoxelReconstruction: projective mapping requires a symmetric exterior shell.");
-        for (uint32_t j=1;j<3;++j)
-            if (std::abs(m_size[j]-m_size[0]) > 1e-5f*m_size[0])
-                Throw("VoxelReconstruction: projective mapping requires cubic cells.");
-    }
-    if (m_scene_mapping != mapping) {
-        m_scene_mapping = mapping;
-        ++m_topology_revision;
+    if (mapping == "bounded") {
+        set_world_shells(0);
+    } else if (mapping == "world_shell") {
+        if (!m_background_shell_levels)
+            Throw("VoxelReconstruction: set world shell levels before selecting world_shell mapping.");
+    } else {
+        Throw("VoxelReconstruction: unsupported scene mapping '%s'; compressed background checkpoints are not compatible with world-space shells.", mapping.c_str());
     }
 }
 
-MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_background_far_distance(float distance) {
-    if (!std::isfinite(distance) || (distance != 0.f && distance <= 1.f))
-        Throw("VoxelReconstruction: background far distance must be zero (legacy infinity) or finite and greater than one.");
-    if (m_background_far_distance != distance) {
-        m_background_far_distance = distance;
-        ++m_topology_revision;
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_world_shells(
+    uint32_t levels, uint32_t subdivision_level, bool adaptive) {
+    if (levels == m_background_shell_levels && subdivision_level == m_background_subdivision_level &&
+        adaptive == m_background_adaptive)
+        return;
+    const uint32_t previous = m_background_shell_levels,
+                   previous_subdivision = m_background_subdivision_level;
+    const bool previous_adaptive = m_background_adaptive;
+    m_background_shell_levels = levels;
+    m_background_subdivision_level = subdivision_level;
+    m_background_adaptive = adaptive;
+    try {
+        SpatialTree replacement;
+        build_world_tree(replacement, m_cells, IntBuffer(dr::arange<UIntBuffer>(m_active_count)));
+        m_tree = std::move(replacement);
+    } catch (...) {
+        m_background_shell_levels = previous;
+        m_background_subdivision_level = previous_subdivision;
+        m_background_adaptive = previous_adaptive;
+        throw;
     }
+    m_scene_mapping = levels ? "world_shell" : "bounded";
+    clear_growth_candidates();
+    m_growth_tree.clear(root_resolution());
+    update_spatial_statistics();
+    ++m_topology_revision;
 }
 
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_background_use_ellipsoid(bool enabled) {
-    if (enabled && m_background_layered_sampling)
-        Throw("VoxelReconstruction: disable layered background sampling before enabling background ellipsoids.");
     if (m_background_use_ellipsoid != enabled) {
         m_background_use_ellipsoid = enabled;
+        // Frozen render/gradient/Adam functions capture this semantic choice.
         ++m_topology_revision;
     }
 }
 
-MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_background_layered_sampling(bool enabled) {
-    if (enabled && (m_scene_mapping != "projective_shell" || m_background_use_ellipsoid))
-        Throw("VoxelReconstruction: layered background sampling requires projective mapping and disabled background ellipsoids.");
-    if (enabled && (m_resolution-m_core_resolution)/2 >= 32u)
-        Throw("VoxelReconstruction: layered background sampling supports at most 31 layers.");
-    if (m_background_layered_sampling != enabled) {
-        m_background_layered_sampling = enabled;
-        ++m_topology_revision;
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::build_world_tree(
+    SpatialTree &tree, const CellBuffer &cells, const IntBuffer &payload) const {
+    if (!m_background_shell_levels) {
+        if (m_background_subdivision_level || m_background_adaptive)
+            Throw("VoxelReconstruction: background subdivision requires world shells.");
+        const uint64_t core_count = uint64_t(m_resolution)*m_resolution*m_resolution;
+        if (cells.size() && !dr::slice(dr::all(cells < core_count)))
+            Throw("VoxelReconstruction: invalid bounded cell ID.");
+        tree.build(UIntBuffer(cells), payload, m_resolution);
+        return;
     }
+    if (m_background_shell_levels > 10 || m_resolution < 2 ||
+        (m_resolution & (m_resolution - 1)) || m_core_resolution != m_resolution)
+        Throw("VoxelReconstruction: world shells require 1..10 levels and a power-of-two core resolution in [2, 1024].");
+    for (uint32_t j=1;j<3;++j)
+        if (std::abs(m_size[j]-m_size[0]) > 1e-5f*m_size[0])
+            Throw("VoxelReconstruction: world shells require a cubic core.");
+    for (uint32_t j=0;j<3;++j)
+        if (!std::isfinite(m_size[j]) || !std::isfinite(root_min(j)) || !std::isfinite(root_max(j)))
+            Throw("VoxelReconstruction: world-shell root bounds must be finite.");
+    uint32_t core_log=0;
+    while ((1u<<core_log)<m_resolution) ++core_log;
+    if (m_background_subdivision_level > (m_background_adaptive ? 9u : std::min(core_log-1,9u)))
+        Throw("VoxelReconstruction: background subdivision must not exceed min(log2(core_resolution)-1, 9).");
+    if (cells.size() > size_t(INT32_MAX))
+        Throw("VoxelReconstruction: parameter rows exceed native index capacity.");
+    if (!cells.size()) {
+        tree.clear(root_resolution());
+        return;
+    }
+    validate_cells(cells);
+    auto decoded = decode_cells(cells);
+    tree.build_mixed(UIntBuffer(decoded[0]),UIntBuffer(decoded[1]),UIntBuffer(decoded[2]),
+                     UIntBuffer(decoded[3]),payload,root_resolution());
 }
 
-MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::ProjectiveSegment
-VoxelReconstruction<Float, Spectrum>::next_projective_segment(const Point3f &origin,
-    const Vector3f &direction, const Float &maxt, const UInt32 &visited) const {
-    const float half = .5f*m_size[0]*m_core_resolution;
-    const float physical_width = float(m_resolution-m_core_resolution)/m_core_resolution;
-    const float width = m_background_far_distance == 0.f ? physical_width :
-        physical_width*(m_background_far_distance/(m_background_far_distance-1.f));
-    Point3f center(.5f*(m_min[0]+m_max[0]),.5f*(m_min[1]+m_max[1]),.5f*(m_min[2]+m_max[2]));
-    Vector3f o=(origin-center)/half, d=direction/half;
-    ProjectiveSegment best{Mask(false),origin,direction,Float(0.f),Float(0.f),
-        Float(0.f),Float(1.f),Float(0.f),Float(1.f),visited,UInt32(0)};
-    Float best_start=dr::Infinity<Float>;
-    // Each region is convex. Clip seven fixed sets of linear inequalities;
-    // select the next interval in world-distance order, without ray marching.
-    for (uint32_t region=0;region<(m_background_layered_sampling ? 1u : 7u);++region) {
-        Float lo(0.f), hi=maxt;
-        Mask valid=(visited & (1u<<region))==0u;
-        auto clip=[&](const Float &a,const Float &b,bool strict_parallel=false) {
-            Mask parallel=b==0.f;
-            valid &= !parallel | (strict_parallel ? a>0.f : a>=0.f);
-            Float crossing=-a/dr::select(parallel,1.f,b);
-            lo=dr::maximum(lo,dr::select(b>0.f,crossing,-dr::Infinity<Float>));
-            hi=dr::minimum(hi,dr::select(b<0.f,crossing, dr::Infinity<Float>));
-        };
-        uint32_t axis=region ? (region-1)/2 : 0;
-        float sign=region && ((region-1)%2) ? -1.f : 1.f;
-        if (!region) {
-            for (uint32_t j=0;j<3;++j) { clip(1.f-o[j],-d[j]);clip(1.f+o[j],d[j]); }
-        } else {
-            clip(sign*o[axis]-1.f,sign*d[axis],true);
-            if (m_background_far_distance != 0.f)
-                clip(m_background_far_distance-sign*o[axis],-sign*d[axis]);
-            for (uint32_t j=0;j<3;++j) if (j!=axis) {
-                // Coplanar ties belong to the lower-numbered dominant axis.
-                clip(sign*o[axis]-o[j],sign*d[axis]-d[j],j<axis);
-                clip(sign*o[axis]+o[j],sign*d[axis]+d[j],j<axis);
-            }
-        }
-        valid &= hi>lo;
-        Mask choose=valid & (lo<best_start);
-        Float start=dr::select(valid,lo,0.f), finish=dr::select(valid,hi,0.f);
-        Point3f mapped_origin=origin;
-        Vector3f mapped_direction=direction;
-        Float mapped_entry=start,mapped_exit=finish,h_start(1.f),h_rate(0.f),speed(1.f);
-        if (region) {
-            Vector3f p=o+start*d;
-            h_start=sign*p[axis];h_rate=sign*d[axis];
-            Float safe_h=dr::select(valid,h_start,1.f);
-            Vector3f q=p/safe_h;
-            q[axis]=m_background_far_distance == 0.f ? sign*(1.f+width-width/safe_h) :
-                sign*(1.f+width*((safe_h-1.f)/safe_h));
-            mapped_origin=center+half*q;
-            Vector3f v=(sign*o[axis])*d-o*h_rate;
-            v[axis]=width*d[axis];
-            speed=half*dr::norm(v);
-            mapped_direction=v/dr::maximum(dr::norm(v),1e-30f);
-            Float delta=dr::select(dr::isfinite(finish),finish-start,0.f);
-            Float h_end=h_start+delta*h_rate;
-            mapped_exit=dr::select(dr::isfinite(finish),
-                speed*delta/(safe_h*dr::maximum(h_end,1e-30f)),
-                speed/(safe_h*dr::maximum(h_rate,1e-30f)));
-            mapped_entry=0.f;
-        }
-        best.valid |= choose;
-        best.origin=dr::select(choose,mapped_origin,best.origin);
-        best.direction=dr::select(choose,mapped_direction,best.direction);
-        best.entry=dr::select(choose,mapped_entry,best.entry);
-        best.exit=dr::select(choose,mapped_exit,best.exit);
-        best.world_entry=dr::select(choose,start,best.world_entry);
-        best.h_start=dr::select(choose,h_start,best.h_start);
-        best.h_rate=dr::select(choose,h_rate,best.h_rate);
-        best.speed=dr::select(choose,speed,best.speed);
-        best.chart=dr::select(choose,region,best.chart);
-        best_start=dr::select(choose,lo,best_start);
-    }
-    best.visited=visited | dr::select(best.valid,UInt32(1)<<best.chart,UInt32(0));
-    if (m_background_layered_sampling) {
-        const uint32_t layers=(m_resolution-m_core_resolution)/2;
-        // Bit zero owns the core interval. Every remaining bit owns a radial
-        // layer, independently of the six faces and of cell occupancy.
-        // A layer is consumed even when its selected cell is absent: deleting
-        // a sample must never expose an alternative cell in the same layer.
-        const double inverse_span=m_background_far_distance==0.f ? 1. :
-            1.-1./double(m_background_far_distance);
-        for (uint32_t layer=0;layer<layers;++layer) {
-            const float u=(float(layer)+.5f)/float(layers);
-            const float h=float(1./(1.-double(u)*inverse_span));
-            Float lo=-dr::Infinity<Float>, hi=dr::Infinity<Float>;
-            UInt32 chart(0);
-            Mask valid=(visited & (1u<<(layer+1u)))==0u;
-            for (uint32_t j=0;j<3;++j) {
-                Mask parallel=d[j]==0.f;
-                valid &= !parallel | (dr::abs(o[j])<=h);
-                Float inverse=dr::rcp(dr::select(parallel,1.f,d[j]));
-                Float a=(-h-o[j])*inverse,b=(h-o[j])*inverse;
-                Float near=dr::select(parallel,-dr::Infinity<Float>,dr::minimum(a,b));
-                Float far=dr::select(parallel,dr::Infinity<Float>,dr::maximum(a,b));
-                // Strict replacement gives x/y/z priority at tied cube edges.
-                chart=dr::select(far<hi,UInt32(1u+2u*j)+dr::select(d[j]<0.f,1u,0u),chart);
-                lo=dr::maximum(lo,near);
-                hi=dr::minimum(hi,far);
-            }
-            // Only the outgoing intersection is represented, including for
-            // an external ray. Near-side shell occlusion is intentionally not
-            // part of this once-per-layer background parameterization.
-            valid &= (hi>lo)&(hi>=0.f)&(hi<=maxt)&dr::isfinite(hi)&(chart>0u);
-            Mask choose=valid&(hi<best_start);
-            Float t=dr::select(valid,hi,0.f);
-            Vector3f q=dr::clip((o+t*d)/h,-1.f,1.f);
-            for (uint32_t j=0;j<3;++j)
-                q[j]=dr::select((chart-1u)/2u==j,
-                    dr::select((chart&1u)!=0u,1.f,-1.f)*(1.f+physical_width*u),q[j]);
-            best.valid |= choose;
-            best.origin=dr::select(choose,center+half*q,best.origin);
-            // A sampled event has no DDA extent. Its exact cell is queried
-            // once and traversal immediately selects the following event.
-            best.direction=dr::select(choose,Vector3f(0.f),best.direction);
-            best.entry=dr::select(choose,0.f,best.entry);
-            best.exit=dr::select(choose,0.f,best.exit);
-            best.world_entry=dr::select(choose,t,best.world_entry);
-            best.h_start=dr::select(choose,h,best.h_start);
-            best.h_rate=dr::select(choose,0.f,best.h_rate);
-            best.speed=dr::select(choose,1.f,best.speed);
-            best.chart=dr::select(choose,chart,best.chart);
-            best.visited=dr::select(choose,visited | UInt32(1u<<(layer+1u)),best.visited);
-            best_start=dr::select(choose,t,best_start);
-        }
-    }
-    return best;
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::validate_cells(const CellBuffer &cells) const {
+    const uint64_t core_count = uint64_t(m_resolution)*m_resolution*m_resolution;
+    const uint64_t descendants = uint64_t(1) << (3u*m_background_subdivision_level);
+    const uint64_t legacy_limit = core_count + uint64_t(56)*m_background_shell_levels*descendants;
+    auto tagged = (cells >> 63u) != 0u;
+    UIntBuffer path(cells), coarse((cells >> 32u) & uint64_t(0x7fffffffu));
+    UIntBuffer top = 31u-dr::lzcnt(dr::maximum(path,UIntBuffer(1u)));
+    auto valid_tag = m_background_adaptive && m_background_shell_levels ?
+        (path != 0u) & (top <= 27u) & ((top % 3u) == 0u) &
+        (coarse < 56u*m_background_shell_levels) : dr::mask_t<UIntBuffer>(false);
+    if (cells.size() && !dr::slice(dr::all(dr::select(tagged,valid_tag,cells < legacy_limit))))
+        Throw("VoxelReconstruction: invalid adaptive or legacy world-shell cell address.");
 }
 
-MI_VARIANT void VoxelReconstruction<Float, Spectrum>::initialize_projective_segment(
-    const ProjectiveSegment &segment, Vector3i &cell, Vector3f &next, Float &entry,
-    float entry_offset_fraction, bool use_octree) const {
-    // Nudge in local cell units, never by an infinite world far-plane distance.
-    entry=dr::minimum(segment.exit,segment.entry+entry_offset_fraction*m_size[0]);
-    Point3f point=segment.origin+segment.direction*entry;
-    Vector3i step;
-    Vector3f inv=dr::rcp(dr::select(segment.direction!=0.f,segment.direction,Vector3f(1.f)));
-    for (uint32_t j=0;j<3;++j) {
-        Float position=(point[j]-m_min[j])/m_size[j];
-        position=dr::select(dr::isfinite(position),position,0.f);
-        Float floor=dr::floor(position);
-        // A segment starts on its outgoing side of an exact grid boundary.
-        floor-=dr::select((segment.direction[j]<0.f)&(position==floor),1.f,0.f);
-        const uint32_t layer=(m_resolution-m_core_resolution)/2;
-        Mask normal=(segment.chart>0u)&((segment.chart-1u)/2u==j);
-        Mask positive=(segment.chart&1u)!=0u;
-        Float lower=dr::select(normal,dr::select(positive,float(layer+m_core_resolution),0.f),float(layer));
-        Float upper=dr::select(normal,dr::select(positive,float(m_resolution-1),float(layer-1)),float(layer+m_core_resolution-1));
-        cell[j]=Int32(dr::clip(floor,lower,upper));
-        step[j]=dr::select(segment.direction[j]>0.f,1,dr::select(segment.direction[j]<0.f,-1,0));
-        Float boundary=m_min[j]+(Float(cell[j])+dr::select(step[j]>0,1.f,0.f))*m_size[j];
-        next[j]=dr::maximum(entry,dr::select(step[j]==0,dr::Infinity<Float>,
-            (boundary-segment.origin[j])*inv[j]));
+MI_VARIANT template <typename Cell>
+dr::uint32_array_t<Cell> VoxelReconstruction<Float, Spectrum>::cell_log_size(const Cell &cells) const {
+    using U=dr::uint32_array_t<Cell>;
+    if (!m_background_shell_levels) return U(0u);
+    const uint64_t core_count=uint64_t(m_resolution)*m_resolution*m_resolution;
+    const uint64_t descendants=uint64_t(1)<<(3u*m_background_subdivision_level);
+    auto tagged=(cells>>63u)!=0u, outside=cells>=core_count;
+    U path(cells);
+    U depth=(31u-dr::lzcnt(dr::maximum(path,U(1u))))/3u;
+    U coarse(dr::select(tagged,(cells>>32u)&uint64_t(0x7fffffffu),
+        dr::select(outside,cells-core_count,Cell(uint64_t(0)))/descendants));
+    uint32_t tree_log=0, core_log=0;
+    while ((1u<<tree_log)<tree_core_resolution()) ++tree_log;
+    while ((1u<<core_log)<m_resolution) ++core_log;
+    return dr::select(outside,coarse/56u+tree_log-1u-
+        dr::select(tagged,depth,U(m_background_subdivision_level)),U(tree_log-core_log));
+}
+
+MI_VARIANT template <typename Cell>
+std::array<dr::uint32_array_t<Cell>,4> VoxelReconstruction<Float, Spectrum>::decode_cells(const Cell &cells) const {
+    using U=dr::uint32_array_t<Cell>;
+    if (!m_background_shell_levels) {
+        U core(cells);
+        return {core%m_resolution,(core/m_resolution)%m_resolution,
+                core/(m_resolution*m_resolution),U(0u)};
     }
-    if (use_octree)
-        next=dr::maximum(entry,octree_boundary_times(cell,step,segment.origin,inv));
+    const uint64_t core_count=uint64_t(m_resolution)*m_resolution*m_resolution;
+    const uint64_t descendants=uint64_t(1)<<(3u*m_background_subdivision_level);
+    auto outside=cells>=core_count, tagged=(cells>>63u)!=0u;
+    Cell address=dr::select(outside,cells-core_count,Cell(uint64_t(0)));
+    U path(cells), depth=(31u-dr::lzcnt(dr::maximum(path,U(1u))))/3u;
+    U subdivision=dr::select(tagged,depth,U(m_background_subdivision_level));
+    U coarse(dr::select(tagged,(cells>>32u)&uint64_t(0x7fffffffu),address/descendants));
+    U morton=dr::select(tagged,path^(U(1u)<<(3u*depth)),U(address%descendants));
+    U shell=coarse/56u, flat=coarse%56u;
+    for (uint32_t hole:{21u,22u,25u,26u,37u,38u,41u,42u}) flat+=U(flat>=hole);
+    uint32_t tree_log=0;
+    while ((1u<<tree_log)<tree_core_resolution()) ++tree_log;
+    U log=cell_log_size(cells), block=U(1u)<<log;
+    U coarse_block=U(1u)<<(shell+tree_log-1u);
+    U low=(U(root_resolution())-(U(tree_core_resolution())<<(shell+1u)))/2u;
+    U core(dr::select(outside,Cell(uint64_t(0)),cells));
+    U core_xyz[3]={core%m_resolution,(core/m_resolution)%m_resolution,core/(m_resolution*m_resolution)};
+    std::array<U,4> result;
+    for(uint32_t axis=0;axis<3;++axis) {
+        U child(0u);
+        for(uint32_t bit=0;bit<9;++bit)
+            child|=dr::select(bit<subdivision,((morton>>(3u*bit+axis))&1u)<<bit,U(0u));
+        result[axis]=dr::select(outside,low+((flat>>(2u*axis))&3u)*coarse_block+child*block,
+            core_xyz[axis]*(tree_core_resolution()/m_resolution)+core_offset());
+    }
+    result[3]=log;
+    return result;
 }
 
 MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
-VoxelReconstruction<Float, Spectrum>::projective_cell_inside(const Vector3i &cell,const UInt32 &chart) const {
-    const int layer=int((m_resolution-m_core_resolution)/2);
-    Mask inside(true);
-    for (uint32_t j=0;j<3;++j) {
-        Mask normal=(chart>0u)&((chart-1u)/2u==j),positive=(chart&1u)!=0u;
-        Int32 lower=dr::select(normal,dr::select(positive,layer+int(m_core_resolution),0),layer);
-        Int32 upper=dr::select(normal,dr::select(positive,int(m_resolution),layer),layer+int(m_core_resolution));
-        inside &= (cell[j]>=lower)&(cell[j]<upper);
-    }
-    return inside;
+VoxelReconstruction<Float, Spectrum>::core_ids(const UInt32 &id, const Mask &active) const {
+    if (!m_background_shell_levels) return active;
+    return active & (dr::gather<CellIndex>(m_cells,id,active) <
+                     uint64_t(m_resolution)*m_resolution*m_resolution);
 }
 
-MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
-VoxelReconstruction<Float, Spectrum>::projective_background_cell_has_extent(
-    const Vector3i &cell, const ProjectiveSegment &segment, const Point3f &origin,
-    const Vector3f &direction, const Float &maxt, const Mask &active) const {
-    // The mapped DDA endpoint and a tangent grid crossing can differ by one
-    // rounding unit even when both represent world infinity. Test the original
-    // linear cell preimage as well: no tolerance may discard a real short hit.
-    return dr::if_stmt(dr::make_tuple(cell, segment, origin, direction, maxt, active), active,
-        [this](const Vector3i &cell,const ProjectiveSegment &segment,const Point3f &origin,
-               const Vector3f &direction,const Float &maxt,const Mask &active) -> Mask {
-            const float half = .5f*m_size[0]*m_core_resolution;
-            const float physical_width = float(m_resolution-m_core_resolution)/m_core_resolution;
-            const float width = m_background_far_distance == 0.f ? physical_width :
-                physical_width*(m_background_far_distance/(m_background_far_distance-1.f));
-            const uint32_t layer = (m_resolution-m_core_resolution)/2;
-            Point3f center(.5f*(m_min[0]+m_max[0]),.5f*(m_min[1]+m_max[1]),.5f*(m_min[2]+m_max[2]));
-            // Clip local world distance from this chart's entry. Absolute t
-            // would round distinct thin-shell boundaries to the same value.
-            Vector3f d=direction/half;
-            Vector3f o=(origin-center)/half+segment.world_entry*d;
-            const UInt32 &chart=segment.chart;
-            Mask positive=(chart&1u)!=0u;
-            const Float &h=segment.h_start, &dh=segment.h_rate;
-            Float lo(0.f), hi=maxt-segment.world_entry;
-            Mask valid=active&(chart>0u);
-            auto clip=[&](const Float &a,const Float &b,const Mask &strict_parallel) {
-                Mask parallel=b==0.f;
-                valid &= !parallel | dr::select(strict_parallel,a>0.f,a>=0.f);
-                Float crossing=-a/dr::select(parallel,1.f,b);
-                lo=dr::maximum(lo,dr::select(b>0.f,crossing,-dr::Infinity<Float>));
-                hi=dr::minimum(hi,dr::select(b<0.f,crossing, dr::Infinity<Float>));
-            };
-            for (uint32_t j=0;j<3;++j) {
-                Mask normal=(chart-1u)/2u==j;
-                Float lower=(m_min[j]+Float(cell[j])*m_size[j]-center[j])/half;
-                Float upper=(m_min[j]+Float(cell[j]+1)*m_size[j]-center[j])/half;
-                Float radial_lower=dr::select(positive,lower,-upper);
-                Float radial_upper=dr::select(positive,upper,-lower);
-                // q = 1 + width*(h-1)/h. Keep the halfspaces in this
-                // factored form instead of rounding an explicit h boundary.
-                Float lower_fraction=(radial_lower-1.f)/width;
-                Float upper_fraction=(radial_upper-1.f)/width;
-                Mask outer=dr::select(positive,cell[j]==int(m_resolution)-1,cell[j]==0);
-                Float lower_a=dr::select(normal,(h-1.f)-lower_fraction*h,o[j]-lower*h);
-                Float lower_b=dr::select(normal,(1.f-lower_fraction)*dh,d[j]-lower*dh);
-                Float upper_a=dr::select(normal,upper_fraction*h-(h-1.f),upper*h-o[j]);
-                Float upper_b=dr::select(normal,(upper_fraction-1.f)*dh,upper*dh-d[j]);
-                if (m_background_far_distance==0.f) {
-                    upper_a=dr::select(normal&outer,1.f,upper_a);
-                    upper_b=dr::select(normal&outer,0.f,upper_b);
-                } else {
-                    upper_a=dr::select(normal&outer,m_background_far_distance-h,upper_a);
-                    upper_b=dr::select(normal&outer,-dh,upper_b);
-                }
-                // Grid ownership is half-open. The finite outer surface remains
-                // included, as in projective chart clipping and initialization.
-                clip(lower_a,lower_b,normal&(!positive|(radial_lower==1.f)));
-                clip(upper_a,upper_b,dr::select(normal,positive&!outer,
-                    cell[j]!=int(layer+m_core_resolution)-1));
-            }
-            return valid&(hi>lo);
-        },
-        [](const Vector3i &,const ProjectiveSegment &,const Point3f &,const Vector3f &,
-           const Float &,const Mask &) { return Mask(false); },
-        "Voxel reconstruction background cell preimage");
-}
-
-MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
-VoxelReconstruction<Float, Spectrum>::projective_core_ids(const UInt32 &id,const Mask &active) const {
-    if (m_scene_mapping!="projective_shell") return active;
-    UInt32 cell=dr::gather<UInt32>(m_cells,id,active);
-    const uint32_t layer=(m_resolution-m_core_resolution)/2;
-    Mask core=active;
-    for (uint32_t j=0;j<3;++j) {
-        UInt32 coordinate=cell%m_resolution;
-        core &= (coordinate>=layer)&(coordinate<layer+m_core_resolution);
-        cell/=m_resolution;
-    }
-    return core;
-}
-
-MI_VARIANT std::pair<Float,Float> VoxelReconstruction<Float,Spectrum>::projective_depth(
-    const ProjectiveSegment &segment,const Float &distance) const {
-    const float half=.5f*m_size[0]*m_core_resolution;
-    // s=t/(t+half). Combined inverse/chain formula remains finite at infinity.
-    Float denominator=segment.speed-distance*segment.h_start*segment.h_rate;
-    Float numerator=segment.world_entry*denominator+distance*dr::square(segment.h_start);
-    Float sum=numerator+half*denominator;
-    Float depth=numerator/dr::maximum(sum,1e-30f);
-    Float chain=half*segment.speed*dr::square(segment.h_start)/dr::maximum(dr::square(sum),1e-30f);
-    Mask core=segment.chart==0u;
-    return {dr::select(core,distance/(distance+half),depth),
-            dr::select(core,half/dr::square(distance+half),chain)};
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::UInt32
+VoxelReconstruction<Float, Spectrum>::leaf_log_size(const UInt32 &id, const Mask &active) const {
+    return cell_log_size(dr::gather<CellIndex>(m_cells,id,active));
 }
 
 MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Vector3f
-VoxelReconstruction<Float, Spectrum>::projective_hit_direction(const Point3f &origin,
-    const Vector3f &direction,const UInt32 &id,const Mask &active) const {
-    if (m_scene_mapping!="projective_shell") return direction;
-    const float half=.5f*m_size[0]*m_core_resolution;
-    const float physical_width=float(m_resolution-m_core_resolution)/m_core_resolution;
-    const float width=m_background_far_distance==0.f ? physical_width :
-        physical_width*(m_background_far_distance/(m_background_far_distance-1.f));
-    const uint32_t layer=(m_resolution-m_core_resolution)/2;
-    Point3f center(.5f*(m_min[0]+m_max[0]),.5f*(m_min[1]+m_max[1]),.5f*(m_min[2]+m_max[2]));
-    Vector3f o=(origin-center)/half,d=direction/half,result=direction;
-    UInt32 cell=dr::gather<UInt32>(m_cells,id,active);
-    for (uint32_t j=0;j<3;++j) {
-        UInt32 coordinate=cell%m_resolution;cell/=m_resolution;
-        Mask outside=(coordinate<layer)|(coordinate>=layer+m_core_resolution);
-        Float sign=dr::select(coordinate<layer,-1.f,1.f);
-        Vector3f v=(sign*o[j])*d-o*(sign*d[j]);v[j]=width*d[j];
-        result=dr::select(outside,v/dr::maximum(dr::norm(v),1e-30f),result);
+VoxelReconstruction<Float, Spectrum>::leaf_size(const UInt32 &id, const Mask &active) const {
+    Float factor(UInt32(1u) << leaf_log_size(id, active));
+    return Vector3f(tree_cell_size(0), tree_cell_size(1), tree_cell_size(2))*factor;
+}
+
+MI_VARIANT std::pair<Float, Float> VoxelReconstruction<Float, Spectrum>::world_depth(const Float &distance) const {
+    const float half=.5f*(m_max[0]-m_min[0]);
+    Float denominator=distance+half;
+    return {distance/denominator, half/dr::square(denominator)};
+}
+
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Vector3f
+VoxelReconstruction<Float, Spectrum>::world_block_boundary_times(
+    const Vector3i &cell,const Vector3i &step,const Point3f &origin,
+    const Vector3f &inv_d,const UInt32 &log_size) const {
+    Vector3f result;
+    for (uint32_t a=0;a<3;++a) {
+        Int32 low=Int32((UInt32(cell[a])>>log_size)<<log_size);
+        Int32 face=low+dr::select(step[a]>0,Int32(UInt32(1u)<<log_size),0);
+        Float plane=dr::fmadd(Float(face)-float(core_offset()),tree_cell_size(a),m_min[a]);
+        result[a]=dr::select(step[a]!=0,(plane-origin[a])*inv_d[a],dr::Infinity<Float>);
     }
     return result;
+}
+
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::advance_world_block(
+    Vector3i &cell,Vector3f &next,Float &entry,UInt32 &iterations,
+    const Vector3i &step,const Point3f &origin,const Vector3f &direction,
+    const Vector3f &inv_d,const Float &exit,const UInt32 &log_size) const {
+    Vector3f boundary=world_block_boundary_times(cell,step,origin,inv_d,log_size);
+    Float target=dr::maximum(entry,dr::minimum(exit,dr::min(boundary)));
+    Point3f point=dr::fmadd(direction,target,origin);
+    for (uint32_t a=0;a<3;++a) {
+        Int32 low=Int32((UInt32(cell[a])>>log_size)<<log_size);
+        Int32 high=low+Int32(UInt32(1u)<<log_size)-1;
+        // Floor in the core-local coordinate system before adding the integer
+        // root offset. A depth-20 root otherwise rounds near-face core points
+        // into the adjacent finest cell before floor() can classify them.
+        Float position=(point[a]-m_min[a])/tree_cell_size(a);
+        Int32 interior=Int32(dr::floor(dr::clip(position,
+            Float(low-int(core_offset())),Float(high-int(core_offset())))))+int(core_offset());
+        cell[a]=dr::select(boundary[a]<=target,
+            dr::select(step[a]>0,high+1,low-1),interior);
+    }
+    entry=target;
+    next=dr::maximum(entry,octree_boundary_times(cell,step,origin,inv_d));
+    ++iterations;
+}
+
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::advance_ray_cell(
+    Vector3i &cell,Vector3f &next,Float &entry,UInt32 &iterations,
+    const Vector3i &step,const Vector3f &step_t,const Point3f &origin,
+    const Vector3f &direction,const Vector3f &inv_d,const Float &exit,
+    const Float &end,const UInt32 &log_size,bool use_octree) const {
+    // The adaptive tree uses a 1024-cell virtual core even before the foreground
+    // reaches that resolution. Its foreground leaves must still visit x/y/z
+    // tied faces one at a time, exactly like the original foreground unit grid.
+    // Only background leaves and larger empty blocks use simultaneous exits.
+    uint32_t foreground_log=0;
+    while ((1u<<foreground_log)<tree_core_resolution()/m_resolution) ++foreground_log;
+    Mask foreground_unit=m_background_adaptive & (foreground_log>0u) &
+        (log_size==foreground_log) & dr::all(cell>=int(core_offset())) &
+        dr::all(cell<int(core_offset()+tree_core_resolution()));
+    Mask coarse=(m_background_shell_levels!=0) & (log_size>0u) & !foreground_unit;
+    dr::tie(cell,next,entry,iterations)=dr::if_stmt(
+        dr::make_tuple(cell,next,entry,iterations),coarse,
+        [this,step,origin,direction,inv_d,exit,log_size](Vector3i cell,
+            Vector3f next,Float entry,UInt32 iterations) {
+            advance_world_block(cell,next,entry,iterations,step,origin,
+                                direction,inv_d,exit,log_size);
+            return dr::make_tuple(cell,next,entry,iterations);
+        },
+        [this,step,step_t,origin,inv_d,end,use_octree,foreground_unit,log_size](Vector3i cell,
+            Vector3f next,Float entry,UInt32 iterations) {
+            Mask cross_x=(next.x()<=next.y())&(next.x()<=next.z());
+            Mask cross_y=!cross_x&(next.y()<=next.z()),cross_z=!cross_x&!cross_y;
+            Mask crossings[3]={cross_x,cross_y,cross_z};
+            for (uint32_t a=0;a<3;++a) {
+                Int32 lower=Int32((UInt32(cell[a])>>log_size)<<log_size);
+                Int32 neighbor=dr::select(step[a]>0,lower+Int32(UInt32(1u)<<log_size),lower-1);
+                cell[a]=dr::select(crossings[a],
+                    dr::select(foreground_unit,neighbor,cell[a]+step[a]),cell[a]);
+            }
+            if (use_octree)
+                next=dr::maximum(end,dr::select(foreground_unit,
+                    world_block_boundary_times(cell,step,origin,inv_d,log_size),
+                    octree_boundary_times(cell,step,origin,inv_d)));
+            else {
+                next.x()=dr::select(cross_x,next.x()+step_t.x(),next.x());
+                next.y()=dr::select(cross_y,next.y()+step_t.y(),next.y());
+                next.z()=dr::select(cross_z,next.z()+step_t.z(),next.z());
+            }
+            entry=end;
+            ++iterations;
+            return dr::make_tuple(cell,next,entry,iterations);
+        }, "Voxel reconstruction leaf exit");
 }
 
 MI_VARIANT std::tuple<typename VoxelReconstruction<Float, Spectrum>::Color3f,
@@ -1461,45 +1381,43 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
     for (size_t a = 0; a < 3; ++a) {
         Mask parallel = d[a] == 0.f;
         Float inv = dr::rcp(dr::select(parallel, 1.f, d[a]));
-        Float near = (m_min[a] - ray.o[a]) * inv;
-        Float far = (m_max[a] - ray.o[a]) * inv;
+        Float near = (root_min(a) - ray.o[a]) * inv;
+        Float far = (root_max(a) - ray.o[a]) * inv;
         entry = dr::maximum(entry, dr::select(parallel, -dr::Infinity<Float>, dr::minimum(near, far)));
         exit = dr::minimum(exit, dr::select(parallel, dr::Infinity<Float>, dr::maximum(near, far)));
         // Grid ownership is half-open: a parallel ray on the maximum face
         // has floor(cell) == resolution in Falcor and never enters the grid.
-        active &= !parallel | ((ray.o[a] >= m_min[a]) & (ray.o[a] < m_max[a]));
+        active &= !parallel | ((ray.o[a] >= root_min(a)) & (ray.o[a] < root_max(a)));
         step[a] = dr::select(d[a] > 0.f, 1, dr::select(d[a] < 0.f, -1, 0));
-        step_t[a] = dr::select(parallel, dr::Infinity<Float>, dr::abs(m_size[a] * inv));
+        step_t[a] = dr::select(parallel, dr::Infinity<Float>, dr::abs(tree_cell_size(a) * inv));
     }
     if (entry_offset_fraction != 0.f) {
-        active &= dr::isfinite(ray.maxt);
-        entry += entry_offset_fraction * ray.maxt * length;
+        if (m_background_shell_levels)
+            entry += entry_offset_fraction*m_size[0];
+        else {
+            active &= dr::isfinite(ray.maxt);
+            entry += entry_offset_fraction * ray.maxt * length;
+        }
     }
     active &= entry <= exit;
     Point3f p = ray.o + d * dr::select(active, entry, 0.f);
     Vector3i cell;
     Vector3f next;
     for (size_t a = 0; a < 3; ++a) {
-        Float grid_pos = (p[a] - m_min[a]) / m_size[a];
+        Float grid_pos = (p[a] - m_min[a]) / tree_cell_size(a);
         grid_pos = dr::select(dr::isfinite(grid_pos), grid_pos, 0.f);
-        cell[a] = Int32(dr::floor(dr::clip(grid_pos, 0.f, float(m_resolution - 1))));
-        Float boundary = m_min[a] + (Float(cell[a]) + dr::select(step[a] > 0, 1.f, 0.f)) * m_size[a];
+        cell[a] = Int32(dr::floor(dr::clip(grid_pos,-float(core_offset()),
+            float(root_resolution()-1-core_offset()))))+int(core_offset());
+        Float boundary = m_min[a] + (Float(cell[a]-int(core_offset())) + dr::select(step[a] > 0, 1.f, 0.f)) * tree_cell_size(a);
         next[a] = dr::select(step[a] == 0, dr::Infinity<Float>,
                             (boundary - ray.o[a]) / dr::select(step[a] == 0, 1.f, d[a]));
         next[a] = dr::maximum(next[a], entry);
     }
     if (use_octree)
         next = dr::maximum(entry, octree_boundary_times(cell, step, ray.o, inv_d));
-    const bool projective=m_scene_mapping=="projective_shell";
+    const bool world_shell=m_scene_mapping=="world_shell";
     const Vector3f world_d=d;
-    ProjectiveSegment first{active,ray.o,d,entry,exit,Float(0.f),Float(1.f),
-        Float(0.f),Float(1.f),UInt32(0),UInt32(0)};
-    if (projective) {
-        first=next_projective_segment(ray.o,d,ray.maxt*length,UInt32(0));
-        active=first.valid & dr::all(dr::isfinite(ray.o)) & dr::all(dr::isfinite(ray.d)) &
-               (length>0.f) & (ray.maxt>0.f);
-        initialize_projective_segment(first,cell,next,entry,entry_offset_fraction,use_octree);
-    }
+    RaySegment first{ray.o,d,exit};
     struct LoopState {
         Mask active;
         Vector3i cell;
@@ -1508,7 +1426,7 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
         Color3f color;
         UInt32 hits, iterations, tree_node, tree_level;
         SpatialAnchor tree_anchor;
-        ProjectiveSegment segment;
+        RaySegment segment;
         DRJIT_STRUCT(LoopState, active, cell, next, entry, transmittance, color, hits, iterations,
                      tree_node, tree_level, tree_anchor, segment)
     } ls{active, cell, next, entry, Float(1.f), Color3f(0.f), UInt32(0), UInt32(0),
@@ -1521,16 +1439,14 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
             const Vector3f inv_d=dr::rcp(dr::select(d!=0.f,d,Vector3f(1.f)));
             const Vector3i step=dr::select(d>0.f,Vector3i(1),dr::select(d<0.f,Vector3i(-1),Vector3i(0)));
             const Vector3f step_t=dr::select(d==0.f,Vector3f(dr::Infinity<Float>),
-                dr::abs(Vector3f(m_size[0],m_size[1],m_size[2])*inv_d));
+                dr::abs(Vector3f(tree_cell_size(0),tree_cell_size(1),tree_cell_size(2))*inv_d));
             const Float exit=s.segment.exit;
             auto [id_signed, empty_log] = m_tree.template lookup<UInt32, Int32>(
                 s.cell.x(), s.cell.y(), s.cell.z(), s.tree_node, s.tree_level, s.tree_anchor, s.active);
             Mask occupied = s.active & (id_signed >= 0);
             UInt32 id = UInt32(dr::maximum(id_signed, 0));
-            if (use_octree) {
+            if (use_octree && !world_shell) {
                 Mask empty = s.active & !occupied;
-                if (m_background_layered_sampling)
-                    empty &= s.segment.chart==0u;
                 s = dr::if_stmt(dr::make_tuple(s, empty, empty_log), empty,
                     [this, step, step_t, origin = s.segment.origin, inv_d, exit](
                         LoopState s, const Mask &empty, const UInt32 &empty_log) {
@@ -1540,20 +1456,26 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
                     }, [](LoopState s, const Mask &, const UInt32 &) { return s; },
                     "Voxel reconstruction octree trace skip");
             }
+            if (world_shell)
+                s.next=dr::maximum(s.entry,world_block_boundary_times(
+                    s.cell,step,s.segment.origin,inv_d,empty_log));
             Float end = dr::minimum(dr::minimum(s.next.x(), dr::minimum(s.next.y(), s.next.z())), exit);
             end = dr::maximum(end, s.entry);
-            const bool voxel_background = projective && !m_background_use_ellipsoid;
-            Mask ellipsoid = voxel_background ? projective_core_ids(id, occupied) : occupied;
+            const bool voxel_background = world_shell && !m_background_use_ellipsoid;
+            Mask ellipsoid = voxel_background ? core_ids(id, occupied) : occupied;
             auto intersects = [this](const UInt32 &id, const Vector3i &cell,
                                     const Point3f &origin, const Vector3f &d,
                                     const Float &entry, const Float &end, const Mask &occupied) -> Mask {
                 Vector3f local, scale, segment = d * (end - entry);
+                UInt32 log_size = leaf_log_size(id, occupied);
+                Float block(UInt32(1u) << log_size);
                 for (size_t a = 0; a < 3; ++a) {
                     Float c = dr::gather<Float>(m_centers, id * 3 + uint32_t(a), occupied);
                     Float log_scale = dr::gather<Float>(m_log_scales, id * 3 + uint32_t(a), occupied);
                     // Subtract the cell origin first to retain precision for small ellipsoids.
+                    Int32 lower = Int32((UInt32(cell[a]) >> log_size) << log_size);
                     local[a] = origin[a] + entry*d[a] -
-                               (m_min[a] + (Float(cell[a]) + c) * m_size[a]);
+                               (m_min[a] + (Float(lower-int(core_offset())) + c*block) * tree_cell_size(a));
                     scale[a] = dr::exp(dr::clip(log_scale, -30.f, 30.f));
                 }
                 Float qw = dr::gather<Float>(m_rotations, id*4, occupied);
@@ -1586,13 +1508,8 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
                 intersects(id, s.cell, s.segment.origin, d, s.entry, end, ellipsoid);
             // DDA may visit tied faces with zero segment length. These are not
             // occupied-volume hits, while the legacy ellipsoid rule is retained.
-            if (voxel_background) {
-                if (m_background_layered_sampling)
-                    hit |= occupied & !ellipsoid;
-                else
-                    hit |= projective_background_cell_has_extent(s.cell, s.segment,
-                        ray.o, world_d, ray.maxt*length, occupied & !ellipsoid & (end > s.entry));
-            }
+            if (voxel_background)
+                hit |= occupied & !ellipsoid & (end > s.entry);
             Color3f emission(0.f);
             Float logit = 0.f;
             for (uint32_t k = 0; k < std::max(m_active_sh_count, m_opacity_sh_count); ++k) {
@@ -1608,37 +1525,11 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
             s.color += s.transmittance * alpha * dr::maximum(emission, 0.f);
             s.transmittance *= 1.f - alpha;
             s.hits += dr::select(hit, 1u, 0u);
-            // Match Falcor's x, then y, then z tie priority. Each iteration
-            // crosses one face, including zero-length cells at exact edges.
-            Mask cross_x = (s.next.x() <= s.next.y()) & (s.next.x() <= s.next.z());
-            Mask cross_y = !cross_x & (s.next.y() <= s.next.z());
-            Mask cross_z = !cross_x & !cross_y;
-            s.cell.x() += dr::select(cross_x, step.x(), 0);
-            s.cell.y() += dr::select(cross_y, step.y(), 0);
-            s.cell.z() += dr::select(cross_z, step.z(), 0);
-            if (use_octree)
-                s.next = dr::maximum(end, octree_boundary_times(s.cell, step, s.segment.origin, inv_d));
-            else {
-                s.next.x() = dr::select(cross_x, s.next.x() + step_t.x(), s.next.x());
-                s.next.y() = dr::select(cross_y, s.next.y() + step_t.y(), s.next.y());
-                s.next.z() = dr::select(cross_z, s.next.z() + step_t.z(), s.next.z());
-            }
-            s.entry = end;
-            s.iterations += 1;
-            Mask in_segment=dr::all(s.cell>=0)&dr::all(s.cell<int(m_resolution))&(s.entry<exit);
-            if (projective) in_segment &= projective_cell_inside(s.cell,s.segment.chart);
-            Mask budget=s.iterations<=3*m_resolution+3;
-            if (projective) {
-                s=dr::if_stmt(dr::make_tuple(s),Mask(!in_segment & budget),
-                    [this,&ray,world_d,length,entry_offset_fraction,use_octree](LoopState s) {
-                        s.segment=next_projective_segment(ray.o,world_d,ray.maxt*length,s.segment.visited);
-                        initialize_projective_segment(s.segment,s.cell,s.next,s.entry,entry_offset_fraction,use_octree);
-                        s.tree_node=UInt32(m_tree.root);s.tree_level=UInt32(m_tree.depth);
-                        s.tree_anchor=SpatialAnchor(0);s.iterations=UInt32(0);
-                        return s;
-                    },[](LoopState s){return s;},"Voxel reconstruction next projective trace segment");
-                s.active &= s.segment.valid & budget;
-            } else s.active &= in_segment & budget;
+            advance_ray_cell(s.cell,s.next,s.entry,s.iterations,step,step_t,
+                s.segment.origin,d,inv_d,exit,end,empty_log,use_octree);
+            Mask in_segment=dr::all(s.cell>=0)&dr::all(s.cell<int(root_resolution()))&(s.entry<exit);
+            Mask budget=s.iterations<=3*root_resolution()+3;
+            s.active &= in_segment & budget;
             s.active &= (s.transmittance>transmittance_threshold)&(s.hits<max_hits);
         }, "Voxel reconstruction DDA");
     return {ls.color + ls.transmittance*background, 1.f-ls.transmittance, ls.hits};
@@ -1790,6 +1681,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         {"profile_stages", 0.f}, {"profile_traversal", 0.f},
         {"use_octree", 1.f}, {"rgb_only", 0.f},
         {"collect_rgb_deletion_evidence", 0.f},
+        {"collect_adaptive_priority", 0.f},
         {"collect_growth_evidence", 0.f}, {"max_growth_hits", 8.f},
         {"distortion_loss_weight", 0.f}, {"compact_gradient_capacity", 0.f},
         {"dssim_loss_weight", 0.f}, {"image_width", 0.f}, {"image_height", 0.f},
@@ -1828,6 +1720,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     const uint32_t gradient_rows = compact_gradients ?
         std::min(uint32_t(requested_capacity), m_active_count) : m_active_count;
     const bool collect_rgb_deletion = cfg["collect_rgb_deletion_evidence"] != 0.f;
+    const bool collect_adaptive_priority = cfg["collect_adaptive_priority"] != 0.f;
     if (collect_rgb_deletion && !rgb_only)
         Throw("VoxelReconstruction.loss_and_grad(): RGB deletion evidence requires RGB-only mode.");
     const bool growth_requested = cfg["collect_growth_evidence"] != 0.f;
@@ -1918,6 +1811,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             result.deletion_counts["deletion_observed"] = dr::zeros<UIntBuffer>(0);
             result.deletion_counts["deletion_unknown"] = dr::zeros<UIntBuffer>(0);
         }
+        if (collect_adaptive_priority)
+            result.deletion_sums["adaptive_priority"] = dr::zeros<FloatBuffer>(0);
         if (dssim_enabled) {
             if (profiler.enabled()) {
                 evaluate_result(result);
@@ -1989,16 +1884,18 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     auto rotate = [](const Vector3f &v, const Float &w, const Vector3f &q) {
         return v + 2.f*dr::cross(q, dr::cross(q, v) + w*v);
     };
-    auto growth_intersects = [this, rotate](const UInt32 &id, const Vector3i &cell,
+    auto growth_intersects = [this, rotate](const UInt32 &id,
         const Float &entry, const Float &end, const Point3f &origin,
         const Vector3f &direction, const Mask &active) {
         // Identical clipped-cell intersection for both the DDA record check and
         // the later proposal scoring. Siblings share a segment, not a shape.
         Vector3f relative, scale, segment = direction*(end-entry);
+        auto cell=decode_cells(dr::gather<CellIndex>(m_growth_cells,id,active));
+        Float block(UInt32(1u)<<cell[3]);
         for (uint32_t a=0; a<3; ++a) {
             Float center = dr::gather<Float>(m_growth_centers,id*3+a,active);
             relative[a] = origin[a]+entry*direction[a] -
-                (m_min[a]+(Float(cell[a])+center)*m_size[a]);
+                (m_min[a]+(Float(Int32(cell[a])-int(core_offset()))+center*block)*tree_cell_size(a));
             scale[a] = dr::exp(dr::clip(dr::gather<Float>(m_growth_log_scales,
                 id*3+a,active),-30.f,30.f));
         }
@@ -2053,41 +1950,39 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     for (uint32_t a=0;a<3;++a) {
         Mask parallel=d[a]==0.f;
         Float inv=dr::rcp(dr::select(parallel,1.f,d[a]));
-        Float near=(m_min[a]-ray.o[a])*inv, far=(m_max[a]-ray.o[a])*inv;
+        Float near=(root_min(a)-ray.o[a])*inv, far=(root_max(a)-ray.o[a])*inv;
         entry=dr::maximum(entry,dr::select(parallel,-dr::Infinity<Float>,dr::minimum(near,far)));
         exit=dr::minimum(exit,dr::select(parallel,dr::Infinity<Float>,dr::maximum(near,far)));
-        active &= !parallel | ((ray.o[a]>=m_min[a]) & (ray.o[a]<m_max[a]));
+        active &= !parallel | ((ray.o[a]>=root_min(a)) & (ray.o[a]<root_max(a)));
         step[a]=dr::select(d[a]>0.f,1,dr::select(d[a]<0.f,-1,0));
-        step_t[a]=dr::select(parallel,dr::Infinity<Float>,dr::abs(m_size[a]*inv));
+        step_t[a]=dr::select(parallel,dr::Infinity<Float>,dr::abs(tree_cell_size(a)*inv));
     }
     if (cfg["entry_offset_fraction"]!=0.f) {
-        active &= dr::isfinite(ray.maxt);
-        entry += cfg["entry_offset_fraction"]*ray.maxt*direction_length;
+        if (m_background_shell_levels)
+            entry += cfg["entry_offset_fraction"]*m_size[0];
+        else {
+            active &= dr::isfinite(ray.maxt);
+            entry += cfg["entry_offset_fraction"]*ray.maxt*direction_length;
+        }
     }
     active &= entry<=exit;
     Point3f p=ray.o+d*dr::select(active,entry,0.f);
     Vector3i cell;
     Vector3f next;
     for (uint32_t a=0;a<3;++a) {
-        Float position=(p[a]-m_min[a])/m_size[a];
+        Float position=(p[a]-m_min[a])/tree_cell_size(a);
         position=dr::select(dr::isfinite(position),position,0.f);
-        cell[a]=Int32(dr::floor(dr::clip(position,0.f,float(m_resolution-1))));
-        Float boundary=m_min[a]+(Float(cell[a])+dr::select(step[a]>0,1.f,0.f))*m_size[a];
+        cell[a]=Int32(dr::floor(dr::clip(position,-float(core_offset()),
+            float(root_resolution()-1-core_offset()))))+int(core_offset());
+        Float boundary=m_min[a]+(Float(cell[a]-int(core_offset()))+dr::select(step[a]>0,1.f,0.f))*tree_cell_size(a);
         next[a]=dr::maximum(entry,dr::select(step[a]==0,dr::Infinity<Float>,
                           (boundary-ray.o[a])/dr::select(step[a]==0,1.f,d[a])));
     }
     if (use_octree)
         next = dr::maximum(entry, octree_boundary_times(cell, step, ray.o, inv_d));
-    const bool projective=m_scene_mapping=="projective_shell";
+    const bool world_shell=m_scene_mapping=="world_shell";
     const Vector3f world_d=d;
-    ProjectiveSegment first{active,ray.o,d,entry,exit,Float(0.f),Float(1.f),
-        Float(0.f),Float(1.f),UInt32(0),UInt32(0)};
-    if (projective) {
-        first=next_projective_segment(ray.o,d,ray.maxt*direction_length,UInt32(0));
-        active=first.valid & dr::all(dr::isfinite(ray.o)) & dr::all(dr::isfinite(ray.d)) &
-               (direction_length>0.f) & (ray.maxt>0.f);
-        initialize_projective_segment(first,cell,next,entry,cfg["entry_offset_fraction"],use_octree);
-    }
+    RaySegment first{ray.o,d,exit};
     struct State {
         Mask active;
         Vector3i cell;
@@ -2099,7 +1994,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         UInt32 tree_node, tree_level, growth_node, growth_level;
         SpatialAnchor tree_anchor, growth_anchor;
         Float distortion_mass, distortion_moment, distortion;
-        ProjectiveSegment segment;
+        RaySegment segment;
         DRJIT_STRUCT(State,active,cell,next,entry,transmittance,color,hits,candidates,
                      iterations,growth_hits,traversal_steps,traversal_skipped,
                      traversal_leaves,traversal_queries,tree_node,tree_level,growth_node,growth_level,
@@ -2117,9 +2012,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             const Vector3f inv_d=dr::rcp(dr::select(d!=0.f,d,Vector3f(1.f)));
             const Vector3i step=dr::select(d>0.f,Vector3i(1),dr::select(d<0.f,Vector3i(-1),Vector3i(0)));
             const Vector3f step_t=dr::select(d==0.f,Vector3f(dr::Infinity<Float>),
-                dr::abs(Vector3f(m_size[0],m_size[1],m_size[2])*inv_d));
+                dr::abs(Vector3f(tree_cell_size(0),tree_cell_size(1),tree_cell_size(2))*inv_d));
             const Float exit=s.segment.exit;
-            UInt32 spatial=UInt32((s.cell.z()*int(m_resolution)+s.cell.y())*int(m_resolution)+s.cell.x());
             auto [signed_id, empty_log] = m_tree.template lookup<UInt32, Int32>(
                 s.cell.x(), s.cell.y(), s.cell.z(), s.tree_node, s.tree_level, s.tree_anchor, s.active);
             Mask occupied=s.active & (signed_id>=0);
@@ -2131,7 +2025,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 signed_id = dr::select(occupied, signed_id, proposal_id);
                 // Aligned octree blocks containing the same cell are nested.
                 // Their smaller empty block is empty in the union as well.
-                empty_log = dr::minimum(empty_log, proposal_log);
+                empty_log = dr::select(occupied,empty_log,dr::minimum(empty_log, proposal_log));
             }
             Mask visit = occupied | (collect_growth && m_growth_count ?
                          s.active & (signed_id <= -2) : Mask(false));
@@ -2139,10 +2033,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 s.traversal_steps += dr::select(s.active, 1u, 0u);
                 s.traversal_leaves += dr::select(visit, 1u, 0u);
             }
-            if (use_octree) {
+            if (use_octree && !world_shell) {
                 Mask empty = s.active & !visit;
-                if (m_background_layered_sampling)
-                    empty &= s.segment.chart==0u;
                 s = dr::if_stmt(dr::make_tuple(s, empty, empty_log), empty,
                     [this, step, step_t, origin = s.segment.origin, inv_d, exit, profile_traversal](
                         State s, const Mask &empty, const UInt32 &empty_log) {
@@ -2157,16 +2049,18 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     }, [](State s, const Mask &, const UInt32 &) { return s; },
                     "Voxel reconstruction octree training skip");
             }
+            if (world_shell)
+                s.next=dr::maximum(s.entry,world_block_boundary_times(
+                    s.cell,step,s.segment.origin,inv_d,empty_log));
             Float end=dr::maximum(s.entry,dr::minimum(dr::minimum(s.next.x(),dr::minimum(s.next.y(),s.next.z())),exit));
             if (collect_growth) {
                 Mask proposal = s.active & (signed_id <= -2);
-                if (projective) proposal &= s.segment.chart==0u;
                 UInt32 growth_id = UInt32(-dr::minimum(signed_id, Int32(-2)) - 2);
                 auto buffers = std::make_shared<GrowthBuffers>(
                     GrowthBuffers{r.growth_values, r.growth_ids, r.growth_unknown});
-                s = dr::if_stmt(dr::make_tuple(s, growth_id, spatial, end, proposal, s.segment.origin, d), proposal,
+                s = dr::if_stmt(dr::make_tuple(s, growth_id, end, proposal, s.segment.origin, d), proposal,
                     [this, growth_intersects, buffers, lane, ray_count, growth_stride, max_growth_hits](
-                        State s, const UInt32 &head, const UInt32 &spatial,
+                        State s, const UInt32 &head,
                         const Float &end, const Mask &proposal,
                         const Point3f &origin, const Vector3f &direction) {
                         // One record per intersected cell, irrespective of the
@@ -2181,7 +2075,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                             },
                             [&](UInt32 &id,Mask &any_hit,UIntBuffer &unknown) {
                                 Mask valid = id!=UInt32(UINT32_MAX);
-                                Mask hit = growth_intersects(id,s.cell,s.entry,end,
+                                Mask hit = growth_intersects(id,s.entry,end,
                                     origin,direction,valid);
                                 any_hit |= hit;
                                 dr::scatter_reduce(ReduceOp::Add,unknown,UInt32(1),id,hit&full);
@@ -2189,7 +2083,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                             },"Voxel reconstruction growth cell intersections");
                         Mask stored = any_hit & !full;
                         UInt32 slot = dr::minimum(s.growth_hits,max_growth_hits-1)*ray_count+lane;
-                        dr::scatter(buffers->ids,spatial,slot,stored);
+                        dr::scatter(buffers->ids,head,slot,stored);
                         for (uint32_t j=0; j<3; ++j)
                             dr::scatter(buffers->values,s.color[j],j*growth_stride+slot,stored);
                         dr::scatter(buffers->values,s.transmittance,3*growth_stride+slot,stored);
@@ -2198,7 +2092,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                         s.growth_hits = dr::minimum(s.growth_hits+dr::select(any_hit,1u,0u),max_growth_hits);
                         return s;
                     },
-                    [](State s,const UInt32 &,const UInt32 &,const Float &,const Mask &,
+                    [](State s,const UInt32 &,const Float &,const Mask &,
                        const Point3f &,const Vector3f &) { return s; },
                     "Voxel reconstruction hypothetical growth hit");
                 r.growth_values = buffers->values;
@@ -2213,21 +2107,23 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             if (m_active_count) dr::tie(s,r.candidates)=dr::if_stmt(
                 dr::make_tuple(s,r.candidates,id,end,occupied,s.segment.origin,d),occupied,
                 [this,rotate,quaternion,appearance,ray_count,hit_stride,lane,
-                 max_candidates,diagonal,hit_buffers,distortion_enabled,world_d,projective,
+                 max_candidates,diagonal,hit_buffers,distortion_enabled,world_d,world_shell,
                  compact_path_records,hit_before_field,hit_depth_field,
-                 world_origin=ray.o,world_maxt=ray.maxt*direction_length,
                  grid_entry=entry](State s,Candidates candidates,const UInt32 &id,
                     const Float &end,const Mask &occupied,const Point3f &origin,
                     const Vector3f &direction) {
-                    const bool voxel_background = projective && !m_background_use_ellipsoid;
-                    Mask ellipsoid = voxel_background ? projective_core_ids(id, occupied) : occupied;
+                    const bool voxel_background = world_shell && !m_background_use_ellipsoid;
+                    Mask ellipsoid = voxel_background ? core_ids(id, occupied) : occupied;
                     auto intersect = [this, rotate, quaternion](const UInt32 &id,
                         const Vector3i &cell, const Point3f &origin, const Vector3f &direction,
                         const Float &entry, const Float &end, const Mask &occupied) {
                         Vector3f relative,scale,segment=direction*(end-entry);
+                        UInt32 log_size = leaf_log_size(id, occupied);
+                        Float block(UInt32(1u) << log_size);
                         for(uint32_t a=0;a<3;++a) {
                             Float center=dr::gather<Float>(m_centers,id*3+a,occupied);
-                            relative[a]=origin[a]+entry*direction[a]-(m_min[a]+(Float(cell[a])+center)*m_size[a]);
+                            Int32 lower = Int32((UInt32(cell[a]) >> log_size) << log_size);
+                            relative[a]=origin[a]+entry*direction[a]-(m_min[a]+(Float(lower-int(core_offset()))+center*block)*tree_cell_size(a));
                             scale[a]=dr::exp(dr::clip(dr::gather<Float>(m_log_scales,id*3+a,occupied),-30.f,30.f));
                         }
                         Float qw;
@@ -2253,30 +2149,22 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                             ellipsoid, intersect,
                             [](const UInt32 &, const Vector3i &, const Point3f &, const Vector3f &,
                                const Float &, const Float &, const Mask &) {
-                                // Fixed background depth is the mapped-cell segment midpoint.
+                                // Fixed background depth is the world-leaf segment midpoint.
                                 return dr::make_tuple(Vector3f(0.f), Vector3f(0.f), Vector3f(1.f),
                                     Float(0.f), Float(.5f), Float(0.f), Mask(false));
                             }, "Voxel reconstruction core training intersection") :
                             intersect(id, s.cell, origin, direction, s.entry, end, ellipsoid);
-                    if (voxel_background) {
-                        if (m_background_layered_sampling)
-                            hit |= occupied & !ellipsoid;
-                        else
-                            hit |= projective_background_cell_has_extent(s.cell, s.segment,
-                                world_origin, world_d, world_maxt, occupied & !ellipsoid & (end > s.entry));
-                    }
+                    if (voxel_background)
+                        hit |= occupied & !ellipsoid & (end > s.entry);
                     Float depth(0.f);
                     Float depth_chain(0.f);
                     if (distortion_enabled) {
-                        // A layered sample has entry=end=0 and world_entry at
-                        // the exact shell intersection. projective_depth then
-                        // returns t/(t+half), independent of cell geometry.
                         Float distance=s.entry+star*(end-s.entry);
                         Mask free=ellipsoid&(a>1e-20f)&(star>0.f)&(star<1.f);
                         depth=(distance-grid_entry)/diagonal;
                         depth_chain=Float(free);
-                        if (projective) {
-                            auto mapped=projective_depth(s.segment,distance);
+                        if (world_shell) {
+                            auto mapped=world_depth(distance);
                             depth=mapped.first;
                             depth_chain=dr::select(free,mapped.second,0.f);
                         }
@@ -2327,7 +2215,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                         dr::tie(s,candidates)=dr::if_stmt(
                             dr::make_tuple(s,candidates,id,relative_star,unit_star,scale,gmin,
                                            star,end,miss),miss,
-                            [this,max_candidates,diagonal,projective,compact_path_records](State s,Candidates candidates,
+                            [this,max_candidates,diagonal,world_shell,compact_path_records](State s,Candidates candidates,
                                 const UInt32 &id,const Vector3f &relative_star,
                                 const Vector3f &unit_star,const Vector3f &scale,
                                 const Float &gmin,const Float &star,const Float &end,
@@ -2337,9 +2225,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                                 Mask valid_distance=dr::isfinite(metric)&(metric>0.f)&(radius2>1e-12f);
                                 Float distance=gmin/dr::select(valid_distance,metric,1.f);
                                 Float depth=s.entry+star*(end-s.entry);
-                                Float depth_score=projective ? projective_depth(s.segment,depth).first :
+                                Float depth_score=world_shell ? world_depth(depth).first :
                                     dr::abs(depth)/std::max(diagonal,1e-6f);
-                                Float score=dr::select(valid_distance,dr::maximum(distance,0.f)/std::max(m_size[0],1e-6f)+
+                                Float score=dr::select(valid_distance,dr::maximum(distance,0.f)/dr::maximum(leaf_size(id,miss)[0],1e-6f)+
                                                       .05f*depth_score,1e30f);
                                 // T is constant between hard hits. Reconstruct
                                 // it from the next recorded hit (or final T)
@@ -2388,32 +2276,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 },"Voxel reconstruction training occupied cell");
             r.hit=hit_buffers->hit;
             r.hit_id=hit_buffers->hit_id;
-            Mask cross_x=(s.next.x()<=s.next.y())&(s.next.x()<=s.next.z());
-            Mask cross_y=!cross_x&(s.next.y()<=s.next.z()),cross_z=!cross_x&!cross_y;
-            s.cell.x()+=dr::select(cross_x,step.x(),0);s.cell.y()+=dr::select(cross_y,step.y(),0);s.cell.z()+=dr::select(cross_z,step.z(),0);
-            if (use_octree)
-                s.next=dr::maximum(end,octree_boundary_times(s.cell,step,s.segment.origin,inv_d));
-            else {
-                s.next.x()=dr::select(cross_x,s.next.x()+step_t.x(),s.next.x());
-                s.next.y()=dr::select(cross_y,s.next.y()+step_t.y(),s.next.y());
-                s.next.z()=dr::select(cross_z,s.next.z()+step_t.z(),s.next.z());
-            }
-            s.entry=end;s.iterations+=1;
-            Mask in_segment=dr::all(s.cell>=0)&dr::all(s.cell<int(m_resolution))&(s.entry<exit);
-            if (projective) in_segment &= projective_cell_inside(s.cell,s.segment.chart);
-            Mask budget=s.iterations<=3*m_resolution+3;
-            if (projective) {
-                s=dr::if_stmt(dr::make_tuple(s),Mask(!in_segment & budget),
-                    [this,&ray,world_d,direction_length,&cfg,use_octree](State s) {
-                        s.segment=next_projective_segment(ray.o,world_d,ray.maxt*direction_length,s.segment.visited);
-                        initialize_projective_segment(s.segment,s.cell,s.next,s.entry,cfg.at("entry_offset_fraction"),use_octree);
-                        s.tree_node=UInt32(m_tree.root);s.tree_level=UInt32(m_tree.depth);s.tree_anchor=SpatialAnchor(0);
-                        s.growth_node=UInt32(m_growth_tree.root);s.growth_level=UInt32(m_growth_tree.depth);s.growth_anchor=SpatialAnchor(0);
-                        s.iterations=UInt32(0);
-                        return s;
-                    },[](State s){return s;},"Voxel reconstruction next projective training segment");
-                s.active &= s.segment.valid & budget;
-            } else s.active &= in_segment & budget;
+            advance_ray_cell(s.cell,s.next,s.entry,s.iterations,step,step_t,
+                s.segment.origin,d,inv_d,exit,end,empty_log,use_octree);
+            Mask in_segment=dr::all(s.cell>=0)&dr::all(s.cell<int(root_resolution()))&(s.entry<exit);
+            Mask budget=s.iterations<=3*root_resolution()+3;
+            s.active &= in_segment & budget;
             s.active &= (s.transmittance>cfg["transmittance_threshold"])&(s.hits<max_hits);
         },"Voxel reconstruction training paths");
     if (profiler.enabled()) {
@@ -2504,26 +2371,17 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         // A stopped path has no reliable full suffix, and inserting a hit can
         // itself trigger the cap/early exit. Be conservative and report unknown
         // for both cases instead of extending traversal or inventing evidence.
-        Mask exited = projective ? !state.segment.valid :
-            (!dr::all(state.cell>=0) | !dr::all(state.cell<int(m_resolution)) | (state.entry>=exit));
-        Mask complete = exited & (state.iterations<=3*m_resolution+3) &
+        Mask exited =
+            (!dr::all(state.cell>=0) | !dr::all(state.cell<int(root_resolution())) | (state.entry>=exit));
+        Mask complete = exited & (state.iterations<=3*root_resolution()+3) &
                         (state.hits+1u<max_hits) &
                         (weight==1.f) & dr::all(dr::isfinite(result.raw_rgb)) &
                         dr::all(dr::isfinite(reference_rgb));
         for (uint32_t k=0; k<max_growth_hits; ++k) {
             Mask stored = k<state.growth_hits;
             UInt32 slot = k*ray_count+lane;
-            UInt32 spatial = dr::gather<UInt32>(records.growth_ids,slot,stored);
-            UInt32 node(m_growth_tree.root), level(m_growth_tree.depth);
-            SpatialAnchor anchor(0);
-            auto [head, unused_skip] = m_growth_tree.template lookup<UInt32, Int32>(
-                Int32(spatial % m_resolution), Int32((spatial / m_resolution) % m_resolution),
-                Int32(spatial / (m_resolution * m_resolution)), node, level, anchor, stored);
-            UInt32 id = dr::select(stored,UInt32(-head-2),UInt32(UINT32_MAX));
-            Vector3i cell;
-            cell.x() = Int32(spatial%m_resolution);
-            cell.y() = Int32((spatial/m_resolution)%m_resolution);
-            cell.z() = Int32(spatial/(m_resolution*m_resolution));
+            UInt32 head=dr::gather<UInt32>(records.growth_ids,slot,stored);
+            UInt32 id=dr::select(stored,head,UInt32(UINT32_MAX));
             Color3f prefix;
             for (uint32_t j=0; j<3; ++j)
                 prefix[j] = dr::gather<Float>(records.growth_values,j*growth_stride+slot,stored);
@@ -2543,7 +2401,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 },
                 [&](UInt32 &id,FloatBuffer &gains,UIntBuffer &observed,UIntBuffer &unknown) {
                     Mask valid = id!=UInt32(UINT32_MAX);
-                    Mask hit = growth_intersects(id,cell,segment_entry,segment_end,ray.o,d,valid);
+                    Mask hit = growth_intersects(id,segment_entry,segment_end,ray.o,d,valid);
                     Color3f radiance(0.f);
                     Float logit(0.f);
                     for (uint32_t j=0; j<std::max(m_active_sh_count,m_opacity_sh_count); ++j) {
@@ -2607,6 +2465,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         result.counters[key]=dr::zeros<UIntBuffer>(gradient_rows);
     for(const auto *key:{"foreground_evidence","background_evidence"})
         result.counters[key]=dr::zeros<UIntBuffer>(m_active_count);
+    if (collect_adaptive_priority)
+        result.deletion_sums["adaptive_priority"] = dr::zeros<FloatBuffer>(m_active_count);
     if (collect_rgb_deletion) {
         result.deletion_sums["deletion_gain"] = dr::zeros<FloatBuffer>(m_active_count);
         result.deletion_counts["deletion_observed"] = dr::zeros<UIntBuffer>(m_active_count);
@@ -2621,19 +2481,20 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         }
         return result;
     }
-    const float tau=std::max(cfg["geometry_tau_voxel_fraction"]*m_size[0],1e-8f);
     using GradientMap = std::map<std::string, FloatBuffer>;
     using CounterMap = std::map<std::string, UIntBuffer>;
-    auto add_geometry=[this,quaternion,rotate,clean,is_background,dcolor,dalpha,weight,tau,cfg,rgb_only,
+    auto add_geometry=[this,quaternion,rotate,clean,is_background,dcolor,dalpha,weight,cfg,rgb_only,
                        gradient_row,gradient_rows](
                           GradientMap &gradients,CounterMap &counters,
                           UInt32 id,const Vector3f &offset,Float gmin,Float before,
                           Float opacity,const Color3f &radiance,const Color3f &behind,
                           Float after,Mask valid,bool hard_hit) {
-        const bool voxel_background = m_scene_mapping == "projective_shell" && !m_background_use_ellipsoid;
+        const bool voxel_background = m_background_shell_levels != 0 && !m_background_use_ellipsoid;
         if (voxel_background)
-            valid &= projective_core_ids(id, valid);
-        auto evaluate = [this,quaternion,rotate,clean,is_background,dcolor,dalpha,tau,cfg,rgb_only,hard_hit](
+            valid &= core_ids(id, valid);
+        Vector3f size = leaf_size(id, valid);
+        Float tau = dr::maximum(cfg.at("geometry_tau_voxel_fraction")*size[0],1e-8f);
+        auto evaluate = [this,quaternion,rotate,clean,is_background,dcolor,dalpha,tau,size,cfg,rgb_only,hard_hit](
             const UInt32 &id,const Vector3f &offset,const Float &gmin,const Float &before,
             const Float &opacity,const Color3f &radiance,const Color3f &behind,
             const Float &after,Mask valid) {
@@ -2662,20 +2523,20 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             if(hard_hit && (two_sided || (transition_only && cfg.at("geometry_hit_expansion_band_tau")>0.f))) {
                 for(uint32_t corner=0;corner<8;++corner) {
                     Vector3f corner_offset;
-                    for(uint32_t j=0;j<3;++j) corner_offset[j]=(float((corner>>j)&1u)-center[j])*m_size[j];
+                    for(uint32_t j=0;j<3;++j) corner_offset[j]=(float((corner>>j)&1u)-center[j])*size[j];
                     contains &= dr::squared_norm(rotate(corner_offset,qw,-qv)/scale)<=1.f;
                 }
             }
             if(two_sided) {
-                float band=tau*cfg.at("geometry_boundary_band_tau");
-                Float t=band>0.f?dr::clip(1.f-dr::abs(distance)/band,0.f,1.f):Float(0.f);
+                Float band=tau*cfg.at("geometry_boundary_band_tau");
+                Float t=dr::select(band>0.f,dr::clip(1.f-dr::abs(distance)/dr::select(band>0.f,band,1.f),0.f,1.f),0.f);
                 Float taper=t*t*(3.f-2.f*t);
                 dg*=hard_hit?dr::select(is_background,1.f,taper):taper;
                 if(hard_hit) dg=dr::select((dg>0.f)&(is_background|contains),0.f,dg);
             } else if(transition_only) {
                 if(hard_hit) {
-                    float band=tau*cfg.at("geometry_hit_expansion_band_tau");
-                    Float t=band>0.f?dr::clip(1.f+distance/band,0.f,1.f):Float(0.f);
+                    Float band=tau*cfg.at("geometry_hit_expansion_band_tau");
+                    Float t=dr::select(band>0.f,dr::clip(1.f+distance/dr::select(band>0.f,band,1.f),0.f,1.f),0.f);
                     Float taper=dr::select(!is_background & !contains,t*t*(3.f-2.f*t),0.f);
                     dg=dr::select(dg>0.f,dg*taper,dg);
                 } else dg=dr::maximum(dg,0.f);
@@ -2698,7 +2559,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         Mask stored = valid & (row < gradient_rows);
         // Apply 1/pdf after the nonlinear proxy clamp and transition gates.
         for(uint32_t j=0;j<3;++j) {
-            dr::scatter_reduce(ReduceOp::Add,gradients["centers"],clean(dg*gc[j]*m_size[j])*weight,row*3+j,stored);
+            dr::scatter_reduce(ReduceOp::Add,gradients["centers"],clean(dg*gc[j]*size[j])*weight,row*3+j,stored);
             dr::scatter_reduce(ReduceOp::Add,gradients["log_scales"],clean(dg*gs[j])*weight,row*3+j,stored);
             dr::scatter_reduce(ReduceOp::Add,gradients["rotation_tangent"],clean(dg*gr[j])*weight,row*3+j,stored);
         }
@@ -2717,9 +2578,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         // that the recorded suffix is complete; no extra traversal is done.
         // Removal reduces hit count and increases T, so insertion's spare-hit
         // capacity and reduced-final-T checks do not apply.
-        Mask exited = projective ? !state.segment.valid :
-            (!dr::all(state.cell>=0) | !dr::all(state.cell<int(m_resolution)) | (state.entry>=exit));
-        deletion_complete = exited & (state.iterations<=3*m_resolution+3) &
+        Mask exited =
+            (!dr::all(state.cell>=0) | !dr::all(state.cell<int(root_resolution())) | (state.entry>=exit));
+        deletion_complete = exited & (state.iterations<=3*root_resolution()+3) &
                             (weight==1.f) & dr::isfinite(inverse_pdf) &
                             dr::all(dr::isfinite(result.raw_rgb)) &
                             dr::all(dr::isfinite(reference_rgb));
@@ -2748,8 +2609,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         [this,hit_records=records.hit,hit_ids=records.hit_id,hit_count=state.hits,
          ray_count,hit_stride,lane,clean,dcolor,dalpha,d,weight,is_background,
          is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry,rgb_only,
-         collect_rgb_deletion,deletion_complete,deletion_residual,distortion_enabled,
-         distortion_weight,diagonal,quaternion,rotate,projective,ray_origin=ray.o,
+         collect_rgb_deletion,collect_adaptive_priority,deletion_complete,deletion_residual,distortion_enabled,
+         distortion_weight,diagonal,quaternion,rotate,world_shell,
          total_mass=state.distortion_mass,total_moment=state.distortion_moment,
          gradient_row,gradient_rows,appearance,compact_path_records,hit_before_field,
          hit_depth_field](ReverseState &s) {
@@ -2775,6 +2636,12 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             if(!rgb_only) grad_rgb=dr::select(is_background,Color3f(0.f),grad_rgb);
             grad_rgb*=weight;
             Float grad_opacity=clean(dr::dot(dcolor,before*(radiance-s.behind))+dalpha*before*s.after);
+            // Appearance sensitivity before the sigmoid chain. This measures
+            // RGB/D-SSIM reconstruction error, not the distortion regularizer;
+            // it reuses the current reverse suffix and needs no extra tracing.
+            if (collect_adaptive_priority)
+                dr::scatter_reduce(ReduceOp::Add,s.deletion_sums["adaptive_priority"],
+                    dr::detach(clean(dr::abs(opacity*weight*grad_opacity))),id,valid);
             Float grad_logit=grad_opacity*weight*opacity*(1.f-opacity);
             Mask distortion_geometry_valid(false);
             if (distortion_enabled) {
@@ -2798,7 +2665,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     opacity*s.distortion_weight_derivative);
                 Float depth_derivative=distortion_weight*weight*
                     (2.f*contribution*(left_mass-s.distortion_mass))/diagonal;
-                if (projective)
+                if (world_shell)
                     depth_derivative=distortion_weight*weight*
                         (2.f*contribution*(left_mass-s.distortion_mass))*depth_chain;
                 depth_derivative=dr::select(hit_count>1u,depth_derivative,0.f);
@@ -2807,9 +2674,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 // Its implicit derivative is exact while hard-hit membership,
                 // cell clipping, and DDA ordering stay fixed. Clipped endpoints
                 // are fixed by the grid, so their geometric depth derivative is zero.
-                const bool voxel_background = projective && !m_background_use_ellipsoid;
-                Mask geometry_hit = voxel_background ? projective_core_ids(id, valid) : valid;
-                auto depth_geometry = [this,quaternion,rotate,ray_origin,d](const UInt32 &id,
+                const bool voxel_background = world_shell && !m_background_use_ellipsoid;
+                Mask geometry_hit = voxel_background ? core_ids(id, valid) : valid;
+                auto depth_geometry = [this,quaternion,rotate,d](const UInt32 &id,
                     const Vector3f &offset,const Float &depth_derivative,
                     const Mask &depth_free,const Mask &valid) {
                     Float qw;Vector3f qv,scale,log_scale;
@@ -2818,7 +2685,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                         log_scale[j]=dr::gather<Float>(m_log_scales,id*3+j,valid);
                         scale[j]=dr::exp(dr::clip(log_scale[j],-30.f,30.f));
                     }
-                    Vector3f local_direction=projective_hit_direction(ray_origin,d,id,valid);
+                    Vector3f local_direction=d;
                     Vector3f principal=rotate(offset,qw,-qv), direction=rotate(local_direction,qw,-qv);
                     Vector3f weighted_point=principal/(scale*scale);
                     Vector3f weighted_direction=direction/(scale*scale);
@@ -2850,9 +2717,10 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                             Vector3f(0.f), Float(0.f), Mask(false), Mask(false));
                     }, "Voxel reconstruction core distortion geometry") :
                     depth_geometry(id, offset, depth_derivative, depth_free, geometry_hit);
+                Vector3f size = leaf_size(id, geometry_hit);
                 for(uint32_t j=0;j<3;++j) {
                     dr::scatter_reduce(ReduceOp::Add,s.gradients["centers"],
-                        clean(factor*center_gradient[j]*m_size[j]),row*3+j,distortion_geometry_valid&stored);
+                        clean(factor*center_gradient[j]*size[j]),row*3+j,distortion_geometry_valid&stored);
                     dr::scatter_reduce(ReduceOp::Add,s.gradients["log_scales"],
                         clean(factor*scale_gradient[j]),row*3+j,
                         distortion_geometry_valid&stored&(log_scale[j]>-30.f)&(log_scale[j]<30.f));

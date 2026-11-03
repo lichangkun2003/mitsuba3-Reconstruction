@@ -102,7 +102,9 @@ def round_cuda_allocation(size, allocator_policy="cuda_2m"):
     return 1 << (aligned - 1).bit_length()
 
 
-def estimate_spatial_index_bytes(active_voxels, resolution, *, allocator_policy="cuda_2m"):
+def estimate_spatial_index_bytes(active_voxels, resolution, *, allocator_policy="cuda_2m",
+                                 background_shell_levels=0, background_subdivision_level=0,
+                                 background_adaptive=False):
     """Bound resident normal-tree arrays before occupied cells are available.
 
     reconstruction_tree.h stores one Int32 per leaf plus three flattened
@@ -119,8 +121,20 @@ def estimate_spatial_index_bytes(active_voxels, resolution, *, allocator_policy=
     """
     n = _integer("active_voxels", active_voxels)
     size = _integer("resolution", resolution, 1)
-    if size**3 > 2**32 - 1 or n > size**3:
-        raise ValueError("Spatial index grid and unique leaf count must fit UInt32")
+    shells = _integer("background_shell_levels", background_shell_levels)
+    subdivision = _integer("background_subdivision_level", background_subdivision_level)
+    if background_adaptive:
+        # Adaptive native trees use this finest virtual core lattice; actual
+        # foreground leaves retain their physical resolution. Bound only the
+        # occupied ancestors, never materialize the logical address space.
+        size, subdivision = 1024, 9
+    if subdivision > 9 or (subdivision and (not shells or size < (1 << (subdivision + 1)))):
+        raise ValueError("Invalid background subdivision for the core grid")
+    background_leaves = 56 * shells * 8**subdivision
+    extent = size**3 + background_leaves
+    if (shells > 10 or size > 1024 or extent > 2**64 - 1 or n > extent or n > 2**32 - 1
+            or (shells and (size < 2 or size & (size-1)))):
+        raise ValueError("Invalid spatial index grid: cell addresses must fit UInt64 and active rows UInt32")
     nodes, divisor = 0, 2
     while divisor < 2 * size:
         side = (size + divisor - 1) // divisor
@@ -129,6 +143,31 @@ def estimate_spatial_index_bytes(active_voxels, resolution, *, allocator_policy=
     # Resolution one has no internal levels. Both empty and root-only trees
     # keep one-element sentinels for arrays without populated records.
     rounded = lambda count: round_cuda_allocation(max(1, count) * 4, allocator_policy)
+    if shells:
+        # Bound occupied ancestors per level, never allocate/count a dense
+        # background address space. Each internal node needs an active leaf
+        # descendant, and a leaf contributes at most one ancestor at a level.
+        core_depth = size.bit_length() - 1
+        depth = core_depth + shells
+        nodes = 0
+        for level in range(1, depth+1):
+            # Fine blocks align with the core. Larger blocks meet its centered
+            # box in eight octants until they reach the single world root.
+            possible = (1 << (3*(core_depth-level)) if level < core_depth else
+                        8 if level < depth else 1)
+            for shell in range(shells):
+                leaf_level = core_depth - 1 + shell - subdivision
+                if level <= leaf_level:
+                    continue  # Occupied coarse leaves are terminal, not nodes.
+                if level < core_depth + shell:
+                    possible += 7 << (3*(core_depth+shell-level))
+                else:
+                    possible += 8 if level < depth else 1
+            world_blocks = 1 << (3*(depth-level))
+            nodes += min(n, possible, world_blocks)
+        # Mixed trees store one edge reference per leaf and non-root node.
+        edges = n + max(0, nodes - 1)
+        return rounded(edges) + 3 * rounded(nodes) + 4 * rounded(1)
     return rounded(n) + 3 * rounded(nodes) + 4 * rounded(1)
 
 
@@ -191,7 +230,7 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
     # Multiplicity avoids ever constructing N- or ray-sized Python arrays.
     buffers = {
         "model_parameters": [(n * width * 4, 1) for width in model_widths.values()],
-        "model_cell_indices": [(n * 4, 1)],
+        "model_cell_indices": [(n * 8, 1)],
         "adam_means": [(n * width * 4, 1) for width in widths.values()],
         "adam_squared_means": [(n * width * 4, 1) for width in widths.values()],
         "adam_step_counters": [(n * 4, 5)],
@@ -326,9 +365,8 @@ def plan_refinement_memory(request, *, gpu, live_memory=None, allocator_policy="
                            radiance_degree_steps=True):
     """Budget the next refinement allocation before parent state is mutated.
 
-    A request comes from the refiner's before_allocate callback. The early
-    projective forecast contains only the unavoidable background children;
-    later requests carry the actual fitted whole-model count. This function
+    A request comes from the refiner's before_allocate callback and carries
+    the fitted core count plus unchanged world-space background leaves. This function
     checks transition storage only. The caller must also check the next
     ordinary-view plan using request['active_voxels'] (a lower bound until
     exact_count becomes true), including its reference cache and loss buffers.
@@ -341,8 +379,8 @@ def plan_refinement_memory(request, *, gpu, live_memory=None, allocator_policy="
     if not isinstance(request, Mapping):
         raise ValueError("Refinement request must be a mapping")
     stage = request.get("stage")
-    stages = ("core_appearance", "projective_core_appearance",
-              "projective_forecast", "projective_model")
+    stages = ("core_appearance", "world_core_appearance", "world_background_appearance", "world_model",
+              "adaptive_background_commit")
     if stage not in stages:
         raise ValueError("Unknown refinement allocation stage")
     if not isinstance(request.get("exact_count"), bool):
@@ -351,6 +389,8 @@ def plan_refinement_memory(request, *, gpu, live_memory=None, allocator_policy="
              "background_child_count")
     counts = {name: _integer(name, request.get(name)) for name in names}
     core_parents = _integer("core_parent_count", request.get("core_parent_count", 0))
+    background_parents = _integer("background_parent_count", request.get("background_parent_count", 0))
+    existing_background = _integer("existing_background_child_count", request.get("existing_background_child_count", 0))
     for name in ("workspace_reserve_mib", "device_reserve_mib", "known_index_bytes"):
         _integer(name, locals()[name])
     if lifecycle_epoch_bytes not in (4, 8) or isinstance(lifecycle_epoch_bytes, bool):
@@ -361,8 +401,8 @@ def plan_refinement_memory(request, *, gpu, live_memory=None, allocator_policy="
     sh = _integer("sh_count", metadata.get("sh_count"), 1)
     opacity = _integer("opacity_sh_count", metadata.get("opacity_sh_count"), 1)
     rounding = lambda size: round_cuda_allocation(size, allocator_policy)
-    model_widths = (1, 3 * sh, opacity, 3, 3, 4)  # Cell IDs, SH, geometry.
-    appearance = stage in ("core_appearance", "projective_core_appearance")
+    model_widths = (2, 3 * sh, opacity, 3, 3, 4)  # UInt64 cell IDs, SH, geometry; four-byte units.
+    appearance = stage in ("core_appearance", "world_core_appearance", "world_background_appearance")
     allocate = counts["allocation_voxels"]
     model_bytes = sum(rounding(allocate * width * 4)
                       for width in ((3 * sh, opacity) if appearance else model_widths))
@@ -371,6 +411,15 @@ def plan_refinement_memory(request, *, gpu, live_memory=None, allocator_policy="
     # for parent IDs, child indices, component values and scatter addresses.
     scratch_rows = counts["background_child_count"] if not appearance else allocate
     scratch_bytes = 6 * rounding(scratch_rows * 4)
+    if stage == "adaptive_background_commit":
+        # Selected refinement keeps the old model live until the replacement
+        # is returned. Adam then migrates one field at a time: budget its
+        # largest destination AND the corresponding flattened gather indices.
+        # Already migrated fields also grow by the net number of newborn rows.
+        scratch_bytes += 2 * rounding(allocate * max(3 * sh, opacity, 4) * 4)
+        grown = max(0, counts["active_voxels"] - counts["old_voxels"])
+        clock_width = 4 + (math.isqrt(sh - 1) + 1 if radiance_degree_steps else 1)
+        scratch_bytes += rounding(grown * (2 * (3 * sh + opacity + 9) + clock_width) * 4)
     additional = model_bytes + scratch_bytes + workspace_reserve_mib * MIB
 
     # Static fallback: parent model+Adam+lifecycle remain live through fitting.
@@ -384,10 +433,13 @@ def plan_refinement_memory(request, *, gpu, live_memory=None, allocator_policy="
     retained += known_index_bytes
     existing = counts["existing_child_count"]
     # Core fitting has geometry and parent IDs before appearance is allocated.
-    existing_widths = (1, 3, 3, 4, 1) if appearance else model_widths
+    existing_widths = (2, 3, 3, 4, 1) if appearance else model_widths
     retained += sum(rounding(existing * width * 4) for width in existing_widths)
-    if stage == "projective_core_appearance":
+    if stage == "world_core_appearance":
         retained += sum(rounding(core_parents * width * 4) for width in model_widths)
+    if stage == "world_background_appearance":
+        retained += sum(rounding(background_parents * width * 4) for width in model_widths)
+    retained += sum(rounding(existing_background * width * 4) for width in model_widths)
 
     total = _gpu_memory_bytes(gpu)
     available = None if total is None else max(0, total - retained - device_reserve_mib * MIB)

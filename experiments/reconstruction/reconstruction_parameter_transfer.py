@@ -96,7 +96,8 @@ class DeferredRemapField:
 
     ``append`` has exactly ``(new_count - len(survivors)) * width`` elements;
     omitted appended values are zero (Adam's newborn state). No conversion or
-    arithmetic is applied to the payload, including UInt32 optimizer clocks.
+    arithmetic is applied to the payload, including UInt32 optimizer clocks
+    and UInt64 logical cell addresses. Row/gather indices remain UInt32.
     """
 
     def __init__(self, old_value, survivors, width, new_count, *, append=None, dr,
@@ -106,8 +107,13 @@ class DeferredRemapField:
             raise ValueError("Invalid topology transfer dimensions")
         self.dr, self.array_type = dr, type(old_value)
         if dr.depth_v(self.array_type) != 1 or dr.type_v(self.array_type) not in (
-                dr.VarType.Float32, dr.VarType.UInt32, dr.VarType.Int32):
-            raise TypeError("Topology transfer fields must be flat Float32/UInt32/Int32 arrays")
+                dr.VarType.Float32, dr.VarType.UInt32, dr.VarType.Int32, dr.VarType.UInt64):
+            raise TypeError("Topology transfer fields must be flat Float32/UInt32/Int32/UInt64 arrays")
+        if dr.depth_v(type(survivors)) != 1 or dr.type_v(type(survivors)) != dr.VarType.UInt32:
+            raise TypeError("Topology survivor row indices must be flat UInt32 arrays")
+        self.itemsize = 8 if dr.type_v(self.array_type) == dr.VarType.UInt64 else 4
+        if chunk_bytes < self.itemsize:
+            raise ValueError("Topology transfer chunks must hold at least one field element")
         self._old, self._survivors, self._append = old_value, survivors, append
         self.width, self.new_count = int(width), int(new_count)
         if self.new_count * self.width > 2 ** 32 - 1 or int(dr.width(old_value)) > 2 ** 32 - 1:
@@ -122,7 +128,8 @@ class DeferredRemapField:
         self.scratch_directory, self.chunk_bytes = scratch_directory, int(chunk_bytes)
         self.allocation_guard = allocation_guard
         self.allocator_policy = allocator_policy
-        self.statistics = {"bytes": self.new_count * self.width * 4, "chunk_bytes": self.chunk_bytes}
+        self.statistics = {"bytes": self.new_count * self.width * self.itemsize,
+                           "chunk_bytes": self.chunk_bytes, "element_bytes": self.itemsize}
         self._consumed = False
 
     def materialize(self, allocation_guard=None):
@@ -130,14 +137,14 @@ class DeferredRemapField:
         if self._consumed:
             raise RuntimeError("A topology field transfer can only be materialized once")
         dr, array_type = self.dr, self.array_type
-        dtype = np.float32 if dr.is_float_v(array_type) else (
-            np.uint32 if dr.is_unsigned_v(array_type) else np.int32)
+        dtype = {dr.VarType.Float32: np.float32, dr.VarType.UInt32: np.uint32,
+                 dr.VarType.Int32: np.int32, dr.VarType.UInt64: np.uint64}[dr.type_v(array_type)]
         length = self.new_count * self.width
         if length == 0:
             self._old = self._append = self._survivors = None
             self._consumed = True
             return dr.empty(array_type, 0)
-        block = max(1, self.chunk_bytes // 4)
+        block = max(1, self.chunk_bytes // self.itemsize)
         host = _HostField(length, dtype, self.scratch_directory)
         self.statistics["storage"] = host.storage
         try:
@@ -175,13 +182,13 @@ class DeferredRemapField:
             # synchronization. Wait for those frees before querying physical
             # residency or rejecting the replacement on a stale free count.
             dr.sync_thread()
-            required = round_cuda_allocation(length * 4, self.allocator_policy) + max(64 * MIB, 8 * self.chunk_bytes)
+            required = round_cuda_allocation(length * self.itemsize, self.allocator_policy) + max(64 * MIB, 8 * self.chunk_bytes)
             guard = allocation_guard or self.allocation_guard
             if guard is not None:
                 try:
                     guard(required)
                 except TrainingMemoryError as error:
-                    error.plan.update(staged_field_bytes=length * 4, staged_field_width=self.width,
+                    error.plan.update(staged_field_bytes=length * self.itemsize, staged_field_width=self.width,
                                       staged_field_rows=self.new_count, staging_storage=host.storage)
                     raise
             else:
