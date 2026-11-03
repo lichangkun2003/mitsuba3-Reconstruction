@@ -517,33 +517,12 @@ def save_initial_training_view(config, model, views, model_path, mi, dr, np, *, 
                                     completed_epochs=0, global_step=0)
 
 
-def is_coarse_training_end(topology, completed_epochs):
-    """Capture the original coarse level only, before its refinement."""
-    core = getattr(topology, "core_resolution", topology.resolution)
-    return core == topology.schedule.start_resolution and is_refinement_boundary(topology, completed_epochs)
-
-
 def is_refinement_boundary(topology, completed_epochs):
     """Use the same old-level boundary as CPU and GPU topology finish_epoch."""
     core = getattr(topology, "core_resolution", topology.resolution)
     return (topology.schedule.enabled
             and core < topology.schedule.target_resolution
             and completed_epochs >= topology.level_start_epoch + topology.level_budget)
-
-
-def save_coarse_training_view(config, model, views, model_path, mi, dr, np, *,
-                             completed_epochs, global_step):
-    """Render the optimized coarse model, never a replacement fine model."""
-    path = model_path.parent / "train" / "0000-coarse.png"
-    if not config.evaluation.enabled:
-        return dict(status="skipped", reason="evaluation_disabled")
-    if path.exists():
-        # A checkpoint preceding the split can revisit this boundary on resume.
-        # Preserve the original coarse-stage comparison image.
-        return dict(status="skipped", reason="existing_image", image=str(path),
-                    existing_image=True)
-    return _save_training_view_zero(config, model, views, path, mi, dr, np,
-                                    completed_epochs=completed_epochs, global_step=global_step)
 
 
 def save_refinement_boundary(config, topology, model, views, model_path, output, mi, dr, np, save, *,
@@ -580,14 +559,7 @@ def save_refinement_boundary(config, topology, model, views, model_path, output,
         rendered = _save_training_view_zero(config, model, views, image, mi, dr, np,
             completed_epochs=completed_epochs, global_step=global_step)
     rendered.update(core_resolution=core, completed_epochs=completed_epochs, global_step=global_step)
-    coarse_render = None
-    if first_level:
-        if image.is_file() and not coarse.exists():
-            shutil.copyfile(image, coarse)
-        coarse_render = dict(rendered)
-        if "image" in rendered:
-            coarse_render["image"] = str(coarse)
-    return dict(checkpoint=saved, render=rendered, coarse_render=coarse_render)
+    return dict(checkpoint=saved, render=rendered)
 
 
 def record_refinement_boundary(report, boundary):
@@ -598,8 +570,6 @@ def record_refinement_boundary(report, boundary):
     core = str(checkpoint["core_resolution"])
     report.setdefault("pre_refine_checkpoints", {})[core] = checkpoint
     report.setdefault("level_renders", {})[core] = boundary["render"]
-    if boundary["coarse_render"] is not None:
-        report["coarse_render"] = boundary["coarse_render"]
 
 
 def _save_training_view_zero(config, model, views, path, mi, dr, np, *,
@@ -1914,17 +1884,6 @@ def run_training(distributed=None):
         topology.topology_memory_guard = lambda current_model, current_optimizer, request: prepare_topology_commit_memory(
             config, current_model, current_optimizer, gpu_reference_cache, native_replay,
             report, len(views), request, dr, world_size=world_size)
-        coarse_path = model_path.parent / "train" / "0000-coarse.png"
-        if not config.evaluation.enabled:
-            report["coarse_render"] = dict(status="skipped", reason="evaluation_disabled")
-        elif (not config.schedule.enabled
-              or config.schedule.start_resolution == config.schedule.target_resolution):
-            report["coarse_render"] = dict(status="skipped", reason="no_coarse_level")
-        elif int(getattr(model, "core_resolution", model.resolution)) != config.schedule.start_resolution:
-            report["coarse_render"] = dict(status="skipped", reason="coarse_stage_already_completed",
-                                          image=str(coarse_path), existing_image=coarse_path.is_file())
-        else:
-            report["coarse_render"] = dict(status="pending", image=str(coarse_path))
 
         def save(path, epochs, *, pending_epoch_transition=False):
             if not primary:
@@ -2022,7 +1981,7 @@ def run_training(distributed=None):
                     rng_state=rng.bit_generator.state, contour_state=sampler.state_dict(),
                     dataset_signature=signature, config=asdict(config), global_step=global_step,
                     refinement_artifacts={key: report[key] for key in
-                        ("pre_refine_checkpoints", "level_renders", "coarse_render")})
+                        ("pre_refine_checkpoints", "level_renders")})
             initial = broadcast_device_state(initial, distributed, collective, mi, dr)
             if initial["dataset_signature"] != signature or initial["config"] != asdict(config):
                 raise ValueError("GPU workers have different datasets or training configurations")
@@ -2385,9 +2344,6 @@ def run_training(distributed=None):
                 entry["level_render"] = refinement_boundary["render"]
                 entry["epoch_refinement_cache_prepare_seconds"] = refinement_boundary["cache_prepare_seconds"]
                 entry["epoch_level_render_seconds"] = refinement_boundary["render"].get("seconds", 0.)
-                if refinement_boundary["coarse_render"] is not None:
-                    entry["coarse_render"] = refinement_boundary["coarse_render"]
-                    entry["epoch_coarse_render_seconds"] = entry["epoch_level_render_seconds"]
             if collective is not None:
                 communication_after = collective.statistics()
                 entry["collective"] = communication_after

@@ -748,13 +748,12 @@ HPC 使用 ``$HOME/envs/mitsuba/bin/python`` 执行同一 ``-m pip install -r`` 
 合成数据通常对应 ``train/0000.png``；COLMAP 使用该相机的全局索引命名最终评价图。
 多层训练在每次升层前保存同一视角的 ``train/0000-level-0256.png``、
 ``train/0000-level-0512.png`` 等图片，文件编号使用旧核心分辨率，内容为分裂前的模型。
-第一层还保留 ``train/0000-coarse.png`` 作为兼容副本。
 对照图使用相同图像分辨率、背景、评价随机种子约定及 ``--eval-spp``（默认 64），训练保持 1 spp，
 额外出图不会改变训练随机序列。
 双卡仅由 rank 0 保存初始化图和升层前图片，其他工作进程等待；固定单层训练不生成升层图片。
 恢复训练不会覆盖已有对照图，也不会把恢复后的模型作为初始化重新出图；
 已进入细层的 checkpoint 若缺少粗层图，不能补出过去的粗层状态。
-``training-report.json`` 的 ``level_renders`` 记录各层出图信息，``coarse_render`` 保留第一层记录。
+``training-report.json`` 的 ``level_renders`` 记录各层出图信息。
 ``--skip-evaluation`` 同时跳过初始化图、升层前图片和最终评价。
 
 中途完整 checkpoint 仅在升层前保存，命名为
@@ -794,7 +793,7 @@ PLY 和相机来源独立判断，因此已有导出 PLY 的 360 场景仍可使
 360 的渲染尺寸自动取所选图像的实际尺寸，不隐式重采样；
 ``fx, fy, cx, cy`` 分别按实际宽高比例缩放，支持 PINHOLE / SIMPLE_PINHOLE 去畸变相机。
 输出图像编号保留排序后的全局索引，报告记录参考文件名。
-``0000-initial.png``、``0000-level-*.png`` 和 ``0000-coarse.png`` 使用首个训练视角；
+``0000-initial.png`` 和 ``0000-level-*.png`` 使用首个训练视角；
 360 中通常对应全局索引 1，可与最终 ``train/0001.png`` 对比，
 具体索引保存在报告的 ``view_index`` 中。
 

@@ -1,4 +1,4 @@
-"""CPU checks for coarse-image timing and safe repeated/resumed output."""
+"""CPU checks for level-image timing and safe repeated/resumed output."""
 
 from __future__ import annotations
 
@@ -10,12 +10,11 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from train import (TrainConfig, is_coarse_training_end, is_refinement_boundary,
-                   save_coarse_training_view, save_refinement_boundary,
+from train import (TrainConfig, is_refinement_boundary, save_refinement_boundary,
                    record_refinement_boundary, refinement_checkpoint_epochs, update)
 
 
-class CoarseImageTests(unittest.TestCase):
+class LevelImageTests(unittest.TestCase):
     def topology(self, **overrides):
         values = dict(schedule=SimpleNamespace(enabled=True, start_resolution=256,
                                                target_resolution=512),
@@ -24,45 +23,20 @@ class CoarseImageTests(unittest.TestCase):
         return SimpleNamespace(**values)
 
     def test_waits_for_all_coarse_epochs_and_excludes_fine_epochs(self):
-        self.assertFalse(is_coarse_training_end(self.topology(), 599))
-        self.assertTrue(is_coarse_training_end(self.topology(), 600))
+        self.assertFalse(is_refinement_boundary(self.topology(), 599))
+        self.assertTrue(is_refinement_boundary(self.topology(), 600))
         # Pending-transition legacy checkpoints may restore at the boundary.
-        self.assertTrue(is_coarse_training_end(self.topology(), 601))
-        self.assertFalse(is_coarse_training_end(
+        self.assertTrue(is_refinement_boundary(self.topology(), 601))
+        self.assertFalse(is_refinement_boundary(
             self.topology(resolution=512, level_start_epoch=600, level_budget=400), 1000))
 
     def test_no_snapshot_when_there_is_no_refinement(self):
         topology = self.topology()
         topology.schedule.enabled = False
-        self.assertFalse(is_coarse_training_end(topology, 600))
+        self.assertFalse(is_refinement_boundary(topology, 600))
         topology.schedule.enabled = True
         topology.schedule.target_resolution = 256
-        self.assertFalse(is_coarse_training_end(topology, 600))
-
-    def test_disabled_evaluation_does_not_render_or_create_output(self):
-        config = TrainConfig()
-        config.evaluation.enabled = False
-        with tempfile.TemporaryDirectory() as temporary, \
-                mock.patch("train.render_view", side_effect=AssertionError("unexpected rendering")):
-            model_path = Path(temporary) / "experiment" / "model.npz"
-            record = save_coarse_training_view(config, None, [], model_path,
-                None, None, None, completed_epochs=600, global_step=60000)
-            self.assertEqual(record["status"], "skipped")
-            self.assertEqual(record["reason"], "evaluation_disabled")
-            self.assertFalse(model_path.parent.exists())
-
-    def test_existing_coarse_output_is_preserved_without_accessing_current_model(self):
-        with tempfile.TemporaryDirectory() as temporary, \
-                mock.patch("train.render_view", side_effect=AssertionError("unexpected rendering")):
-            model_path = Path(temporary) / "model.npz"
-            image = model_path.parent / "train" / "0000-coarse.png"
-            image.parent.mkdir()
-            image.write_bytes(b"historical coarse pixels")
-            record = save_coarse_training_view(TrainConfig(), None, [], model_path,
-                None, None, None, completed_epochs=1000, global_step=100000)
-            self.assertEqual(record["status"], "skipped")
-            self.assertEqual(record["reason"], "existing_image")
-            self.assertEqual(image.read_bytes(), b"historical coarse pixels")
+        self.assertFalse(is_refinement_boundary(topology, 600))
 
     def test_each_old_core_level_has_a_boundary_including_fixed_shell_storage(self):
         topology = self.topology(resolution=528, core_resolution=512,
@@ -70,7 +44,6 @@ class CoarseImageTests(unittest.TestCase):
         topology.schedule.target_resolution = 1024
         self.assertFalse(is_refinement_boundary(topology, 1049))
         self.assertTrue(is_refinement_boundary(topology, 1050))
-        self.assertFalse(is_coarse_training_end(topology, 1050))
         topology.core_resolution = 1024
         self.assertFalse(is_refinement_boundary(topology, 1500))
 
@@ -118,14 +91,15 @@ class CoarseImageTests(unittest.TestCase):
             self.assertEqual(events, [
                 ("save", "before-refine-0256-epoch-00600.npz", 600), ("render", 272, 600),
                 ("save", "before-refine-0512-epoch-01050.npz", 1050), ("render", 528, 1050)])
-            self.assertEqual((directory / "train/0000-coarse.png").read_bytes(), b"272")
+            self.assertEqual({path.name for path in (directory / "train").glob("*.png")},
+                             {"0000-level-0256.png", "0000-level-0512.png"})
             self.assertEqual((directory / "train/0000-level-0256.png").read_bytes(), b"272")
             self.assertEqual((directory / "train/0000-level-0512.png").read_bytes(), b"528")
             report = {}
             record_refinement_boundary(report, first)
             record_refinement_boundary(report, second)
             self.assertEqual(set(report["level_renders"]), {"256", "512"})
-            self.assertEqual(report["coarse_render"]["core_resolution"], 256)
+            self.assertNotIn("coarse_render", report)
             self.assertEqual(set(report["pre_refine_checkpoints"]), {"256", "512"})
 
     def test_pending_resume_preserves_existing_checkpoint_and_level_image(self):

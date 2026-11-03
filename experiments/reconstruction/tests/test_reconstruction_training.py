@@ -21,8 +21,7 @@ from reconstruction_common import (WORKSPACE, REPOSITORY, initialize_runtime, mo
                                    restore_model, workspace_path, render_view, load_views)
 from preview import RuntimeConfig, RenderConfig
 from reconstruction_checkpoint import load_checkpoint, save_checkpoint
-from train import (GradientSettings, TrainConfig, save_initial_training_view,
-                   save_coarse_training_view)
+from train import GradientSettings, TrainConfig, save_initial_training_view
 
 
 def main():
@@ -375,8 +374,8 @@ def main():
         coarse_report = json.loads((run / "coarse" / "training-report.json").read_text(encoding="utf-8"))
         assert coarse_report["initial_render"]["status"] == "skipped"
         assert coarse_report["initial_render"]["reason"] == "evaluation_disabled"
-        assert coarse_report["coarse_render"]["status"] == "skipped"
-        assert coarse_report["coarse_render"]["reason"] == "evaluation_disabled"
+        assert coarse_report["level_renders"]["4"]["status"] == "skipped"
+        assert coarse_report["level_renders"]["4"]["reason"] == "evaluation_disabled"
         assert not (run / "coarse" / "train" / "0000-initial.png").exists()
         assert not (run / "coarse" / "train" / "0000-coarse.png").exists()
         coarse_performance = json.loads(Path(coarse_report["performance_file"]).read_text(encoding="utf-8"))
@@ -416,8 +415,8 @@ def main():
         run_process([sys.executable, "-I", str(entry), "--config", str(config_path)], "coarse-image")
         coarse_image_report = json.loads(
             (run / "coarse-image" / "training-report.json").read_text(encoding="utf-8"))
-        coarse_record = coarse_image_report["coarse_render"]
-        coarse_image_path = run / "coarse-image" / "train" / "0000-coarse.png"
+        coarse_record = coarse_image_report["level_renders"]["4"]
+        coarse_image_path = run / "coarse-image" / "train" / "0000-level-0004.png"
         assert coarse_record["status"] == "passed"
         assert Path(coarse_record["image"]) == coarse_image_path
         assert (coarse_record["view_index"], coarse_record["completed_epochs"],
@@ -446,25 +445,14 @@ def main():
         assert coarse_image_saved["training_state"]["rng_state"] == coarse_oracle["training_state"]["rng_state"]
         coarse_image_history = [json.loads(line) for line in
             (run / "coarse-image" / "training.jsonl").read_text(encoding="utf-8").splitlines()]
-        assert coarse_image_history[1]["coarse_render"] == coarse_record
-        assert coarse_image_history[1]["epoch_coarse_render_seconds"] == coarse_record["seconds"]
+        assert coarse_image_history[1]["level_render"] == coarse_record
+        assert coarse_image_history[1]["epoch_level_render_seconds"] == coarse_record["seconds"]
         assert coarse_image_history[1]["training_resolution"] == 4
         assert coarse_image_history[1]["resolution"] == 8
         assert coarse_image_history[1]["topology"]["refined"] is True
         assert {path.name for path in (run / "coarse-image" / "train").glob("*.png")} == {
-            "0000-initial.png", "0000-coarse.png", "0000-level-0004.png", "0000.png"}
-        # A repeat call must retain the historical coarse image, even if the
-        # currently available model is already refined and further optimized.
-        coarse_bytes = coarse_image_path.read_bytes()
-        coarse_image_final = load_checkpoint(run / "coarse-image" / "model.npz")
-        preserved_coarse = save_coarse_training_view(TrainConfig(),
-            restore_model(coarse_image_final, mi), initial_views,
-            run / "coarse-image" / "model.npz", mi, dr, np,
-            completed_epochs=3, global_step=6)
-        assert preserved_coarse["status"] == "skipped"
-        assert preserved_coarse["reason"] == "existing_image"
-        assert coarse_image_path.read_bytes() == coarse_bytes
-        report["checks"].append("coarse train-view-0 PNG matches optimized pre-split model, preserves sampling RNG, and is not overwritten")
+            "0000-initial.png", "0000-level-0004.png", "0000.png"}
+        report["checks"].append("level train-view-0 PNG matches optimized pre-split model and preserves sampling RNG without a coarse alias")
 
         run_process([sys.executable, "-I", str(Path(__file__).resolve().parents[1] / "evaluate.py"),
                      "--checkpoint", str(run / "full" / "model.npz"), "--split", "both", "--spp", "2",

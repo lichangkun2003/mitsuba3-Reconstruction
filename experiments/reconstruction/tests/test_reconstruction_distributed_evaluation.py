@@ -159,8 +159,9 @@ def compare_evaluations(serial, parallel, splits, selected, np, *, save_linear=T
         assert json.loads((parallel / split / "metrics.json").read_text(encoding="utf-8")) == b
         expected_pngs = {f"{index:04d}.png" for index in expected_indices}
         pngs = {path.name for path in (parallel / split).glob("*.png")}
-        # Automatic training also saves initialization/coarse comparisons.
-        assert pngs - {"0000-initial.png", "0000-coarse.png"} == expected_pngs
+        # Automatic training also saves initialization and per-level comparisons.
+        level_pngs = {name for name in pngs if name.startswith("0000-level-")}
+        assert pngs - {"0000-initial.png"} - level_pngs == expected_pngs
         if save_linear:
             assert {path.name for path in (parallel / split).glob("*.npz")} == {
                 f"{index:04d}.npz" for index in expected_indices}

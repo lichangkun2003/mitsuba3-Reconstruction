@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from preview import RenderConfig
 import reconstruction_common as common
 from test_reconstruction_dataset import write_fixture
-from train import TrainConfig, is_coarse_training_end
+from train import TrainConfig, is_refinement_boundary
 
 
 def numpy_runtime():
@@ -266,15 +266,15 @@ class InitializationIntegrationTests(unittest.TestCase):
         np.testing.assert_allclose(rays.o + rays.d * rays.maxt,
                                    position + render.far_clip * direction, rtol=1e-6, atol=1e-6)
 
-    def test_coarse_snapshot_follows_core_and_ignores_shell_padding(self):
+    def test_refinement_snapshot_follows_core_and_ignores_shell_padding(self):
         manager = SimpleNamespace(
             schedule=SimpleNamespace(enabled=True, start_resolution=256, target_resolution=512),
             resolution=256, core_resolution=256, level_start_epoch=0, level_budget=600)
-        self.assertFalse(is_coarse_training_end(manager, 599))
-        self.assertTrue(is_coarse_training_end(manager, 600))
+        self.assertFalse(is_refinement_boundary(manager, 599))
+        self.assertTrue(is_refinement_boundary(manager, 600))
         manager.resolution, manager.core_resolution = 512, 512
         manager.level_start_epoch, manager.level_budget = 600, 400
-        self.assertFalse(is_coarse_training_end(manager, 1000))
+        self.assertFalse(is_refinement_boundary(manager, 1000))
 
 
 if __name__ == "__main__":

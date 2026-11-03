@@ -1798,7 +1798,6 @@ Adam 状态的数值误差。可调整 ``--cameras``、``--warmup``、``--repeat
      train/             # 初始化、每次升层前对照图、最终训练集视角 PNG 和 metrics.json
        0000-initial.png  # 第一次参数更新前，第一个训练相机的初始化体素图
        0000-level-0256.png  # 256 层全部视角优化结束后、升层前，同一相机的图
-       0000-coarse.png   # 第一层对照图的兼容副本
        0000.png         # 同一相机下的最终重建图
      test/              # 最终模型的测试集视角 PNG 和 metrics.json
      evaluation-config.json
@@ -2334,11 +2333,11 @@ COLMAP 数据集中的相机全局索引不一定为 0。
 启用多层调度时，每层最后一个 epoch 的全部训练视角更新完、执行升层之前，
 还会保存 ``train/0000-level-{core:04d}.png``。256 → 512 → 1024 时分别保存
 ``0000-level-0256.png`` 和 ``0000-level-0512.png``，展示该层完成优化、尚未分裂的模型；
-文件名使用核心分辨率，而非含背景的存储网格分辨率。第一层另保留 ``0000-coarse.png``
-作为兼容副本。对照图与初始化图和最终图使用相同的第一个训练相机、分辨率、
+文件名使用核心分辨率，而非含背景的存储网格分辨率。
+对照图与初始化图和最终图使用相同的第一个训练相机、分辨率、
 背景、评价随机种子约定及 ``evaluation.spp``（默认 64），不会改变训练随机序列。
 ``training-report.json`` 的 ``level_renders`` 记录各层出图信息，
-``pre_refine_checkpoints`` 记录对应 checkpoint；第一层同时保留 ``coarse_render``。
+``pre_refine_checkpoints`` 记录对应 checkpoint。
 双卡只由 rank 0 出图，其他工作进程等待完成后继续升层；固定单层训练不生成此类对照图。
 恢复训练时保留已有文件；恢复升层前 checkpoint 时可以补存该层缺失的对照图，
 但已进入细层的 checkpoint 无法还原此前粗层的图。``--skip-evaluation`` 关闭这些对照图，
