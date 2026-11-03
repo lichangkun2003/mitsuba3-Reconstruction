@@ -315,7 +315,7 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
                    background_shell_levels=None, background_opacity=None,
                    background_initial_resolution=None, background_refinement=None,
                    background_initial_leaf_budget=200000, background_initial_pixel_threshold=32.0,
-                   background_max_resolution=512, **removed_options):
+                   background_max_resolution=512, background_resolution_mode="per_shell", **removed_options):
     """Prepare normalized cameras and core-only point seeds without contraction.
 
     New unbounded scenes start with 56 leaves per world-space cube shell and
@@ -328,6 +328,8 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
                                             WORLD_SHELL_VERSION)
 
     reject_removed_background_fields(removed_options)
+    if background_resolution_mode not in ("per_shell", "core_parent", "core"):
+        raise ValueError("background_resolution_mode must be per_shell, core_parent or core")
     if removed_options or shell_layers is not None:
         raise ValueError("Legacy shell settings are unsupported; use background_shell_levels")
     dataset = Path(dataset).resolve()
@@ -430,7 +432,8 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
                     background_initialization="adaptive_full_shells",
                     background_initial_leaf_budget=background_initial_leaf_budget,
                     background_initial_pixel_threshold=background_initial_pixel_threshold,
-                    background_max_resolution=background_max_resolution)
+                    background_max_resolution=background_max_resolution,
+                    background_resolution_mode=background_resolution_mode)
             if initial_subdivision:
                 initialization.update(background_initial_resolution=initial_resolution,
                                       background_initialization="point_cloud_sparse", background_voxels=0)
@@ -445,6 +448,8 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
             reject_removed_background_fields(initialization)
             expected.update(background_shell_levels=levels, root_half_extent=2 ** levels)
             if refinement == "adaptive":
+                if initialization.get("background_resolution_mode", "per_shell") != background_resolution_mode:
+                    raise ValueError("Saved background_resolution_mode differs from configuration")
                 expected.update(background_initial_resolution=2,
                     background_initialization="adaptive_full_shells",
                     background_initial_leaf_budget=background_initial_leaf_budget,
@@ -523,7 +528,8 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
                     normalized, source_colors, start, [-1.] * 3, [1.] * 3, levels, views, np,
                     initial_leaf_budget=background_initial_leaf_budget,
                     pixel_threshold=background_initial_pixel_threshold,
-                    max_depth=background_max_resolution.bit_length() - 2)
+                    max_depth=background_max_resolution.bit_length() - 2,
+                    resolution_mode=background_resolution_mode, max_resolution=background_max_resolution)
                 background_point_counts = adaptive_background["point_counts"]
             elif initial_subdivision:
                 background_points = prepare_sparse_background(normalized, source_colors, start,

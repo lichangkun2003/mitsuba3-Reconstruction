@@ -75,6 +75,80 @@ class AdaptiveAddressTests(unittest.TestCase):
 
 
 class AdaptivePreparationTests(unittest.TestCase):
+    def test_core_mode_initialization_reaches_foreground_size_in_every_shell(self):
+        with patch("reconstruction_adaptive_background.projected_leaf_pixels",
+                   side_effect=lambda cells, *args: np.full(len(cells), 100., np.float32)):
+            data = prepare_adaptive_background(np.empty((0,3)), np.empty((0,3)),
+                4, [-1.]*3, [1.]*3, 2, cameras(), np, initial_leaf_budget=5000,
+                pixel_threshold=8., resolution_mode="core", max_resolution=1024)
+        coarse, depth, _ = adaptive_decode_numpy(data["cell_indices"], 2, np)
+        self.assertEqual(len(data["cell_indices"]), 56*8 + 56*64)
+        np.testing.assert_array_equal(depth[coarse < 56], 1)
+        np.testing.assert_array_equal(depth[coarse >= 56], 2)
+        low, high = leaf_boxes_numpy(data["cell_indices"], 4, [-1.]*3, [1.]*3, 2, np)
+        np.testing.assert_array_equal(high-low, .5)
+        self.assertEqual(data["background_resolution_mode"], "core")
+        self.assertEqual(data["background_max_resolution"], 1024)
+
+    def test_core_mode_all_ten_shells_unlock_depth_18_at_1024(self):
+        coarse = np.arange(10)*56 + 45
+        cells = adaptive_encode_numpy(coarse, np.arange(10)+8, 0, np)
+        metadata = dict(fixture()["model_metadata"], resolution=512, core_resolution=512,
+            background_shell_levels=10, world_shell_version=7, background_max_depth=17,
+            background_resolution_mode="core", background_max_resolution=1024)
+        state = dict(cell_indices=cells)
+        projector = lambda low, high, cameras: np.full(len(low), 100., np.float32)
+        checkpoint = dict(model_metadata=metadata, model_state=state)
+        self.assertEqual(len(select_adaptive_background(checkpoint, cameras(), np.ones(10), np,
+                                                        projector=projector)), 0)
+        metadata.update(resolution=1024, core_resolution=1024, background_max_depth=18)
+        selected = select_adaptive_background(checkpoint, cameras(), np.ones(10), np,
+                                              projector=projector)
+        np.testing.assert_array_equal(np.sort(selected), np.arange(10))
+        state["cell_indices"] = adaptive_encode_numpy(coarse, np.arange(10)+9, 0, np)
+        self.assertEqual(len(select_adaptive_background(checkpoint, cameras(), np.ones(10), np,
+                                                        projector=projector)), 0)
+
+    def test_core_parent_initialization_has_one_world_size_floor_across_shells(self):
+        # N=4 has core edge .5; all shell leaves may become edge 1, not .5.
+        # Making projection demand uniform refines only the coarser outer shell.
+        with patch("reconstruction_adaptive_background.projected_leaf_pixels",
+                   side_effect=lambda cells, *args: np.full(len(cells), 100., np.float32)):
+            data = prepare_adaptive_background(np.empty((0,3)), np.empty((0,3)),
+                4, [-1.]*3, [1.]*3, 2, cameras(), np, initial_leaf_budget=1000,
+                pixel_threshold=8., resolution_mode="core_parent", max_resolution=512)
+        coarse, depth, _ = adaptive_decode_numpy(data["cell_indices"], 2, np)
+        self.assertEqual(len(data["cell_indices"]), 56 + 56*8)
+        np.testing.assert_array_equal(depth[coarse < 56], 0)
+        np.testing.assert_array_equal(depth[coarse >= 56], 1)
+        low, high = leaf_boxes_numpy(data["cell_indices"], 4, [-1.]*3, [1.]*3, 2, np)
+        np.testing.assert_array_equal(high-low, 1.)
+        self.assertEqual(data["background_resolution_mode"], "core_parent")
+        self.assertEqual(data["max_depth"], 1)
+
+    def test_core_refinement_unlocks_each_shell_without_a_scalar_depth_cap(self):
+        # All five shells are at their common world floor with a 256 core.
+        # A 512 core permits one more split in every shell, even depths > 9.
+        cells = adaptive_encode_numpy([45, 101, 157, 213, 269], [6, 7, 8, 9, 10], 0, np)
+        metadata = dict(fixture()["model_metadata"], resolution=256, core_resolution=256,
+            background_shell_levels=5, world_shell_version=6, background_max_depth=10,
+            background_resolution_mode="core_parent", background_max_resolution=512)
+        state = dict(cell_indices=cells)
+        projector = lambda low, high, cameras: np.full(len(low), 100., np.float32)
+        checkpoint = dict(model_metadata=metadata, model_state=state)
+        selected = select_adaptive_background(checkpoint, cameras(), np.ones(5), np,
+                                              projector=projector)
+        self.assertEqual(len(selected), 0)
+        metadata.update(resolution=512, core_resolution=512, background_max_depth=11)
+        selected = select_adaptive_background(checkpoint, cameras(), np.ones(5), np,
+                                              projector=projector)
+        self.assertEqual(set(selected.tolist()), set(range(5)))
+        metadata.update(resolution=1024, core_resolution=1024, background_max_depth=12)
+        state["cell_indices"] = adaptive_encode_numpy([45, 101, 157, 213, 269], [8, 9, 10, 11, 12], 0, np)
+        selected = select_adaptive_background(checkpoint, cameras(), np.ones(5), np,
+                                              projector=projector)
+        self.assertEqual(len(selected), 0)
+
     def prepare(self, positions=(), colors=(), budget=252):
         return prepare_adaptive_background(np.asarray(positions).reshape(-1,3), np.asarray(colors).reshape(-1,3),
             4, [-1.]*3, [1.]*3, 2, cameras(), np, initial_leaf_budget=budget, pixel_threshold=8, max_depth=3)

@@ -53,6 +53,7 @@ class DataConfig:
     background_initial_leaf_budget: int = 200000
     background_initial_pixel_threshold: float = 32.0
     background_max_resolution: int = 512  # Finest first-shell edge relative to the core extent.
+    background_resolution_mode: str = "per_shell"  # Legacy default; core/core_parent align world sizes.
 
 
 @dataclass
@@ -174,6 +175,8 @@ def apply_saved_background_defaults(data, entries: dict) -> None:
             data.background_opacity = saved["background_opacity"]
         if "background_initial_resolution" not in entries:
             data.background_initial_resolution = saved.get("background_initial_resolution", 2)
+        if "background_resolution_mode" not in entries:
+            data.background_resolution_mode = saved.get("background_resolution_mode", "per_shell")
         for name in ("background_refinement", "background_initial_leaf_budget",
                      "background_initial_pixel_threshold", "background_max_resolution"):
             if name not in entries and name in saved:
@@ -315,6 +318,8 @@ def validate_config(config: PreviewConfig) -> None:
     validate_shell_levels(config.data.background_shell_levels)
     if config.data.background_refinement not in ("fixed", "uniform", "adaptive"):
         raise ValueError("data.background_refinement must be fixed, uniform, or adaptive")
+    if config.data.background_resolution_mode not in ("per_shell", "core_parent", "core"):
+        raise ValueError("data.background_resolution_mode must be per_shell, core_parent or core")
     for name in ("background_initial_leaf_budget", "background_max_resolution"):
         value = getattr(config.data, name)
         if type(value) is not int or value < 1:

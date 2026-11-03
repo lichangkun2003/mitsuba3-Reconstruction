@@ -66,7 +66,8 @@ def device_checkpoint(model):
                         background_subdivision_level=int(getattr(model, "native_background_subdivision_level", lambda: 0)()),
                         background_shell_levels=int(model.native_background_shell_levels()))
         if metadata["background_refinement"] == "adaptive":
-            metadata["background_max_depth"] = int(getattr(model, "background_max_depth", 9))
+            from reconstruction_world_shell import model_adaptive_limit_fields
+            metadata.update(model_adaptive_limit_fields(model, metadata))
     return {"model_state": {key: (dr.cuda.UInt64 if key == "cell_indices" else dr.cuda.Float32)(value)
                             for key, value in model.snapshot().items()},
             "model_metadata": metadata}

@@ -15,6 +15,24 @@ NAMESPACE_BEGIN(mitsuba)
 
 namespace {
 
+/// Keep v5/v6 addresses canonical through depth 17. Only shell 9 can reach
+/// depth 18 on the native world grid. Its v7 addresses use the otherwise
+/// unused top nibble 0xf, a 6-bit local root and 54 Morton bits; the sentinel
+/// is implicit. All three formats decode to a sentinel path and coarse root.
+template <typename Cell>
+std::array<Cell, 2> adaptive_address_parts(const Cell &cells) {
+    auto extended = (cells & (uint64_t(1) << 62u)) != 0u;
+    auto deepest = (cells >> 60u) == 0xfu;
+    return {
+        dr::select(deepest, (cells & ((uint64_t(1) << 54u) - 1u)) | (uint64_t(1) << 54u),
+            dr::select(extended, cells & ((uint64_t(1) << 52u) - 1u),
+                                 cells & uint64_t(0xffffffffu))),
+        dr::select(deepest, uint64_t(504u) + ((cells >> 54u) & uint64_t(0x3fu)),
+            dr::select(extended, (cells >> 52u) & uint64_t(0x3ffu),
+                                 (cells >> 32u) & uint64_t(0x7fffffffu)))
+    };
+}
+
 /// Diagnostic-only barriers and nested history regions. The disabled path must
 /// neither change evaluation nor read a clock or alter the caller's JIT flags.
 template <bool IsJit> class ReconstructionStageProfiler {
@@ -1180,10 +1198,16 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::validate_cells(const CellB
     const uint64_t descendants = uint64_t(1) << (3u*m_background_subdivision_level);
     const uint64_t legacy_limit = core_count + uint64_t(56)*m_background_shell_levels*descendants;
     auto tagged = (cells >> 63u) != 0u;
-    UIntBuffer path(cells), coarse((cells >> 32u) & uint64_t(0x7fffffffu));
-    UIntBuffer top = 31u-dr::lzcnt(dr::maximum(path,UIntBuffer(1u)));
+    auto extended = (cells & (uint64_t(1) << 62u)) != 0u;
+    auto deepest = (cells >> 60u) == 0xfu;
+    auto parts = adaptive_address_parts(cells);
+    const CellBuffer &path = parts[0];
+    UIntBuffer coarse(parts[1]);
+    UIntBuffer top(63u-dr::lzcnt(dr::maximum(path,CellBuffer(uint64_t(1u)))));
     auto valid_tag = m_background_adaptive && m_background_shell_levels ?
-        (path != 0u) & (top <= 27u) & ((top % 3u) == 0u) &
+        (path != 0u) & dr::select(deepest, (top == 54u) & (coarse < 560u),
+            dr::select(extended, (top >= 30u) & (top <= 51u), top <= 27u)) &
+        ((top % 3u) == 0u) & ((top / 3u) <= 9u + coarse / 56u) &
         (coarse < 56u*m_background_shell_levels) : dr::mask_t<UIntBuffer>(false);
     if (cells.size() && !dr::slice(dr::all(dr::select(tagged,valid_tag,cells < legacy_limit))))
         Throw("VoxelReconstruction: invalid adaptive or legacy world-shell cell address.");
@@ -1196,9 +1220,10 @@ dr::uint32_array_t<Cell> VoxelReconstruction<Float, Spectrum>::cell_log_size(con
     const uint64_t core_count=uint64_t(m_resolution)*m_resolution*m_resolution;
     const uint64_t descendants=uint64_t(1)<<(3u*m_background_subdivision_level);
     auto tagged=(cells>>63u)!=0u, outside=cells>=core_count;
-    U path(cells);
-    U depth=(31u-dr::lzcnt(dr::maximum(path,U(1u))))/3u;
-    U coarse(dr::select(tagged,(cells>>32u)&uint64_t(0x7fffffffu),
+    auto parts=adaptive_address_parts(cells);
+    const Cell &path=parts[0];
+    U depth=U(63u-dr::lzcnt(dr::maximum(path,Cell(uint64_t(1u)))))/3u;
+    U coarse(dr::select(tagged,parts[1],
         dr::select(outside,cells-core_count,Cell(uint64_t(0)))/descendants));
     uint32_t tree_log=0, core_log=0;
     while ((1u<<tree_log)<tree_core_resolution()) ++tree_log;
@@ -1219,10 +1244,12 @@ std::array<dr::uint32_array_t<Cell>,4> VoxelReconstruction<Float, Spectrum>::dec
     const uint64_t descendants=uint64_t(1)<<(3u*m_background_subdivision_level);
     auto outside=cells>=core_count, tagged=(cells>>63u)!=0u;
     Cell address=dr::select(outside,cells-core_count,Cell(uint64_t(0)));
-    U path(cells), depth=(31u-dr::lzcnt(dr::maximum(path,U(1u))))/3u;
+    auto parts=adaptive_address_parts(cells);
+    const Cell &path=parts[0];
+    U depth=U(63u-dr::lzcnt(dr::maximum(path,Cell(uint64_t(1u)))))/3u;
     U subdivision=dr::select(tagged,depth,U(m_background_subdivision_level));
-    U coarse(dr::select(tagged,(cells>>32u)&uint64_t(0x7fffffffu),address/descendants));
-    U morton=dr::select(tagged,path^(U(1u)<<(3u*depth)),U(address%descendants));
+    U coarse(dr::select(tagged,parts[1],address/descendants));
+    Cell morton=dr::select(tagged,path^(Cell(uint64_t(1u))<<(3u*depth)),address%descendants);
     U shell=coarse/56u, flat=coarse%56u;
     for (uint32_t hole:{21u,22u,25u,26u,37u,38u,41u,42u}) flat+=U(flat>=hole);
     uint32_t tree_log=0;
@@ -1235,8 +1262,8 @@ std::array<dr::uint32_array_t<Cell>,4> VoxelReconstruction<Float, Spectrum>::dec
     std::array<U,4> result;
     for(uint32_t axis=0;axis<3;++axis) {
         U child(0u);
-        for(uint32_t bit=0;bit<9;++bit)
-            child|=dr::select(bit<subdivision,((morton>>(3u*bit+axis))&1u)<<bit,U(0u));
+        for(uint32_t bit=0;bit<18;++bit)
+            child|=dr::select(bit<subdivision,U((morton>>(3u*bit+axis))&1u)<<bit,U(0u));
         result[axis]=dr::select(outside,low+((flat>>(2u*axis))&3u)*coarse_block+child*block,
             core_xyz[axis]*(tree_core_resolution()/m_resolution)+core_offset());
     }

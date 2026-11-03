@@ -19,6 +19,9 @@ def _metadata(metadata):
     result = dict(metadata)
     result["resolution"] *= 2
     result["core_resolution"] = result["resolution"]
+    if mode == "adaptive":
+        from reconstruction_world_shell import adaptive_limit_fields
+        result.update(adaptive_limit_fields(result))
     if mode == "uniform":
         result["background_subdivision_level"] = subdivision + 1
     validate_world_shell_layout(result["resolution"], result["background_shell_levels"],
@@ -95,7 +98,7 @@ def _shell_world_cells_device(cells, subdivision, shell, core_resolution, dr):
     U, C = dr.cuda.UInt32, dr.cuda.UInt64
     _, ordinal = _shell_coordinate_tables()
     resolution = 4 << subdivision
-    # These local-grid coordinates are at most 1023; only world addresses need 64 bits.
+    # Each axis fits UInt32; flattened grid addresses and Morton paths need UInt64.
     coordinates = [U(cells % resolution), U(cells // resolution % resolution), U(cells // (resolution ** 2))]
     coarse = [value >> subdivision for value in coordinates]
     ordinal = dr.gather(U, U(ordinal), coarse[0] + 4 * coarse[1] + 16 * coarse[2])

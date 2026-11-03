@@ -12,7 +12,8 @@
     "background_refinement": "adaptive",
     "background_initial_leaf_budget": 200000,
     "background_initial_pixel_threshold": 32.0,
-    "background_max_resolution": 512,
+    "background_max_resolution": 1024,
+    "background_resolution_mode": "core",
     "background_opacity": 0.5
   },
   "model": {

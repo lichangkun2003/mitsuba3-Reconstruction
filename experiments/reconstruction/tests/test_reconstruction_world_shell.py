@@ -133,7 +133,7 @@ class WorldShellLayoutTests(unittest.TestCase):
         configure_world_shell_model(model, 5, "uniform", 2)
         self.assertEqual(changes, [(5, 2)])
         self.assertEqual((model.background_refinement, model.background_subdivision_level,
-                          model.world_shell_version), ("uniform", 2, 5))
+                          model.world_shell_version), ("uniform", 2, 7))
         configure_world_shell_model(model, 5, "fixed", 0, "occupied_cell")
         self.assertEqual(model.background_geometry, "occupied_cell")
         self.assertEqual(geometry_changes, [False])
@@ -322,7 +322,7 @@ class WorldShellDatasetTests(unittest.TestCase):
         self.assertEqual(initial["version"], 8)
         self.assertEqual(initial["background_refinement"], "uniform")
         self.assertEqual(initial["background_subdivision_level"], 0)
-        self.assertEqual(initial["world_shell_version"], 5)
+        self.assertEqual(initial["world_shell_version"], 7)
         self.assertEqual(initial["background_geometry"], "ellipsoid")
         self.assertEqual(initial["background_shell_levels"], 5)
         self.assertEqual(initial["background_voxels"], 280)

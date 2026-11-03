@@ -12,7 +12,8 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 
 def check(mi,dr,np):
     from reconstruction_common import restore_model
-    from reconstruction_world_shell import ADAPTIVE_TAG,adaptive_encode_numpy,leaf_boxes_numpy
+    from reconstruction_world_shell import (ADAPTIVE_TAG,ADAPTIVE_EXTENDED_TAG,ADAPTIVE_DEEPEST_TAG,
+        adaptive_encode_numpy,adaptive_decode_numpy,leaf_boxes_numpy)
     from reconstruction_adaptive_background import (select_adaptive_background_device,
         refine_adaptive_background_device,refine_adaptive_background_numpy,prepare_adaptive_background)
     from reconstruction_topology import CoarseToFineConfig,refine_state,TopologyManager,TopologySettings
@@ -96,6 +97,83 @@ def check(mi,dr,np):
     assert requests[1]["exact_count"] is True
     assert 3 in np.asarray(actual["source_rows"])
     print("PASS batched GPU fit agrees with CPU, deep UInt64 addresses, empty-parent preservation and two preflights",flush=True)
+
+    # Per-shell depth floors are measured in world units. The third shell
+    # crosses the legacy encoding boundary, while the fifth reaches depth 12.
+    deep = copy.deepcopy(payload)
+    deep["model_metadata"].update(resolution=1024,core_resolution=1024,
+        background_shell_levels=5,world_shell_version=6,background_resolution_mode="core_parent",
+        background_max_resolution=512,background_max_depth=12)
+    deep_cells = adaptive_encode_numpy([157,269],[9,11],[8**9-1,8**11-1],np)
+    lo,hi = leaf_boxes_numpy(deep_cells,1024,[-1.]*3,[1.]*3,5,np)
+    deep["model_state"] = dict(cell_indices=deep_cells,centers=np.full(6,.5,np.float32),
+        log_scales=np.log((hi-lo)*.9).astype(np.float32).ravel(),
+        rotations=np.tile(np.array([1.,0.,0.,0.],np.float32),2),
+        radiance_sh=rng.normal(size=54).astype(np.float32),opacity_sh=np.zeros(2,np.float32))
+    expected = refine_adaptive_background_numpy(deep,np.array([0,1],np.uint32),
+        CoarseToFineConfig(),20,refine_state,np)
+    deep_device = dict(model_metadata=deep["model_metadata"],model_state={
+        name:(mi.UInt64(value) if name=="cell_indices" else mi.Float(value))
+        for name,value in deep["model_state"].items()})
+    actual = refine_adaptive_background_device(deep_device,mi.UInt32([0,1]),CoarseToFineConfig(),20,dr)
+    for name,value in actual["model_state"].items():
+        if name=="cell_indices":
+            np.testing.assert_array_equal(np.asarray(value),expected["model_state"][name])
+        else:
+            np.testing.assert_allclose(np.asarray(value),expected["model_state"][name],rtol=2e-5,atol=2e-6)
+    child_cells = np.asarray(actual["model_state"]["cell_indices"])
+    assert len(child_cells)==16
+    assert np.all(child_cells & ADAPTIVE_EXTENDED_TAG)
+    _,depth,_ = adaptive_decode_numpy(child_cells,5,np)
+    np.testing.assert_array_equal(np.unique(depth),[10,12])
+    lo,hi = leaf_boxes_numpy(child_cells,1024,[-1.]*3,[1.]*3,5,np)
+    np.testing.assert_allclose(hi-lo,2./512,rtol=0.,atol=0.)
+    for fitter,checkpoint,rows in (
+        (refine_adaptive_background_numpy,dict(model_metadata=deep["model_metadata"],
+                                             model_state=expected["model_state"]),np.array([0],np.uint32)),
+        (refine_adaptive_background_device,dict(model_metadata=deep["model_metadata"],
+                                               model_state=actual["model_state"]),mi.UInt32([0]))):
+        try:
+            if fitter is refine_adaptive_background_numpy:
+                fitter(checkpoint,rows,CoarseToFineConfig(),100,refine_state,np)
+            else:
+                fitter(checkpoint,rows,CoarseToFineConfig(),100,dr)
+        except ValueError as error:
+            assert "maximum depth" in str(error)
+        else:
+            raise AssertionError("Finest background leaf must not split below the core-parent floor")
+    print("PASS extended GPU child encoding, depth 10/12 CPU parity and common world floor",flush=True)
+
+    # At full foreground resolution the tenth shell requires 54 Morton bits.
+    # Its temporary fitting grid has 1,048,576 cells on each axis (2^60 IDs).
+    deepest = copy.deepcopy(deep)
+    deepest["model_metadata"].update(background_shell_levels=10,world_shell_version=7,
+        background_resolution_mode="core",background_max_resolution=1024,background_max_depth=18)
+    deepest_cells = adaptive_encode_numpy([559],[17],[8**17-1],np)
+    lo,hi = leaf_boxes_numpy(deepest_cells,1024,[-1.]*3,[1.]*3,10,np)
+    deepest["model_state"] = {name:value.reshape(2,-1)[:1].ravel().copy()
+                              for name,value in deep["model_state"].items()}
+    deepest["model_state"]["cell_indices"] = deepest_cells
+    deepest["model_state"]["log_scales"] = np.log((hi-lo)*.9).astype(np.float32).ravel()
+    expected = refine_adaptive_background_numpy(deepest,np.array([0],np.uint32),
+        CoarseToFineConfig(),20,refine_state,np)
+    resident = dict(model_metadata=deepest["model_metadata"],model_state={
+        name:(mi.UInt64(value) if name=="cell_indices" else mi.Float(value))
+        for name,value in deepest["model_state"].items()})
+    actual = refine_adaptive_background_device(resident,mi.UInt32([0]),CoarseToFineConfig(),20,dr)
+    for name,value in actual["model_state"].items():
+        if name=="cell_indices":
+            np.testing.assert_array_equal(np.asarray(value),expected["model_state"][name])
+        else:
+            np.testing.assert_allclose(np.asarray(value),expected["model_state"][name],rtol=2e-5,atol=2e-6)
+    child_cells = np.asarray(actual["model_state"]["cell_indices"])
+    assert len(child_cells)==8
+    assert np.all((child_cells & ADAPTIVE_DEEPEST_TAG)==ADAPTIVE_DEEPEST_TAG)
+    _,depth,_ = adaptive_decode_numpy(child_cells,10,np)
+    np.testing.assert_array_equal(depth,18)
+    lo,hi = leaf_boxes_numpy(child_cells,1024,[-1.]*3,[1.]*3,10,np)
+    np.testing.assert_array_equal(hi-lo,2./1024)
+    print("PASS depth 17->18 GPU fit matches CPU with 54-bit paths and foreground world size",flush=True)
 
     original={name:np.asarray(value).copy() for name,value in live["model_state"].items()}
     def reject(_):

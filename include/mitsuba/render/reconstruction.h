@@ -48,7 +48,7 @@ public:
     /// RGB removal evidence includes world-space background leaves.
     static constexpr uint32_t background_rgb_deletion_version = 1;
     /// Mixed-size world-space cube shells in the unified occupancy tree.
-    static constexpr uint32_t world_shell_version = 5;
+    static constexpr uint32_t world_shell_version = 7;
     static constexpr uint32_t cell_index_bits = 64;
     /// Point-pair L1 depth distortion with exact fixed-hit continuous gradients.
     static constexpr uint32_t distortion_version = 1;

@@ -48,6 +48,51 @@ def assert_disjoint(test,state,result):
 
 
 class Cpu(unittest.TestCase):
+    def test_core_mode_tenth_shell_depth_18_round_trip_and_growth(self):
+        cells = [bg(shell=s, depth=9+s, child=(1,2,3)) for s in range(9)]
+        cells.append(bg(shell=9, depth=18, child=(2**18-1,131072,12345)))
+        state = fixture(cells, core=1024, levels=10)
+        metadata = state['model_metadata']
+        metadata.update(world_shell_version=7, background_resolution_mode='core',
+                        background_max_resolution=1024, background_max_depth=18)
+        op = growth._Ops(np)
+        xyz, log = growth._decode(state['model_state']['cell_indices'], metadata, op)
+        np.testing.assert_array_equal(log, 0)
+        actual, _, _, valid, split = growth._canonical(xyz, log, metadata, op)
+        np.testing.assert_array_equal(actual, state['model_state']['cell_indices'])
+        self.assertTrue(valid.all())
+        self.assertFalse(split.any())
+        result = growth.generate_adaptive_growth_numpy(manager(state), state, 10)
+        self.assertGreater(len(result['cells']), 0)
+        lower, upper = leaf_boxes_numpy(result['cells'], 1024, [-1.]*3, [1.]*3, 10, np)
+        np.testing.assert_array_equal(upper-lower, 2./1024)
+        assert_disjoint(self, state, result)
+
+    def test_deep_outer_leaves_round_trip_and_growth_keep_core_parent_world_floor(self):
+        # Outer shells need extended paths to match the closest shell's edge;
+        # the final entry exercises depth 17 with populated high Morton bits.
+        cells = [bg(shell=s, depth=8+s, child=(1,2,3)) for s in range(5)]
+        cells.append(bg(shell=9, depth=17, child=(2**17-1,65536,12345)))
+        state = fixture(cells, core=1024, levels=10)
+        state['model_metadata'].update(world_shell_version=6, background_resolution_mode='core_parent',
+                                       background_max_resolution=512, background_max_depth=17)
+        metadata = state['model_metadata']
+        op = growth._Ops(np)
+        xyz, log = growth._decode(state['model_state']['cell_indices'], metadata, op)
+        np.testing.assert_array_equal(log, 1)  # Virtual core grid has spacing L/1024.
+        actual, _, _, valid, split = growth._canonical(xyz, log, metadata, op)
+        np.testing.assert_array_equal(actual, state['model_state']['cell_indices'])
+        self.assertTrue(valid.all())
+        self.assertFalse(split.any())
+        # A fine requested neighbor is promoted to the background world floor.
+        _, _, promoted, _, _ = growth._canonical(xyz, np.zeros(len(cells),np.int32), metadata, op)
+        np.testing.assert_array_equal(promoted, 1)
+        result = growth.generate_adaptive_growth_numpy(manager(state), state, 10)
+        self.assertGreater(len(result['cells']), 0)
+        lower, upper = leaf_boxes_numpy(result['cells'], 1024, [-1.]*3, [1.]*3, 10, np)
+        np.testing.assert_allclose(upper-lower, 2./512, rtol=0., atol=0.)
+        assert_disjoint(self, state, result)
+
     def test_integer_boxes_and_round_trip(self):
         rng=np.random.default_rng(29302)
         d=rng.integers(0,10,2000)
@@ -181,6 +226,53 @@ class Cpu(unittest.TestCase):
 
 @unittest.skipUnless('--gpu' in sys.argv,'explicit --gpu required')
 class Cuda(unittest.TestCase):
+    def test_core_mode_depth_18_gpu_matches_cpu(self):
+        from reconstruction_growth_candidates_gpu import generate_growth_gpu
+        state = fixture([bg(shell=s,depth=9+s,child=((1<<(9+s))-1,1<<(8+s),123))
+                         for s in range(10)],core=1024,levels=10)
+        metadata = state['model_metadata']
+        metadata.update(world_shell_version=7,background_resolution_mode='core',
+                        background_max_resolution=1024,background_max_depth=18)
+        op = growth._Ops(dr,True)
+        xyz, log = growth._decode(dr.cuda.UInt64(state['model_state']['cell_indices']),metadata,op)
+        np.testing.assert_array_equal(np.asarray(log),0)
+        actual, _, _, valid, split = growth._canonical(xyz,log,metadata,op)
+        np.testing.assert_array_equal(np.asarray(actual),state['model_state']['cell_indices'])
+        self.assertTrue(np.asarray(valid).all())
+        self.assertFalse(np.asarray(split).any())
+        m = manager(state)
+        expected, actual = growth.generate_adaptive_growth_numpy(m,state,10), generate_growth_gpu(m,state,10)
+        for name,width in growth._WIDTHS.items():
+            got, wanted = np.asarray(actual[name]).reshape(-1,width), expected[name].reshape(-1,width)
+            if width==1:
+                np.testing.assert_array_equal(got,wanted,err_msg=name)
+            else:
+                np.testing.assert_allclose(got,wanted,atol=3e-12,rtol=3e-12,err_msg=name)
+
+    def test_extended_outer_growth_and_round_trip_matches_cpu(self):
+        from reconstruction_growth_candidates_gpu import generate_growth_gpu
+        state = fixture([bg(shell=s, depth=8+s, child=(1,2,3)) for s in range(5)],
+                        core=1024, levels=5)
+        metadata = state['model_metadata']
+        metadata.update(world_shell_version=6, background_resolution_mode='core_parent',
+                        background_max_resolution=512, background_max_depth=12)
+        cells = dr.cuda.UInt64(state['model_state']['cell_indices'])
+        xyz, size = growth._decode(cells, metadata, growth._Ops(dr,True))
+        actual, _, _, valid, split = growth._canonical(xyz, size, metadata, growth._Ops(dr,True))
+        np.testing.assert_array_equal(np.asarray(actual), state['model_state']['cell_indices'])
+        np.testing.assert_array_equal(np.asarray(size), 1)
+        self.assertTrue(np.asarray(valid).all())
+        self.assertFalse(np.asarray(split).any())
+        m = manager(state)
+        expected = growth.generate_adaptive_growth_numpy(m,state,10)
+        actual = generate_growth_gpu(m,state,10)
+        for name,width in growth._WIDTHS.items():
+            got, wanted = np.asarray(actual[name]).reshape(-1,width), expected[name].reshape(-1,width)
+            if width == 1:
+                np.testing.assert_array_equal(got,wanted,err_msg=name)
+            else:
+                np.testing.assert_allclose(got,wanted,atol=3e-12,rtol=3e-12,err_msg=name)
+
     def test_geometry_and_parent_order_matches_cpu(self):
         from reconstruction_growth_candidates_gpu import generate_growth_gpu
         for cells in ([bg()], [bg(depth=6,child=(0,30,30))],

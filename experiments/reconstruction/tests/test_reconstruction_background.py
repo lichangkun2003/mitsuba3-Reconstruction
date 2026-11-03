@@ -546,7 +546,7 @@ def native_background_checks(mi, dr, np):
     assert metadata["scene_mapping"] == "world_shell"
     assert metadata["background_shell_levels"] == 5
     assert metadata["background_geometry"] == "ellipsoid"
-    assert metadata["world_shell_version"] == 5
+    assert metadata["world_shell_version"] == 7
     assert model.native_background_use_ellipsoid()
     state = {name: np.asarray(value).copy() for name, value in model.snapshot().items()}
     indices = state["cell_indices"]

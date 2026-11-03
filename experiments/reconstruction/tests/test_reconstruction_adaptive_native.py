@@ -17,11 +17,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_reconstruction_world_shell_native import oracle, Y00, ENV
 
 TAG = 1 << 63
+EXTENDED = 1 << 62
+DEEPEST = 0xf << 60
 
 
 def address(coarse, depth, morton=0):
-    assert 0 <= depth <= 9 and 0 <= morton < 8 ** depth
-    return TAG | (coarse << 32) | (1 << (3 * depth)) | morton
+    assert 0 <= depth <= 18 and 0 <= morton < 8 ** depth
+    if depth == 18:
+        assert 504 <= coarse < 560
+        return DEEPEST | ((coarse - 504) << 54) | morton
+    if depth <= 9:
+        return TAG | (coarse << 32) | (1 << (3 * depth)) | morton
+    return TAG | EXTENDED | (coarse << 52) | (1 << (3 * depth)) | morton
 
 
 def box(key, core, np):
@@ -31,7 +38,12 @@ def box(key, core, np):
         low = -1 + np.array([key % core, key // core % core, key // core ** 2]) * (2 / core)
         return low, low + 2 / core
     assert key & TAG
-    coarse, path = (key & ~TAG) >> 32, key & 0xffffffff
+    if key >> 60 == 0xf:
+        coarse, path = 504 + ((key >> 54) & 63), (1 << 54) | (key & ((1 << 54) - 1))
+    elif key & EXTENDED:
+        coarse, path = (key >> 52) & 1023, key & ((1 << 52) - 1)
+    else:
+        coarse, path = (key & ~TAG) >> 32, key & 0xffffffff
     digits = []
     while path > 1:
         digits.append(path % 8)
@@ -55,7 +67,7 @@ def payload(np, cells, core=4, levels=3):
     return {"model_metadata": {"resolution": core, "core_resolution": core,
         "grid_min": [-1.] * 3, "grid_max": [1.] * 3, "scene_mapping": "world_shell",
         "background_shell_levels": levels, "background_subdivision_level": 0,
-        "background_refinement": "adaptive", "world_shell_version": 5,
+        "background_refinement": "adaptive", "world_shell_version": 7,
         "background_geometry": "ellipsoid", "sh_count": 1, "opacity_sh_count": 1},
         "model_state": {"cell_indices": np.asarray(cells, np.uint64),
             "centers": np.full(count * 3, .5, np.float32),
@@ -125,6 +137,40 @@ def check_cpu(np):
         after = box(key, 1024, np)
         np.testing.assert_array_equal(before, after)
     return leaves
+
+
+def equal_world_size_fixture(np, core, coarseness=1):
+    """All shells reach the foreground level, or the legacy parent level."""
+    assert coarseness in (1, 2)
+    first_depth = core.bit_length() - 2 - (coarseness == 2)
+    leaves = [address(shell * 56 + 55, first_depth + shell,
+                      8 ** (first_depth + shell) - 1) for shell in range(10)]
+    # The highest Morton digits are deliberately nonzero, exercising paths
+    # beyond 32 bits and depth 18 in the farthest shell at core 1024.
+    for key in leaves:
+        low, high = box(key, core, np)
+        np.testing.assert_array_equal(high - low, [2 * coarseness / core] * 3)
+    return leaves
+
+
+def check_deep_shell_geometry(mi, dr, np):
+    for core, coarseness in ((256, 1), (512, 1), (1024, 1), (1024, 2)):
+        leaves = equal_world_size_fixture(np, core, coarseness)
+        data = payload(np, leaves, core=core, levels=10)
+        model = restore(data, mi)
+        sizes = np.asarray(model.leaf_sizes(mi.UInt32(list(range(len(leaves)))))).T
+        np.testing.assert_array_equal(sizes, np.full((len(leaves), 3), 2 * coarseness / core))
+        lows, highs = zip(*(box(key, core, np) for key in leaves))
+        prepared = np.array(lows), np.array(highs), np.zeros(len(leaves), bool)
+        for row, key in enumerate(leaves):
+            for axis in range(3):
+                sample = ray_for(key, core, np, axis=axis)
+                expected = oracle(data, *sample[:2], np, maxt=sample[2], threshold=0., prepared=prepared)
+                actual = rendered(model, sample, mi, dr, np)
+                label = f"equal world size core={core}, coarseness={coarseness}, shell={row}, axis={axis}"
+                np.testing.assert_allclose(actual[0], expected["rgb"], atol=3e-5, rtol=3e-5, err_msg=label)
+                np.testing.assert_allclose(actual[1], expected["alpha"], atol=3e-6, rtol=3e-5, err_msg=label)
+                np.testing.assert_allclose(actual[1], .35, atol=3e-6, rtol=3e-5, err_msg=label)
 
 
 def foreground_tie_fixture(np, core, axes, negative):
@@ -224,8 +270,9 @@ def check_growth(mi, dr, np):
     first = address(0, 1, 0)
     candidate = address(0, 1, 1)
     fine = address(0, 3, 135)
-    tiny = address(112, 9, 54321)
-    base = payload(np, [first])
+    # Candidate-only leaves must support the same extended paths as occupied leaves.
+    tiny = address(559, 18, (1 << 53) + 54321)
+    base = payload(np, [first], levels=10)
     proposals = payload(np, [candidate, candidate, fine, tiny])["model_state"]
     # Same target, different shapes: the first must not hide a later sibling hit.
     proposals["centers"].reshape(-1, 3)[0] = [5., 5., 5.]
@@ -271,7 +318,12 @@ def check_growth(mi, dr, np):
 
 
 def check_layout_validation(mi, np):
-    for bad in (TAG, TAG | 2, TAG | (1 << 30), TAG | (168 << 32) | 1):
+    for bad in (TAG, TAG | 2, TAG | (1 << 30), TAG | (168 << 32) | 1,
+                TAG | EXTENDED,
+                TAG | EXTENDED | (1 << 27),  # Noncanonical extended depth 9.
+                TAG | EXTENDED | (56 << 52) | (1 << 33),  # Depth 11 exceeds shell 1's virtual grid.
+                TAG | EXTENDED | (168 << 52) | (1 << 30),
+                DEEPEST):  # Shell 9 cannot be used in a three-shell model.
         data = payload(np, [address(0, 0)])
         data["model_state"]["cell_indices"][0] = bad
         try:
@@ -280,6 +332,15 @@ def check_layout_validation(mi, np):
             pass
         else:
             raise AssertionError(f"Invalid adaptive path accepted: {bad}")
+    for bad in (DEEPEST | (56 << 54), DEEPEST | (63 << 54)):
+        data = payload(np, [address(0, 0)], levels=10)
+        data["model_state"]["cell_indices"][0] = bad
+        try:
+            restore(data, mi)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"Invalid depth-18 shell root accepted: {bad}")
     for keys in ([address(0, 0), address(0, 1, 7)],
                  [address(0, 2, 63), address(0, 2, 63)]):
         try:
@@ -312,6 +373,8 @@ def main():
     args = parser.parse_args()
     import numpy as np
     leaves = check_cpu(np)
+    for core in (256, 512, 1024):
+        equal_world_size_fixture(np, core)
     check_foreground_tie_cpu(np)
     if args.cpu_only:
         print("adaptive native fixtures: CPU geometry PASS")
@@ -322,6 +385,7 @@ def main():
         check_foreground_ties(mi, dr, np)
         if not args.ties_only:
             check_geometry(mi, dr, np, leaves)
+            check_deep_shell_geometry(mi, dr, np)
             check_growth(mi, dr, np)
             check_layout_validation(mi, np)
     print("adaptive native: mixed-depth geometry, gradients, priority, growth votes PASS")

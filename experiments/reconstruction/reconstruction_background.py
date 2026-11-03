@@ -252,6 +252,11 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, shell_levels=5
     if adaptive:
         if adaptive_background is None or subdivision != 0 or background_geometry != "ellipsoid":
             raise ValueError("Adaptive background requires prepared mixed-depth leaves, S=0 and ellipsoid geometry")
+        mode = adaptive_background.get("background_resolution_mode")
+        required = 7 if mode == "core" else 6
+        if (mode in ("core_parent", "core")
+                and getattr(mi.VoxelReconstruction, "world_shell_version", 0) < required):
+            raise RuntimeError(f"Rebuild this checkout: world-space background resolution limits require native version {required}")
         if background_points is not None or background_colors is not None or background_point_counts is not None:
             raise ValueError("Adaptive initialization cannot use legacy sparse/dense background color tables")
         for key, expected in (("core_resolution", core), ("shell_levels", shell_levels),
@@ -343,7 +348,11 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, shell_levels=5
         straight_ray_forward=True)
     if adaptive:
         result.background_max_depth = adaptive_background["max_depth"]
+        result.background_resolution_mode = adaptive_background.get("background_resolution_mode", "per_shell")
+        result.background_max_resolution = adaptive_background.get("background_max_resolution", 512)
         result.background_initialization.update(initialization="camera_sampling_adaptive",
+            background_resolution_mode=result.background_resolution_mode,
+            background_max_resolution=result.background_max_resolution,
             geometry_initialization="cell_covering_clipped_ellipsoid",
             initial_leaf_budget=adaptive_background["initial_leaf_budget"],
             pixel_threshold=adaptive_background["pixel_threshold"],

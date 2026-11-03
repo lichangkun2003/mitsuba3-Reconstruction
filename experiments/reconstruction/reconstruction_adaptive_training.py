@@ -81,7 +81,7 @@ class AdaptiveBackgroundController:
         parents = select_adaptive_background_device(checkpoint, self.views, priority, dr,
             pixel_threshold=cfg.background_refine_pixel_threshold,
             max_new_leaves=capacity,
-            max_depth=self.config.data.background_max_resolution.bit_length() - 2,
+            max_depth=checkpoint["model_metadata"].get("background_max_depth", 9),
             projection_cache=self.projection_cache)
         limit = max(1, int(background_count * cfg.background_refine_fraction))
         if len(parents) > limit:

@@ -129,7 +129,8 @@ def prepare_dataset(config, np, *, load_points=True):
                    background_refinement=config.data.background_refinement,
                    background_initial_leaf_budget=config.data.background_initial_leaf_budget,
                    background_initial_pixel_threshold=config.data.background_initial_pixel_threshold,
-                   background_max_resolution=config.data.background_max_resolution)
+                   background_max_resolution=config.data.background_max_resolution,
+                   background_resolution_mode=config.data.background_resolution_mode)
     prepared = prepare_colmap(dataset, split=_colmap_split(config.data.cameras), images_dir=config.data.images,
         point_cloud=config.data.point_cloud, initialization=config.data.initialization,
         start_core_resolution=start, target_core_resolution=target,
@@ -146,6 +147,11 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
         raise ValueError("Compressed scene mappings are no longer supported")
     if mapping == "world_shell":
         require_world_shell_native(mi.VoxelReconstruction)
+        mode = prepared["initialization"].get("background_resolution_mode")
+        required = 7 if mode == "core" else 6
+        if (mode in ("core_parent", "core")
+                and getattr(mi.VoxelReconstruction, "world_shell_version", 0) < required):
+            raise RuntimeError(f"Rebuild this checkout: world-space background resolution limits require native version {required}")
     if prepared is not None:
         if not hasattr(mi.VoxelReconstruction, "from_points"):
             raise RuntimeError("Rebuild this checkout: in-memory point-cloud initialization is missing")
@@ -167,8 +173,6 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
                 background_points=prepared.get("background_points"),
                 adaptive_background=prepared.get("adaptive_background"),
                 background_subdivision_level=prepared["initialization"].get("background_subdivision_level", 0))
-            if getattr(result, "background_refinement", "fixed") == "adaptive":
-                result.background_max_depth = config.data.background_max_resolution.bit_length() - 2
             return result
         return model
     lo, hi = np.asarray(config.model.bounds_min), np.asarray(config.model.bounds_max)
@@ -195,7 +199,7 @@ def load_views(dataset: Path, cameras_file: str, render: RenderConfig, np, *,
             target_core_resolution=initialization["target_core_resolution"], load_points=False,
             **{name: initialization[name] for name in (
                 "background_initial_leaf_budget", "background_initial_pixel_threshold",
-                "background_max_resolution") if name in initialization})
+                "background_max_resolution", "background_resolution_mode") if name in initialization})
         return _colmap_views(prepared, render)
     document = json.loads((dataset / cameras_file).read_text(encoding="utf-8"))
     frames = document.get("frames", [])
@@ -397,7 +401,8 @@ def model_metadata(model) -> dict:
                         background_geometry=geometry,
                         background_subdivision_level=subdivision, world_shell_version=WORLD_SHELL_VERSION)
         if refinement == "adaptive":
-            metadata["background_max_depth"] = int(getattr(model, "background_max_depth", 9))
+            from reconstruction_world_shell import model_adaptive_limit_fields
+            metadata.update(model_adaptive_limit_fields(model, metadata))
     return metadata
 
 
@@ -409,6 +414,11 @@ def restore_model(checkpoint, mi):
     options = ({"core_resolution": metadata["core_resolution"]} if "core_resolution" in metadata else {})
     if mapping == "world_shell":
         require_world_shell_native(mi.VoxelReconstruction)
+        mode = metadata.get("background_resolution_mode")
+        required = 7 if mode == "core" else 6
+        if (mode in ("core_parent", "core")
+                and getattr(mi.VoxelReconstruction, "world_shell_version", 0) < required):
+            raise RuntimeError(f"Rebuild this checkout: world-space background resolution limits require native version {required}")
         options["background_shell_levels"] = metadata["background_shell_levels"]
         refinement, subdivision = world_shell_metadata_layout(metadata)
         options["background_subdivision_level"] = subdivision
@@ -427,6 +437,9 @@ def restore_model(checkpoint, mi):
                                     background_subdivision_level=subdivision)
         if refinement == "adaptive":
             model.background_max_depth = int(metadata.get("background_max_depth", 9))
+            model.background_resolution_mode = metadata.get("background_resolution_mode", "per_shell")
+            model.background_max_resolution = int(metadata.get("background_max_resolution",
+                1024 if model.background_resolution_mode == "core" else 512))
     return model
 
 

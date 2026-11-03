@@ -23,7 +23,7 @@ def run(output):
         "data": {"dataset": str(dataset), "scene_mode": "unbounded", "background_shell_levels": 2,
             "background_refinement": "adaptive", "background_initial_resolution": 2,
             "background_initial_leaf_budget": 500, "background_initial_pixel_threshold": 8,
-            "background_max_resolution": 16},
+            "background_max_resolution": 16, "background_resolution_mode": "core"},
         "model": {"grid_resolution": 4, "sh_count": 9, "opacity_sh_count": 1},
         "render": {"max_hits": 32},
         "training": {"rgb_only": True, "num_epochs": 8, "output": str(full),
@@ -55,6 +55,9 @@ def run(output):
     final = load_checkpoint(full / "model.npz")
     metadata, state = final["model_metadata"], final["model_state"]
     assert metadata["background_refinement"] == "adaptive" and metadata["resolution"] == 8
+    assert metadata["background_resolution_mode"] == "core"
+    assert metadata["background_max_depth"] == 3
+    assert metadata["world_shell_version"] == 7
     validate_adaptive_cells_numpy(state["cell_indices"], 8, 2, np)
     assert np.any(state["cell_indices"] >= ADAPTIVE_TAG)
     history = [json.loads(line) for line in (full / "training.jsonl").read_text(encoding="utf-8").splitlines()]

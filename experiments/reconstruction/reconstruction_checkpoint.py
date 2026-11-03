@@ -43,7 +43,7 @@ def _validate_model_metadata(metadata):
     if not required.issubset(metadata):
         raise ValueError(f"Missing model metadata: {sorted(required - metadata.keys())}")
     from reconstruction_world_shell import (reject_removed_background_fields, validate_world_shell_layout,
-                                            world_shell_metadata_layout)
+                                            world_shell_metadata_layout, adaptive_max_depth)
     resolution = _integer(metadata["resolution"], "resolution", 1, 1024)
     core = _integer(metadata.get("core_resolution", resolution), "core_resolution", 1, 1024)
     mapping = metadata.get("scene_mapping", "bounded")
@@ -57,7 +57,16 @@ def _validate_model_metadata(metadata):
         validate_world_shell_layout(core, metadata.get("background_shell_levels"),
                                     metadata["grid_min"], metadata["grid_max"], subdivision)
         if mode == "adaptive":
-            _integer(metadata.get("background_max_depth", 9), "background_max_depth", 0, 9)
+            maximum = adaptive_max_depth(metadata)
+            declared = _integer(metadata.get("background_max_depth", maximum), "background_max_depth", 0, 18)
+            if declared != maximum:
+                raise ValueError("background_max_depth differs from the per-shell resolution policy")
+            if (metadata.get("background_resolution_mode") == "core_parent"
+                    and metadata.get("world_shell_version", 1) < 6):
+                raise ValueError("core_parent background requires world_shell_version 6")
+            if (metadata.get("background_resolution_mode") == "core"
+                    and metadata.get("world_shell_version", 1) < 7):
+                raise ValueError("core background requires world_shell_version 7")
     elif any(name in metadata for name in ("background_shell_levels", "background_refinement",
                                            "background_subdivision_level", "world_shell_version", "background_geometry")):
         raise ValueError("Bounded models cannot contain background shell metadata")
@@ -94,10 +103,19 @@ def _validate_mapping_config(metadata, config):
     levels = metadata["background_shell_levels"]
     if "background_shell_levels" in data and data["background_shell_levels"] != levels:
         raise ValueError("Checkpoint background_shell_levels differs between model and configuration")
-    if metadata.get("background_refinement") == "adaptive" and "background_max_resolution" in data:
-        resolution = _integer(data["background_max_resolution"], "background_max_resolution", 2, 1024)
-        if resolution & (resolution - 1) or resolution.bit_length() - 2 != metadata.get("background_max_depth", 9):
-            raise ValueError("Checkpoint background_max_depth differs from data.background_max_resolution")
+    if metadata.get("background_refinement") == "adaptive":
+        policy = metadata.get("background_resolution_mode", "per_shell")
+        if "background_resolution_mode" in data and data["background_resolution_mode"] != policy:
+            raise ValueError("Checkpoint background_resolution_mode differs from configuration")
+        if "background_max_resolution" in data:
+            resolution = _integer(data["background_max_resolution"], "background_max_resolution", 2, 1024)
+            if (resolution & (resolution - 1)
+                    or (policy in ("core_parent", "core") and resolution != metadata.get(
+                        "background_max_resolution", 1024 if policy == "core" else 512))
+                    or (policy == "per_shell" and resolution.bit_length() - 2 != metadata.get("background_max_depth", 9))):
+                raise ValueError("Checkpoint background_max_depth differs from data.background_max_resolution")
+        if initialization and initialization.get("background_resolution_mode", "per_shell") != policy:
+            raise ValueError("Checkpoint background_resolution_mode differs from initialization")
     if initialization:
         mode, _ = world_shell_metadata_layout(metadata)
         initial_mode, initial_subdivision = world_shell_metadata_layout(initialization)
@@ -128,10 +146,11 @@ def validate_model_state(state: dict, metadata: dict) -> None:
     extent = resolution ** 3 + (56 * metadata["background_shell_levels"]
         * 8 ** metadata.get("background_subdivision_level", 0) if mapping == "world_shell" else 0)
     if metadata.get("background_refinement") == "adaptive":
-        from reconstruction_world_shell import ADAPTIVE_TAG, adaptive_decode_numpy, validate_adaptive_cells_numpy
+        from reconstruction_world_shell import (ADAPTIVE_TAG, adaptive_decode_numpy,
+                                                validate_adaptive_cells_numpy, adaptive_depth_limit)
         validate_adaptive_cells_numpy(cells, core, metadata["background_shell_levels"], np)
-        _, depth, _ = adaptive_decode_numpy(cells[cells >= ADAPTIVE_TAG], metadata["background_shell_levels"], np)
-        if np.any(depth > metadata.get("background_max_depth", 9)):
+        coarse, depth, _ = adaptive_decode_numpy(cells[cells >= ADAPTIVE_TAG], metadata["background_shell_levels"], np)
+        if np.any(depth > adaptive_depth_limit(metadata, coarse // 56)):
             raise ValueError("Adaptive leaf depth exceeds background_max_depth")
     else:
         if np.any(cells < 0) or np.any(cells >= extent):
@@ -192,7 +211,7 @@ def _validate_save_layout(model_state, metadata):
         * 8 ** metadata.get("background_subdivision_level", 0) if mapping == "world_shell" else 0)
     if metadata.get("background_refinement") == "adaptive":
         return state, (resolution, core, mapping, 2**64, metadata["background_shell_levels"],
-                       metadata.get("background_max_depth", 9))
+                       metadata.get("background_max_depth", 9), metadata)
     return state, (resolution, core, mapping, extent)
 
 
@@ -236,6 +255,7 @@ class _CellValidation:
         self.resolution, self.core, self.mapping, self.extent = layout[:4]
         self.adaptive_levels = layout[4] if len(layout) > 4 else None
         self.adaptive_max_depth = layout[5] if len(layout) > 5 else 9
+        self.adaptive_metadata = layout[6] if len(layout) > 6 else {"background_max_depth": self.adaptive_max_depth}
         self.directory = directory
         self.stream = self.seen = None
         self.runs = []
@@ -258,13 +278,16 @@ class _CellValidation:
         self.interval_runs.clear()
 
     def check_adaptive(self, chunk, np):
-        from reconstruction_world_shell import ADAPTIVE_TAG, adaptive_decode_numpy, adaptive_intervals_numpy
+        from reconstruction_world_shell import (ADAPTIVE_TAG, adaptive_decode_numpy,
+                                                adaptive_intervals_numpy, adaptive_depth_limit)
         tagged = chunk >= ADAPTIVE_TAG
         if np.any(chunk[~tagged] >= self.core ** 3) or np.any(chunk < 0):
             raise ValueError("Adaptive models cannot contain legacy shell cell addresses")
-        _, depth, _ = adaptive_decode_numpy(chunk[tagged], self.adaptive_levels, np)
-        if np.any(depth > self.adaptive_max_depth):
+        coarse, depth, _ = adaptive_decode_numpy(chunk[tagged], self.adaptive_levels, np)
+        if np.any(depth > adaptive_depth_limit(self.adaptive_metadata, coarse // 56)):
             raise ValueError("Adaptive leaf depth exceeds background_max_depth")
+        if np.any(depth > 9 + coarse // 56):
+            raise ValueError("Adaptive leaf is smaller than the world-tree base cell")
         start, end = adaptive_intervals_numpy(chunk[tagged], self.adaptive_levels, np)
         if not len(start):
             return

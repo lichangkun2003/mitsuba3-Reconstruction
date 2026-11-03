@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reconstruction_checkpoint import (FORMAT, FORMAT_VERSION, _array_digest,
     _decode, _reject_json_constant, _unique_json_object)
 from reconstruction_world_shell import (ADAPTIVE_TAG, adaptive_decode_numpy,
-    leaf_boxes_numpy, validate_world_shell_layout, world_shell_metadata_layout)
+    leaf_boxes_numpy, validate_world_shell_layout, world_shell_metadata_layout, adaptive_depth_limit)
 
 
 def _layout(metadata):
@@ -134,7 +134,7 @@ def iter_boxes(cells, metadata, chunk_rows=65535):
             boxes[legacy, 7] = subdivision
             if np.any(adaptive):
                 coarse, depth, _ = adaptive_decode_numpy(ids[adaptive], levels, np)
-                if np.any(depth > metadata.get("background_max_depth", 9)):
+                if np.any(depth > adaptive_depth_limit(metadata, coarse // 56)):
                     raise ValueError("Adaptive leaf depth exceeds model metadata")
                 boxes[adaptive, 6] = coarse // 56 + 1
                 boxes[adaptive, 7] = depth

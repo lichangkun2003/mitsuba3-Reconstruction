@@ -143,7 +143,9 @@ CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
 CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再解码；渲染与损失仍在线性空间。
 CONFIG.data.scene_mode = "auto"  # 合成场景：有界白色背景；COLMAP：无界远景层、无白色背景尾项。
-CONFIG.data.background_shell_levels = 5  # 每壳初始56叶；新实验随前景升层同步八分裂。
+CONFIG.data.background_shell_levels = 5  # 每壳从56个粗叶开始，按相机采样和训练证据自适应细分。
+CONFIG.data.background_resolution_mode = "core"  # 自适应外壳最细与当前前景体素边长一致。
+CONFIG.data.background_max_resolution = 1024
 CONFIG.data.background_opacity = 0.5  # 远景新生体素 opacity；允许后续优化和删除。
 
 CONFIG.render.width = 800
@@ -363,6 +365,12 @@ def validate(config):
         raise ValueError("Training render.max_hits must be an integer in [1, 128]")
     validate_sh_schedule(config)
     if config.data.background_refinement == "adaptive":
+        if config.data.background_resolution_mode in ("core_parent", "core"):
+            from reconstruction_world_shell import adaptive_max_depth
+            core = config.schedule.start_resolution if config.schedule.enabled else config.model.grid_resolution
+            adaptive_max_depth(dict(core_resolution=core, background_resolution_mode=config.data.background_resolution_mode,
+                background_max_resolution=config.data.background_max_resolution,
+                background_shell_levels=config.data.background_shell_levels))
         if not config.training.rgb_only or not config.topology.gpu_topology:
             raise ValueError("Adaptive background training requires RGB-only GPU topology")
         for name in ("background_refine_interval", "background_refine_max_new_leaves",
@@ -1730,6 +1738,7 @@ def run_training(distributed=None):
                                                   else "halve_optical_depth_for_uniform_children"),
                 "background_growth": config.data.background_refinement == "adaptive" and config.topology.enable_growth,
                 "background_max_resolution": config.data.background_max_resolution if config.data.background_refinement == "adaptive" else None,
+                "background_resolution_mode": config.data.background_resolution_mode,
                 "background_rgb_deletion": rgb_deletion_enabled,
                 "background_rgb_deletion_version": getattr(
                     mi.VoxelReconstruction, "background_rgb_deletion_version", 0),

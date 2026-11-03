@@ -9,9 +9,10 @@ from __future__ import annotations
 import math
 
 from reconstruction_world_shell import (
-    ADAPTIVE_TAG, ADAPTIVE_MAX_DEPTH, WORLD_SHELL_VERSION, adaptive_decode_numpy,
+    ADAPTIVE_TAG, ADAPTIVE_MAX_DEPTH, ADAPTIVE_LEGACY_MAX_DEPTH,
+    ADAPTIVE_EXTENDED_TAG, ADAPTIVE_DEEPEST_TAG, ADAPTIVE_PATH_BITS, WORLD_SHELL_VERSION, adaptive_decode_numpy,
     adaptive_encode_numpy, leaf_boxes_numpy, shell_coordinates_numpy,
-    validate_adaptive_cells_numpy, validate_world_shell_layout,
+    validate_adaptive_cells_numpy, validate_world_shell_layout, adaptive_depth_limit, adaptive_max_depth,
 )
 
 
@@ -208,7 +209,8 @@ def _point_colors(cells, positions, colors, metadata, np):
 
 def prepare_adaptive_background(positions, colors, core_resolution, grid_min, grid_max,
                                 shell_levels, views, np, *, initial_leaf_budget=200000,
-                                pixel_threshold=32., max_depth=8, camera_max_views=None):
+                                pixel_threshold=32., max_depth=8, camera_max_views=None,
+                                resolution_mode="per_shell", max_resolution=1024):
     validate_world_shell_layout(core_resolution, shell_levels, grid_min, grid_max)
     if (type(initial_leaf_budget) is not int or initial_leaf_budget < 56*shell_levels
             or type(max_depth) is not int or not 0 <= max_depth <= ADAPTIVE_MAX_DEPTH
@@ -219,12 +221,20 @@ def prepare_adaptive_background(positions, colors, core_resolution, grid_min, gr
         background_refinement="adaptive", background_subdivision_level=0,
         background_geometry="ellipsoid", background_max_depth=max_depth,
         world_shell_version=WORLD_SHELL_VERSION, scene_mapping="world_shell")
+    if resolution_mode not in ("per_shell", "core_parent", "core"):
+        raise ValueError("Unsupported adaptive background resolution mode")
+    if resolution_mode != "per_shell":
+        metadata.update(background_resolution_mode=resolution_mode,
+                        background_max_resolution=max_resolution)
+        max_depth = adaptive_max_depth(metadata)
+        metadata["background_max_depth"] = max_depth
     cameras = prepare_projection_cameras(views, np, camera_max_views)
     cells = adaptive_encode_numpy(np.arange(56*shell_levels), 0, 0, np)
     for _ in range(max_depth):
-        _, depth, _ = adaptive_decode_numpy(cells, shell_levels, np)
+        coarse, depth, _ = adaptive_decode_numpy(cells, shell_levels, np)
         scores = projected_leaf_pixels(cells, metadata, cameras, np)
-        candidates = np.flatnonzero((depth < max_depth) & (scores > pixel_threshold))
+        candidates = np.flatnonzero((depth < adaptive_depth_limit(metadata, coarse//56))
+                                    & (scores > pixel_threshold))
         budget = (initial_leaf_budget-len(cells))//7
         if not len(candidates) or budget <= 0:
             break
@@ -240,7 +250,9 @@ def prepare_adaptive_background(positions, colors, core_resolution, grid_min, gr
     return dict(cell_indices=cells, mean_linear_colors=means, point_counts=counts,
         core_resolution=core_resolution, grid_min=list(grid_min), grid_max=list(grid_max),
         shell_levels=shell_levels, background_refinement="adaptive", background_subdivision_level=0,
-        world_shell_version=5, initial_leaf_budget=initial_leaf_budget, pixel_threshold=float(pixel_threshold),
+        world_shell_version=WORLD_SHELL_VERSION, initial_leaf_budget=initial_leaf_budget, pixel_threshold=float(pixel_threshold),
+        background_resolution_mode=resolution_mode,
+        background_max_resolution=max_resolution if resolution_mode != "per_shell" else 1 << (max_depth+1),
         max_depth=max_depth, background_max_depth=max_depth,
         actual_max_depth=int(depths.max()), camera_sample_count=len(cameras),
         depth_histogram={str(int(value)): int(np.count_nonzero(depths == value)) for value in np.unique(depths)})
@@ -257,12 +269,15 @@ def select_adaptive_background(checkpoint, cameras, signals, np, *, pixel_thresh
     rows = np.flatnonzero(cells >= ADAPTIVE_TAG)
     if not len(rows) or max_new_leaves < 7:
         return np.empty(0, np.uint32)
-    _, depth, _ = adaptive_decode_numpy(cells[rows], metadata["background_shell_levels"], np)
+    coarse, depth, _ = adaptive_decode_numpy(cells[rows], metadata["background_shell_levels"], np)
     values = signals.get("adaptive_priority", 0.) if isinstance(signals, dict) else signals
     values = np.asarray(values, np.float64)
     if values.shape != (len(cells),) or not np.isfinite(values).all() or np.any(values < 0):
         raise ValueError("Adaptive priorities must contain one finite nonnegative scalar per active row")
-    eligible = (depth < max_depth) & (values[rows] > 0)
+    limits = adaptive_depth_limit(metadata, coarse//56)
+    if metadata.get("background_resolution_mode", "per_shell") == "per_shell":
+        limits = np.minimum(limits, max_depth)
+    eligible = (depth < limits) & (values[rows] > 0)
     prepared_cameras = prepare_projection_cameras(cameras,np)
     projection = np.zeros(len(rows),np.float32)
     projection[eligible] = cached_leaf_projection(cells[rows[eligible]], metadata, prepared_cameras, np,
@@ -356,7 +371,7 @@ def refine_adaptive_background_numpy(checkpoint, parent_rows, config, max_active
         raise ValueError("Invalid adaptive parent row selection")
     rows = rows.astype(np.int64)
     coarse, depth, morton = adaptive_decode_numpy(cells[rows], metadata["background_shell_levels"], np)
-    if np.any(depth >= ADAPTIVE_MAX_DEPTH):
+    if np.any(depth >= np.minimum(ADAPTIVE_MAX_DEPTH, adaptive_depth_limit(metadata, coarse//56))):
         raise ValueError("Adaptive selected parent is already at maximum depth")
     widths = dict(cell_indices=1, centers=3, log_scales=3, rotations=4,
                   radiance_sh=3*metadata["sh_count"], opacity_sh=metadata["opacity_sh_count"])
@@ -435,7 +450,7 @@ def refine_adaptive_background_device(checkpoint, parent_rows, config, max_activ
         raise ValueError("Invalid adaptive parent row selection")
     cells = dr.gather(C,state["cell_indices"],parent_rows)
     coarse, depth, morton = adaptive_decode_numpy(np.asarray(cells),metadata["background_shell_levels"],np)
-    if np.any(depth >= ADAPTIVE_MAX_DEPTH):
+    if np.any(depth >= np.minimum(ADAPTIVE_MAX_DEPTH, adaptive_depth_limit(metadata, coarse//56))):
         raise ValueError("Adaptive selected parent is already at maximum depth")
     widths = dict(cell_indices=1, centers=3, log_scales=3, rotations=4,
                   radiance_sh=3*metadata["sh_count"], opacity_sh=metadata["opacity_sh_count"])
@@ -472,8 +487,8 @@ def refine_adaptive_background_device(checkpoint, parent_rows, config, max_activ
                 continue
             fine = C(fitted["cell_indices"])
             resolution = int(local_metadata["resolution"])*2
-            # Keep all address arithmetic 64 bit: depth 8 -> 9 fits a local
-            # 1024 -> 2048 grid whose linear cell IDs exceed UInt32.
+            # A deep shell's temporary fitting grid can exceed 1024 cubed;
+            # retain UInt64 address arithmetic throughout the conversion.
             xyz = [fine % resolution,fine//resolution % resolution,fine//(resolution*resolution)]
             parent_cells = (xyz[0]//2+(resolution//2)*(xyz[1]//2)
                             +(resolution//2)**2*(xyz[2]//2))
@@ -495,8 +510,16 @@ def refine_adaptive_background_device(checkpoint, parent_rows, config, max_activ
                         +dr.opaque(C,start)+C(parents))
             compact = _shell_world_cells_device(fine,level+1,shell,0,dr)
             child_bits = 3*(level+1)
-            fitted["cell_indices"] = (C(ADAPTIVE_TAG)|((compact>>child_bits)<<32)
-                                      |C(1<<child_bits)|(compact&((1<<child_bits)-1)))
+            if level+1 == 18:
+                # The tenth shell uses an implicit depth and its local coarse
+                # ordinal to reserve all 54 low bits for the Morton path.
+                fitted["cell_indices"] = (C(ADAPTIVE_DEEPEST_TAG)|(((compact>>54)-504)<<54)
+                                          |(compact&((1<<54)-1)))
+            else:
+                address_shift = ADAPTIVE_PATH_BITS if level+1 > ADAPTIVE_LEGACY_MAX_DEPTH else 32
+                address_tag = ADAPTIVE_TAG | (ADAPTIVE_EXTENDED_TAG if level+1 > ADAPTIVE_LEGACY_MAX_DEPTH else 0)
+                fitted["cell_indices"] = (C(address_tag)|((compact>>child_bits)<<address_shift)
+                                          |C(1<<child_bits)|(compact&((1<<child_bits)-1)))
             dr.eval(*fitted.values(),replaced,keys[-1])
             child_count += len(fitted["cell_indices"])
             pieces.append(fitted)

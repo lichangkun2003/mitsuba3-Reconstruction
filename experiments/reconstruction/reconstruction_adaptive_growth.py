@@ -10,7 +10,9 @@ from __future__ import annotations
 import math
 import time
 
-from reconstruction_world_shell import ADAPTIVE_TAG, ADAPTIVE_MAX_DEPTH
+from reconstruction_world_shell import (ADAPTIVE_TAG, ADAPTIVE_MAX_DEPTH,
+    ADAPTIVE_LEGACY_MAX_DEPTH, ADAPTIVE_EXTENDED_TAG, ADAPTIVE_DEEPEST_TAG, ADAPTIVE_PATH_BITS,
+    adaptive_depth_limit)
 
 _HOLES = (21, 22, 25, 26, 37, 38, 41, 42)
 _WIDTHS = dict(parent_ids=1, parent_cells=1, cells=1, centers=3, log_scales=3, rotations=4)
@@ -50,20 +52,26 @@ def _decode(cells, metadata, op):
     bg = cells >= ADAPTIVE_TAG
     core = op.C(op.choose(bg, 0, cells))
     xyz = [core_offset + op.I(core // (n**axis) % n) * (1 << core_l) for axis in range(3)]
-    coarse = op.I((cells & (ADAPTIVE_TAG-1)) >> 32)
+    extended = (cells & ADAPTIVE_EXTENDED_TAG) != 0
+    deepest = (cells & ADAPTIVE_DEEPEST_TAG) == ADAPTIVE_DEEPEST_TAG
+    coarse = op.I(op.choose(extended,
+        (cells >> ADAPTIVE_PATH_BITS) & 1023,
+        (cells & (ADAPTIVE_TAG-1)) >> 32))
+    coarse = op.I(op.choose(deepest, 504+op.I((cells >> 54) & 63), coarse))
     shell, ordinal = coarse // 56, coarse % 56
     flat = ordinal
     for hole in _HOLES:
         flat = flat + op.I(flat >= hole)
-    path = cells & (2**32-1)
-    depth = op.I(path)*0
+    path = op.C(op.choose(extended, cells & ((1 << ADAPTIVE_PATH_BITS)-1), cells & (2**32-1)))
+    depth = op.I(bg)*0
     for d in range(1, ADAPTIVE_MAX_DEPTH+1):
         depth = op.choose(path >= (1 << (3*d)), d, depth)
-    morton = path - (op.C(1) << op.U(3*depth))
+    depth = op.choose(deepest, 18, depth)
+    morton = op.C(op.choose(deepest, cells & ((1<<54)-1), path-(op.C(1) << op.U(3*depth))))
     coarse_l = 9 + shell
     leaf_l = coarse_l-depth
     for axis in range(3):
-        child = op.I(path)*0
+        child = op.I(bg)*0
         for bit in range(ADAPTIVE_MAX_DEPTH):
             child |= op.I((morton >> (3*bit+axis)) & 1) << bit
         a = root//2 + ((flat // (4**axis) % 4)-2) * (op.I(1) << op.I(coarse_l))
@@ -93,7 +101,7 @@ def _canonical(xyz, log_size, metadata, op):
         shell = op.choose(radius2 >= (1024 << k), k, shell)
     coarse_l = 9+shell
     # The configured finest depth bounds growth as well as refinement.
-    max_depth = min(ADAPTIVE_MAX_DEPTH, int(metadata.get('background_max_depth', ADAPTIVE_MAX_DEPTH)))
+    max_depth = op.minimum(ADAPTIVE_MAX_DEPTH, adaptive_depth_limit(metadata, shell))
     desired_l = op.I(op.choose(bg, op.maximum(log_size, coarse_l-max_depth), core_l))
     needs_split = op.choose(bg, log_size > coarse_l, log_size > core_l)
     lower = [op.I(a >> op.I(desired_l)) << op.I(desired_l) for a in xyz]
@@ -113,8 +121,14 @@ def _canonical(xyz, log_size, metadata, op):
     depth = op.maximum(coarse_l-desired_l, 0)
     local = [((lower[a]-root//2) >> op.I(desired_l)) -
              ((coarse_xyz[a]-2) << op.I(depth)) for a in range(3)]
-    address_bg = op.C(ADAPTIVE_TAG) | (op.C(shell*56+ordinal) << 32) | \
-                 (op.C(1) << op.U(3*depth)) | _morton(local, ADAPTIVE_MAX_DEPTH, op)
+    extended = depth > ADAPTIVE_LEGACY_MAX_DEPTH
+    coarse_address = op.C(shell*56+ordinal)
+    morton = _morton(local, ADAPTIVE_MAX_DEPTH, op)
+    address_bg = op.C(ADAPTIVE_TAG) | op.C(op.choose(extended,
+        op.C(ADAPTIVE_EXTENDED_TAG) | (coarse_address << ADAPTIVE_PATH_BITS), coarse_address << 32)) | \
+        (op.C(1) << op.U(3*depth)) | morton
+    address_bg = op.C(op.choose(depth == 18,
+        op.C(ADAPTIVE_DEEPEST_TAG) | ((coarse_address-504) << 54) | morton, address_bg))
     core_coords = [(a-(root-1024)//2) >> core_l for a in lower]
     address_core = op.C(core_coords[0]+n*(core_coords[1]+n*core_coords[2]))
     return op.C(op.choose(bg, address_bg, address_core)), lower, desired_l, valid, needs_split
