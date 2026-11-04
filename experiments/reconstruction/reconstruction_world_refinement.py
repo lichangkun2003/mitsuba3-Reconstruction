@@ -11,6 +11,9 @@ from reconstruction_world_shell import (validate_world_shell_layout, world_shell
 
 
 def _metadata(metadata):
+    if metadata.get("foreground_refinement") == "adaptive":
+        raise ValueError("Uniform core refinement is unavailable for adaptive foreground; "
+                         "use selective leaf refinement")
     mode, subdivision = world_shell_metadata_layout(metadata)
     validate_world_shell_layout(metadata["resolution"], metadata["background_shell_levels"],
                                 metadata["grid_min"], metadata["grid_max"], subdivision)

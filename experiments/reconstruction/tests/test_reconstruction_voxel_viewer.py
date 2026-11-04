@@ -16,7 +16,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from reconstruction_checkpoint import save_checkpoint
-from reconstruction_world_shell import adaptive_encode_numpy
+from reconstruction_world_shell import adaptive_encode_numpy, core_adaptive_encode_numpy
 from visualize_voxels import export_viewer, iter_boxes, read_layout
 
 
@@ -123,6 +123,24 @@ class VoxelViewerTests(unittest.TestCase):
             _, cells = read_layout(self.path)
         self.assertEqual(set(accessed), {"metadata_json", cells_key})
         np.testing.assert_array_equal(cells, [0, 21, 63])
+
+    def test_adaptive_foreground_keeps_core_region_and_actual_leaf_depths(self):
+        tagged = core_adaptive_encode_numpy(np.array([5, 6]), np.array([0, 512]), np)
+        background = adaptive_encode_numpy(np.array([0]), np.array([0]), np.array([0]), np)
+        self.save(np.r_[np.array([17], np.uint64), tagged, background],
+                  self.shell_metadata(world_shell_version=8, background_refinement="adaptive",
+                    foreground_refinement="adaptive", foreground_max_resolution=1024,
+                    background_resolution_mode="core", background_max_resolution=1024))
+        metadata, cells = read_layout(self.path)
+        boxes = np.concatenate(list(iter_boxes(cells, metadata, chunk_rows=1)))
+        np.testing.assert_array_equal(boxes[:, 6], [0, 0, 0, 1])
+        np.testing.assert_array_equal(boxes[:, 7], [4, 5, 6, 0])
+        np.testing.assert_array_equal(boxes[:, 3], [.125, .0625, .03125, 1.])
+
+    def test_tagged_foreground_requires_matching_metadata(self):
+        tagged = core_adaptive_encode_numpy(np.array([5]), np.array([0]), np)
+        with self.assertRaisesRegex(ValueError, "adaptive foreground metadata"):
+            list(iter_boxes(tagged, self.shell_metadata(background_refinement="adaptive")))
 
     def test_corrupted_cell_checksum_is_rejected_before_visualization(self):
         self.save([0, 21, 63])

@@ -132,7 +132,7 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     const std::array<float, 3> &grid_min, const std::array<float, 3> &grid_max,
     double opacity_threshold, uint32_t sh_count, uint32_t opacity_sh_count)
     : m_resolution(resolution), m_core_resolution(resolution), m_active_count(0), m_sh_count(sh_count),
-      m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count), m_min(grid_min), m_max(grid_max) {
+      m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count), m_active_opacity_sh_count(opacity_sh_count), m_min(grid_min), m_max(grid_max) {
     if (resolution < 1 || resolution > max_core_resolution)
         Throw("VoxelReconstruction: resolution must be in [1, 1024].");
     if (sh_count < 1 || sh_count > 16 || opacity_sh_count < 1 || opacity_sh_count > 16)
@@ -155,7 +155,7 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     uint32_t opacity_sh_count, uint32_t core_resolution, uint32_t background_shell_levels,
     uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive)
     : m_resolution(resolution), m_core_resolution(core_resolution ? core_resolution : resolution),
-      m_active_count(0), m_sh_count(sh_count), m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count),
+      m_active_count(0), m_sh_count(sh_count), m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count), m_active_opacity_sh_count(opacity_sh_count),
       m_min(grid_min), m_max(grid_max) {
     if (resolution < 1 || resolution > max_grid_resolution ||
         m_core_resolution > max_core_resolution || m_core_resolution != resolution)
@@ -227,7 +227,7 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive)
     : m_resolution(resolution), m_core_resolution(core_resolution ? core_resolution : resolution),
       m_active_count((uint32_t) cells.size()),
-      m_sh_count(sh_count), m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count),
+      m_sh_count(sh_count), m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count), m_active_opacity_sh_count(opacity_sh_count),
       m_min(grid_min), m_max(grid_max) {
     if (!resolution || resolution > max_grid_resolution || cells.size() > size_t(INT32_MAX) ||
         m_core_resolution > max_core_resolution || m_core_resolution != resolution ||
@@ -278,6 +278,8 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::update_spatial_statistics(
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::rebuild_octree() {
     // Payload rows preserve parameter/Adam order, irrespective of Morton order.
     // Validation and sorting only touch occupied leaves, never resolution^3.
+    m_core_adaptive = m_cells.size() && dr::slice(dr::any(
+        ((m_cells >> 63u) == 0u) & ((m_cells & (uint64_t(1) << 61u)) != 0u)));
     build_world_tree(m_tree, m_cells, IntBuffer(dr::arange<UIntBuffer>(m_active_count)));
     m_growth_tree.clear(root_resolution());
     update_spatial_statistics();
@@ -577,6 +579,7 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
         }};
         const size_t input_rows = compact_indices ? compact_indices->size() : m_active_count;
         const uint32_t radiance_degrees = uint32_t(std::ceil(std::sqrt(double(m_sh_count))));
+        const uint32_t opacity_degrees = uint32_t(std::ceil(std::sqrt(double(m_opacity_sh_count))));
         if (dr::width(allowed) != 1 || appearance_valid.size() != input_rows ||
             geometry_valid.size() != input_rows || background_carve_valid.size() != input_rows ||
             (compact_indices && (!compact_count || dr::width(*compact_count) != 1)))
@@ -591,7 +594,9 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                 mean->second->size() != size || square->second->size() != size ||
                 (clock->second->size() != m_active_count &&
                  !(std::string(group.name) == "radiance_sh" &&
-                   clock->second->size() == size_t(m_active_count) * radiance_degrees)) ||
+                   clock->second->size() == size_t(m_active_count) * radiance_degrees) &&
+                 !(std::string(group.name) == "opacity_sh" &&
+                   clock->second->size() == size_t(m_active_count) * opacity_degrees)) ||
                 (group.rate > 0.f && (gradient == gradients.end() ||
                                      gradient->second.size() != input_rows * group.size)))
                 Throw("VoxelReconstruction.optimizer_step_device(): invalid group %s.", group.name);
@@ -662,6 +667,9 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                     continue;
                 const bool rotation = std::string(group.name) == "rotation_tangent";
                 const bool radiance = std::string(group.name) == "radiance_sh";
+                const bool opacity = std::string(group.name) == "opacity_sh";
+                const uint32_t active_coefficients = radiance ? m_active_sh_count : m_active_opacity_sh_count;
+                const uint32_t degree_count = radiance ? radiance_degrees : opacity_degrees;
                 const bool centers = std::string(group.name) == "centers";
                 const bool scales = std::string(group.name) == "log_scales";
                 const auto &compact_rows = group.geometry ? geometry : appearance;
@@ -672,15 +680,15 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                 FloatBuffer &mean_target = *means.at(group.name),
                             &square_target = *squared_means.at(group.name);
                 UIntBuffer &clock_target = *steps.at(group.name);
-                const uint32_t component_count = radiance ? m_active_sh_count * 3 : group.size;
+                const uint32_t component_count = radiance ? m_active_sh_count * 3 : (opacity ? m_active_opacity_sh_count : group.size);
                 // Legacy callers retain one voxel clock. Progressive training
                 // supplies voxel-major degree clocks so a newly enabled degree
                 // starts its own Adam bias correction without altering DC age.
-                const uint32_t clock_width = clock_target.size() == m_active_count ? 1 : radiance_degrees;
+                const uint32_t clock_width = clock_target.size() == m_active_count ? 1 : degree_count;
                 const uint32_t active_clocks = clock_width == 1 ? 1 :
-                    uint32_t(std::ceil(std::sqrt(double(m_active_sh_count))));
+                    uint32_t(std::ceil(std::sqrt(double(active_coefficients))));
                 auto component_clock = [&](uint32_t component) {
-                    return clock_width == 1 ? 0u : uint32_t(std::sqrt(double(component / 3)));
+                    return clock_width == 1 ? 0u : uint32_t(std::sqrt(double(component / (radiance ? 3u : 1u))));
                 };
                 auto clock_biases = [&](const UIntBuffer &buffer, const UInt32 &ids, const Mask &active) {
                     std::vector<std::tuple<UInt32, Float, Float>> result;
@@ -1044,7 +1052,7 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_growth_candidates(
     SpatialTree new_tree;
     if (count)
         build_world_tree(new_tree, CellBuffer(new_cells), -2 - IntBuffer(new_heads));
-    if (count && m_active_count && m_background_shell_levels) {
+    if (count && m_active_count && (m_background_shell_levels || m_core_adaptive)) {
         // The first lookup rejects a proposal contained by an existing leaf.
         // This converse check rejects a coarse proposal containing a finer leaf
         // away from its minimum corner. Dyadic overlap always has one of these
@@ -1110,6 +1118,15 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_active_sh_count(uint32
     }
 }
 
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_active_opacity_sh_count(uint32_t count) {
+    if (!count || count > m_opacity_sh_count)
+        Throw("VoxelReconstruction.set_active_opacity_sh_count(): count must be in [1, %u].", m_opacity_sh_count);
+    if (count != m_active_opacity_sh_count) {
+        m_active_opacity_sh_count = count;
+        ++m_topology_revision;
+    }
+}
+
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_scene_mapping(const std::string &mapping) {
     if (mapping == "bounded") {
         set_world_shells(0);
@@ -1159,7 +1176,7 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_background_use_ellipso
 
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::build_world_tree(
     SpatialTree &tree, const CellBuffer &cells, const IntBuffer &payload) const {
-    if (!m_background_shell_levels) {
+    if (!m_background_shell_levels && !m_core_adaptive) {
         if (m_background_subdivision_level || m_background_adaptive)
             Throw("VoxelReconstruction: background subdivision requires world shells.");
         const uint64_t core_count = uint64_t(m_resolution)*m_resolution*m_resolution;
@@ -1198,6 +1215,14 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::validate_cells(const CellB
     const uint64_t descendants = uint64_t(1) << (3u*m_background_subdivision_level);
     const uint64_t legacy_limit = core_count + uint64_t(56)*m_background_shell_levels*descendants;
     auto tagged = (cells >> 63u) != 0u;
+    auto core_tagged = !tagged & ((cells & (uint64_t(1) << 61u)) != 0u);
+    CellBuffer core_path = cells & uint64_t(0x7fffffffu);
+    UIntBuffer core_top(63u-dr::lzcnt(dr::maximum(core_path,CellBuffer(uint64_t(1u)))));
+    // A flat bounded model has no virtual core. Reject a tagged overlay rather
+    // than interpreting it on the smaller grid (or changing installed bounds).
+    auto valid_core = (m_core_adaptive || m_background_adaptive) &
+        ((cells & ~((uint64_t(1) << 61u) | uint64_t(0x7fffffffu))) == 0u) &
+        (core_top >= 3u) & (core_top <= 30u) & ((core_top % 3u) == 0u);
     auto extended = (cells & (uint64_t(1) << 62u)) != 0u;
     auto deepest = (cells >> 60u) == 0xfu;
     auto parts = adaptive_address_parts(cells);
@@ -1209,47 +1234,53 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::validate_cells(const CellB
             dr::select(extended, (top >= 30u) & (top <= 51u), top <= 27u)) &
         ((top % 3u) == 0u) & ((top / 3u) <= 9u + coarse / 56u) &
         (coarse < 56u*m_background_shell_levels) : dr::mask_t<UIntBuffer>(false);
-    if (cells.size() && !dr::slice(dr::all(dr::select(tagged,valid_tag,cells < legacy_limit))))
+    if (cells.size() && !dr::slice(dr::all(dr::select(tagged,valid_tag,dr::select(core_tagged,valid_core,cells < legacy_limit)))))
         Throw("VoxelReconstruction: invalid adaptive or legacy world-shell cell address.");
 }
 
 MI_VARIANT template <typename Cell>
 dr::uint32_array_t<Cell> VoxelReconstruction<Float, Spectrum>::cell_log_size(const Cell &cells) const {
     using U=dr::uint32_array_t<Cell>;
-    if (!m_background_shell_levels) return U(0u);
+    if (!m_background_shell_levels && !m_core_adaptive) return U(0u);
     const uint64_t core_count=uint64_t(m_resolution)*m_resolution*m_resolution;
-    const uint64_t descendants=uint64_t(1)<<(3u*m_background_subdivision_level);
-    auto tagged=(cells>>63u)!=0u, outside=cells>=core_count;
+    auto tagged=(cells>>63u)!=0u;
+    auto core_tagged=!tagged & ((cells & (uint64_t(1)<<61u))!=0u);
+    auto outside=(cells>=core_count)&!core_tagged;
     auto parts=adaptive_address_parts(cells);
-    const Cell &path=parts[0];
-    U depth=U(63u-dr::lzcnt(dr::maximum(path,Cell(uint64_t(1u)))))/3u;
+    Cell core_path=cells & uint64_t(0x7fffffffu);
+    U core_depth=U(63u-dr::lzcnt(dr::maximum(core_path,Cell(uint64_t(1u)))))/3u;
+    U depth=U(63u-dr::lzcnt(dr::maximum(parts[0],Cell(uint64_t(1u)))))/3u;
+    const uint64_t descendants=uint64_t(1)<<(3u*m_background_subdivision_level);
     U coarse(dr::select(tagged,parts[1],
         dr::select(outside,cells-core_count,Cell(uint64_t(0)))/descendants));
     uint32_t tree_log=0, core_log=0;
     while ((1u<<tree_log)<tree_core_resolution()) ++tree_log;
     while ((1u<<core_log)<m_resolution) ++core_log;
-    return dr::select(outside,coarse/56u+tree_log-1u-
-        dr::select(tagged,depth,U(m_background_subdivision_level)),U(tree_log-core_log));
+    return dr::select(core_tagged,U(tree_log)-core_depth,
+        dr::select(outside,coarse/56u+tree_log-1u-
+        dr::select(tagged,depth,U(m_background_subdivision_level)),U(tree_log-core_log)));
 }
 
 MI_VARIANT template <typename Cell>
 std::array<dr::uint32_array_t<Cell>,4> VoxelReconstruction<Float, Spectrum>::decode_cells(const Cell &cells) const {
     using U=dr::uint32_array_t<Cell>;
-    if (!m_background_shell_levels) {
+    if (!m_background_shell_levels && !m_core_adaptive) {
         U core(cells);
         return {core%m_resolution,(core/m_resolution)%m_resolution,
                 core/(m_resolution*m_resolution),U(0u)};
     }
     const uint64_t core_count=uint64_t(m_resolution)*m_resolution*m_resolution;
     const uint64_t descendants=uint64_t(1)<<(3u*m_background_subdivision_level);
-    auto outside=cells>=core_count, tagged=(cells>>63u)!=0u;
+    auto tagged=(cells>>63u)!=0u;
+    auto core_tagged=!tagged & ((cells & (uint64_t(1)<<61u))!=0u);
+    auto outside=(cells>=core_count)&!core_tagged;
     Cell address=dr::select(outside,cells-core_count,Cell(uint64_t(0)));
     auto parts=adaptive_address_parts(cells);
-    const Cell &path=parts[0];
+    Cell path=dr::select(core_tagged,cells & uint64_t(0x7fffffffu),parts[0]);
     U depth=U(63u-dr::lzcnt(dr::maximum(path,Cell(uint64_t(1u)))))/3u;
-    U subdivision=dr::select(tagged,depth,U(m_background_subdivision_level));
+    U subdivision=dr::select(tagged|core_tagged,depth,U(m_background_subdivision_level));
     U coarse(dr::select(tagged,parts[1],address/descendants));
-    Cell morton=dr::select(tagged,path^(Cell(uint64_t(1u))<<(3u*depth)),address%descendants);
+    Cell morton=dr::select(tagged|core_tagged,path^(Cell(uint64_t(1u))<<(3u*depth)),address%descendants);
     U shell=coarse/56u, flat=coarse%56u;
     for (uint32_t hole:{21u,22u,25u,26u,37u,38u,41u,42u}) flat+=U(flat>=hole);
     uint32_t tree_log=0;
@@ -1257,15 +1288,16 @@ std::array<dr::uint32_array_t<Cell>,4> VoxelReconstruction<Float, Spectrum>::dec
     U log=cell_log_size(cells), block=U(1u)<<log;
     U coarse_block=U(1u)<<(shell+tree_log-1u);
     U low=(U(root_resolution())-(U(tree_core_resolution())<<(shell+1u)))/2u;
-    U core(dr::select(outside,Cell(uint64_t(0)),cells));
+    U core(dr::select(outside|core_tagged,Cell(uint64_t(0)),cells));
     U core_xyz[3]={core%m_resolution,(core/m_resolution)%m_resolution,core/(m_resolution*m_resolution)};
     std::array<U,4> result;
     for(uint32_t axis=0;axis<3;++axis) {
         U child(0u);
         for(uint32_t bit=0;bit<18;++bit)
             child|=dr::select(bit<subdivision,U((morton>>(3u*bit+axis))&1u)<<bit,U(0u));
-        result[axis]=dr::select(outside,low+((flat>>(2u*axis))&3u)*coarse_block+child*block,
-            core_xyz[axis]*(tree_core_resolution()/m_resolution)+core_offset());
+        result[axis]=dr::select(core_tagged,child*block+core_offset(),
+            dr::select(outside,low+((flat>>(2u*axis))&3u)*coarse_block+child*block,
+            core_xyz[axis]*(tree_core_resolution()/m_resolution)+core_offset()));
     }
     result[3]=log;
     return result;
@@ -1274,8 +1306,9 @@ std::array<dr::uint32_array_t<Cell>,4> VoxelReconstruction<Float, Spectrum>::dec
 MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
 VoxelReconstruction<Float, Spectrum>::core_ids(const UInt32 &id, const Mask &active) const {
     if (!m_background_shell_levels) return active;
-    return active & (dr::gather<CellIndex>(m_cells,id,active) <
-                     uint64_t(m_resolution)*m_resolution*m_resolution);
+    CellIndex cells=dr::gather<CellIndex>(m_cells,id,active);
+    return active & ((cells < uint64_t(m_resolution)*m_resolution*m_resolution) |
+        (((cells>>63u)==0u) & ((cells & (uint64_t(1)<<61u))!=0u)));
 }
 
 MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::UInt32
@@ -1344,10 +1377,10 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::advance_ray_cell(
     // Only background leaves and larger empty blocks use simultaneous exits.
     uint32_t foreground_log=0;
     while ((1u<<foreground_log)<tree_core_resolution()/m_resolution) ++foreground_log;
-    Mask foreground_unit=m_background_adaptive & (foreground_log>0u) &
-        (log_size==foreground_log) & dr::all(cell>=int(core_offset())) &
+    Mask foreground_unit=(m_core_adaptive || m_background_adaptive) &
+        (foreground_log>0u) & (log_size==foreground_log) & dr::all(cell>=int(core_offset())) &
         dr::all(cell<int(core_offset()+tree_core_resolution()));
-    Mask coarse=(m_background_shell_levels!=0) & (log_size>0u) & !foreground_unit;
+    Mask coarse=(m_background_shell_levels!=0 || m_core_adaptive) & (log_size>0u) & !foreground_unit;
     dr::tie(cell,next,entry,iterations)=dr::if_stmt(
         dr::make_tuple(cell,next,entry,iterations),coarse,
         [this,step,origin,direction,inv_d,exit,log_size](Vector3i cell,
@@ -1356,18 +1389,31 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::advance_ray_cell(
                                 direction,inv_d,exit,log_size);
             return dr::make_tuple(cell,next,entry,iterations);
         },
-        [this,step,step_t,origin,inv_d,end,use_octree,foreground_unit,log_size](Vector3i cell,
+        [this,step,step_t,origin,direction,inv_d,end,use_octree,foreground_unit,log_size](Vector3i cell,
             Vector3f next,Float entry,UInt32 iterations) {
             Mask cross_x=(next.x()<=next.y())&(next.x()<=next.z());
             Mask cross_y=!cross_x&(next.y()<=next.z()),cross_z=!cross_x&!cross_y;
             Mask crossings[3]={cross_x,cross_y,cross_z};
+            Point3f point = dr::fmadd(direction,end,origin);
             for (uint32_t a=0;a<3;++a) {
                 Int32 lower=Int32((UInt32(cell[a])>>log_size)<<log_size);
                 Int32 neighbor=dr::select(step[a]>0,lower+Int32(UInt32(1u)<<log_size),lower-1);
+                Int32 interior=cell[a];
+                if (m_core_adaptive) {
+                    // The adjacent leaf can be finer. An un-crossed axis may
+                    // have moved across many virtual cells since entry, so its
+                    // entry index cannot identify that next leaf. Keep tied
+                    // faces inside the old block until their x/y/z turn.
+                    Int32 upper=lower+Int32(UInt32(1u)<<log_size)-1;
+                    Float position=(point[a]-m_min[a])/tree_cell_size(a);
+                    Int32 refreshed=Int32(dr::floor(dr::clip(position,
+                        Float(lower-int(core_offset())),Float(upper-int(core_offset())))))+int(core_offset());
+                    interior=dr::select(foreground_unit,refreshed,interior);
+                }
                 cell[a]=dr::select(crossings[a],
-                    dr::select(foreground_unit,neighbor,cell[a]+step[a]),cell[a]);
+                    dr::select(foreground_unit,neighbor,cell[a]+step[a]),interior);
             }
-            if (use_octree)
+            if (use_octree || m_core_adaptive || m_background_adaptive)
                 next=dr::maximum(end,dr::select(foreground_unit,
                     world_block_boundary_times(cell,step,origin,inv_d,log_size),
                     octree_boundary_times(cell,step,origin,inv_d)));
@@ -1443,6 +1489,7 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
     if (use_octree)
         next = dr::maximum(entry, octree_boundary_times(cell, step, ray.o, inv_d));
     const bool world_shell=m_scene_mapping=="world_shell";
+    const bool mixed_tree=world_shell || m_core_adaptive;
     const Vector3f world_d=d;
     RaySegment first{ray.o,d,exit};
     struct LoopState {
@@ -1472,7 +1519,7 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
                 s.cell.x(), s.cell.y(), s.cell.z(), s.tree_node, s.tree_level, s.tree_anchor, s.active);
             Mask occupied = s.active & (id_signed >= 0);
             UInt32 id = UInt32(dr::maximum(id_signed, 0));
-            if (use_octree && !world_shell) {
+            if (use_octree && !mixed_tree) {
                 Mask empty = s.active & !occupied;
                 s = dr::if_stmt(dr::make_tuple(s, empty, empty_log), empty,
                     [this, step, step_t, origin = s.segment.origin, inv_d, exit](
@@ -1483,7 +1530,7 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
                     }, [](LoopState s, const Mask &, const UInt32 &) { return s; },
                     "Voxel reconstruction octree trace skip");
             }
-            if (world_shell)
+            if (mixed_tree)
                 s.next=dr::maximum(s.entry,world_block_boundary_times(
                     s.cell,step,s.segment.origin,inv_d,empty_log));
             Float end = dr::minimum(dr::minimum(s.next.x(), dr::minimum(s.next.y(), s.next.z())), exit);
@@ -1539,13 +1586,13 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
                 hit |= occupied & !ellipsoid & (end > s.entry);
             Color3f emission(0.f);
             Float logit = 0.f;
-            for (uint32_t k = 0; k < std::max(m_active_sh_count, m_opacity_sh_count); ++k) {
+            for (uint32_t k = 0; k < std::max(m_active_sh_count, m_active_opacity_sh_count); ++k) {
                 Float sh = reconstruction_sh(k, Vector3f(-world_d));
                 if (k < m_active_sh_count)
                     for (uint32_t channel = 0; channel < 3; ++channel)
                         emission[channel] += sh * dr::gather<Float>(m_radiance,
                             (id*m_sh_count+k)*3+channel, hit);
-                if (k < m_opacity_sh_count)
+                if (k < m_active_opacity_sh_count)
                     logit += sh * dr::gather<Float>(m_opacity, id*m_opacity_sh_count+k, hit);
             }
             Float alpha = dr::select(hit, dr::rcp(1.f + dr::exp(-logit)), 0.f);
@@ -1954,12 +2001,12 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     auto appearance = [this, clean](UInt32 id, const Vector3f &view, Mask mask, Color3f &rgb, Float &alpha) {
         rgb = Color3f(0.f);
         Float logit(0.f);
-        for (uint32_t k=0; k<std::max(m_active_sh_count,m_opacity_sh_count); ++k) {
+        for (uint32_t k=0; k<std::max(m_active_sh_count,m_active_opacity_sh_count); ++k) {
             Float sh = reconstruction_sh(k,view);
             if (k<m_active_sh_count)
                 for (uint32_t a=0;a<3;++a)
                     rgb[a] += sh*dr::gather<Float>(m_radiance,(id*m_sh_count+k)*3+a,mask);
-            if (k<m_opacity_sh_count)
+            if (k<m_active_opacity_sh_count)
                 logit += sh*dr::gather<Float>(m_opacity,id*m_opacity_sh_count+k,mask);
         }
         rgb = dr::maximum(clean(rgb),0.f);
@@ -2008,6 +2055,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     if (use_octree)
         next = dr::maximum(entry, octree_boundary_times(cell, step, ray.o, inv_d));
     const bool world_shell=m_scene_mapping=="world_shell";
+    const bool mixed_tree=world_shell || m_core_adaptive;
     const Vector3f world_d=d;
     RaySegment first{ray.o,d,exit};
     struct State {
@@ -2060,7 +2108,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 s.traversal_steps += dr::select(s.active, 1u, 0u);
                 s.traversal_leaves += dr::select(visit, 1u, 0u);
             }
-            if (use_octree && !world_shell) {
+            if (use_octree && !mixed_tree) {
                 Mask empty = s.active & !visit;
                 s = dr::if_stmt(dr::make_tuple(s, empty, empty_log), empty,
                     [this, step, step_t, origin = s.segment.origin, inv_d, exit, profile_traversal](
@@ -2076,7 +2124,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     }, [](State s, const Mask &, const UInt32 &) { return s; },
                     "Voxel reconstruction octree training skip");
             }
-            if (world_shell)
+            if (mixed_tree)
                 s.next=dr::maximum(s.entry,world_block_boundary_times(
                     s.cell,step,s.segment.origin,inv_d,empty_log));
             Float end=dr::maximum(s.entry,dr::minimum(dr::minimum(s.next.x(),dr::minimum(s.next.y(),s.next.z())),exit));
@@ -2431,13 +2479,13 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     Mask hit = growth_intersects(id,segment_entry,segment_end,ray.o,d,valid);
                     Color3f radiance(0.f);
                     Float logit(0.f);
-                    for (uint32_t j=0; j<std::max(m_active_sh_count,m_opacity_sh_count); ++j) {
+                    for (uint32_t j=0; j<std::max(m_active_sh_count,m_active_opacity_sh_count); ++j) {
                         Float sh = reconstruction_sh(j,Vector3f(-d));
                         if (j<m_active_sh_count)
                             for (uint32_t channel=0; channel<3; ++channel)
                                 radiance[channel] += sh*dr::gather<Float>(m_growth_radiance,
                                     (id*m_sh_count+j)*3+channel,hit);
-                        if (j<m_opacity_sh_count)
+                        if (j<m_active_opacity_sh_count)
                             logit += sh*dr::gather<Float>(m_growth_opacity,id*m_opacity_sh_count+j,hit);
                     }
                     radiance = dr::maximum(clean(radiance),0.f);
@@ -2759,12 +2807,12 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 s.distortion_moment += contribution*depth;
                 s.distortion_weight_derivative += contribution*derivative;
             }
-            for(uint32_t k=0;k<std::max(m_active_sh_count,m_opacity_sh_count);++k) {
+            for(uint32_t k=0;k<std::max(m_active_sh_count,m_active_opacity_sh_count);++k) {
                 Float sh=reconstruction_sh(k,Vector3f(-d));
                 if(k<m_active_sh_count)
                     for(uint32_t j=0;j<3;++j)
                         dr::scatter_reduce(ReduceOp::Add,s.gradients["radiance_sh"],grad_rgb[j]*sh,(row*m_sh_count+k)*3+j,stored);
-                if(k<m_opacity_sh_count)
+                if(k<m_active_opacity_sh_count)
                     dr::scatter_reduce(ReduceOp::Add,s.gradients["opacity_sh"],grad_logit*sh,row*m_opacity_sh_count+k,stored);
             }
             dr::scatter_reduce(ReduceOp::Add,s.counters["appearance_valid"],UInt32(1),row,stored);

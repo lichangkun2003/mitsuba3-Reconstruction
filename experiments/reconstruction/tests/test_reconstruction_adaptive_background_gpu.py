@@ -43,6 +43,57 @@ def check(mi,dr,np):
     for key,value in result["model_state"].items():
         np.testing.assert_allclose(np.asarray(value),expected["model_state"][key],rtol=1e-6,atol=1e-7)
     print("PASS actual AD priority selector and mixed survivor refinement",flush=True)
+    # The same fitter and selector now cover core and shell leaves together.
+    from test_reconstruction_unified_adaptive import metadata as unified_metadata, state as unified_state, camera as unified_camera
+    from reconstruction_world_shell import core_adaptive_encode_numpy
+    from reconstruction_adaptive_background import select_adaptive_background
+    unified_cells = np.r_[core_adaptive_encode_numpy([8,9],[0,8],np),
+                          adaptive_encode_numpy([45],[2],[0],np)]
+    unified = dict(model_metadata=unified_metadata(), model_state=unified_state(unified_cells))
+    unified_device = dict(model_metadata=unified["model_metadata"],model_state={
+        name:(mi.UInt64(value) if name=="cell_indices" else mi.Float(value))
+        for name,value in unified["model_state"].items()})
+    selected_cpu = select_adaptive_background(unified,unified_camera(),np.ones(3),np,
+        pixel_threshold=.01,max_new_leaves=21,max_background_new_leaves=7)
+    selected_gpu = select_adaptive_background_device(unified_device,unified_camera(),mi.Float([1.,1.,1.]),dr,
+        pixel_threshold=.01,max_new_leaves=21,max_background_new_leaves=7)
+    np.testing.assert_array_equal(np.asarray(selected_gpu),selected_cpu)
+    expected_unified = refine_adaptive_background_numpy(unified,np.array([2,0],np.uint32),
+        CoarseToFineConfig(),100,refine_state,np)
+    with patch("reconstruction_adaptive_background._FIT_PARENT_BATCH",1):
+        actual_unified = refine_adaptive_background_device(unified_device,mi.UInt32([2,0]),
+            CoarseToFineConfig(),100,dr)
+    for name,value in actual_unified["model_state"].items():
+        if name=="cell_indices":
+            np.testing.assert_array_equal(np.asarray(value),expected_unified["model_state"][name])
+        else:
+            np.testing.assert_allclose(np.asarray(value),expected_unified["model_state"][name],rtol=2e-5,atol=2e-6)
+    np.testing.assert_array_equal(np.asarray(actual_unified["source_rows"]),expected_unified["source_rows"].astype(np.uint32))
+    assert actual_unified["replaced"]==2 and actual_unified["children"]==16
+    print("PASS unified mixed-core/shell selector, batched GPU child fitting and CPU parity",flush=True)
+    seed_cells = np.asarray([0, 256**3-1],np.uint64)
+    seed_arrays = unified_state(seed_cells)
+    seed_native = mi.VoxelReconstruction.from_state(256,[-1.]*3,[1.]*3,
+        {name:(mi.UInt64(value) if name=="cell_indices" else mi.Float(value))
+         for name,value in seed_arrays.items()},9,1)
+    prepared_unified = prepare_adaptive_background(np.empty((0,3)),np.empty((0,3)),
+        256,[-1.]*3,[1.]*3,1,unified_camera(),np,initial_leaf_budget=56,
+        resolution_mode="core",max_resolution=1024,
+        foreground_refinement="adaptive",foreground_max_resolution=1024)
+    initialized = initialize_background_model(seed_native,mi,dr,np,shell_levels=1,
+        background_refinement="adaptive",adaptive_background=prepared_unified)
+    initialized_arrays = initialized.snapshot()
+    dr.eval(*initialized_arrays.values())
+    initialized_cells = np.asarray(initialized_arrays["cell_indices"])[:2]
+    old_boxes = leaf_boxes_numpy(seed_cells,256,[-1.]*3,[1.]*3,1,np)
+    new_boxes = leaf_boxes_numpy(initialized_cells,256,[-1.]*3,[1.]*3,1,np)
+    for a,b in zip(old_boxes,new_boxes):
+        np.testing.assert_array_equal(a,b)
+    for name,width in (("centers",3),("log_scales",3),("rotations",4),("radiance_sh",27),("opacity_sh",1)):
+        np.testing.assert_array_equal(np.asarray(initialized_arrays[name])[:2*width],seed_arrays[name])
+    assert initialized.native_core_adaptive()
+    assert initialized.foreground_max_resolution==1024
+    print("PASS initialization converts foreground addresses without changing world boxes or parameters",flush=True)
     for tiny in (False,True):
         one=copy.deepcopy(payload)
         one["model_state"]={key:value.reshape(3,-1)[1:2].ravel().copy() for key,value in payload["model_state"].items()}

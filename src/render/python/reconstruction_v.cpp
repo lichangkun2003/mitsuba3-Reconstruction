@@ -238,12 +238,15 @@ MI_PY_EXPORT(VoxelReconstruction) {
         .def("native_background_shell_levels", &Model::native_background_shell_levels)
         .def("native_background_subdivision_level", &Model::native_background_subdivision_level)
         .def("native_background_adaptive", &Model::native_background_adaptive)
+        .def("native_core_adaptive", &Model::native_core_adaptive)
         .def("leaf_sizes", &Model::leaf_sizes, "ids"_a,
              "World-space XYZ leaf dimensions for UInt32 active row IDs; invalid IDs return zero.")
         .def("set_background_use_ellipsoid", &Model::set_background_use_ellipsoid, "enabled"_a)
         .def("native_background_use_ellipsoid", &Model::native_background_use_ellipsoid)
         .def("set_active_sh_count", &Model::set_active_sh_count, "count"_a,
              "Activate the first count radiance SH coefficients; preserve stored parameters.")
+        .def("set_active_opacity_sh_count", &Model::set_active_opacity_sh_count, "count"_a,
+             "Activate the first count opacity SH coefficients; preserve stored parameters.")
         .def("native_scene_mapping", &Model::native_scene_mapping)
         .def_prop_ro("growth_candidate_count", &Model::growth_candidate_count)
         .def_prop_ro("topology_revision", &Model::topology_revision)
@@ -308,6 +311,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
         .def_prop_ro("active_voxel_count", &Model::active_voxel_count)
         .def_prop_ro("sh_count", &Model::sh_count)
         .def_prop_ro("active_sh_count", &Model::active_sh_count)
+        .def_prop_ro("active_opacity_sh_count", &Model::active_opacity_sh_count)
         .def_prop_ro("opacity_sh_count", &Model::opacity_sh_count)
         .def_prop_ro("grid_min", &Model::grid_min)
         .def_prop_ro("grid_max", &Model::grid_max)

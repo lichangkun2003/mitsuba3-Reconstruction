@@ -51,6 +51,8 @@ class TopologySettings:
     growth_fine_warmup_epochs: int = 20
     # Global training tail; zero preserves historical checkpoint behavior.
     growth_freeze_last_epochs: int = 0
+    # A single global tail freezes refinement, growth and every deletion rule.
+    freeze_last_fraction: float = 0.0
     # Missing fields in historical checkpoints retain their old loss units.
     # The current training CONFIG explicitly selects "observed".
     growth_rgb_normalization: str = "full_image"
@@ -107,9 +109,10 @@ class CoarseToFineConfig:
     growth_finer_level_multiplier: float = 2.5
     coarse_growth_interval: int = 10
     save_each_level: bool = True
+    refinement: str = "uniform"  # Adaptive leaves keep one fixed address domain.
 
 
-def validate_growth_opacity(settings, opacity_sh_count):
+def validate_growth_opacity(settings, opacity_sh_count, *, active_opacity_sh_count=None):
     """Validate parent-opacity initialization in both CLI and topology paths."""
     if not isinstance(settings.growth_inherit_opacity, bool):
         raise ValueError("topology.growth_inherit_opacity must be a boolean")
@@ -118,8 +121,9 @@ def validate_growth_opacity(settings, opacity_sh_count):
             or not math.isfinite(scale) or not 0 < scale <= 1):
         raise ValueError("topology.growth_opacity_scale must satisfy 0 < scale <= 1")
     if settings.growth_inherit_opacity:
-        if opacity_sh_count != 1:
-            raise ValueError("Parent-opacity growth requires isotropic opacity_sh_count == 1")
+        active = opacity_sh_count if active_opacity_sh_count is None else active_opacity_sh_count
+        if active != 1:
+            raise ValueError("Parent-opacity growth requires one active opacity coefficient (active opacity_sh_count == 1)")
         cap = settings.growth_initial_opacity
         if (isinstance(cap, bool) or not isinstance(cap, (int, float))
                 or not math.isfinite(cap) or not 0 < cap < 1):
@@ -129,7 +133,8 @@ def validate_growth_opacity(settings, opacity_sh_count):
 def _growth_opacity_coefficients(state, metadata, parent_ids, settings, np):
     """Freeze candidate opacity in probability space, then encode its DC logit."""
     sh_count = metadata["opacity_sh_count"]
-    validate_growth_opacity(settings, sh_count)
+    validate_growth_opacity(settings, sh_count,
+                            active_opacity_sh_count=metadata.get("active_opacity_sh_count"))
     opacity = np.zeros((len(parent_ids), sh_count), dtype=np.float32)
     inverse_y0 = 2 * math.sqrt(math.pi)
     if settings.growth_inherit_opacity:
@@ -590,14 +595,17 @@ class TopologyManager:
         self.core_resolution = int(getattr(model, "core_resolution", model.resolution))
         self.scene_mapping = getattr(model, "scene_mapping", "bounded")
         self.background_refinement = getattr(model, "background_refinement", "fixed")
+        self.foreground_refinement = getattr(model, "foreground_refinement", "uniform")
         self._model_opacity_sh_count = getattr(model, "opacity_sh_count", None)
+        self._model_active_opacity_sh_count = getattr(model, "active_opacity_sh_count", self._model_opacity_sh_count)
+        self._model_opacity_progression = bool(getattr(model, "opacity_sh_degree_progression", False))
         self.level_start_epoch = 0
         # A checkpoint can already be at 512/1024 while its three weights still
         # describe the entire 256->512->1024 run. Construct those original
         # budgets before load_state_dict restores the current level's epoch.
         self.schedule_start_resolution = min(self.core_resolution, self.schedule.start_resolution)
         self.budgets = (level_budgets(self.schedule_start_resolution, self.schedule.target_resolution, self.schedule.total_epochs,
-                                     self.schedule.level_weights) if self.schedule.enabled else {self.core_resolution: self.schedule.total_epochs})
+                                     self.schedule.level_weights) if self.uniform_refinement else {self.core_resolution: self.schedule.total_epochs})
         self.cooldown = {}
         self.pending_growth = None
         # Diagnostic wall times only: never serialized as algorithm state.
@@ -625,6 +633,14 @@ class TopologyManager:
 
     def _validate(self):
         cfg, schedule = self.settings, self.schedule
+        if schedule.refinement not in ("uniform", "adaptive"):
+            raise ValueError("schedule.refinement must be uniform or adaptive")
+        if schedule.refinement == "adaptive" and self.foreground_refinement != "adaptive":
+            raise ValueError("Adaptive foreground scheduling requires a mixed-depth foreground model")
+        if (isinstance(cfg.freeze_last_fraction, bool)
+                or not isinstance(cfg.freeze_last_fraction, (int, float))
+                or not 0 <= cfg.freeze_last_fraction < 1):
+            raise ValueError("topology.freeze_last_fraction must be in [0, 1)")
         if not (1 <= self.core_resolution <= 1024 and self.core_resolution <= self.resolution <= 1040):
             raise ValueError("Topology requires core resolution <= 1024 and grid resolution <= 1040")
         if self.core_resolution not in self.budgets:
@@ -640,9 +656,15 @@ class TopologyManager:
             raise ValueError("topology.use_rgb_deletion must be a boolean")
         if not isinstance(cfg.use_low_opacity_deletion, bool):
             raise ValueError("topology.use_low_opacity_deletion must be a boolean")
-        validate_growth_opacity(cfg, self._model_opacity_sh_count)
+        active_opacity = self._model_active_opacity_sh_count
+        # Restoring a frozen-tail checkpoint may already have high orders active.
+        # Runtime entry points still refuse any topology work in that state.
+        if self._model_opacity_progression and cfg.freeze_last_fraction > 0:
+            active_opacity = 1
+        validate_growth_opacity(cfg, self._model_opacity_sh_count,
+                                active_opacity_sh_count=active_opacity)
         if (cfg.enable_deletion and cfg.use_low_opacity_deletion and
-                self._model_opacity_sh_count != 1):
+                active_opacity != 1):
             raise ValueError("Low-opacity deletion requires isotropic opacity_sh_count == 1")
         for name in ("deletion_warmup_epochs", "deletion_protection_epochs",
                      "deletion_freeze_last_epochs", "deletion_rgb_min_support_views",
@@ -779,6 +801,10 @@ class TopologyManager:
         self._deletion_eligible = value
 
     @property
+    def uniform_refinement(self):
+        return self.schedule.enabled and self.schedule.refinement == "uniform"
+
+    @property
     def level_budget(self):
         return self.budgets[self.core_resolution]
 
@@ -787,14 +813,25 @@ class TopologyManager:
         return self.level_start_epoch if self.schedule.enabled else self.opacity_warmup + self.opacity_ramp
 
     def collect_deletion(self, epoch):
+        if self.deletion_frozen(int(epoch) + 1):
+            return False
         if self.settings.use_rgb_deletion:
             return self._rgb_deletion_due(int(epoch) + 1)
         return (self.settings.enable_deletion and epoch >= self.evidence_start and
-                (not self.schedule.enabled or self.core_resolution == self.schedule.target_resolution))
+                (not self.uniform_refinement or self.core_resolution == self.schedule.target_resolution))
+
+    def topology_frozen(self, boundary):
+        fraction = self.settings.freeze_last_fraction
+        return fraction > 0 and boundary > math.floor(self.schedule.total_epochs * (1. - fraction))
+
+    def require_isotropic_topology(self, model, boundary):
+        if (self._model_opacity_progression and not self.topology_frozen(boundary)
+                and int(getattr(model, "active_opacity_sh_count", model.opacity_sh_count)) != 1):
+            raise ValueError("Progressive opacity high orders require the fixed-topology training tail")
 
     def deletion_frozen(self, boundary):
         count = self.settings.deletion_freeze_last_epochs
-        return count > 0 and boundary > max(0, self.schedule.total_epochs - count)
+        return self.topology_frozen(boundary) or (count > 0 and boundary > max(0, self.schedule.total_epochs - count))
 
     def _rgb_deletion_due(self, boundary):
         return self.settings.use_rgb_deletion and self._scheduled_deletion_due(boundary)
@@ -810,7 +847,7 @@ class TopologyManager:
         local_epoch = boundary - self.level_start_epoch
         # Refinement replaces all rows and resets evidence. Avoid collecting
         # statistics that would immediately be discarded at that boundary.
-        if (self.schedule.enabled and self.core_resolution < self.schedule.target_resolution and
+        if (self.uniform_refinement and self.core_resolution < self.schedule.target_resolution and
                 local_epoch >= self.level_budget):
             return False
         return (1 <= boundary <= self.schedule.total_epochs and
@@ -821,10 +858,10 @@ class TopologyManager:
         """Whether a one-based epoch lies in the global growth-free training tail.
 
         This uses the complete training schedule, not the current level budget
-        or a temporary stop-after limit. Refinement and deletion remain separate.
+        or a temporary stop-after limit. The unified tail also freezes deletion.
         """
         count = self.settings.growth_freeze_last_epochs
-        return count > 0 and boundary > max(0, self.schedule.total_epochs - count)
+        return self.topology_frozen(boundary) or (count > 0 and boundary > max(0, self.schedule.total_epochs - count))
 
     def _growth_due(self, boundary):
         if self.growth_frozen(boundary):
@@ -945,6 +982,7 @@ class TopologyManager:
             self._rgb_growth_device = None
             timings["candidate_clear"] = time.perf_counter() - started
             return False
+        self.require_isotropic_topology(model, boundary)
         pending = self.pending_growth
         if (pending is None or pending.get("mode") != "rgb" or
                 pending["boundary"] != boundary or pending["resolution"] != self.resolution):
@@ -1185,15 +1223,19 @@ class TopologyManager:
         if not self._low_opacity_deletion_due(boundary):
             return None
         np, cfg = self.np, self.settings
-        if int(model.opacity_sh_count) != 1:
-            raise ValueError("Low-opacity deletion requires isotropic opacity_sh_count == 1")
+        if int(getattr(model, "active_opacity_sh_count", model.opacity_sh_count)) != 1:
+            raise ValueError("Low-opacity deletion requires one active opacity coefficient")
         # snapshot() returns existing device buffers; copy just this field.
         value = model.snapshot()["opacity_sh"]
         dr = _cuda_array(value)
         if dr is not None:
+            value = dr.gather(type(value), value,
+                              dr.arange(dr.cuda.UInt32, self.count) * int(model.opacity_sh_count))
             dr.eval(value)
             dr.sync_thread()
-        coefficients = np.array(value, copy=True).reshape(-1)
+            coefficients = np.array(value, copy=True).reshape(-1)
+        else:
+            coefficients = np.array(value, copy=True).reshape(-1, int(model.opacity_sh_count))[:, 0]
         self._device_statistics["deletion_opacity_readback_bytes"] += coefficients.nbytes
         if coefficients.shape != (self.count,):
             raise ValueError("Low-opacity deletion parameter dimensions differ")
@@ -1240,7 +1282,11 @@ class TopologyManager:
                 or self.core_resolution >= self.schedule.target_resolution)
 
     def _core_region_numpy(self, model):
-        return self.np.asarray(model.snapshot()["cell_indices"]) < self.core_resolution ** 3
+        cells = self.np.asarray(model.snapshot()["cell_indices"])
+        if self.foreground_refinement == "adaptive":
+            from reconstruction_world_shell import ADAPTIVE_TAG
+            return cells < ADAPTIVE_TAG
+        return cells < self.core_resolution ** 3
 
     def _growth_world_points(self, pending, metadata):
         """Reuse the seven frozen proposal samples across views, never evidence.
@@ -1360,7 +1406,7 @@ class TopologyManager:
         np, cfg = self.np, self.settings
         if cfg.use_rgb_deletion:
             return False
-        if not self.collect_deletion(boundary) or boundary <= self.evidence_start or (boundary - self.evidence_start) % cfg.evidence_interval:
+        if not self.collect_deletion(boundary - 1) or boundary <= self.evidence_start or (boundary - self.evidence_start) % cfg.evidence_interval:
             return False
         if self._deletion_device is not None:
             fg, bg = self._deletion_device.counts()
@@ -1522,7 +1568,8 @@ class TopologyManager:
         event = {"completed_epochs": boundary, "resolution": self.resolution, "deleted": 0, "grown": 0,
                  "refined": False, "finished": False, "level_budget": self.level_budget,
                  "growth_frozen": self.growth_frozen(boundary),
-                 "growth_freeze_last_epochs": cfg.growth_freeze_last_epochs}
+                 "growth_freeze_last_epochs": cfg.growth_freeze_last_epochs,
+                 "topology_frozen": self.topology_frozen(boundary)}
         if self.core_resolution != self.resolution:
             event["core_resolution"] = self.core_resolution
         if cfg.use_rgb_growth:
@@ -1544,9 +1591,17 @@ class TopologyManager:
                          deletion_evidence_requested=self._rgb_deletion_due(boundary))
         if cfg.use_low_opacity_deletion:
             event["deletion_opacity_requested"] = self._low_opacity_deletion_due(boundary)
+        if self.topology_frozen(boundary):
+            self.pending_growth = self.pending_rgb_deletion = None
+            self._growth_world_cache = self._growth_device = self._rgb_growth_device = self._rgb_deletion_device = None
+            model.clear_growth_candidates()
+            event.update(finished=boundary >= schedule.total_epochs, active_voxel_count=self.count,
+                         evidence_window_evaluated=False)
+            return None, event
+        self.require_isotropic_topology(model, boundary)
         checkpoint = None
         level_done = boundary - self.level_start_epoch >= self.level_budget
-        if schedule.enabled and self.core_resolution < schedule.target_resolution and level_done:
+        if self.uniform_refinement and self.core_resolution < schedule.target_resolution and level_done:
             previous = model_checkpoint(model)
             replacement = refine_state(previous, schedule, cfg.max_active_voxels)
             if schedule.save_each_level:
@@ -1578,7 +1633,7 @@ class TopologyManager:
         first = self.evidence_start + 2 * cfg.evidence_interval
         periodic = boundary >= first and (boundary - first) % cfg.deletion_interval == 0
         legacy_delete = (self.candidates if not cfg.use_rgb_deletion and
-                         (periodic or final) and self.collect_deletion(boundary) else None)
+                         (periodic or final) and self.collect_deletion(boundary - 1) else None)
         if legacy_delete is not None and self.scene_mapping == "world_shell":
             legacy_delete = legacy_delete & self._core_region_numpy(model)
         masks = [mask for mask in (rgb_delete, legacy_delete, opacity_delete) if mask is not None]
@@ -1865,7 +1920,7 @@ class TopologyManager:
                     local_epoch <= self.settings.deletion_warmup_epochs or
                     (local_epoch - self.settings.deletion_warmup_epochs) % self.settings.deletion_interval or
                     self.deletion_frozen(last) or
-                    (self.schedule.enabled and self.core_resolution < self.schedule.target_resolution and
+                    (self.uniform_refinement and self.core_resolution < self.schedule.target_resolution and
                      local_epoch >= self.level_budget)):
                 raise ValueError("Low-opacity deletion previous boundary is not a scheduled window")
         elif self.np.any(self.low_opacity_deletion_streak):

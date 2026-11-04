@@ -60,6 +60,7 @@ from reconstruction_topology import (TopologyManager, TopologySettings, CoarseTo
 class TrainingSettings:
     rgb_only: bool = False  # Legacy schema default; CONFIG enables RGB-only phase 1.
     sh_degree_progression: bool = False  # Legacy schema default; CONFIG enables progressive radiance.
+    opacity_sh_degree_progression: bool = False  # High-order opacity starts only after topology freezes.
     sh_degree_weights: tuple[int, int, int] = (4, 3, 3)  # Legacy default; zero middle weight skips the 0+1 stage.
     num_epochs: int = 1000
     chunk_size: int = 0  # 0: submit the whole image; positive: explicit ray batches.
@@ -76,7 +77,7 @@ class TrainingSettings:
     batch_reduction: str = "auto"  # Multi-GPU RGB batches: exact sparse union, or dense diagnostic transport.
     seed: int = 42
     shuffle: bool = True
-    save_count: int = 3  # Legacy config field; saves now occur only before refinement and at completion.
+    save_count: int = 3  # Legacy field; adaptive saves follow the topology freeze boundary.
     output: str | None = None  # None: automatically allocate a daily experiment.
 
 
@@ -137,6 +138,7 @@ class TrainConfig:
 # 路径相对于 mitsuba 仓库的父目录；切换场景只需修改下面的 dataset。
 CONFIG = TrainConfig()
 CONFIG.training.sh_degree_progression = True
+CONFIG.training.opacity_sh_degree_progression = True
 CONFIG.training.sh_degree_weights = (8, 0, 2)  # 前 80% 仅 DC，最后 20% 前景／背景同时开启 1、2 阶。
 CONFIG.data.dataset = "datasets/bicycle"
 CONFIG.data.point_cloud = "init_points.ply"
@@ -146,6 +148,7 @@ CONFIG.data.scene_mode = "auto"  # 合成场景：有界白色背景；COLMAP：
 CONFIG.data.background_shell_levels = 5  # 每壳从56个粗叶开始，按相机采样和训练证据自适应细分。
 CONFIG.data.background_resolution_mode = "core"  # 自适应外壳最细与当前前景体素边长一致。
 CONFIG.data.background_max_resolution = 1024
+CONFIG.data.background_refinement = "adaptive"
 CONFIG.data.background_opacity = 0.5  # 远景新生体素 opacity；允许后续优化和删除。
 
 CONFIG.render.width = 800
@@ -154,7 +157,7 @@ CONFIG.render.spp = 1  # 训练固定每视角 1 spp；多 spp 出图使用评�
 CONFIG.render.traversal = "octree"  # 默认八叉占用树跳过空区域；"dda" 仅用于对照。
 CONFIG.render.max_hits = 128  # 背景同步细分后需要更多射线命中记录；训练与评价共用。
 CONFIG.training.rgb_only = True  # 参考 alpha 仅用于读图时合成 RGB，不进入训练或生长投票。
-CONFIG.model.opacity_sh_count = 1  # 仅优化 DC logit；opacity = sigmoid(Y0 * b0)。
+CONFIG.model.opacity_sh_count = 9  # DC until the fixed-topology tail, then degrees 1 and 2.
 CONFIG.gradient.alpha_loss_weight = 0.
 CONFIG.gradient.alpha_geometry_weight = 0.
 CONFIG.gradient.background_carve_weight = 0.
@@ -201,11 +204,13 @@ CONFIG.training.gpu_reference_cache_mib = 4096  # 显存缓存上限，按需分
 CONFIG.training.freeze_native = True  # 重放原生计算；拓扑变化后重新记录，分段诊断时旁路。
 
 CONFIG.schedule.enabled = True
+CONFIG.schedule.refinement = "adaptive"
+CONFIG.topology.freeze_last_fraction = .2
 CONFIG.schedule.start_resolution = 256
 CONFIG.schedule.target_resolution = 512
 CONFIG.schedule.level_weights = (6, 4)  # 512终点默认6:4；1024终点默认(4,3,3)。
 CONFIG.training.num_epochs = 1500  # 整个实验总轮数，每轮遍历全部训练视角。
-CONFIG.training.save_count = 3  # 兼容旧配置；只在升层前保存续训 checkpoint，训练结束保留 model.npz。
+CONFIG.training.save_count = 3  # 兼容字段；自适应模式在冻结轮数的一半、冻结边界和最终各保存一次。
 CONFIG.training.output = None  # 自动创建 outputs/场景-MM.DD-E编号/training。
 # 需要手动指定目录时，将 None 改为路径字符串，或传 --output-dir。
 CONFIG.evaluation.enabled = True  # 最终 model.npz 保存后，自动评价训练集和测试集。
@@ -359,6 +364,23 @@ def apply_arguments(config, args, values):
         config.schedule.level_weights = (4, 3, 3)
 
 
+def delayed_opacity_topology_safe(config):
+    """Allow directional opacity only when every topology operation has stopped."""
+    if not config.training.opacity_sh_degree_progression:
+        return False
+    if config.model.opacity_sh_count not in (1, 4, 9):
+        raise ValueError("Progressive opacity requires 1, 4 or 9 stored coefficients")
+    weights = config.training.sh_degree_weights
+    first = config.training.num_epochs * weights[0] // sum(weights)
+    fraction = config.topology.freeze_last_fraction
+    frozen_from = int(config.training.num_epochs * (1. - fraction))
+    if fraction <= 0 or frozen_from > first:
+        raise ValueError("High-order opacity requires all topology to freeze before its first active epoch")
+    if config.schedule.enabled and getattr(config.schedule, "refinement", "uniform") != "adaptive":
+        raise ValueError("Progressive opacity with topology requires adaptive refinement")
+    return True
+
+
 def validate(config):
     validate_config(PreviewConfig(data=config.data, model=config.model, render=config.render, runtime=config.runtime))
     if config.render.max_hits > 128:
@@ -386,7 +408,14 @@ def validate(config):
             raise ValueError("Initial background budget exceeds its active leaf cap")
         if config.data.background_initial_leaf_budget > config.topology.max_active_voxels:
             raise ValueError("Initial background budget exceeds the total active leaf cap")
-    if config.schedule.enabled:
+    if getattr(config.schedule, "refinement", "uniform") == "adaptive":
+        if not config.schedule.enabled or config.data.background_refinement != "adaptive":
+            raise ValueError("Unified adaptive refinement requires an enabled schedule and adaptive world shells")
+        if config.schedule.target_resolution < config.schedule.start_resolution:
+            raise ValueError("Adaptive target resolution must be >= the initialization resolution")
+        if config.render.traversal != "octree" or not config.topology.gpu_topology:
+            raise ValueError("Unified adaptive refinement requires octree traversal and GPU topology")
+    if config.schedule.enabled and getattr(config.schedule, "refinement", "uniform") == "uniform":
         level_budgets(config.schedule.start_resolution, config.schedule.target_resolution,
                       config.schedule.total_epochs, config.schedule.level_weights)
     if config.render.spp != 1:
@@ -431,8 +460,9 @@ def validate(config):
     if (type(config.topology.growth_freeze_last_epochs) is not int or
             config.topology.growth_freeze_last_epochs < 0):
         raise ValueError("topology.growth_freeze_last_epochs must be a nonnegative integer")
+    delayed_opacity = delayed_opacity_topology_safe(config)
     if config.training.rgb_only:
-        if config.model.opacity_sh_count != 1:
+        if config.model.opacity_sh_count != 1 and not delayed_opacity:
             raise ValueError("RGB-only training requires model.opacity_sh_count=1 (DC logit only)")
         disabled = {
             "gradient.alpha_loss_weight": config.gradient.alpha_loss_weight,
@@ -450,9 +480,10 @@ def validate(config):
             raise ValueError("RGB-only deletion requires topology.use_rgb_deletion=true; legacy alpha deletion is unavailable")
         if not config.topology.use_rgb_growth and (config.topology.enable_growth or config.schedule.enable_coarse_growth):
             raise ValueError("RGB-only growth requires topology.use_rgb_growth=true; legacy alpha growth is unavailable")
-    validate_growth_opacity(config.topology, config.model.opacity_sh_count)
+    validate_growth_opacity(config.topology, config.model.opacity_sh_count,
+                            active_opacity_sh_count=1 if delayed_opacity else None)
     if (config.topology.enable_deletion and config.topology.use_low_opacity_deletion
-            and config.model.opacity_sh_count != 1):
+            and config.model.opacity_sh_count != 1 and not delayed_opacity):
         raise ValueError("Low-opacity deletion requires model.opacity_sh_count=1 (DC logit only)")
     if (isinstance(config.gradient.max_growth_hits, bool) or not isinstance(config.gradient.max_growth_hits, int)
             or not 1 <= config.gradient.max_growth_hits <= 32):
@@ -529,6 +560,7 @@ def is_refinement_boundary(topology, completed_epochs):
     """Use the same old-level boundary as CPU and GPU topology finish_epoch."""
     core = getattr(topology, "core_resolution", topology.resolution)
     return (topology.schedule.enabled
+            and getattr(topology.schedule, "refinement", "uniform") == "uniform"
             and core < topology.schedule.target_resolution
             and completed_epochs >= topology.level_start_epoch + topology.level_budget)
 
@@ -578,6 +610,31 @@ def record_refinement_boundary(report, boundary):
     core = str(checkpoint["core_resolution"])
     report.setdefault("pre_refine_checkpoints", {})[core] = checkpoint
     report.setdefault("level_renders", {})[core] = boundary["render"]
+
+
+def save_epoch_checkpoint(config, model, views, model_path, output, mi, dr, np, save, *,
+                          completed_epochs, global_step, primary=True):
+    """Save a completed topology transaction, then preview that same model.
+
+    Epoch filenames distinguish mixed-resolution adaptive states. Rendering uses
+    the evaluation seed without advancing the training RNG or optimizer.
+    """
+    if not primary:
+        return None
+    path = (model_path if completed_epochs == config.training.num_epochs else
+            output / f"epoch-{completed_epochs:05d}.npz")
+    save(path, completed_epochs, pending_epoch_transition=False)
+    checkpoint = dict(status="passed", path=str(path), completed_epochs=completed_epochs,
+                      global_step=global_step, pending_epoch_transition=False)
+    if config.evaluation.enabled:
+        image = model_path.parent / "train" / f"0000-epoch-{completed_epochs:05d}.png"
+        # Rewriting a checkpoint also refreshes its preview, including a rerun
+        # from an earlier checkpoint into the same experiment directory.
+        rendered = _save_training_view_zero(config, model, views, image, mi, dr, np,
+            completed_epochs=completed_epochs, global_step=global_step)
+    else:
+        rendered = dict(status="skipped", reason="evaluation_disabled")
+    return dict(checkpoint=checkpoint, render=rendered)
 
 
 def _save_training_view_zero(config, model, views, path, mi, dr, np, *,
@@ -653,6 +710,7 @@ def training_memory_plan(config, model, report, view_count, *, world_size=1,
     return plan_training_memory(active_voxels=count,
         sh_count=int(model.sh_count), opacity_sh_count=int(model.opacity_sh_count),
         radiance_degree_steps=config.training.sh_degree_progression,
+        opacity_degree_steps=config.training.opacity_sh_degree_progression,
         compact_capacity=compact, ray_count=effective_chunk_size(config),
         reference_image_pixels=pixels, max_hits=config.render.max_hits,
         max_candidates=config.gradient.max_candidates,
@@ -705,12 +763,11 @@ def refinement_memory_snapshot(gpu):
 
 def prepare_refinement_memory(config, model, optimizer, cache, native_replay, report,
                               view_count, request, dr, *, world_size=1):
-    """Retire replay/cache owners and check both transition and next-view storage."""
+    """Retire stale replay owners and reclaim useful caches only under pressure."""
+    started = time.perf_counter()
     native_replay.clear()
     optimizer.clear_replay()
-    cache.clear()
     dr.sync_thread()
-    dr.flush_malloc_cache()
     policy = report["cuda_allocator"]["policy"]
     metadata = request["model_metadata"]
     index_bound = estimate_spatial_index_bytes(request["active_voxels"], metadata["resolution"],
@@ -719,12 +776,27 @@ def prepare_refinement_memory(config, model, optimizer, cache, native_replay, re
         background_adaptive=metadata.get("background_refinement") == "adaptive")
     ordinary = training_memory_plan(config, model, report, view_count, world_size=world_size,
         active_voxels=request["active_voxels"], known_index_bytes=index_bound)
-    transition = plan_refinement_memory(request, gpu=report.get("gpu"),
-        live_memory=refinement_memory_snapshot(report.get("gpu")), allocator_policy=policy,
-        known_index_bytes=model_index_bytes(model, policy),
-        radiance_degree_steps=config.training.sh_degree_progression)
+    known_index_bytes = model_index_bytes(model, policy)
+
+    def transition_plan(live):
+        return plan_refinement_memory(request, gpu=report.get("gpu"),
+            live_memory=live, allocator_policy=policy, known_index_bytes=known_index_bytes,
+            radiance_degree_steps=config.training.sh_degree_progression,
+            opacity_degree_steps=config.training.opacity_sh_degree_progression)
+
+    live = refinement_memory_snapshot(report.get("gpu"))
+    transition = transition_plan(live)
+    reclaimed = live is None or not ordinary["supported"] or not transition["supported"]
+    if reclaimed:
+        cache.clear()
+        dr.sync_thread()
+        dr.flush_malloc_cache()
+        # Pool frees are asynchronous; measure physical memory after they finish.
+        dr.sync_thread()
+        transition = transition_plan(refinement_memory_snapshot(report.get("gpu")))
     record = {"stage": request["stage"], "exact_count": request["exact_count"],
-              "active_voxels": request["active_voxels"], "training": ordinary, "transition": transition}
+              "active_voxels": request["active_voxels"], "training": ordinary, "transition": transition,
+              "cache_reclaimed": reclaimed, "guard_seconds": time.perf_counter() - started}
     report.setdefault("refinement_memory_plans", []).append(record)
     if not ordinary["supported"]:
         raise TrainingMemoryError(ordinary)
@@ -741,13 +813,9 @@ def prepare_topology_commit_memory(config, model, optimizer, cache, native_repla
     lifecycle streaks, so a refused commit must resume an existing checkpoint;
     the exception handler must not serialize the partial topology transaction.
     """
+    started = time.perf_counter()
     native_replay.clear()
     optimizer.clear_replay()
-    cache.clear()
-    dr.sync_thread()
-    dr.flush_malloc_cache()
-    # CUDA pool frees submitted by flush are asynchronous. Wait for those
-    # frees too, before querying physical memory for a replacement field.
     dr.sync_thread()
     policy = report["cuda_allocator"]["policy"]
     count, metadata = int(request["active_voxels"]), request["model_metadata"]
@@ -757,17 +825,30 @@ def prepare_topology_commit_memory(config, model, optimizer, cache, native_repla
             background_shell_levels=metadata.get("background_shell_levels", 0),
             background_subdivision_level=metadata.get("background_subdivision_level", 0),
             background_adaptive=metadata.get("background_refinement") == "adaptive"))
-    live = refinement_memory_snapshot(report.get("gpu"))
     # Adam remaps and model materialization retire one field at a time. The
     # largest destination is one SH field, not the difference in row counts.
     field_bytes = round_cuda_allocation(count * 4 * max(
         3 * int(metadata["sh_count"]), int(metadata["opacity_sh_count"]), 4), policy)
     required = field_bytes + 1024**3
-    available = None if live is None else max(0, min(live["free_bytes"],
-        live.get("dedicated_free_bytes", live["free_bytes"])) - 1024**3)
     old_field_bytes = round_cuda_allocation(int(request.get("old_voxels", count)) * 4 * max(
         3 * int(metadata["sh_count"]), int(metadata["opacity_sh_count"]), 4), policy)
     staged_required = max(0, field_bytes - old_field_bytes) + 1024**3
+
+    def available_memory():
+        live = refinement_memory_snapshot(report.get("gpu"))
+        return None if live is None else max(0, min(live["free_bytes"],
+            live.get("dedicated_free_bytes", live["free_bytes"])) - 1024**3)
+
+    available = available_memory()
+    # Reclaim before falling back to host staging: cache retention should not
+    # turn an otherwise viable device remap into a host/device transfer.
+    reclaimed = not ordinary["supported"] or available is None or required > available
+    if reclaimed:
+        cache.clear()
+        dr.sync_thread()
+        dr.flush_malloc_cache()
+        dr.sync_thread()
+        available = available_memory()
     direct_supported = available is not None and required <= available
     staged_supported = available is not None and staged_required <= available
     migration_mode = "gpu" if direct_supported else "host_staged"
@@ -785,7 +866,8 @@ def prepare_topology_commit_memory(config, model, optimizer, cache, native_repla
          if not direct_supported and staged_supported else
          " Resume the latest complete checkpoint if this commit is refused."))
     record = {"stage": request["stage"], "active_voxels": count,
-              "migration_mode": migration_mode, "training": ordinary, "transition": transition}
+              "migration_mode": migration_mode, "training": ordinary, "transition": transition,
+              "cache_reclaimed": reclaimed, "guard_seconds": time.perf_counter() - started}
     report.setdefault("topology_commit_memory_plans", []).append(record)
     if not ordinary["supported"]:
         raise TrainingMemoryError(ordinary)
@@ -1253,7 +1335,7 @@ def dataset_signature(views, dataset, camera_file, initialization=None):
 
 def refinement_checkpoint_epochs(config) -> tuple[int, ...]:
     """Planned pre-refinement boundaries; final and explicit stops save separately."""
-    if not config.schedule.enabled:
+    if not config.schedule.enabled or getattr(config.schedule, "refinement", "uniform") == "adaptive":
         return ()
     budgets = level_budgets(config.schedule.start_resolution, config.schedule.target_resolution,
                            config.training.num_epochs, config.schedule.level_weights)
@@ -1264,6 +1346,17 @@ def refinement_checkpoint_epochs(config) -> tuple[int, ...]:
         if core < config.schedule.target_resolution:
             boundaries.append(completed)
     return tuple(boundaries)
+
+
+def adaptive_checkpoint_epochs(config) -> tuple[int, ...]:
+    """Save halfway to topology freeze, at freeze, and at training completion."""
+    if getattr(config.schedule, "refinement", "uniform") != "adaptive":
+        return ()
+    total = config.training.num_epochs
+    freeze_epoch = math.floor(total * (1. - config.topology.freeze_last_fraction))
+    # Short runs can place two boundaries at the same completed epoch. Never
+    # save twice, and leave the initialization image separate from checkpoints.
+    return tuple(sorted({max(1, freeze_epoch // 2), max(1, freeze_epoch), total}))
 
 
 def final_model_path(output: Path) -> Path:
@@ -1450,7 +1543,14 @@ def run_training(distributed=None):
         # Resolve new fields before the first validation/runtime check too.
         # The full immutable-settings check follows loading the saved config.
         saved_training = checkpoint["config"].get("training", {})
-        for name, default in (("sh_degree_progression", False), ("sh_degree_weights", (4, 3, 3))):
+        saved_schedule = checkpoint["config"].get("schedule", {})
+        config.schedule.refinement = overrides.get("schedule", {}).get("refinement", saved_schedule.get("refinement", "uniform"))
+        config.topology.freeze_last_fraction = overrides.get("topology", {}).get("freeze_last_fraction",
+            checkpoint["config"].get("topology", {}).get("freeze_last_fraction", 0.))
+        config.model.opacity_sh_count = overrides.get("model", {}).get("opacity_sh_count",
+            checkpoint["config"].get("model", {}).get("opacity_sh_count", 1))
+        for name, default in (("sh_degree_progression", False), ("opacity_sh_degree_progression", False),
+                              ("sh_degree_weights", (4, 3, 3))):
             setattr(config.training, name, overrides.get("training", {}).get(
                 name, saved_training.get(name, default)))
     output = prepare_training_output(config, resume_path, checkpoint["config"] if checkpoint else None) if primary else None
@@ -1507,6 +1607,9 @@ def run_training(distributed=None):
         if config.training.sh_degree_progression and getattr(mi.VoxelReconstruction, "sh_schedule_version", 0) < 1:
             raise RuntimeError("Progressive SH requires a rebuilt native implementation; "
                                "incrementally rebuild this Mitsuba source checkout")
+        if (config.training.opacity_sh_degree_progression
+                and getattr(mi.VoxelReconstruction, "sh_schedule_version", 0) < 2):
+            raise RuntimeError("Progressive opacity SH requires native sh_schedule_version 2; rebuild this checkout")
         if distributed is not None:
             from reconstruction_collective import NcclCollective
             collective = NcclCollective(distributed.rank, distributed.world_size,
@@ -1532,8 +1635,10 @@ def run_training(distributed=None):
             config.render = RenderConfig()
             config.model = ModelConfig()
             config.topology = TopologySettings()
+            config.schedule = CoarseToFineConfig()
             config.gradient = GradientSettings()
             config.training.sh_degree_progression = False
+            config.training.opacity_sh_degree_progression = False
             config.training.sh_degree_weights = (4, 3, 3)
             update(config, checkpoint["config"])
             # The field did not exist in legacy checkpoints. Do not inherit a
@@ -1786,8 +1891,13 @@ def run_training(distributed=None):
             gpu_reference_cache_mib=config.training.gpu_reference_cache_mib)
         emit(f"Training rays: {ray_count} per view, {batch_size} per batch, "
               f"{report['training_protocol']['batches_per_view']} ray batch(es) per view", flush=True)
-        report["checkpoint_policy"] = "before_refinement_and_final; explicit_stop_saves_resume_checkpoint"
-        report["checkpoint_epochs"] = list(refinement_checkpoint_epochs(config))
+        checkpoint_epochs = adaptive_checkpoint_epochs(config)
+        report["checkpoint_policy"] = (
+            "halfway_to_topology_freeze_then_freeze_and_final; explicit_stop_saves_resume_checkpoint" if checkpoint_epochs else
+            "before_refinement_and_final; explicit_stop_saves_resume_checkpoint")
+        report["checkpoint_epochs"] = list(checkpoint_epochs or refinement_checkpoint_epochs(config))
+        report["epoch_checkpoints"] = {}
+        report["checkpoint_renders"] = {}
         report["level_renders"] = {}
         report["pre_refine_checkpoints"] = {}
         if primary:
@@ -1821,7 +1931,8 @@ def run_training(distributed=None):
              + ("hard-hit pairwise depth concentration" if distortion_enabled else "disabled"), flush=True)
         emit("D-SSIM loss:", f"weight={config.gradient.dssim_loss_weight:g}; "
              + ("linear RGB, Gaussian 11x11, one forward" if dssim_enabled else "disabled"), flush=True)
-        emit("Training supervision:", ("RGB only; DC opacity; "
+        emit("Training supervision:", (("RGB only; DC opacity until frozen topology, then directional opacity; "
+             if config.training.opacity_sh_degree_progression else "RGB only; DC opacity; ")
              + "refinement" + (" + RGB growth" if rgb_growth_enabled else "")
              + (" + RGB deletion" if rgb_deletion_enabled else "")) if config.training.rgb_only
              else "legacy RGB + reference alpha", flush=True)
@@ -1870,13 +1981,15 @@ def run_training(distributed=None):
             model = initialize_model(config, dataset, mi, np, prepared=prepared)
             apply_sh_schedule(model, config, 0)
         del prepared
-        if config.training.rgb_only and int(model.opacity_sh_count) != 1:
+        if (config.training.rgb_only and int(model.opacity_sh_count) != 1
+                and not delayed_opacity_topology_safe(config)):
             raise ValueError("RGB-only model/checkpoint must contain exactly one opacity coefficient per voxel")
         configure_training_memory(config, model, gpu_reference_cache, report, len(views),
                                   world_size=world_size, emit=emit)
         performance.metadata["memory_plans"] = report["memory_plans"]
         optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native,
-                                   radiance_degree_steps=config.training.sh_degree_progression)
+                                   radiance_degree_steps=config.training.sh_degree_progression,
+                                   opacity_degree_steps=config.training.opacity_sh_degree_progression)
         if not callable(getattr(model, "optimizer_step_device", None)):
             raise RuntimeError("Device sparse Adam requires a rebuilt native optimizer_step_device binding; "
                                "incrementally rebuild this checkout before training")
@@ -1925,6 +2038,23 @@ def run_training(distributed=None):
                 arrays = optimizer_state = topology_state = None
             report["checkpoint"] = str(path)
             performance.record_checkpoint(path, time.perf_counter()-save_started)
+
+        def capture_epoch_checkpoint(completed_epochs):
+            if not primary:
+                return
+            progress_line.finish()
+            emit(f"Saving completed epoch {completed_epochs}", flush=True)
+            # Drop recorded paths/gradients before streamed export and the
+            # bounded evaluation render. Keep the reference image LRU warm.
+            native_replay.clear()
+            optimizer.clear_replay()
+            release_topology_cache(model, dr)
+            boundary = save_epoch_checkpoint(config, model, views, model_path, output,
+                mi, dr, np, save, completed_epochs=completed_epochs, global_step=global_step)
+            report["epoch_checkpoints"][str(completed_epochs)] = boundary["checkpoint"]
+            report["checkpoint_renders"][str(completed_epochs)] = boundary["render"]
+            if boundary["render"]["status"] == "passed":
+                emit("Checkpoint training-view-0 image:", boundary["render"]["image"], flush=True)
 
         def capture_refinement_boundary(completed_epochs):
             if not primary or not is_refinement_boundary(topology, completed_epochs):
@@ -1978,7 +2108,12 @@ def run_training(distributed=None):
                                               world_size=world_size, emit=emit)
                     report["resume_refinement_cache_release_seconds"] = release_topology_cache(model, dr)
 
-        emit("Training epochs by core resolution:", json.dumps(topology.budgets), flush=True)
+        if config.schedule.refinement == "adaptive":
+            emit(f"Adaptive foreground: initial {config.schedule.start_resolution}, maximum {config.schedule.target_resolution}; "
+                 f"topology frozen after epoch {math.floor(config.training.num_epochs * (1. - config.topology.freeze_last_fraction))}",
+                 flush=True)
+        else:
+            emit("Training epochs by core resolution:", json.dumps(topology.budgets), flush=True)
 
         if distributed is not None:
             # Establish a canonical model/Adam/RNG before the first collective,
@@ -2000,7 +2135,8 @@ def run_training(distributed=None):
             if not primary:
                 model = restore_model(initial, mi)
                 optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native,
-                                           radiance_degree_steps=config.training.sh_degree_progression)
+                                           radiance_degree_steps=config.training.sh_degree_progression,
+                                           opacity_degree_steps=config.training.opacity_sh_degree_progression)
                 optimizer.load_state_dict(initial["optimizer_state"])
                 rng.bit_generator.state = initial["rng_state"]
                 sampler.load_state_dict(initial["contour_state"])
@@ -2052,13 +2188,19 @@ def run_training(distributed=None):
             started = time.perf_counter()
             config._collect_adaptive_priority = adaptive_background.begin_epoch(model, epoch + 1)
             previous_sh_count = int(getattr(model, "active_sh_count", model.sh_count))
+            previous_opacity_sh_count = int(getattr(model, "active_opacity_sh_count", model.opacity_sh_count))
             active_sh_count = apply_sh_schedule(model, config, epoch)
-            if active_sh_count != previous_sh_count:
+            active_opacity_sh_count = int(getattr(model, "active_opacity_sh_count", model.opacity_sh_count))
+            if active_sh_count != previous_sh_count or active_opacity_sh_count != previous_opacity_sh_count:
                 native_replay.clear()
                 optimizer.clear_replay()
             if epoch == completed or active_sh_count != previous_sh_count:
                 emit(f"Radiance SH: {active_sh_count}/{int(model.sh_count)} coefficients active "
                      f"from epoch {epoch + 1}", flush=True)
+            if epoch == completed or active_opacity_sh_count != previous_opacity_sh_count:
+                emit(f"Opacity SH: {active_opacity_sh_count}/{int(model.opacity_sh_count)} coefficients active "
+                     f"from epoch {epoch + 1}; topology {'frozen' if topology.topology_frozen(epoch + 1) else 'adaptive'}",
+                     flush=True)
             training_resolution = int(model.resolution)
             active_voxels_before = int(model.active_voxel_count)
             entering_resolution = last_training_resolution != training_resolution
@@ -2296,7 +2438,8 @@ def run_training(distributed=None):
                 model = restore_model(new_state, mi)
                 if not primary:
                     optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native,
-                                               radiance_degree_steps=config.training.sh_degree_progression)
+                                               radiance_degree_steps=config.training.sh_degree_progression,
+                                               opacity_degree_steps=config.training.opacity_sh_degree_progression)
                     optimizer.load_state_dict(new_optimizer)
             # Release borrowed state before updates resume: retaining a full
             # model/Adam transfer snapshot would force native copy-on-write.
@@ -2317,6 +2460,11 @@ def run_training(distributed=None):
             entry = {"epoch": epoch+1, "global_step": global_step, "mean_loss": epoch_loss / len(views),
                      "active_sh_count": active_sh_count,
                      "active_sh_degree": math.isqrt(active_sh_count - 1),
+                     "active_opacity_sh_count": active_opacity_sh_count,
+                     "active_opacity_sh_degree": math.isqrt(active_opacity_sh_count - 1),
+                     "topology_frozen": topology.topology_frozen(epoch + 1),
+                     "foreground_refinement": getattr(model, "foreground_refinement", "uniform"),
+                     "maximum_foreground_resolution": int(getattr(model, "foreground_max_resolution", model.resolution)),
                      "optimizer_step": optimizer_step, "views_per_update": world_size,
                      "updates_per_epoch": (len(views) + world_size - 1) // world_size,
                      "mean_rgb_loss": epoch_rgb_loss / len(views) if epoch_rgb_loss is not None else None,
@@ -2378,9 +2526,16 @@ def run_training(distributed=None):
             report["trained_epochs_this_run"] = epoch + 1 - completed
             performance.record_epoch(entry)
             last_training_resolution = training_resolution
+            # The final/explicit-stop branch below owns the last save of this
+            # invocation, even if it coincides with a scheduled boundary.
+            if epoch + 1 in checkpoint_epochs and epoch + 1 < end_epoch:
+                capture_epoch_checkpoint(epoch + 1)
+                if distributed is not None:
+                    distributed.barrier()
             progress_line.finish(f"Epoch {epoch+1}/{config.training.num_epochs} done "
                 f"| loss={entry['mean_loss']:.6f} | {entry['seconds']:.2f}s "
-                f"| grid={entry['resolution']} | voxels={entry['active_voxels']}")
+                + (f"| adaptive max={entry['maximum_foreground_resolution']}" if entry['foreground_refinement'] == 'adaptive'
+                   else f"| grid={entry['resolution']}") + f" | voxels={entry['active_voxels']}")
             performance.set_phase_seconds("training_loop", time.perf_counter()-training_loop_started)
             publish_performance("running", training_status="running",
                               gpu_reference_cache=entry["gpu_reference_cache"], native_replay=entry["native_replay"],
@@ -2396,7 +2551,10 @@ def run_training(distributed=None):
             reference_cache, gpu_reference_cache, native_replay, optimizer, sampler, dr)
         if end_epoch < config.training.num_epochs:
             stopped_checkpoint = output / f"epoch-{end_epoch:05d}.npz"
-            save(stopped_checkpoint, end_epoch)
+            if checkpoint_epochs:
+                capture_epoch_checkpoint(end_epoch)
+            else:
+                save(stopped_checkpoint, end_epoch)
             if distributed is not None:
                 distributed.barrier()
             report.update(status="stopped", training_status="stopped", completed_epochs=end_epoch,
@@ -2408,7 +2566,10 @@ def run_training(distributed=None):
         # Publish only the completed reconstruction, using the same portable,
         # atomic checkpoint format understood by independent evaluation scripts.
         export_started = time.perf_counter()
-        save(model_path, config.training.num_epochs)
+        if checkpoint_epochs:
+            capture_epoch_checkpoint(config.training.num_epochs)
+        else:
+            save(model_path, config.training.num_epochs)
         emit("Saved reconstructed voxel model:", model_path, flush=True)
         if distributed is not None:
             distributed.barrier()

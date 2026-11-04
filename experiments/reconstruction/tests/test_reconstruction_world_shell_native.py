@@ -302,7 +302,7 @@ def check_ellipsoid_geometry(mi, dr, np):
         saved = {"model_metadata": model_metadata(model), "model_state": {
             key: np.asarray(value).copy() for key, value in model.snapshot().items()}}
         assert saved["model_metadata"]["background_geometry"] == "ellipsoid"
-        assert saved["model_metadata"]["world_shell_version"] == 7
+        assert saved["model_metadata"]["world_shell_version"] == 8
         assert restore_model(saved, mi).native_background_use_ellipsoid()
         checked += len(rays)
     return {"ellipsoid_trace_loss_hit_miss_and_bounded_proxy_parity": checked,
@@ -649,7 +649,7 @@ def check_high_address_trace(mi, dr, np):
     assert snapshot["cell_indices"].dtype == np.dtype(np.uint64)
     np.testing.assert_array_equal(snapshot["cell_indices"], payload["model_state"]["cell_indices"])
     saved = {"model_metadata": model_metadata(model), "model_state": snapshot}
-    assert saved["model_metadata"]["world_shell_version"] == 7
+    assert saved["model_metadata"]["world_shell_version"] == 8
     assert saved["model_metadata"]["background_subdivision_level"] == 8
     restored = restore_model(saved, mi)
     restored_trace = restored.trace(ray, mi.Color3f(*ENV), 0., 128)

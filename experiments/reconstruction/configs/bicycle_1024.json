@@ -31,7 +31,7 @@
     "bounds_padding": 1.02,
     "opacity_threshold": 0.05,
     "sh_count": 9,
-    "opacity_sh_count": 1
+    "opacity_sh_count": 9
   },
   "render": {
     "width": 800,
@@ -52,6 +52,7 @@
   "training": {
     "rgb_only": true,
     "sh_degree_progression": true,
+    "opacity_sh_degree_progression": true,
     "sh_degree_weights": [8, 0, 2],
     "num_epochs": 1500,
     "chunk_size": 0,
@@ -117,6 +118,7 @@
     "deletion_warmup_epochs": 20,
     "deletion_protection_epochs": 20,
     "deletion_freeze_last_epochs": 0,
+    "freeze_last_fraction": 0.2,
     "deletion_rgb_min_support_views": 3,
     "deletion_rgb_max_conflict_views": 1,
     "deletion_rgb_gain_epsilon": 1e-07,
@@ -127,7 +129,7 @@
     "use_rgb_growth": true,
     "growth_warmup_epochs": 20,
     "growth_fine_warmup_epochs": 20,
-    "growth_freeze_last_epochs": 50,
+    "growth_freeze_last_epochs": 0,
     "growth_rgb_normalization": "observed",
     "growth_rgb_min_support_views": 3,
     "growth_rgb_max_conflict_views": 2,
@@ -159,20 +161,16 @@
     "gpu_topology": true,
     "background_refine_interval": 10,
     "background_refine_max_new_leaves": 100000,
-    "background_refine_pixel_threshold": 8.0,
+    "background_refine_pixel_threshold": 6.0,
     "background_refine_fraction": 0.05,
-    "background_max_active_voxels": 4000000,
+    "background_max_active_voxels": 12000000,
     "background_growth_max_candidates": 200000
   },
   "schedule": {
     "enabled": true,
+    "refinement": "adaptive",
     "start_resolution": 256,
     "target_resolution": 1024,
-    "level_weights": [
-      4,
-      3,
-      3
-    ],
     "parent_opacity_threshold": 0.0,
     "opacity_optical_depth_scale": 0.65,
     "child_face_overlap": 0.1,

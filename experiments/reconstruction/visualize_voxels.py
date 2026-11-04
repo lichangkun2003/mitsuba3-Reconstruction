@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from reconstruction_checkpoint import (FORMAT, FORMAT_VERSION, _array_digest,
     _decode, _reject_json_constant, _unique_json_object)
-from reconstruction_world_shell import (ADAPTIVE_TAG, adaptive_decode_numpy,
+from reconstruction_world_shell import (ADAPTIVE_TAG, CORE_ADAPTIVE_TAG, adaptive_decode_numpy,
+    core_leaf_depths_numpy,
     leaf_boxes_numpy, validate_world_shell_layout, world_shell_metadata_layout, adaptive_depth_limit)
 
 
@@ -120,7 +121,10 @@ def iter_boxes(cells, metadata, chunk_rows=65535):
             boxes[:, 3:6] = size
         else:
             adaptive = ids >= ADAPTIVE_TAG
-            background = ids >= resolution ** 3
+            adaptive_core = ~adaptive & ((ids & np.uint64(CORE_ADAPTIVE_TAG)) != 0)
+            background = (ids >= resolution ** 3) & ~adaptive_core
+            if np.any(adaptive_core) and metadata.get("foreground_refinement") != "adaptive":
+                raise ValueError("Tagged foreground cells require adaptive foreground metadata")
             if metadata.get("background_refinement", "fixed") == "adaptive":
                 if np.any(background & ~adaptive):
                     raise ValueError("Adaptive model contains legacy background addresses")
@@ -129,6 +133,12 @@ def iter_boxes(cells, metadata, chunk_rows=65535):
             lo, hi = leaf_boxes_numpy(ids, resolution, lower, upper, levels, np, subdivision)
             boxes[:, :3] = (lo + hi) * .5
             boxes[:, 3:6] = hi - lo
+            if np.any(adaptive_core):
+                depths, _ = core_leaf_depths_numpy(ids[adaptive_core], resolution, np)
+                maximum = int(metadata.get("foreground_max_resolution", resolution)).bit_length()-1
+                if np.any(depths > maximum):
+                    raise ValueError("Adaptive foreground leaf depth exceeds model metadata")
+                boxes[adaptive_core, 7] = depths
             legacy = background & ~adaptive
             boxes[legacy, 6] = (ids[legacy] - resolution ** 3) // (56 * 8 ** subdivision) + 1
             boxes[legacy, 7] = subdivision

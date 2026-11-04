@@ -6,7 +6,9 @@ import math
 
 SHELL_CELLS = 56
 MAX_SHELL_LEVELS = 10
-WORLD_SHELL_VERSION = 7
+WORLD_SHELL_VERSION = 8
+CORE_ADAPTIVE_TAG = 1 << 61
+CORE_ADAPTIVE_MAX_DEPTH = 10
 ADAPTIVE_TAG = 1 << 63
 ADAPTIVE_EXTENDED_TAG = 1 << 62
 ADAPTIVE_DEEPEST_TAG = 0xF << 60
@@ -71,10 +73,17 @@ def world_shell_metadata_layout(metadata):
         raise ValueError("background_refinement must be fixed, uniform or adaptive")
     if type(subdivision) is not int or subdivision < 0:
         raise ValueError("background_subdivision_level must be a nonnegative integer")
-    if type(version) is not int or version not in (1, 2, 3, 4, 5, 6, WORLD_SHELL_VERSION):
+    if type(version) is not int or version not in (1, 2, 3, 4, 5, 6, 7, WORLD_SHELL_VERSION):
         raise ValueError("Unsupported world_shell_version")
-    if mode == "adaptive" and (version not in (5, 6, 7) or subdivision != 0):
-        raise ValueError("Adaptive background requires world_shell_version 5, 6 or 7 and background_subdivision_level 0")
+    if mode == "adaptive" and (version not in (5, 6, 7, 8) or subdivision != 0):
+        raise ValueError("Adaptive background requires world_shell_version >=5 and background_subdivision_level 0")
+    foreground = metadata.get("foreground_refinement", "uniform")
+    if foreground not in ("uniform", "adaptive"):
+        raise ValueError("foreground_refinement must be uniform or adaptive")
+    if foreground == "adaptive":
+        if version < 8 or mode != "adaptive":
+            raise ValueError("Adaptive foreground requires world_shell_version 8 and adaptive background")
+        foreground_adaptive_fields(metadata)
     if version == 1 and (mode != "fixed" or subdivision != 0):
         raise ValueError("Subdivided or uniform background metadata requires world_shell_version 2")
     world_shell_metadata_geometry(metadata)
@@ -111,6 +120,71 @@ def background_cells_numpy(core_resolution, levels, np, background_subdivision_l
     count = SHELL_CELLS * levels * 8 ** background_subdivision_level
     return np.arange(core_resolution ** 3, core_resolution ** 3 + count,
                      dtype=np.uint64)
+
+
+def core_adaptive_encode_numpy(depth, morton, np):
+    """Self-describing core leaves; depth is relative to the complete core box."""
+    depth, morton = np.broadcast_arrays(np.asarray(depth), np.asarray(morton))
+    if (depth.dtype.kind not in "iu" or morton.dtype.kind not in "iu"
+            or np.any(depth < 1) or np.any(depth > CORE_ADAPTIVE_MAX_DEPTH)
+            or np.any(morton < 0)):
+        raise ValueError("Invalid adaptive foreground address components")
+    depth, morton = depth.astype(np.uint64), morton.astype(np.uint64)
+    sentinel = np.left_shift(np.uint64(1), 3 * depth)
+    if np.any(morton >= sentinel):
+        raise ValueError("Adaptive foreground Morton code exceeds its depth")
+    return np.uint64(CORE_ADAPTIVE_TAG) | sentinel | morton
+
+
+def core_adaptive_decode_numpy(cells, np):
+    cells = np.asarray(cells)
+    if cells.dtype.kind not in "iu" or np.any(cells < 0):
+        raise ValueError("Invalid adaptive foreground cell address")
+    cells = cells.astype(np.uint64, copy=False)
+    path = cells & np.uint64((1 << 31) - 1)
+    depth = np.full(cells.shape, -1, np.int32)
+    for value in range(1, CORE_ADAPTIVE_MAX_DEPTH + 1):
+        sentinel = np.uint64(1 << (3 * value))
+        depth[(path >= sentinel) & (path < 2 * sentinel)] = value
+    if (np.any((cells & np.uint64(~((1 << 31) - 1) & ((1 << 64) - 1)))
+               != np.uint64(CORE_ADAPTIVE_TAG)) or np.any(depth < 0)):
+        raise ValueError("Invalid adaptive foreground cell address")
+    return depth, path - np.left_shift(np.uint64(1), 3 * depth.astype(np.uint64))
+
+
+def core_cells_to_adaptive_numpy(cells, resolution, np):
+    """Convert legacy flat core addresses without changing their world boxes."""
+    if type(resolution) is not int or not 2 <= resolution <= 1024 or resolution & (resolution - 1):
+        raise ValueError("Adaptive foreground resolution must be a power of two in [2, 1024]")
+    cells = np.asarray(cells)
+    if cells.dtype.kind not in "iu" or np.any(cells < 0) or np.any(cells >= resolution ** 3):
+        raise ValueError("Expected legacy foreground cells")
+    cells = cells.astype(np.uint64, copy=False)
+    xyz = (cells % resolution, cells // resolution % resolution, cells // (resolution ** 2))
+    morton = np.zeros(cells.shape, np.uint64)
+    depth = resolution.bit_length() - 1
+    for bit in range(depth):
+        for axis in range(3):
+            morton |= ((xyz[axis] >> np.uint64(bit)) & np.uint64(1)) << np.uint64(3 * bit + axis)
+    return core_adaptive_encode_numpy(depth, morton, np)
+
+
+def core_leaf_depths_numpy(cells, core_resolution, np):
+    """Decode mixed legacy/tagged core leaves to depths and Morton paths."""
+    cells = np.asarray(cells, np.uint64)
+    tagged = (cells & np.uint64(CORE_ADAPTIVE_TAG)) != 0
+    encoded = cells.copy()
+    encoded[~tagged] = core_cells_to_adaptive_numpy(cells[~tagged], core_resolution, np)
+    return core_adaptive_decode_numpy(encoded, np)
+
+
+def foreground_adaptive_fields(metadata):
+    if metadata.get("foreground_refinement", "uniform") != "adaptive":
+        return {}
+    maximum = metadata.get("foreground_max_resolution", 1024)
+    if type(maximum) is not int or not 2 <= maximum <= 1024 or maximum & (maximum - 1):
+        raise ValueError("foreground_max_resolution must be a power of two in [2, 1024]")
+    return dict(foreground_refinement="adaptive", foreground_max_resolution=maximum)
 
 
 def adaptive_encode_numpy(coarse, depth, morton, np):
@@ -174,7 +248,9 @@ def adaptive_depth_limit(metadata, shell):
         return depth
     if mode not in ("core_parent", "core"):
         raise ValueError("background_resolution_mode must be per_shell, core_parent or core")
-    core = metadata.get("core_resolution", metadata.get("resolution"))
+    core = (metadata.get("foreground_max_resolution", 1024)
+            if metadata.get("foreground_refinement") == "adaptive" else
+            metadata.get("core_resolution", metadata.get("resolution")))
     maximum = metadata.get("background_max_resolution", 1024 if mode == "core" else 512)
     divisor = 1 if mode == "core" else 2
     if (type(core) is not int or not 2 * divisor <= core <= 1024 or core & (core-1)
@@ -189,7 +265,7 @@ def adaptive_max_depth(metadata):
 
 def adaptive_limit_fields(metadata):
     """Canonical policy metadata, recomputed after foreground refinement."""
-    result = {"background_max_depth": adaptive_max_depth(metadata)}
+    result = {"background_max_depth": adaptive_max_depth(metadata), **foreground_adaptive_fields(metadata)}
     mode = metadata.get("background_resolution_mode", "per_shell")
     if mode in ("core_parent", "core"):
         result.update(background_resolution_mode=mode,
@@ -200,6 +276,8 @@ def adaptive_limit_fields(metadata):
 def model_adaptive_limit_fields(model, metadata):
     mode = getattr(model, "background_resolution_mode", "per_shell")
     return adaptive_limit_fields(dict(metadata,
+        foreground_refinement=getattr(model, "foreground_refinement", metadata.get("foreground_refinement", "uniform")),
+        foreground_max_resolution=int(getattr(model, "foreground_max_resolution", metadata.get("foreground_max_resolution", 1024))),
         background_resolution_mode=mode,
         background_max_resolution=int(getattr(model, "background_max_resolution", 1024 if mode == "core" else 512)),
         background_max_depth=int(getattr(model, "background_max_depth", 9))))
@@ -218,16 +296,24 @@ def validate_adaptive_cells_numpy(cells, core_resolution, levels, np):
     if cells.ndim != 1 or cells.dtype.kind not in "iu" or np.any(cells < 0):
         raise ValueError("Invalid adaptive cell address")
     background = cells >= ADAPTIVE_TAG
-    if np.any(cells[~background] >= core_resolution ** 3):
+    tagged_core = ~background & ((cells.astype(np.uint64) & np.uint64(CORE_ADAPTIVE_TAG)) != 0)
+    if np.any(cells[~background & ~tagged_core] >= core_resolution ** 3):
         raise ValueError("Adaptive models cannot contain legacy shell cell addresses")
     coarse, depth, _ = adaptive_decode_numpy(cells[background], levels, np)
     if np.any(depth > 9 + coarse // 56):
         raise ValueError("Adaptive leaf is smaller than the world-tree base cell")
     if len(np.unique(cells)) != len(cells):
         raise ValueError("cell_indices must be unique")
+    core_depth, core_morton = core_leaf_depths_numpy(cells[~background], core_resolution, np)
+    core_shift = (3 * (CORE_ADAPTIVE_MAX_DEPTH - core_depth)).astype(np.uint64)
+    core_start = np.left_shift(core_morton, core_shift)
+    core_end = core_start + np.left_shift(np.uint64(1), core_shift)
+    core_order = np.argsort(core_start)
+    if np.any(core_start[core_order][1:] < np.maximum.accumulate(core_end[core_order])[:-1]):
+        raise ValueError("Adaptive foreground leaves contain ancestor/descendant overlap")
     start, end = adaptive_intervals_numpy(cells[background], levels, np)
     order = np.argsort(start)
-    if np.any(start[order][1:] < end[order][:-1]):
+    if np.any(start[order][1:] < np.maximum.accumulate(end[order])[:-1]):
         raise ValueError("Adaptive background leaves contain ancestor/descendant overlap")
 
 
@@ -242,7 +328,8 @@ def leaf_boxes_numpy(cells, core_resolution, grid_min, grid_max, levels, np,
     if cells.ndim != 1 or cells.dtype.kind not in "ui" or np.any(cells < 0):
         raise ValueError("Invalid world shell cell address")
     adaptive = cells >= ADAPTIVE_TAG
-    if np.any(cells[~adaptive] >= limit):
+    core_adaptive = ~adaptive & ((cells.astype(np.uint64) & np.uint64(CORE_ADAPTIVE_TAG)) != 0)
+    if np.any(cells[~adaptive & ~core_adaptive] >= limit):
         raise ValueError("Invalid world shell cell address")
     lo, hi = np.asarray(grid_min, dtype=np.float64), np.asarray(grid_max, dtype=np.float64)
     lower = np.empty((len(cells), 3), dtype=np.float64)
@@ -254,7 +341,16 @@ def leaf_boxes_numpy(cells, core_resolution, grid_min, grid_max, levels, np,
     edge = (hi - lo) / core_resolution
     lower[foreground] = lo + coordinates * edge
     upper[foreground] = lower[foreground] + edge
-    legacy = ~foreground & ~adaptive
+    if np.any(core_adaptive):
+        depth, morton = core_adaptive_decode_numpy(cells[core_adaptive], np)
+        xyz = np.zeros((len(depth), 3), np.uint64)
+        for bit in range(CORE_ADAPTIVE_MAX_DEPTH):
+            for axis in range(3):
+                xyz[:, axis] |= ((morton >> np.uint64(3 * bit + axis)) & np.uint64(1)) << np.uint64(bit)
+        edge = (hi - lo) / np.exp2(depth)[:, None]
+        lower[core_adaptive] = lo + xyz * edge
+        upper[core_adaptive] = lower[core_adaptive] + edge
+    legacy = ~foreground & ~adaptive & ~core_adaptive
     address = cells[legacy].astype(np.int64) - core_resolution ** 3
     coarse, morton = address // children, address % children
     shell = coarse // SHELL_CELLS

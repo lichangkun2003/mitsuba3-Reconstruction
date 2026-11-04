@@ -327,6 +327,19 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, shell_levels=5
     state = {key: _concat_nonempty([mi.UInt64(seed[key]) if key == "cell_indices" else seed[key],
                            (mi.UInt64 if key == "cell_indices" else mi.Float)(value.ravel())], dr)
              for key, value in background.items()}
+    if adaptive and adaptive_background.get("foreground_refinement") == "adaptive":
+        if getattr(mi.VoxelReconstruction, "world_shell_version", 0) < 8:
+            raise RuntimeError("Rebuild this checkout: adaptive foreground requires native world_shell_version 8")
+        from reconstruction_world_shell import CORE_ADAPTIVE_TAG
+        depth = core.bit_length() - 1
+        ids = mi.UInt64(seed["cell_indices"])
+        coordinates = (ids % core, ids // core % core, ids // (core * core))
+        morton = dr.zeros(mi.UInt64, len(ids))
+        for bit in range(depth):
+            for axis in range(3):
+                morton |= ((coordinates[axis] >> bit) & 1) << (3 * bit + axis)
+        core_cells = mi.UInt64(CORE_ADAPTIVE_TAG | (1 << (3 * depth))) | morton
+        state["cell_indices"] = _concat_nonempty([core_cells, mi.UInt64(cells)], dr)
     dr.eval(*state.values())
     result = mi.VoxelReconstruction.from_state(
         core, model.grid_min, model.grid_max, state, sh, opacity_sh,
@@ -348,6 +361,9 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, shell_levels=5
         straight_ray_forward=True)
     if adaptive:
         result.background_max_depth = adaptive_background["max_depth"]
+        if adaptive_background.get("foreground_refinement") == "adaptive":
+            result.foreground_refinement = "adaptive"
+            result.foreground_max_resolution = int(adaptive_background["foreground_max_resolution"])
         result.background_resolution_mode = adaptive_background.get("background_resolution_mode", "per_shell")
         result.background_max_resolution = adaptive_background.get("background_max_resolution", 512)
         result.background_initialization.update(initialization="camera_sampling_adaptive",

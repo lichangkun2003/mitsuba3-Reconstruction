@@ -58,7 +58,7 @@ class FalcorOptimizer:
     """
 
     def __init__(self, model, config: OptimizerConfig | None = None, *, sparse_updates=True,
-                 replay_updates=True, radiance_degree_steps=False):
+                 replay_updates=True, radiance_degree_steps=False, opacity_degree_steps=False):
         import drjit as dr
         import mitsuba as mi
         self.dr, self.mi = dr, mi
@@ -69,6 +69,7 @@ class FalcorOptimizer:
         self.sparse_updates = sparse_updates
         self.replay_updates = replay_updates
         self.radiance_degree_steps = bool(radiance_degree_steps)
+        self.opacity_degree_steps = bool(opacity_degree_steps)
         self._update_cache = OrderedDict()
         self._compact_update_cache = OrderedDict()
         self._update_model = self._update_key = None
@@ -137,6 +138,10 @@ class FalcorOptimizer:
         self.active_sh_count = int(getattr(model, "active_sh_count", self.sh_count))
         self.sh_degree_count = math.isqrt(self.sh_count - 1) + 1
         self.radiance_degree_steps |= self.active_sh_count < self.sh_count
+        self.opacity_sh_count = int(model.opacity_sh_count)
+        self.active_opacity_sh_count = int(getattr(model, "active_opacity_sh_count", self.opacity_sh_count))
+        self.opacity_degree_count = math.isqrt(self.opacity_sh_count - 1) + 1
+        self.opacity_degree_steps |= self.active_opacity_sh_count < self.opacity_sh_count
         self.dimensions = {
             "radiance_sh": 3 * int(model.sh_count), "opacity_sh": int(model.opacity_sh_count),
             "centers": 3, "log_scales": 3, "rotation_tangent": 3,
@@ -151,19 +156,27 @@ class FalcorOptimizer:
         self._remember_state()
 
     def _step_size(self, name):
-        return self.sh_degree_count if name == "radiance_sh" and self.radiance_degree_steps else 1
+        if name == "radiance_sh" and self.radiance_degree_steps:
+            return self.sh_degree_count
+        if name == "opacity_sh" and self.opacity_degree_steps:
+            return self.opacity_degree_count
+        return 1
 
     def _prepare_sh_state(self, model):
-        self.active_sh_count = int(getattr(model, "active_sh_count", self.sh_count))
-        if self.active_sh_count < self.sh_count and not self.radiance_degree_steps:
-            # A legacy caller may enable the schedule after constructing Adam.
-            # Preserve the existing age for every previously optimized band;
-            # subsequent inactive bands stop advancing independently.
-            self.radiance_degree_steps = True
-            self._state["radiance_sh"]["steps"] = self._expand(
-                self._state["radiance_sh"]["steps"], self.sh_degree_count)
-            self.clear_replay()
-            self._remember_state()
+        for name, active_name, stored_name, flag, degree_name in (
+                ("radiance_sh", "active_sh_count", "sh_count", "radiance_degree_steps", "sh_degree_count"),
+                ("opacity_sh", "active_opacity_sh_count", "opacity_sh_count", "opacity_degree_steps", "opacity_degree_count")):
+            stored = getattr(self, stored_name)
+            active = int(getattr(model, active_name, stored))
+            setattr(self, active_name, active)
+            if active < stored and not getattr(self, flag):
+                # Legacy clocks represent bands that were already optimized.
+                # Keep that age when enabling independent clocks later.
+                setattr(self, flag, True)
+                self._state[name]["steps"] = self._expand(
+                    self._state[name]["steps"], getattr(self, degree_name))
+                self.clear_replay()
+                self._remember_state()
 
     def _row_indices(self, ids, size):
         lane = self.dr.arange(self.mi.UInt32, self.dr.width(ids) * size)
@@ -216,7 +229,8 @@ class FalcorOptimizer:
         dr, mi = self.dr, self.mi
         if ids is not None:
             cells = dr.gather(type(cells), cells, ids)
-        exterior = cells >= int(model.core_resolution) ** 3
+        core_tagged = ((cells >> 63) == 0) & ((cells & (1 << 61)) != 0)
+        exterior = (cells >= int(model.core_resolution) ** 3) & ~core_tagged
         return self._expand(exterior, 3)
 
     @staticmethod
@@ -228,7 +242,7 @@ class FalcorOptimizer:
         """Occupied background cells freeze geometry and its accumulated Adam state."""
         if self._background_use_ellipsoid(model):
             return geometry
-        core = cells < int(model.core_resolution) ** 3
+        core = (cells < int(model.core_resolution) ** 3) | (((cells >> 63) == 0) & ((cells & (1 << 61)) != 0))
         return self.dr.select(core, geometry, 0)
 
     def _leaf_component_sizes(self, model, cells, ids=None):
@@ -239,12 +253,14 @@ class FalcorOptimizer:
         count = dr.width(cells)
         lane = dr.arange(mi.UInt32, count * 3)
         size = dr.gather(mi.Float, mi.Float(list(model.voxel_size)), lane % 3)
+        if (bool(getattr(model, "native_core_adaptive", lambda: False)()) or
+                (getattr(model, "scene_mapping", "bounded") == "world_shell"
+                 and getattr(model, "background_refinement", "fixed") == "adaptive")):
+            rows = ids if ids is not None else dr.arange(mi.UInt32, count)
+            actual = model.leaf_sizes(rows)
+            return dr.select(lane % 3 == 0, self._expand(actual[0], 3),
+                dr.select(lane % 3 == 1, self._expand(actual[1], 3), self._expand(actual[2], 3)))
         if getattr(model, "scene_mapping", "bounded") == "world_shell":
-            if getattr(model, "background_refinement", "fixed") == "adaptive":
-                rows = ids if ids is not None else dr.arange(mi.UInt32, count)
-                actual = model.leaf_sizes(rows)
-                return dr.select(lane % 3 == 0, self._expand(actual[0], 3),
-                    dr.select(lane % 3 == 1, self._expand(actual[1], 3), self._expand(actual[2], 3)))
             core = int(model.core_resolution)
             subdivision = int(model.native_background_subdivision_level())
             exterior = cells >= core ** 3
@@ -263,19 +279,20 @@ class FalcorOptimizer:
         active = valid & (lr > 0)
         mask = self._expand(active, size)
         step_size = self._step_size(name)
-        if name == "radiance_sh":
+        active_coefficients = self.active_sh_count if name == "radiance_sh" else self.active_opacity_sh_count
+        if name in ("radiance_sh", "opacity_sh"):
             lane = dr.arange(mi.UInt32, count * size)
-            coefficient = lane % size // 3
-            mask &= coefficient < self.active_sh_count
+            coefficient = lane % size // (3 if name == "radiance_sh" else 1)
+            mask &= coefficient < active_coefficients
         original = self._finite(gradient)
         gradient = dr.clip(original, -cfg.gradient_clip, cfg.gradient_clip)
         if step_size > 1:
             step_lane = dr.arange(mi.UInt32, count * step_size)
             degree = step_lane % step_size
-            step_active = self._expand(active, step_size) & (degree * degree < self.active_sh_count)
+            step_active = self._expand(active, step_size) & (degree * degree < active_coefficients)
             steps = state["steps"] + mi.UInt32(step_active)
             coefficient_degree = dr.zeros(mi.UInt32, count * size)
-            for degree in range(1, self.sh_degree_count):
+            for degree in range(1, step_size):
                 coefficient_degree += mi.UInt32(coefficient >= degree * degree)
             exponent = mi.Float(dr.gather(mi.UInt32, steps,
                 lane // size * step_size + coefficient_degree))
@@ -388,7 +405,8 @@ class FalcorOptimizer:
         means = {name: state["mean"] for name, state in self._state.items()}
         squares = {name: state["squared_mean"] for name, state in self._state.items()}
         steps = {name: state["steps"] for name, state in self._state.items()}
-        key = (self.count, tuple(self.dimensions.items()), self.active_sh_count,
+        key = (self.count, tuple(self.dimensions.items()), self.active_sh_count, self.active_opacity_sh_count,
+               self.opacity_degree_steps,
                self.radiance_degree_steps, tuple(float(v) for v in model.voxel_size),
                getattr(model, "scene_mapping", "bounded"),
                self._background_use_ellipsoid(model),
@@ -743,6 +761,7 @@ class FalcorOptimizer:
         self.dr.sync_thread()
         return {"config": asdict(self.config), "count": self.count, "dimensions": dict(self.dimensions),
                 "radiance_degree_steps": self.radiance_degree_steps,
+                "opacity_degree_steps": self.opacity_degree_steps,
                 "groups": {name: {key: np.array(value, copy=True) for key, value in state.items()}
                            for name, state in self._state.items()}}
 
@@ -755,6 +774,7 @@ class FalcorOptimizer:
         return {"config": asdict(self.config), "count": self.count,
                 "dimensions": dict(self.dimensions),
                 "radiance_degree_steps": self.radiance_degree_steps,
+                "opacity_degree_steps": self.opacity_degree_steps,
                 "groups": {name: dict(state) for name, state in self._state.items()}}
 
     def load_state_dict(self, data: dict):
@@ -762,16 +782,19 @@ class FalcorOptimizer:
             raise ValueError("Checkpoint optimizer dimensions do not match model")
         config = OptimizerConfig(**data["config"])
         config.validate()
-        radiance_steps = data["groups"]["radiance_sh"]["steps"]
-        degree_steps = (self.radiance_degree_steps or bool(data.get("radiance_degree_steps", False))
-                        or (self.sh_degree_count > 1 and self.count > 0
-                            and len(radiance_steps) == self.count * self.sh_degree_count))
+        degree_modes = {}
+        for name, flag, degrees in (("radiance_sh", "radiance_degree_steps", self.sh_degree_count),
+                                    ("opacity_sh", "opacity_degree_steps", self.opacity_degree_count)):
+            steps = data["groups"][name]["steps"]
+            degree_modes[name] = (getattr(self, flag) or bool(data.get(flag, False))
+                                 or (degrees > 1 and self.count > 0 and len(steps) == self.count * degrees))
         restored = {}
         valid = self.mi.Bool(True)
         for name, state in self._state.items():
             restored[name] = {}
             for key in state:
-                step_size = self.sh_degree_count if name == "radiance_sh" and degree_steps else 1
+                step_size = ((self.sh_degree_count if name == "radiance_sh" else self.opacity_degree_count)
+                             if degree_modes.get(name, False) else 1)
                 expected = self.count * (step_size if key == "steps" else self.dimensions[name])
                 value = data["groups"][name][key]
                 if key == "steps" and step_size > 1 and len(value) == self.count:
@@ -787,7 +810,8 @@ class FalcorOptimizer:
         if not bool(valid[0]):
             raise ValueError("Checkpoint optimizer moments must be finite")
         self.config, self._state = config, restored
-        self.radiance_degree_steps = degree_steps
+        self.radiance_degree_steps = degree_modes["radiance_sh"]
+        self.opacity_degree_steps = degree_modes["opacity_sh"]
         self.clear_replay()
         self._state_exposed = False
         self._remember_state()

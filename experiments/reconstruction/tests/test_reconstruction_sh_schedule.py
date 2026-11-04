@@ -139,6 +139,111 @@ def check_schedule():
             "degree_clock_memory_budget_includes_two_extra_UInt32_per_voxel": "passed"}
 
 
+def check_opacity_schedule_cpu():
+    from reconstruction_sh_schedule import (active_opacity_sh_count_for_epoch,
+        apply_sh_schedule, restore_sh_state, sh_model_metadata, resolve_resume_sh_schedule,
+        validate_sh_schedule)
+    config = SimpleNamespace(training=SimpleNamespace(num_epochs=1500,
+        sh_degree_progression=True, opacity_sh_degree_progression=True, sh_degree_weights=(8, 0, 2)),
+        model=SimpleNamespace(sh_count=9, opacity_sh_count=9))
+    class Model:
+        sh_count = opacity_sh_count = 9
+        active_sh_count = active_opacity_sh_count = 9
+        def set_active_sh_count(self, value): self.active_sh_count = value
+        def set_active_opacity_sh_count(self, value): self.active_opacity_sh_count = value
+    model = Model()
+    for completed, count in ((0, 1), (1199, 1), (1200, 9), (1499, 9)):
+        assert active_opacity_sh_count_for_epoch(config, completed) == count
+        assert apply_sh_schedule(model, config, completed) == count
+        assert model.active_opacity_sh_count == count
+        metadata = sh_model_metadata(model)
+        assert metadata == {"active_sh_count": count, "active_opacity_sh_count": count}
+        restored = Model()
+        restore_sh_state(restored, metadata)
+        assert restored.active_opacity_sh_count == count
+    for value in (0, 10, True, 4.0):
+        try: restore_sh_state(Model(), {"active_opacity_sh_count": value})
+        except ValueError: pass
+        else: raise AssertionError("invalid opacity active count")
+    config.training.opacity_sh_degree_progression = False
+    assert active_opacity_sh_count_for_epoch(config, 0) == 9
+    config.training.opacity_sh_degree_progression = True
+    config.model.opacity_sh_count = 16
+    try: validate_sh_schedule(config)
+    except ValueError: pass
+    else: raise AssertionError("progressive opacity degree 3 unexpectedly accepted")
+    config.model.opacity_sh_count = 9
+    saved = {"config": {"training": {"num_epochs": 1500, "opacity_sh_degree_progression": True,
+        "sh_degree_weights": [8, 0, 2]}}}
+    resolve_resume_sh_schedule(config, saved, {})
+    assert config.training.opacity_sh_degree_progression
+    try: resolve_resume_sh_schedule(config, saved, {"training": {"opacity_sh_degree_progression": False}})
+    except ValueError: pass
+    else: raise AssertionError("changed opacity resume schedule accepted")
+    config.training.num_epochs = 1600
+    try: resolve_resume_sh_schedule(config, saved, {})
+    except ValueError: pass
+    else: raise AssertionError("changed opacity-only epoch budget accepted")
+    config.training.num_epochs = 1500
+    resolve_resume_sh_schedule(config, {"config": {"training": {"num_epochs": 1500}}}, {})
+    assert not config.training.opacity_sh_degree_progression
+    return {"independent_opacity_schedule_metadata_validation_and_legacy_resume": "passed"}
+
+
+def opacity_fixture(np, count=3):
+    result = sh_fixture(np, count)
+    coefficients = np.zeros((count, 9), np.float32)
+    coefficients[:, 0] = result["model_state"]["opacity_sh"]
+    coefficients[:, 1:] = np.linspace(-.23, .37, count * 8).reshape(count, 8)
+    result["model_metadata"]["opacity_sh_count"] = 9
+    result["model_state"]["opacity_sh"] = coefficients.ravel()
+    return result
+
+
+def check_opacity_rendering(mi, dr, np):
+    snapshot = opacity_fixture(np)
+    model = restore_model(snapshot, mi)
+    replay = NativeLossReplay(dr)
+    proposal = opacity_fixture(np, 1)
+    proposal["model_state"]["cell_indices"][:] = 53
+    install_proposal(model, proposal, mi)
+    for count in (1, 4, 9, 1, 9):
+        model.set_active_sh_count(4)
+        model.set_active_opacity_sh_count(count)
+        revision = int(model.topology_revision)
+        model.set_active_opacity_sh_count(count)
+        assert int(model.topology_revision) == revision
+        masked, masked_proposal = copy.deepcopy(snapshot), copy.deepcopy(proposal)
+        for payload in (masked, masked_proposal):
+            payload["model_state"]["opacity_sh"].reshape(-1, 9)[:, count:] = 0.
+        reference = restore_model(masked, mi)
+        reference.set_active_sh_count(4)
+        install_proposal(reference, masked_proposal, mi)
+        for octree in (False, True):
+            arguments = (ray(mi, np), mi.Color3f(1.), .00001, 8, .0001, octree)
+            actual_trace, expected_trace = model.trace(*arguments), reference.trace(*arguments)
+            dr.eval(actual_trace, expected_trace)
+            for actual, expected in zip(actual_trace, expected_trace):
+                np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=3e-7, rtol=3e-5)
+            options = {"use_octree": float(octree), "collect_growth_evidence": 1.,
+                       "collect_rgb_deletion_evidence": 1., "max_growth_hits": 4., "max_candidates": 4.}
+            expected = evaluate(reference, mi, dr, np, coefficient=.1, native_options=options)
+            for replay_backend in (None, replay, replay):
+                actual = evaluate(model, mi, dr, np, coefficient=.1, native_options=options, replay=replay_backend)
+                grad = np.asarray(actual["gradients"]["opacity_sh"]).reshape(-1, 9)
+                ref = np.asarray(expected["gradients"]["opacity_sh"]).reshape(-1, 9)
+                np.testing.assert_array_equal(grad[:, count:], 0.)
+                np.testing.assert_allclose(grad[:, :count], ref[:, :count], atol=4e-7, rtol=4e-5)
+                for key in ("loss", "rgb", "alpha", "growth_gain", "deletion_gain"):
+                    if key in actual:
+                        np.testing.assert_allclose(np.asarray(actual[key]), np.asarray(expected[key]), atol=4e-7, rtol=4e-5)
+    for value in (0, 10):
+        try: model.set_active_opacity_sh_count(value)
+        except (ValueError, RuntimeError): pass
+        else: raise AssertionError("invalid native active opacity count")
+    return {"opacity_forward_gradient_distortion_growth_and_replay_mask": "passed"}
+
+
 def sh_fixture(np, count=3):
     result = fixture(np, count)
     coefficients = np.zeros((count, 9, 3), dtype=np.float32)
@@ -294,19 +399,22 @@ def check_refinement_and_metadata(mi, dr, np):
             "legacy_refinement_remains_DC_only": "passed"}
 
 
-def check_optimizer_freezing(mi, dr, np):
+def check_optimizer_freezing(mi, dr, np, *, opacity=False):
+    group_name = "opacity_sh" if opacity else "radiance_sh"
+    channels = 1 if opacity else 3
+    flag = "opacity_degree_steps" if opacity else "radiance_degree_steps"
     modes = ("dense", "device", "device_replay", "compact_replay", "compact_reference")
-    models = [restore_model(sh_fixture(np), mi) for _ in modes]
-    config = OptimizerConfig(lr_opacity=0., lr_center=0., lr_log_scale=0., lr_rotation=0.)
+    models = [restore_model(opacity_fixture(np) if opacity else sh_fixture(np), mi) for _ in modes]
+    config = OptimizerConfig(lr_radiance=0. if opacity else .001, lr_opacity=.001 if opacity else 0., lr_center=0., lr_log_scale=0., lr_rotation=0.)
     optimizers = [FalcorOptimizer(model, copy.deepcopy(config), sparse_updates=mode != "dense",
-                                  replay_updates="replay" in mode, radiance_degree_steps=True)
+                                  replay_updates="replay" in mode, radiance_degree_steps=not opacity, opacity_degree_steps=opacity)
                   for mode, model in zip(modes, models)]
     expected_clocks = np.zeros((3, 3), dtype=np.uint32)
     for iteration, active_count in enumerate((1, 1, 9, 9, 1, 1, 4, 4, 9, 9, 1)):
         expected_clocks[:, :int(active_count ** .5)] += 1
         states = []
         for mode, model, optimizer in zip(modes, models, optimizers):
-            model.set_active_sh_count(active_count)
+            (model.set_active_opacity_sh_count if opacity else model.set_active_sh_count)(active_count)
             previous, previous_state = optimizer_snapshot(model, optimizer, np)
             out = {"gradients": {name: dr.full(mi.Float, .3 + iteration * .02, 3 * width)
                                   for name, width in optimizer.dimensions.items()},
@@ -322,22 +430,22 @@ def check_optimizer_freezing(mi, dr, np):
                 optimizer.step(model, out, epoch=iteration, update_allowed=mi.Bool(True))
             dr.sync_thread()
             current, current_state = optimizer_snapshot(model, optimizer, np)
-            old_coefficients = previous["radiance_sh"].reshape(3, 9, 3)
-            new_coefficients = current["radiance_sh"].reshape(3, 9, 3)
+            old_coefficients = previous[group_name].reshape(3, 9, channels)
+            new_coefficients = current[group_name].reshape(3, 9, channels)
             np.testing.assert_array_equal(new_coefficients[:, active_count:, :],
                                           old_coefficients[:, active_count:, :], err_msg=mode)
             assert np.any(new_coefficients[:, :active_count, :] != old_coefficients[:, :active_count, :])
             for key in ("mean", "squared_mean"):
-                old = np.asarray(previous_state["groups"]["radiance_sh"][key]).reshape(3, 9, 3)
-                new = np.asarray(current_state["groups"]["radiance_sh"][key]).reshape(3, 9, 3)
+                old = np.asarray(previous_state["groups"][group_name][key]).reshape(3, 9, channels)
+                new = np.asarray(current_state["groups"][group_name][key]).reshape(3, 9, channels)
                 np.testing.assert_array_equal(new[:, active_count:, :], old[:, active_count:, :],
                                               err_msg=mode + "." + key)
-            np.testing.assert_array_equal(np.asarray(current_state["groups"]["radiance_sh"]["steps"])
+            np.testing.assert_array_equal(np.asarray(current_state["groups"][group_name]["steps"])
                                           .reshape(3, 3), expected_clocks, err_msg=mode)
             if iteration <= 2:
                 # Two DC updates must not age either higher band. Both degree
                 # clocks start at one on their simultaneous first update.
-                clocks = np.asarray(current_state["groups"]["radiance_sh"]["steps"]).reshape(3, 3)
+                clocks = np.asarray(current_state["groups"][group_name]["steps"]).reshape(3, 3)
                 np.testing.assert_array_equal(clocks[:, 1:], 1 if iteration == 2 else 0,
                                               err_msg=mode + ".simultaneous_degree_clock_start")
             states.append((current, current_state))
@@ -359,10 +467,10 @@ def check_optimizer_freezing(mi, dr, np):
         for key, value in group.items():
             np.testing.assert_array_equal(restored.state_dict()["groups"][name][key], value)
     legacy = copy.deepcopy(saved)
-    legacy.pop("radiance_degree_steps", None)
-    legacy["groups"]["radiance_sh"]["steps"] = np.array([7, 11, 13], dtype=np.uint32)
+    legacy.pop(flag, None)
+    legacy["groups"][group_name]["steps"] = np.array([7, 11, 13], dtype=np.uint32)
     restored.load_state_dict(legacy)
-    np.testing.assert_array_equal(restored.state_dict()["groups"]["radiance_sh"]["steps"]
+    np.testing.assert_array_equal(restored.state_dict()["groups"][group_name]["steps"]
                                   .reshape(3, 3), np.repeat([[7], [11], [13]], 3, axis=1))
     before_remap = restored.state_dict()["groups"]
     restored.remap([2, 0], 3)
@@ -372,7 +480,7 @@ def check_optimizer_freezing(mi, dr, np):
             rows = np.asarray(value).reshape(3, -1)
             np.testing.assert_array_equal(np.asarray(after_remap[name][key]).reshape(3, -1),
                                           np.concatenate((rows[[2, 0]], np.zeros_like(rows[:1]))))
-    return {"dense_device_compact_reference_Adam_and_replay_parity": "passed",
+    return {(group_name + "_dense_device_compact_reference_Adam_and_replay_parity"): "passed",
             "direct_DC_to_SH2_starts_both_new_Adam_degree_clocks_at_one": "passed",
             "inactive_parameters_moments_and_degree_clocks_frozen_with_stale_momentum": "passed",
             "degree_clock_checkpoint_legacy_migration_and_topology_remap": "passed"}
@@ -385,6 +493,7 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
     results = check_schedule()
+    results.update(check_opacity_schedule_cpu())
     if not args.cpu_only:
         with tempfile.TemporaryDirectory(prefix="mitsuba-sh-schedule-") as output:
             mi, dr, np, handles = initialize_runtime(RuntimeConfig(args.build_dir, args.gpu), Path(output), {})
@@ -392,6 +501,8 @@ def main():
             results.update(check_rendering_and_replay(mi, dr, np))
             print("Checking SH Adam freeze and state migration", flush=True)
             results.update(check_optimizer_freezing(mi, dr, np))
+            results.update(check_opacity_rendering(mi, dr, np))
+            results.update(check_optimizer_freezing(mi, dr, np, opacity=True))
             print("Checking SH metadata and refinement", flush=True)
             results.update(check_refinement_and_metadata(mi, dr, np))
     print(json.dumps(results, indent=2), flush=True)

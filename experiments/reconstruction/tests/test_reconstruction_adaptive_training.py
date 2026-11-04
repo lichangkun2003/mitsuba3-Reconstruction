@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_reconstruction_colmap_training import write_scene
 from reconstruction_checkpoint import load_checkpoint
-from reconstruction_world_shell import ADAPTIVE_TAG, validate_adaptive_cells_numpy
+from reconstruction_world_shell import ADAPTIVE_TAG, WORLD_SHELL_VERSION, validate_adaptive_cells_numpy
 
 
 def run(output):
@@ -57,7 +57,7 @@ def run(output):
     assert metadata["background_refinement"] == "adaptive" and metadata["resolution"] == 8
     assert metadata["background_resolution_mode"] == "core"
     assert metadata["background_max_depth"] == 3
-    assert metadata["world_shell_version"] == 7
+    assert metadata["world_shell_version"] == WORLD_SHELL_VERSION
     validate_adaptive_cells_numpy(state["cell_indices"], 8, 2, np)
     assert np.any(state["cell_indices"] >= ADAPTIVE_TAG)
     history = [json.loads(line) for line in (full / "training.jsonl").read_text(encoding="utf-8").splitlines()]

@@ -4,6 +4,37 @@
 RGB-only 训练、在线生长与删除（当前默认）
 ----------------------------------------
 
+统一自适应训练（``bicycle_1024.json``）
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``schedule.refinement="adaptive"`` 保留点云在 ``start_resolution=256`` 的稀疏前景初始化，
+前后景使用相同的投影尺寸、优化优先级和新叶成熟期判据。训练一开始就允许达到
+``target_resolution=1024`` 对应的最小世界空间叶边长，不再按 ``level_weights`` 整体升层。
+每片前景叶保存自己的 Morton 路径和深度；外壳仍使用世界空间混合尺寸叶，均保持椭球表示。
+
+``topology.freeze_last_fraction=0.2`` 在最后 20% 同时关闭前后景细分、生长、删除及其证据收集。
+1500 轮时，第 1–1200 轮允许拓扑变化，第 1201–1500 轮只优化已有叶子的参数。
+自适应模式在冻结边界轮数的一半、冻结边界和训练结束各保存一次：1500 轮、冻结比例 20% 时，
+第 600、1200 轮保存 ``training/epoch-00600.npz``、``training/epoch-01200.npz``，
+第 1500 轮保存 ``model.npz``。每次保存后渲染第一个训练视角到 ``train/0000-epoch-XXXXX.png``。
+几何中心、尺度、旋转、DC 和已经开启的高阶系数在固定拓扑阶段继续更新。
+
+``training.sh_degree_weights=[8,0,2]`` 与
+``training.opacity_sh_degree_progression=true`` 让 radiance 和 opacity 同时在最后 20%
+从 DC 开放到二阶。``model.opacity_sh_count=9`` 为标量 opacity 保存九个系数；radiance
+每个 RGB 通道各保存九个系数。未开启的高阶参数及其 Adam 状态保持零，开启时使用独立阶数时钟，
+不重置已有 DC 或几何的优化历史。高阶 opacity 启用前必须已经冻结全部拓扑。
+
+当前统一模式复用 ``background_refine_*`` 参数作为两区域共同的细分间隔、像素阈值、比例与单轮预算。
+``background_refine_pixel_threshold=6`` 指投影包围盒的最长边像素数，不是投影面积。
+存在前景候选时保留最多约 25% 的单轮分裂名额供前景使用，剩余名额按同一评分竞争；
+背景另受 ``background_max_active_voxels`` 限制，全部叶受 ``max_active_voxels`` 限制。
+统一模式的生长候选共用 ``background_growth_max_candidates`` 上限，避免前景候选绕过容量保护。
+这些上限不会预先分配满额叶子，也不替代训练过程的显存预检。
+
+旧检查点缺少新字段时继续采用原来的整体升层和 opacity 设置。新模式需从新实验启动，
+且需要重新编译原生模块（world-shell 协议版本 8、SH 调度版本 2）。下文保留旧模式的细节说明。
+
 本阶段从新的初始化开始，使用 800 × 800、每像素 1 spp、总计 1000 个 epoch。
 每个 epoch 遍历全部训练视角；单卡和多卡使用相同总轮数及 coarse-to-fine 调度。
 多卡按下文 N 视角批次更新，因此同轮数的 Adam 更新次数与单卡不同。
@@ -903,13 +934,22 @@ j 按外盒 x、y、z 顺序枚举并跳过中央八格。子码使用 S 层 xyz
 邻格生长支持不同叶尺寸、壳边界和核心接口，冷却及占用检查均覆盖完整空间区间。
 候选生成的动态批次偏移、二分查找边界和展开长度使用设备标量，避免拓扑变化时
 把新数组长度反复编译为不同内核；候选顺序、数量限制和几何判断保持不变。
+背景提案按原遍历顺序写入固定容量的连续缓冲区，避免积累大量小数组后逐个拼接；
+前景与背景合并时只排序和筛选行号，最后一次搬运几何字段，重复项取首和支持计数不变。
+FP64几何的三／四分量先求值再用原生AoS打包，保留求值边界并减少小内核和Python调度。
 ``epoch_growth_prepare_stage_seconds`` 中的 ``generation_*`` 项进一步区分前景、
 混合叶索引、背景候选、合并筛选和外观准备；它们是主机墙钟计时，未额外增加设备同步。
 
 默认每10轮检查背景细分（与普通生长/删除错开一轮），每轮最多增加10万叶子，
-最多选择背景叶子的5%，背景总上限400万。细分前检查实际子叶数量与设备显存，
+最多选择背景叶子的5%。当前 bicycle JSON 将 ``background_max_active_voxels``
+设为1200万；基础配置默认仍为400万。增加总容量不提高每轮新增上限。
+细分前检查实际子叶数量与设备显存，
 超预算则保持现有模型继续训练，不强制达到1024。背景生长提案另有20万条上限。
 完整图像路径记录、参考缓存、前景和临时内存仍计入显存预检；叶子上限不是实测峰值保证。
+拓扑替换仍先失效旧模型的调用重放；显存预检充足时保留GPU参考图缓存。
+显存不足或无法测量时，才清理参考图和分配缓存，再查询实际空闲显存并复核原预算。
+``refinement_memory_plans`` 和 ``topology_commit_memory_plans`` 的
+``cache_reclaimed``、``guard_seconds`` 记录缓存回收与预检耗时。
 
 新背景地址保存粗格编号和带终止位的Morton路径，每个叶子独立表达深度；
 前景升层不重解释背景地址。叶参数保持紧密数组，树只提供实际大小的叶查询。
@@ -969,7 +1009,7 @@ Adam 回归覆盖密集、设备稀疏、紧凑与参考实现。旧 Distortion�
    CONFIG.schedule.target_resolution = 512
    CONFIG.schedule.level_weights = (6, 4)  # 512终点；1024终点使用(4,3,3)
    CONFIG.training.num_epochs = 1000
-   CONFIG.training.save_count = 3  # 旧配置兼容字段；不控制当前保存计划
+   CONFIG.training.save_count = 3  # 兼容字段；自适应模式在冻结轮数的一半、冻结边界和最终保存
    CONFIG.training.output = None  # 自动创建 outputs/场景-月.日-E编号/training
    CONFIG.evaluation.enabled = True  # 保存初始化、每次升层前对照图，并在训练完成后自动出图
    CONFIG.evaluation.spp = 64
@@ -989,7 +1029,8 @@ Adam 回归覆盖密集、设备稀疏、紧凑与参考实现。旧 Distortion�
 配置还支持 JSON 分组覆盖及少量命令行覆盖，优先级为：代码中的 ``CONFIG``，然后
 ``--config`` JSON，最后命令行参数。例如 ``--dataset datasets/ficus`` 会覆盖配置块中的数据集。
 当前配置块默认是 bicycle、1 spp、1500 个 epoch；合成场景默认出图 800 × 800，COLMAP 使用所选参考图分辨率。
-随机种子 42，在每次升分辨率前保存完整 checkpoint，训练完成后保存最终模型。
+随机种子 42。统一自适应配置按拓扑冻结边界安排保存，旧整体升层模式在每次升分辨率前保存；
+两者均在训练完成后保存最终模型。
 修改 ``--epochs`` 同时设置分辨率调度的
 总训练预算，因此不能把不同预算的早期阶段当成相同调度。
 两层默认按 ``schedule.level_weights = (6, 4)`` 分配：
@@ -1052,13 +1093,13 @@ JSON 的 ``schedule.level_weights`` 若已显式给定，则不会被自动替�
 * ``schedule``：coarse-to-fine 开关和分辨率计划；启用时由此组决定起始分辨率。
 * ``contour``：训练时可选的 contour 重要性采样。
 * ``runtime``：源码构建目录和本地 GPU 编号。
-* ``evaluation``：初始化、每次升层前对照图及训练结束后出图设置，默认 ``enabled=True``、``spp=64``、
+* ``evaluation``：初始化、检查点对照图及训练结束后出图设置，默认 ``enabled=True``、``spp=64``、
   ``max_views=None``、``train_max_views=None``、``test_max_views=None``、
   ``chunk_size=65536``、``seed=42``。合成场景测试相机文件由
   ``test_cameras="transforms_test.json"`` 指定；分划分的 ``None`` 或 ``0`` 表示全部视角。
 
 仅想训练时可传 ``--skip-evaluation``，或设置 ``CONFIG.evaluation.enabled=False``，
-同时跳过初始化、每次升层前对照图与最终评价；checkpoint 仍按原边界保存。
+同时跳过初始化、检查点对照图与最终评价；checkpoint 仍按对应模式的计划保存。
 ``--eval-spp`` 覆盖自动评价的采样数；``--eval-train-max-views`` /
 ``--eval-test-max-views`` 分别覆盖两个划分的上限，``0`` 表示全部。
 旧 ``--eval-max-views`` 及配置中的非空 ``max_views`` 仍优先同时覆盖两个划分；
@@ -2234,16 +2275,24 @@ RTX 4060 Laptop 的 8192 父体素→60320 子体素合成拟合，CPU 1.535 秒
 Checkpoint 与恢复
 -----------------
 
-自动 checkpoint 在每次升分辨率之前和全部训练完成时保存，不再按 epoch 等间隔保存。
+统一自适应模式（``schedule.refinement="adaptive"``）保存三次：冻结边界轮数的一半、冻结边界、最终。
+冻结边界为 ``floor(num_epochs * (1 - topology.freeze_last_fraction))``，一半轮数向下取整。
+当前 1500 轮、冻结比例 20% 时，计划为 600、1200、1500；前两次写入
+``training/epoch-00600.npz`` 和 ``training/epoch-01200.npz``，最后一次只写 ``model.npz``。
+总轮数或冻结比例改变时自动重算；极短训练的边界至少为第 1 轮，重合边界只保存一次。
+中间保存发生在本轮拓扑更新完成后，包含完整模型、Adam、随机数和生命周期状态，
+``pending_epoch_transition=false``。恢复后继续按原总轮数和冻结边界的计划保存，不从恢复点重新计时。
+
+旧整体升层模式保留每次升分辨率之前和全部训练完成时保存的策略：
 升层前文件名为 ``training/before-refine-{core:04d}-epoch-{completed:05d}.npz``，
 其中 ``core`` 是当前核心分辨率，``completed`` 是已完成的总 epoch 数。
 1000 轮、256 → 512、权重 6:4 时保存 ``before-refine-0256-epoch-00600.npz``；
 1500 轮、256 → 512 → 1024、权重 4:3:3 时，分别在第 600、1050 轮保存
 ``before-refine-0256-epoch-00600.npz`` 和 ``before-refine-0512-epoch-01050.npz``。
-完成全部预算后保存实验根目录的 ``model.npz``。固定分辨率训练没有自动中间 checkpoint，
+完成全部预算后保存实验根目录的 ``model.npz``。旧模式的固定分辨率训练没有自动中间 checkpoint，
 也不额外生成 ``latest.npz`` 或最终轮次的 ``epoch-XXXXX.npz``。
 显式使用 ``--stop-after-epochs`` 做有界短测试时，会在本次结束的完整轮次额外保存
-``epoch-XXXXX.npz`` 作为恢复点；这个主动停止点不改变总训练预算和分辨率调度。
+``epoch-XXXXX.npz`` 作为恢复点；与计划保存同轮时只写一次。这个主动停止点不改变总训练预算和分辨率调度。
 尚未完成全部预算时，不生成最终的 ``model.npz``，也不运行最终评价。
 
 训练输出还包括 ``config.json``、``training.jsonl``、``training-report.json`` 和
@@ -2253,19 +2302,19 @@ Checkpoint 与恢复
 拓扑转换前保存，并标记 ``pending_epoch_transition=true``；显式停止和最终 checkpoint
 在该轮拓扑处理结束后保存。它们都不是任意视角中途的恢复点。
 中断后需从最近保存的 checkpoint 重算尚未保存的 epoch；第一次保存前中断则需要重新开始。
-启用评价时，每次升层前另保存该层的第一个训练视角对照图；全部 epoch 完成并保存
+启用评价时，自适应模式每次保存检查点后、旧模式每次升层前另保存第一个训练视角对照图；全部 epoch 完成并保存
 ``model.npz`` 后，默认自动调用最终评价流程一次。
 
 最终的 ``model.npz`` 使用同一套原子写入和校验格式，包含完整体素状态、网格元数据、
 配置和训练恢复状态。它在全部训练成功完成后、自动评价开始前导出；训练中断时，可从最近保存的
-升层前 checkpoint 或显式停止的 ``training/epoch-XXXXX.npz`` 恢复或评价中间结果。
+计划 checkpoint、升层前 checkpoint 或显式停止的 ``training/epoch-XXXXX.npz`` 恢复或评价中间结果。
 恢复一个已经完成的 checkpoint 到新目录时，
 也会自动导出 ``model.npz``。训练报告的 ``reconstructed_model`` 记录导出路径、SHA-256、
 完成轮数及更新次数。新实验拒绝覆盖已有的最终模型；恢复时也会校验既有模型的配置、
 随机种子和训练数据签名，防止把其他实验的结果替换掉。
 
-旧配置中的 ``training.save_count`` 和 ``training.save_every_epochs`` 仍可读取，
-但都不再控制保存计划，恢复时也不要求 ``save_count`` 一致。
+旧字段 ``training.save_count`` 和 ``training.save_every_epochs`` 仍可读取但不控制保存计划，
+恢复时不要求 ``save_count`` 一致。
 ``schedule.save_each_level`` 保留底层调用的旧配置兼容性，训练入口统一保存上述完整
 升层前 checkpoint，关闭底层的重复存档。已有的 ``latest.npz``、``epoch-XXXXX.npz``
 和 ``level-R-epoch-XXXXX.npz`` 仍可通过 ``--resume`` 加载，不会自动删除或改写这些旧结果。
@@ -2345,7 +2394,15 @@ COLMAP 数据集中的相机全局索引不一定为 0。
 双卡训练只由 rank 0 保存这一张图。恢复 checkpoint 时保留已有初始化图，
 若缺失也不把恢复后的模型当作初始化模型重新出图。``--skip-evaluation`` 同时关闭此功能。
 
-启用多层调度时，每层最后一个 epoch 的全部训练视角更新完、执行升层之前，
+统一自适应模式在每次检查点成功写入后，保存同一模型的
+``train/0000-epoch-{completed:05d}.png``。当前计划生成 ``0000-epoch-00600.png``、
+``0000-epoch-01200.png``、``0000-epoch-01500.png``。这些图使用初始化图相同的第一个
+训练相机、``evaluation.spp``、分辨率和固定评价随机种子，不消耗训练随机数。
+``training-report.json`` 的 ``epoch_checkpoints`` 和 ``checkpoint_renders`` 按轮数记录模型和图片路径。
+仅 rank 0 保存和出图；``--skip-evaluation`` 关闭图片但仍保存模型。
+最终训练集、测试集的全视角评价继续执行，epoch 对照图不会被最终评价覆盖。
+
+旧整体升层模式启用多层调度时，每层最后一个 epoch 的全部训练视角更新完、执行升层之前，
 还会保存 ``train/0000-level-{core:04d}.png``。256 → 512 → 1024 时分别保存
 ``0000-level-0256.png`` 和 ``0000-level-0512.png``，展示该层完成优化、尚未分裂的模型；
 文件名使用核心分辨率，而非含背景的存储网格分辨率。

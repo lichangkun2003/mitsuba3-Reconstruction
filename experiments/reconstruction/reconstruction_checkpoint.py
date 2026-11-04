@@ -74,6 +74,8 @@ def _validate_model_metadata(metadata):
     if "active_sh_count" in metadata:
         _integer(metadata["active_sh_count"], "active_sh_count", 1, sh)
     opacity_sh = _integer(metadata["opacity_sh_count"], "opacity_sh_count", 1, 16)
+    if "active_opacity_sh_count" in metadata:
+        _integer(metadata["active_opacity_sh_count"], "active_opacity_sh_count", 1, opacity_sh)
     lo, hi = np.asarray(metadata["grid_min"]), np.asarray(metadata["grid_max"])
     if (lo.shape != (3,) or hi.shape != (3,) or lo.dtype.kind not in "iuf"
             or hi.dtype.kind not in "iuf" or not np.isfinite(lo).all()
@@ -100,6 +102,11 @@ def _validate_mapping_config(metadata, config):
             raise ValueError("Checkpoint scene_mapping differs between model and initialization")
     if actual != "world_shell":
         return
+    schedule = config.get("schedule", {})
+    if schedule and metadata.get("foreground_refinement") == "adaptive":
+        if (schedule.get("refinement", "uniform") != "adaptive"
+                or schedule.get("target_resolution") != metadata.get("foreground_max_resolution")):
+            raise ValueError("Adaptive foreground policy differs from saved training configuration")
     levels = metadata["background_shell_levels"]
     if "background_shell_levels" in data and data["background_shell_levels"] != levels:
         raise ValueError("Checkpoint background_shell_levels differs between model and configuration")
@@ -152,6 +159,7 @@ def validate_model_state(state: dict, metadata: dict) -> None:
         coarse, depth, _ = adaptive_decode_numpy(cells[cells >= ADAPTIVE_TAG], metadata["background_shell_levels"], np)
         if np.any(depth > adaptive_depth_limit(metadata, coarse // 56)):
             raise ValueError("Adaptive leaf depth exceeds background_max_depth")
+        _validate_core_depths(cells[cells < ADAPTIVE_TAG], metadata, np)
     else:
         if np.any(cells < 0) or np.any(cells >= extent):
             raise ValueError("cell_indices contains an index outside the foreground/shell address space")
@@ -168,6 +176,19 @@ def validate_model_state(state: dict, metadata: dict) -> None:
             raise ValueError(f"{key} contains a nonfinite value")
     if np.any(np.linalg.norm(arrays["rotations"].reshape(-1, 4), axis=1) == 0):
         raise ValueError("rotations contains a zero quaternion")
+
+
+def _validate_core_depths(cells, metadata, np):
+    from reconstruction_world_shell import CORE_ADAPTIVE_TAG, core_leaf_depths_numpy
+    core = metadata.get("core_resolution", metadata["resolution"])
+    tagged = (cells & np.uint64(CORE_ADAPTIVE_TAG)) != 0
+    if np.any(tagged) and metadata.get("foreground_refinement") != "adaptive":
+        raise ValueError("Tagged foreground requires adaptive foreground metadata")
+    depth, morton = core_leaf_depths_numpy(cells, core, np)
+    maximum = metadata.get("foreground_max_resolution", core).bit_length() - 1
+    if np.any(depth > maximum):
+        raise ValueError("Adaptive foreground leaf exceeds foreground_max_resolution")
+    return depth, morton
 
 
 def _is_array_source(value):
@@ -281,14 +302,22 @@ class _CellValidation:
         from reconstruction_world_shell import (ADAPTIVE_TAG, adaptive_decode_numpy,
                                                 adaptive_intervals_numpy, adaptive_depth_limit)
         tagged = chunk >= ADAPTIVE_TAG
-        if np.any(chunk[~tagged] >= self.core ** 3) or np.any(chunk < 0):
-            raise ValueError("Adaptive models cannot contain legacy shell cell addresses")
+        if np.any(chunk < 0):
+            raise ValueError("Adaptive cell addresses must be nonnegative")
+        metadata = dict(self.adaptive_metadata, resolution=self.resolution, core_resolution=self.core)
+        core_depth, core_morton = _validate_core_depths(chunk[~tagged], metadata, np)
         coarse, depth, _ = adaptive_decode_numpy(chunk[tagged], self.adaptive_levels, np)
         if np.any(depth > adaptive_depth_limit(self.adaptive_metadata, coarse // 56)):
             raise ValueError("Adaptive leaf depth exceeds background_max_depth")
         if np.any(depth > 9 + coarse // 56):
             raise ValueError("Adaptive leaf is smaller than the world-tree base cell")
         start, end = adaptive_intervals_numpy(chunk[tagged], self.adaptive_levels, np)
+        # A reserved interval root keeps foreground overlap checks independent
+        # of the 560 possible background roots, including across export chunks.
+        shift = (3 * (18 - core_depth)).astype(np.uint64)
+        core_start = np.uint64(1022 << 54) | np.left_shift(core_morton, shift)
+        core_end = core_start + np.left_shift(np.uint64(1), shift)
+        start, end = np.r_[start, core_start], np.r_[end, core_end]
         if not len(start):
             return
         order = np.argsort(start)

@@ -85,7 +85,7 @@ class InitializationIntegrationTests(unittest.TestCase):
         self.assertEqual((self.config.render.width, self.config.render.height), (16, 12))
         self.assertEqual(self.config.data.initialization, prepared["initialization"])
         self.assertEqual(prepared["initialization"]["background_shell_levels"], self.config.data.background_shell_levels)
-        self.assertEqual(prepared["initialization"]["world_shell_version"], 7)
+        self.assertEqual(prepared["initialization"]["world_shell_version"], 8)
         self.assertEqual(prepared["initialization"]["background_geometry"], "ellipsoid")
         self.assertEqual((prepared["resolution"], prepared["core_resolution"]), (256, 256))
         mi = self.native()
@@ -129,7 +129,7 @@ class InitializationIntegrationTests(unittest.TestCase):
         self.config.data.background_initial_resolution = 128
         prepared = common.prepare_dataset(self.config, np)
         metadata = prepared["initialization"]
-        self.assertEqual(metadata["world_shell_version"], 7)
+        self.assertEqual(metadata["world_shell_version"], 8)
         self.assertEqual(metadata["background_initial_resolution"], 128)
         self.assertEqual(metadata["background_subdivision_level"], 6)
         self.assertEqual(metadata["background_initialization"], "point_cloud_sparse")

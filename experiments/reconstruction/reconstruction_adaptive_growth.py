@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import time
 
-from reconstruction_world_shell import (ADAPTIVE_TAG, ADAPTIVE_MAX_DEPTH,
+from reconstruction_world_shell import (ADAPTIVE_TAG, CORE_ADAPTIVE_TAG, ADAPTIVE_MAX_DEPTH,
     ADAPTIVE_LEGACY_MAX_DEPTH, ADAPTIVE_EXTENDED_TAG, ADAPTIVE_DEEPEST_TAG, ADAPTIVE_PATH_BITS,
     adaptive_depth_limit)
 
@@ -50,8 +50,24 @@ def _decode(cells, metadata, op):
     core_offset = (root-1024)//2
     cells = op.C(cells)
     bg = cells >= ADAPTIVE_TAG
-    core = op.C(op.choose(bg, 0, cells))
+    tagged_core = ~bg & ((cells & CORE_ADAPTIVE_TAG) != 0)
+    core = op.C(op.choose(bg | tagged_core, 0, cells))
     xyz = [core_offset + op.I(core // (n**axis) % n) * (1 << core_l) for axis in range(3)]
+    core_path = cells & ((1 << 31)-1)
+    core_depth = op.I(tagged_core)*0
+    for d in range(1, 11):
+        core_depth = op.choose(core_path >= (1 << (3*d)), d, core_depth)
+    tagged_l = 10-core_depth
+    core_morton = core_path-(op.C(1) << op.U(3*core_depth))
+    for axis in range(3):
+        coordinate = op.I(tagged_core)*0
+        for bit in range(10):
+            coordinate |= op.I((core_morton >> (3*bit+axis)) & 1) << bit
+        xyz[axis] = op.I(op.choose(tagged_core,
+            core_offset + coordinate*(op.I(1) << op.I(tagged_l)), xyz[axis]))
+    core_l = op.I(op.choose(tagged_core, tagged_l, core_l))
+    # Inactive tagged core lanes must not create out-of-range shell shifts.
+    cells = op.C(op.choose(bg, cells, op.C(ADAPTIVE_TAG | 1)))
     extended = (cells & ADAPTIVE_EXTENDED_TAG) != 0
     deepest = (cells & ADAPTIVE_DEEPEST_TAG) == ADAPTIVE_DEEPEST_TAG
     coarse = op.I(op.choose(extended,
@@ -102,8 +118,18 @@ def _canonical(xyz, log_size, metadata, op):
     coarse_l = 9+shell
     # The configured finest depth bounds growth as well as refinement.
     max_depth = op.minimum(ADAPTIVE_MAX_DEPTH, adaptive_depth_limit(metadata, shell))
-    desired_l = op.I(op.choose(bg, op.maximum(log_size, coarse_l-max_depth), core_l))
-    needs_split = op.choose(bg, log_size > coarse_l, log_size > core_l)
+    unified = metadata.get('foreground_refinement') == 'adaptive'
+    if unified:
+        finest_l = 10-(int(metadata.get('foreground_max_resolution', 1024)).bit_length()-1)
+        # Keep the foreground's initialization scale as its coarsest prior.
+        # A coarse shell entering the core splits to that scale; existing fine
+        # core/shell neighbors keep their finer size instead of merging back.
+        core_target_l = op.minimum(op.maximum(log_size, finest_l), core_l)
+        core_needs_split = log_size > core_l
+    else:
+        core_target_l, core_needs_split = core_l, log_size > core_l
+    desired_l = op.I(op.choose(bg, op.maximum(log_size, coarse_l-max_depth), core_target_l))
+    needs_split = op.choose(bg, log_size > coarse_l, core_needs_split)
     lower = [op.I(a >> op.I(desired_l)) << op.I(desired_l) for a in xyz]
     coarse_xyz = [((lower[a]-root//2) >> op.I(coarse_l))+2 for a in range(3)]
     inside_hole = (coarse_xyz[0] >= 1) & (coarse_xyz[0] <= 2)
@@ -129,8 +155,14 @@ def _canonical(xyz, log_size, metadata, op):
         (op.C(1) << op.U(3*depth)) | morton
     address_bg = op.C(op.choose(depth == 18,
         op.C(ADAPTIVE_DEEPEST_TAG) | ((coarse_address-504) << 54) | morton, address_bg))
-    core_coords = [(a-(root-1024)//2) >> core_l for a in lower]
-    address_core = op.C(core_coords[0]+n*(core_coords[1]+n*core_coords[2]))
+    if unified:
+        core_depth = op.maximum(1, 10-desired_l)
+        core_coords = [(a-(root-1024)//2) >> op.I(desired_l) for a in lower]
+        address_core = (op.C(CORE_ADAPTIVE_TAG) | (op.C(1) << op.U(3*core_depth))
+                        | _morton(core_coords, 10, op))
+    else:
+        core_coords = [(a-(root-1024)//2) >> core_l for a in lower]
+        address_core = op.C(core_coords[0]+n*(core_coords[1]+n*core_coords[2]))
     return op.C(op.choose(bg, address_bg, address_core)), lower, desired_l, valid, needs_split
 
 
@@ -302,8 +334,9 @@ def generate_adaptive_growth_numpy(manager, checkpoint, boundary, target_cells=N
     cap=max(0,int(getattr(cfg,'background_growth_max_candidates',200000)))
     remaining=cap
     pieces=[]
+    unified=metadata.get('foreground_refinement') == 'adaptive'
     # Separate core/core enumeration preserves its original unlimited capacity.
-    for extra in (False,True):
+    for extra in ((True,) if unified else (False,True)):
         for offset in offsets:
             ids=np.flatnonzero(eligible)
             for begin in range(0,len(ids),2048):
@@ -317,7 +350,8 @@ def generate_adaptive_growth_numpy(manager, checkpoint, boundary, target_cells=N
                 while len(parents):
                     targets,anchor,leaf_l,valid,split=_canonical(active,level,metadata,op)
                     mixed=(cells[parents]>=ADAPTIVE_TAG)|(targets>=ADAPTIVE_TAG)
-                    valid&=mixed if extra else ~mixed
+                    if not unified:
+                        valid&=mixed if extra else ~mixed
                     start,end=_interval(anchor,leaf_l,metadata,op)
                     covered,overlap=_query_numpy(index,start,end,np)
                     split|=overlap&~covered
@@ -441,10 +475,59 @@ def _concat(pieces, dr):
     return result
 
 
+class _BackgroundProposalBuffer:
+    """Bounded prefix append preserving the original frontier enumeration.
+
+    A nonempty accepted batch allocates the configured cap once. Each batch is
+    scattered immediately, so thousands of tiny geometry arrays do not survive
+    until the final merge. Empty/cap-zero streams allocate no proposal fields.
+    """
+
+    def __init__(self, capacity, dr):
+        self.capacity, self.dr = int(capacity), dr
+        self.count = 0
+        self.fields = None
+
+    def append(self, piece):
+        dr = self.dr
+        count = dr.width(piece['cells'])
+        if not count:
+            return
+        if self.count+count > self.capacity:
+            raise RuntimeError("Background proposal append exceeds its candidate cap")
+        U,C,D = dr.cuda.UInt32,dr.cuda.UInt64,dr.cuda.Float64
+        if self.fields is None:
+            self.fields = {
+                name: dr.empty(C if name in ('cells','parent_cells') else U if name=='parent_ids' else D,
+                               self.capacity*width)
+                for name,width in _WIDTHS.items()}
+        for name,width in _WIDTHS.items():
+            positions = dr.arange(U,count*width)+dr.opaque(U,self.count*width)
+            dr.scatter(self.fields[name],piece[name],positions,mode=dr.ReduceMode.Permute)
+        # Finish this batch's scatter graph before constructing the next one.
+        # This retains only the fixed-capacity destination, not every source.
+        dr.eval(*self.fields.values())
+        self.count += count
+
+    def finish(self):
+        if self.fields is None:
+            return None
+        dr,U = self.dr,self.dr.cuda.UInt32
+        result = {}
+        for name,width in _WIDTHS.items():
+            source = self.fields.pop(name)
+            result[name] = (source if self.count==self.capacity else
+                            dr.gather(type(source),source,dr.arange(U,self.count*width)))
+            dr.eval(result[name])
+        self.fields = None
+        return result
+
+
 def _append_appearance(result,state,metadata,cfg,dr,parameter_parent_rows=None):
     from reconstruction_topology import validate_growth_opacity
     U,C,F,D=dr.cuda.UInt32,dr.cuda.UInt64,dr.cuda.Float32,dr.cuda.Float64
-    validate_growth_opacity(cfg,metadata['opacity_sh_count'])
+    validate_growth_opacity(cfg,metadata['opacity_sh_count'],
+                            active_opacity_sh_count=metadata.get('active_opacity_sh_count'))
     n=dr.width(result['cells'])
     parents=result['parent_ids']
     if parameter_parent_rows is not None:
@@ -471,9 +554,66 @@ def _append_appearance(result,state,metadata,cfg,dr,parameter_parent_rows=None):
     dr.eval(*result['candidate_state'].values())
 
 
+def _merge_proposal_rows_gpu(cells, parent_cells, metadata, minimum_support, dr):
+    """Return the canonical retained rows without repeatedly moving geometry.
+
+    Stable pair ordering preserves the first proposal's geometry when multiple
+    traversal frontiers produced the same (target, parent). Support counts are
+    computed after this pair deduplication, before competing coarse targets are
+    removed, exactly as in the original full-field merge.
+    """
+    from reconstruction_growth_filter import growth_pair_order_gpu
+    C,U,B=dr.cuda.UInt64,dr.cuda.UInt32,dr.cuda.Bool
+    n=dr.width(cells)
+    if not n:
+        return dr.empty(U,0),dr.empty(U,0)
+    order=growth_pair_order_gpu(cells,parent_cells,dr)
+    ordered_cells=dr.gather(C,cells,order)
+    ordered_parents=dr.gather(C,parent_cells,order)
+    lane=dr.arange(U,n)
+    prev=dr.maximum(lane,1)-1
+    distinct=(lane==0)|(ordered_cells!=dr.gather(C,ordered_cells,prev))|\
+             (ordered_parents!=dr.gather(C,ordered_parents,prev))
+    unique=dr.compress(distinct)
+    order=dr.gather(U,order,unique)
+    ordered_cells=dr.gather(C,ordered_cells,unique)
+    del ordered_parents,unique,distinct,prev,lane
+    n=dr.width(order)
+    lane=dr.arange(U,n)
+    first=(lane==0)|(ordered_cells!=dr.gather(C,ordered_cells,dr.maximum(lane,1)-1))
+    groups=dr.cumsum(U(first))-1
+    # A row-sized counter table avoids an extra compress/count host barrier;
+    # unused trailing entries are zero and never read.
+    counts=dr.zeros(U,n)
+    dr.scatter_reduce(dr.ReduceOp.Add,counts,U(1),groups)
+    support=dr.gather(U,counts,groups)
+    keep=dr.compress(support>=minimum_support) if minimum_support>1 else lane
+    order=dr.gather(U,order,keep)
+    ordered_cells=dr.gather(C,ordered_cells,keep)
+    support=dr.gather(U,support,keep)
+    del first,groups,counts,keep,lane
+    n=dr.width(order)
+    if not n:
+        return order,support
+    lane=dr.arange(U,n)
+    first=(lane==0)|(ordered_cells!=dr.gather(C,ordered_cells,dr.maximum(lane,1)-1))
+    target_rows=dr.compress(first)
+    unique_targets=dr.gather(C,ordered_cells,target_rows)
+    retained=filter_nonoverlapping_growth_gpu(unique_targets,metadata,dr)
+    # Every proposal of an exact target shares its group. Broadcasting a mask
+    # over those groups replaces a binary search per parent proposal.
+    target_keep=dr.zeros(B,dr.width(unique_targets))
+    dr.scatter(target_keep,B(True),retained)
+    groups=dr.cumsum(U(first))-1
+    keep=dr.compress(dr.gather(B,target_keep,groups))
+    order,support=dr.gather(U,order,keep),dr.gather(U,support,keep)
+    dr.eval(order,support)
+    return order,support
+
+
 def generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells=None, *, eligible=None,
                                  cooldown_cells=None, parent_batch_size=65536, dr=None):
-    """Keep the foreground generator; add bounded mixed/background proposals.
+    """Generate bounded mixed-leaf proposals; retain the legacy core fast path.
 
     Geometry, occupancy indexes, wait masks, and candidates remain on device.
     Only compressed sizes are read by the bounded batching loops.
@@ -481,7 +621,6 @@ def generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells=Non
     if dr is None:
         import drjit as dr
     from reconstruction_growth_candidates_gpu import _generate,gather_rows
-    from reconstruction_growth_filter import growth_pair_order_gpu
     U,C,I,D,F,B=dr.cuda.UInt32,dr.cuda.UInt64,dr.cuda.Int32,dr.cuda.Float64,dr.cuda.Float32,dr.cuda.Bool
     op=_Ops(dr,True)
     timings=manager.growth_generation_stage_seconds={}
@@ -489,7 +628,15 @@ def generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells=Non
     state,metadata,cfg=checkpoint['model_state'],checkpoint['model_metadata'],manager.settings
     state={k:C(v) if k=='cell_indices' else F(v) for k,v in state.items()}
     occupied=state['cell_indices']
+    unified=metadata.get('foreground_refinement') == 'adaptive'
     if not dr.width(occupied) or (target_cells is not None and not dr.width(target_cells)):
+        if unified:
+            result=_concat([],dr)
+            result.update(boundary=boundary,resolution=metadata['resolution'],seen_views=set(),
+                          foreground=U([]),background=U([]),geometric_support=U([]),
+                          radiance_sh=F([]),opacity_sh=F([]))
+            result['candidate_state']={k:dr.empty(C if k=='cell_indices' else F,0) for k in state}
+            return result
         result=_generate(manager,checkpoint,boundary,target_cells,eligible,cooldown_cells,parent_batch_size,dr)
         result['cells'],result['parent_cells']=C(result['cells']),C(result['parent_cells'])
         return result
@@ -503,14 +650,17 @@ def generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells=Non
         parameter_rows=U(parameter_rows)
     # Do not discard a core target supported by one core and one background
     # parent before their two proposal streams have been combined.
-    core=_generate(manager,checkpoint,boundary,target_cells,eligible,cooldown_cells,parent_batch_size,dr,
-                   minimum_support=1,geometry_only=True)
-    pieces=[{k:core[k] for k in _WIDTHS}] if dr.width(core['cells']) else []
-    del core
+    pieces=[]
+    if not unified:
+        core=_generate(manager,checkpoint,boundary,target_cells,eligible,cooldown_cells,parent_batch_size,dr,
+                       minimum_support=1,geometry_only=True)
+        pieces=[{k:core[k] for k in _WIDTHS}] if dr.width(core['cells']) else []
+        del core
     timings['core_candidates']=time.perf_counter()-started
     started=time.perf_counter()
     offsets,penetration,evidence=_options(manager,metadata)
     remaining=max(0,int(getattr(cfg,'background_growth_max_candidates',200000)))
+    background_buffer=_BackgroundProposalBuffer(remaining,dr)
     xyz,logs=_decode(occupied,metadata,op)
     # Only background parents and the one-cell core boundary can cross into a
     # background leaf. Interior foreground geometry never enters this path.
@@ -520,7 +670,7 @@ def generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells=Non
     boundary_parent=(occupied>=ADAPTIVE_TAG)
     for a in range(3):
         boundary_parent|=(xyz[a]==clo)|(xyz[a]+edge==chi)
-    parent_ids=dr.compress(B(eligible)&boundary_parent)
+    parent_ids=dr.compress(B(eligible) if unified else B(eligible)&boundary_parent)
     blocked=occupied
     if dr.width(cooldown_cells):
         blocked=(dr.concat([occupied,C(cooldown_cells)]) if dr.width(occupied) else C(cooldown_cells))
@@ -540,7 +690,8 @@ def generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells=Non
         initial_l=dr.gather(I,logs,parent_ids)
         initial_xyz=[dr.gather(I,xyz[a],parent_ids)+offset[a]*(I(1)<<I(initial_l)) for a in range(3)]
         initial_cells,initial_xyz,initial_l,initial_valid,_=_canonical(initial_xyz,initial_l,metadata,op)
-        initial_valid&=(dr.gather(C,occupied,parent_ids)>=ADAPTIVE_TAG)|(initial_cells>=ADAPTIVE_TAG)
+        if not unified:
+            initial_valid&=(dr.gather(C,occupied,parent_ids)>=ADAPTIVE_TAG)|(initial_cells>=ADAPTIVE_TAG)
         initial_start,initial_end=_interval(initial_xyz,initial_l,metadata,op)
         initial_covered,_=_query_gpu(index,initial_start,initial_end,dr)
         exposed=dr.gather(U,parent_ids,dr.compress(initial_valid&~initial_covered))
@@ -554,7 +705,8 @@ def generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells=Non
             active=[dr.gather(I,xyz[a],parents)+offset[a]*(I(1)<<I(level)) for a in range(3)]
             while dr.width(parents):
                 targets,anchor,leaf_l,valid,split=_canonical(active,level,metadata,op)
-                valid&=(dr.gather(C,occupied,parents)>=ADAPTIVE_TAG)|(targets>=ADAPTIVE_TAG)
+                if not unified:
+                    valid&=(dr.gather(C,occupied,parents)>=ADAPTIVE_TAG)|(targets>=ADAPTIVE_TAG)
                 start,end=_interval(anchor,leaf_l,metadata,op)
                 covered,overlap=_query_gpu(index,start,end,dr)
                 split|=overlap&~covered
@@ -572,10 +724,9 @@ def generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells=Non
                         take=dr.gather(U,take,dr.arange(U,remaining))
                     if dr.width(take):
                         ids=dr.gather(U,ids,take)
-                        pieces.append(dict(parent_ids=ids,parent_cells=dr.gather(C,occupied,ids),
+                        background_buffer.append(dict(parent_ids=ids,parent_cells=dr.gather(C,occupied,ids),
                             cells=dr.gather(C,targets,dr.gather(U,rows,take)),centers=gather_rows(center,take,3,dr),
                             log_scales=gather_rows(scale,take,3,dr),rotations=gather_rows(q,take,4,dr)))
-                        dr.eval(*pieces[-1].values())
                         remaining-=dr.width(take)
                 if remaining<=0:
                     break
@@ -595,45 +746,25 @@ def generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells=Non
                 parents=dr.gather(U,parents,source)
                 level=newlevel
                 dr.eval(parents,level,*active)
+    background=background_buffer.finish()
+    if background is not None:
+        pieces.append(background)
     timings['background_candidates']=time.perf_counter()-started
     started=time.perf_counter()
     result=_concat(pieces,dr)
     n=dr.width(result['cells'])
     if n:
-        order=growth_pair_order_gpu(result['cells'],result['parent_cells'],dr)
+        minimum_support=max(1,min(26,cfg.growth_min_supporting_parents)) if evidence else 1
+        order,support=_merge_proposal_rows_gpu(result['cells'],result['parent_cells'],metadata,
+                                              minimum_support,dr)
+        # Parameters are moved only once after the final decision. One field at
+        # a time also bounds replacement scratch when proposal counts are large.
         for key,width in _WIDTHS.items():
-            result[key]=gather_rows(result[key],order,width,dr)
-        lane=dr.arange(U,n)
-        prev=dr.maximum(lane,1)-1
-        distinct=(lane==0)|(result['cells']!=dr.gather(C,result['cells'],prev))|\
-                 (result['parent_cells']!=dr.gather(C,result['parent_cells'],prev))
-        unique=dr.compress(distinct)
-        for key,width in _WIDTHS.items():
-            result[key]=gather_rows(result[key],unique,width,dr)
-        n=dr.width(unique)
-        lane=dr.arange(U,n)
-        first=(lane==0)|(result['cells']!=dr.gather(C,result['cells'],dr.maximum(lane,1)-1))
-        groups=dr.cumsum(U(first))-1
-        counts=dr.zeros(U,dr.width(dr.compress(first)))
-        dr.scatter_reduce(dr.ReduceOp.Add,counts,U(1),groups)
-        support=dr.gather(U,counts,groups)
-        keep=dr.compress(support>=max(1,min(26,cfg.growth_min_supporting_parents))) if evidence else lane
-        for key,width in _WIDTHS.items():
-            result[key]=gather_rows(result[key],keep,width,dr)
-        result['geometric_support']=dr.gather(U,support,keep)
-        # The native candidate overlay is itself a mixed-leaf tree. Eliminate
-        # competing coarse targets before upload, retaining every parent of
-        # each surviving exact target.
-        n=dr.width(result['cells'])
-        lane=dr.arange(U,n)
-        first=(lane==0)|(result['cells']!=dr.gather(C,result['cells'],dr.maximum(lane,1)-1))
-        unique_targets=dr.gather(C,result['cells'],dr.compress(first))
-        retained=dr.gather(C,unique_targets,filter_nonoverlapping_growth_gpu(unique_targets,metadata,dr))
-        # Input targets are sorted by their full address and retained row IDs
-        # are ascending, so another sort is unnecessary here.
-        keep=dr.compress(_sorted_membership_gpu(retained,result['cells'],dr))
-        for key,width in dict(_WIDTHS,geometric_support=1).items():
-            result[key]=gather_rows(result[key],keep,width,dr)
+            previous=result.pop(key)
+            result[key]=gather_rows(previous,order,width,dr)
+            dr.eval(result[key])
+            del previous
+        result['geometric_support']=support
     else:
         result['geometric_support']=U([])
     n=dr.width(result['cells'])

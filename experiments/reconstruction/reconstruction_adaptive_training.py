@@ -1,4 +1,4 @@
-"""Budgeted background-only refinement at validated epoch boundaries.
+"""Budgeted adaptive leaf refinement at validated epoch boundaries.
 
 Priorities cover one complete training epoch. Their collection boundaries are
 offset from the ordinary grow/prune cadence, and need no checkpoint history.
@@ -22,6 +22,7 @@ class AdaptiveBackgroundController:
     def begin_epoch(self, model, boundary):
         cfg = self.config.topology
         self.collecting = (self.enabled and boundary > cfg.deletion_warmup_epochs
+            and not getattr(self.topology, "topology_frozen", lambda _: False)(boundary)
             and not self.topology.growth_frozen(boundary)
             and (boundary - 1) % cfg.background_refine_interval == 0)
         self.priority = self.dr.zeros(self.dr.cuda.Float32, int(model.active_voxel_count)) if self.collecting else None
@@ -59,17 +60,22 @@ class AdaptiveBackgroundController:
 
         dr, m, cfg = self.dr, self.topology, self.config.topology
         checkpoint = device_checkpoint(model)
+        unified = checkpoint["model_metadata"].get("foreground_refinement") == "adaptive"
         cells = checkpoint["model_state"]["cell_indices"]
         if not len(cells):
             event["background_adaptive"] = {"status": "no_candidates", "background_leaves": 0}
             return None, event
         background_count = int(dr.count((cells & ADAPTIVE_TAG) != 0)[0])
-        capacity = min(cfg.background_refine_max_new_leaves,
-                       cfg.background_max_active_voxels - background_count,
-                       cfg.max_active_voxels - len(cells))
+        background_capacity = max(0, cfg.background_max_active_voxels - background_count)
+        capacity = min(cfg.background_refine_max_new_leaves, cfg.max_active_voxels - len(cells))
+        if not unified:
+            capacity = min(capacity, background_capacity)
         detail = dict(status="no_candidates", background_leaves=background_count,
                       new_leaf_budget=max(0, capacity), priority_scope="complete_training_epoch",
                       pixel_threshold=cfg.background_refine_pixel_threshold)
+        if unified:
+            detail.update(scope="foreground_and_background", foreground_leaves=len(cells)-background_count,
+                          background_new_leaf_budget=background_capacity, foreground_reserved_fraction=.25)
         event["background_adaptive"] = detail
         if capacity <= 0:
             detail["status"] = "leaf_budget_reached"
@@ -78,17 +84,23 @@ class AdaptiveBackgroundController:
         lifecycle = get_gpu_lifecycle(m, model)
         mature = lifecycle.mature(boundary)
         priority = dr.select(mature, self.priority, 0.)
+        limit = max(1, int((len(cells) if unified else background_count) * cfg.background_refine_fraction))
+        selection_capacity = min(capacity, 7*limit) if unified else capacity
         parents = select_adaptive_background_device(checkpoint, self.views, priority, dr,
             pixel_threshold=cfg.background_refine_pixel_threshold,
-            max_new_leaves=capacity,
+            max_new_leaves=selection_capacity,
             max_depth=checkpoint["model_metadata"].get("background_max_depth", 9),
-            projection_cache=self.projection_cache)
-        limit = max(1, int(background_count * cfg.background_refine_fraction))
+            projection_cache=self.projection_cache,
+            **({"max_background_new_leaves": background_capacity} if unified else {}))
         if len(parents) > limit:
             parents = take_rows(parents, dr.arange(dr.cuda.UInt32, limit))
         # New leaves need time to establish geometry before another split.
         parents = take_rows(parents, dr.compress(dr.gather(dr.cuda.Bool, mature, parents)))
         detail["selected_parents"] = len(parents)
+        if unified:
+            selected_background = int(dr.count(dr.gather(type(cells), cells, parents) >= ADAPTIVE_TAG)[0])
+            detail.update(selected_foreground_parents=len(parents)-selected_background,
+                          selected_background_parents=selected_background)
         selected_at = time.perf_counter()
         detail["selection_seconds"] = selected_at - started
         if not len(parents):
@@ -132,4 +144,6 @@ class AdaptiveBackgroundController:
                       **{name: int(replacement.pop(name, 0)) for name in
                          ("selected", "replaced", "children", "added")})
         event.update(background_refined=True, active_voxel_count=count)
+        if unified:
+            event["adaptive_refined"] = True
         return replacement, event

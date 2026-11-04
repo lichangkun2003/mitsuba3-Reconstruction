@@ -32,6 +32,14 @@ def _fields(value, count, width, T, dr):
 
 def _pack(fields, T, dr):
     count, width = dr.width(fields[0]), len(fields)
+    if T is dr.cuda.Float64 and width in (3, 4):
+        if not count:
+            return dr.empty(T, 0)
+        # Preserve the geometry expression boundary before packing through the
+        # native static-vector path. Fortran order gives interleaved AoS rows.
+        dr.eval(*fields)
+        vector = dr.cuda.Array3f64 if width == 3 else dr.cuda.Array4f64
+        return dr.ravel(vector(*fields), order='F')
     result = dr.empty(T, count * width)
     index = dr.arange(dr.cuda.UInt32, count)
     for j, value in enumerate(fields):
@@ -435,6 +443,14 @@ def _generate(manager, checkpoint, boundary, target_cells, eligible, cooldown_ce
     dimensions = dict(parent_ids=1, parent_cells=1, cells=1, centers=3, log_scales=3, rotations=4)
     result = _concatenate_fields(pieces, dimensions, dr)
     n = dr.width(result['cells'])
+    if geometry_only and minimum_support == 1:
+        # Adaptive growth merges this unique core/core stream with mixed-shell
+        # proposals and applies the canonical pair order/support test once.
+        # Sorting and gathering all geometry here would be discarded there.
+        # Keep the original enumeration; the final stable sort restores the
+        # same output, since a core/core (target, parent) pair is unique.
+        result.update(boundary=boundary, resolution=resolution, seen_views=set())
+        return result
     if n:
         # Parent batches change enumeration order only. Every (cell,parent-cell)
         # pair is unique; global sorting restores the original canonical order

@@ -176,7 +176,7 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
                              distortion=True, dssim=False, lifecycle_epoch_bytes=4,
                              rgb_only=True, known_index_bytes=0,
                              allocator_policy="cuda_2m", reference_image_pixels=None,
-                             radiance_degree_steps=False, path_record_layout_version=0):
+                             radiance_degree_steps=False, opacity_degree_steps=False, path_record_layout_version=0):
     """Return named logical/allocated bytes for one view, excluding its cache.
 
     ``compact_capacity=0`` is the original N-row gradient layout. A positive
@@ -210,7 +210,7 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         raise ValueError("Reference image pixels must fit UInt32")
     if isinstance(lifecycle_epoch_bytes, bool) or lifecycle_epoch_bytes not in (4, 8):
         raise ValueError("lifecycle_epoch_bytes must be 4 or 8")
-    if not all(isinstance(value, bool) for value in (distortion, dssim, rgb_only, radiance_degree_steps)):
+    if not all(isinstance(value, bool) for value in (distortion, dssim, rgb_only, radiance_degree_steps, opacity_degree_steps)):
         raise ValueError("distortion, dssim, rgb_only and radiance_degree_steps must be booleans")
     round_cuda_allocation(0, allocator_policy)
 
@@ -252,9 +252,11 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         # RGB/raw RGB, alpha/raw alpha, three loss planes, and hit_count.
         "render_result_planes": [(ray_count * 4, 12)],
     }
-    if radiance_degree_steps:
-        degree_count = math.isqrt(sh_count - 1) + 1
-        buffers["adam_step_counters"] = [(n * 4, 4), (n * degree_count * 4, 1)]
+    if radiance_degree_steps or opacity_degree_steps:
+        radiance_clocks = math.isqrt(sh_count - 1) + 1 if radiance_degree_steps else 1
+        opacity_clocks = math.isqrt(opacity_sh_count - 1) + 1 if opacity_degree_steps else 1
+        buffers["adam_step_counters"] = [(n * 4, 3), (n * radiance_clocks * 4, 1),
+                                         (n * opacity_clocks * 4, 1)]
     if dssim:
         # Horizontal/vertical moments can retain 15 float planes each. Allow
         # another 18 for adjoints, image loss and coordinate/index temporaries.
@@ -290,6 +292,7 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         "gradient_float_components": gradient_width,
         "lifecycle_epoch_bytes": lifecycle_epoch_bytes,
         "radiance_degree_steps": radiance_degree_steps,
+        "opacity_degree_steps": opacity_degree_steps,
         "path_record_layout_version": path_record_layout_version,
         "compact_path_records": compact_records,
         "allocator_policy": allocator_policy,
@@ -362,7 +365,7 @@ def query_cuda_memory():
 def plan_refinement_memory(request, *, gpu, live_memory=None, allocator_policy="cuda_2m",
                            workspace_reserve_mib=1024, device_reserve_mib=1024,
                            known_index_bytes=0, lifecycle_epoch_bytes=4,
-                           radiance_degree_steps=True):
+                           radiance_degree_steps=True, opacity_degree_steps=False):
     """Budget the next refinement allocation before parent state is mutated.
 
     A request comes from the refiner's before_allocate callback and carries
@@ -418,14 +421,16 @@ def plan_refinement_memory(request, *, gpu, live_memory=None, allocator_policy="
         # Already migrated fields also grow by the net number of newborn rows.
         scratch_bytes += 2 * rounding(allocate * max(3 * sh, opacity, 4) * 4)
         grown = max(0, counts["active_voxels"] - counts["old_voxels"])
-        clock_width = 4 + (math.isqrt(sh - 1) + 1 if radiance_degree_steps else 1)
+        clock_width = (3 + (math.isqrt(sh - 1) + 1 if radiance_degree_steps else 1)
+                       + (math.isqrt(opacity - 1) + 1 if opacity_degree_steps else 1))
         scratch_bytes += rounding(grown * (2 * (3 * sh + opacity + 9) + clock_width) * 4)
     additional = model_bytes + scratch_bytes + workspace_reserve_mib * MIB
 
     # Static fallback: parent model+Adam+lifecycle remain live through fitting.
     n = counts["old_voxels"]
     gradient_widths = (3 * sh, opacity, 3, 3, 3)
-    clocks = (1, 1, 1, 1, math.isqrt(sh - 1) + 1 if radiance_degree_steps else 1)
+    clocks = (1, 1, 1, math.isqrt(opacity - 1) + 1 if opacity_degree_steps else 1,
+              math.isqrt(sh - 1) + 1 if radiance_degree_steps else 1)
     retained = sum(rounding(n * width * 4) for width in model_widths)
     retained += 2 * sum(rounding(n * width * 4) for width in gradient_widths)
     retained += sum(rounding(n * width * 4) for width in clocks)
@@ -487,7 +492,7 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
                          device_reserve_mib=1024, known_index_bytes=0,
                          pressure_cache_cap_mib=256, cache_quantum_mib=128,
                          allocator_policy="cuda_2m", reference_image_pixels=None,
-                         radiance_degree_steps=False, path_record_layout_version=0):
+                         radiance_degree_steps=False, opacity_degree_steps=False, path_record_layout_version=0):
     """Recommend a reference-cache cap without changing training algorithms.
 
     ``gpu`` is the runtime report containing ``memory_mib`` (number or numeric
@@ -522,6 +527,7 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         known_index_bytes=known_index_bytes, allocator_policy=allocator_policy,
         reference_image_pixels=reference_image_pixels,
         radiance_degree_steps=radiance_degree_steps,
+        opacity_degree_steps=opacity_degree_steps,
         path_record_layout_version=path_record_layout_version)
     image_pixels = estimate["reference_image_pixels"]
     image_bytes = image_pixels * (3 if rgb_only else 4) * 4

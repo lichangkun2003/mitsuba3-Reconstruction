@@ -315,7 +315,8 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
                    background_shell_levels=None, background_opacity=None,
                    background_initial_resolution=None, background_refinement=None,
                    background_initial_leaf_budget=200000, background_initial_pixel_threshold=32.0,
-                   background_max_resolution=512, background_resolution_mode="per_shell", **removed_options):
+                   background_max_resolution=512, background_resolution_mode="per_shell",
+                   foreground_refinement="uniform", foreground_max_resolution=None, **removed_options):
     """Prepare normalized cameras and core-only point seeds without contraction.
 
     New unbounded scenes start with 56 leaves per world-space cube shell and
@@ -427,6 +428,9 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
                                   background_subdivision_level=initial_subdivision, world_shell_version=WORLD_SHELL_VERSION,
                                   background_geometry="ellipsoid",
                                   background_voxels=56 * levels, root_half_extent=2 ** levels)
+            if foreground_refinement == "adaptive":
+                initialization.update(foreground_refinement="adaptive",
+                    foreground_max_resolution=foreground_max_resolution or target)
             if refinement == "adaptive":
                 initialization.update(background_initial_resolution=2,
                     background_initialization="adaptive_full_shells",
@@ -444,6 +448,9 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
                     "source_model": model.relative_to(dataset).as_posix(), "camera_count": len(images),
                     "scene_mode": mode, "scene_mapping": "world_shell" if mode == "unbounded" else "bounded",
                     "background_opacity": float(background_opacity)}
+        if foreground_refinement == "adaptive":
+            expected.update(foreground_refinement="adaptive",
+                            foreground_max_resolution=foreground_max_resolution or target)
         if mode == "unbounded":
             reject_removed_background_fields(initialization)
             expected.update(background_shell_levels=levels, root_half_extent=2 ** levels)
@@ -529,7 +536,9 @@ def prepare_colmap(dataset, split="train", images_dir=None, point_cloud="init_po
                     initial_leaf_budget=background_initial_leaf_budget,
                     pixel_threshold=background_initial_pixel_threshold,
                     max_depth=background_max_resolution.bit_length() - 2,
-                    resolution_mode=background_resolution_mode, max_resolution=background_max_resolution)
+                    resolution_mode=background_resolution_mode, max_resolution=background_max_resolution,
+                    **(dict(foreground_refinement="adaptive", foreground_max_resolution=foreground_max_resolution or target)
+                       if foreground_refinement == "adaptive" else {}))
                 background_point_counts = adaptive_background["point_counts"]
             elif initial_subdivision:
                 background_points = prepare_sparse_background(normalized, source_colors, start,

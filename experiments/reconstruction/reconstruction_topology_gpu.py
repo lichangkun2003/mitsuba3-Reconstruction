@@ -227,6 +227,7 @@ class GPUTopologyLifecycle:
             m.pending_growth = None
             timings["candidate_clear"] = time.perf_counter() - started
             return False
+        m.require_isotropic_topology(model, boundary)
         pending = m.pending_growth
         if (pending is None or pending.get("mode") != "rgb" or
                 pending["boundary"] != boundary or pending["resolution"] != m.resolution):
@@ -449,8 +450,12 @@ class GPUTopologyLifecycle:
         if not m._low_opacity_deletion_due(boundary):
             return None
         coefficients = self.Float(model.snapshot()["opacity_sh"])
-        if int(model.opacity_sh_count) != 1 or len(coefficients) != m.count:
+        if (int(getattr(model, "active_opacity_sh_count", model.opacity_sh_count)) != 1
+                or len(coefficients) != m.count * int(model.opacity_sh_count)):
             raise ValueError("Low-opacity deletion requires isotropic parameter dimensions")
+        if int(model.opacity_sh_count) != 1:
+            coefficients = dr.gather(self.Float, coefficients,
+                                     dr.arange(self.UInt, m.count)*int(model.opacity_sh_count))
         if m.count and not bool(dr.all(dr.isfinite(coefficients))[0]):
             raise ValueError("Low-opacity deletion encountered nonfinite opacity coefficients")
         threshold = float(cfg.deletion_opacity_threshold)
@@ -686,6 +691,9 @@ class GPUTopologyLifecycle:
             metadata["background_subdivision_level"] = int(getattr(model, "native_background_subdivision_level", lambda: 0)())
             metadata["background_refinement"] = getattr(model, "background_refinement", "fixed")
             metadata["background_geometry"] = "ellipsoid" if model.native_background_use_ellipsoid() else "occupied_cell"
+            if metadata["background_refinement"] == "adaptive":
+                from reconstruction_world_shell import model_adaptive_limit_fields
+                metadata.update(model_adaptive_limit_fields(model, metadata))
         return guard(model, optimizer, {"stage": stage, "active_voxels": int(count), "count": int(count),
             "exact_count": True, "old_voxels": int(model.active_voxel_count),
             "current_voxels": int(self.manager.count), "added_voxels": int(added),
@@ -697,6 +705,7 @@ class GPUTopologyLifecycle:
         model.clear_growth_candidates()
         event = {"completed_epochs": boundary, "resolution": m.resolution, "deleted": 0, "grown": 0,
             "refined": False, "finished": False, "level_budget": m.level_budget,
+            "topology_frozen": m.topology_frozen(boundary),
             "growth_frozen": m.growth_frozen(boundary), "growth_freeze_last_epochs": cfg.growth_freeze_last_epochs,
             "growth_mode": "rgb_online", "growth_level_epoch": boundary - m.level_start_epoch,
             "growth_rgb_normalization": cfg.growth_rgb_normalization, "growth_warmup_epochs": m.growth_warmup,
@@ -713,7 +722,14 @@ class GPUTopologyLifecycle:
             event["core_resolution"] = m.core_resolution
         if cfg.use_low_opacity_deletion:
             event["deletion_opacity_requested"] = m._low_opacity_deletion_due(boundary)
-        if (m.schedule.enabled and m.core_resolution < m.schedule.target_resolution and
+        if m.topology_frozen(boundary):
+            m.pending_growth = m.pending_rgb_deletion = None
+            m._growth_world_cache = m._growth_device = m._rgb_growth_device = m._rgb_deletion_device = None
+            event.update(finished=boundary >= m.schedule.total_epochs, active_voxel_count=m.count,
+                         evidence_window_evaluated=False)
+            return None, event
+        m.require_isotropic_topology(model, boundary)
+        if (m.uniform_refinement and m.core_resolution < m.schedule.target_resolution and
                 boundary - m.level_start_epoch >= m.level_budget):
             return self.refine(model, optimizer, boundary, event)
         rgb = self.evaluate_rgb_deletion(boundary, event)

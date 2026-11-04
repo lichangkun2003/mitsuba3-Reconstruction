@@ -77,6 +77,8 @@ class Optimizer(FalcorOptimizer):
         self.count = count
         self.radiance_degree_steps = False
         self.sh_degree_count = 3
+        self.opacity_degree_steps = False
+        self.opacity_sh_count = self.active_opacity_sh_count = self.opacity_degree_count = 1
         self.dimensions = dict(radiance_sh=27, opacity_sh=1, centers=3,
                                log_scales=3, rotation_tangent=3)
         self._state = {
@@ -117,6 +119,8 @@ class CommitRemapTests(unittest.TestCase):
             resolution=8, core_resolution=8, scene_mapping="bounded", level_start_epoch=0,
             level_budget=30, growth_warmup=0, count=count, completed_windows=3,
             growth_frozen=lambda boundary: False, deletion_frozen=lambda boundary: False,
+            topology_frozen=lambda boundary: False, uniform_refinement=False,
+            require_isotropic_topology=lambda model, boundary: None,
             _growth_due=lambda boundary: growth_due,
             _rgb_deletion_due=lambda boundary: bool(removed),
             _low_opacity_deletion_due=lambda boundary: False,

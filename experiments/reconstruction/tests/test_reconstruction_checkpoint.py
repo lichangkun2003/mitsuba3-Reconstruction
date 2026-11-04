@@ -128,13 +128,13 @@ class CheckpointTests(unittest.TestCase):
                              VoxelReconstruction=native)
         restored = restore_model({"model_metadata": metadata, "model_state": self.model}, mi)
         self.assertFalse(restored.native_background_use_ellipsoid())
-        self.assertEqual(model_metadata(restored), {**metadata, "world_shell_version": 7,
+        self.assertEqual(model_metadata(restored), {**metadata, "world_shell_version": 8,
             "background_subdivision_level": 0, "background_geometry": "occupied_cell"})
         metadata.update(world_shell_version=2, background_subdivision_level=2,
                         background_refinement="uniform")
         restored = restore_model({"model_metadata": metadata, "model_state": self.model}, mi)
         self.assertFalse(restored.native_background_use_ellipsoid())
-        upgraded = {**metadata, "world_shell_version": 7, "background_geometry": "occupied_cell"}
+        upgraded = {**metadata, "world_shell_version": 8, "background_geometry": "occupied_cell"}
         self.assertEqual(model_metadata(restored), upgraded)
         # Resaving marks the new schema explicitly without changing old box semantics.
         checkpoint.save_checkpoint(self.path, self.model, model_metadata(restored))
@@ -145,7 +145,7 @@ class CheckpointTests(unittest.TestCase):
                 checkpoint.save_checkpoint(self.path, self.model, current)
                 restored = restore_model(checkpoint.load_checkpoint(self.path), mi)
                 self.assertEqual(restored.native_background_use_ellipsoid(), geometry == "ellipsoid")
-                self.assertEqual(model_metadata(restored), {**current, "world_shell_version": 7})
+                self.assertEqual(model_metadata(restored), {**current, "world_shell_version": 8})
         high_metadata = {**upgraded, "background_subdivision_level": 8, "background_geometry": "ellipsoid"}
         high_state = {**self.model, "cell_indices": np.array([2 ** 32 + 17, 17], np.uint64)}
         restored = restore_model({"model_metadata": high_metadata, "model_state": high_state}, mi)

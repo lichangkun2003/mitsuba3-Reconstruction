@@ -147,7 +147,7 @@ class TrainingMemoryGuardTests(unittest.TestCase):
         self.assertIn("image", cache.entries)
         self.assertEqual(cache.capacity_bytes, 4096 * MIB)
 
-    def exercise_refinement(self, *, refused=None):
+    def exercise_refinement(self, *, refused=None, reclaim=None):
         config, current, state, proposed = configuration(), model(), report(), request()
         config_before, proposed_before = asdict(config), copy.deepcopy(proposed)
         current.parameters = np.arange(9, dtype=np.float32)
@@ -162,12 +162,23 @@ class TrainingMemoryGuardTests(unittest.TestCase):
                              flush_malloc_cache=lambda: events.append("flush"))
         ordinary = {"supported": refused != "training", "reason": "ordinary budget"}
         transition = {"supported": refused != "transition", "reason": "transition budget"}
+        final_live = {"free_bytes": 20 * 1024**3, "total_bytes": 32 * 1024**3}
+        if reclaim == "unknown_stays":
+            final_live = None
+        first_live = ({"free_bytes": 1024**3, "total_bytes": 32 * 1024**3}
+                      if reclaim == "pressure" else None if reclaim else final_live)
+        reclaimed = bool(refused or reclaim)
+        snapshots = iter([first_live, final_live] if reclaimed else [first_live])
+
+        def memory_snapshot(_gpu):
+            events.append("memory.snapshot")
+            return next(snapshots)
 
         def training_plan(*args, **kwargs):
             events.append("training.plan")
             self.assertEqual(kwargs["active_voxels"], proposed["active_voxels"])
             self.assertEqual(kwargs["known_index_bytes"], 321 * MIB)
-            self.assertEqual(cache.entries, {})
+            self.assertIn("image", cache.entries)
             return ordinary
 
         def transition_plan(actual_request, **kwargs):
@@ -175,14 +186,15 @@ class TrainingMemoryGuardTests(unittest.TestCase):
             self.assertIs(actual_request, proposed)
             self.assertEqual(kwargs["known_index_bytes"], 46 * MIB)
             self.assertTrue(kwargs["radiance_degree_steps"])
-            self.assertEqual(kwargs["live_memory"]["free_bytes"], 20 * 1024**3)
+            if reclaim == "pressure" and cache.entries:
+                self.assertEqual(kwargs["live_memory"]["free_bytes"], 1024**3)
+                return {"supported": False, "reason": "cached storage occupies device budget"}
             return transition
 
         with patch.object(train, "training_memory_plan", side_effect=training_plan), \
              patch.object(train, "plan_refinement_memory", side_effect=transition_plan), \
              patch.object(train, "estimate_spatial_index_bytes", return_value=321 * MIB) as index, \
-             patch.object(train, "refinement_memory_snapshot", return_value={
-                 "free_bytes": 20 * 1024**3, "total_bytes": 32 * 1024**3}):
+             patch.object(train, "refinement_memory_snapshot", side_effect=memory_snapshot) as snapshot:
             if refused:
                 with self.assertRaises(TrainingMemoryError) as caught:
                     train.prepare_refinement_memory(config, current, optimizer, cache, replay,
@@ -194,15 +206,23 @@ class TrainingMemoryGuardTests(unittest.TestCase):
                 self.assertIs(result, state["refinement_memory_plans"][-1])
             index.assert_called_once_with(proposed["active_voxels"], 1024,
                                           allocator_policy="cuda_2m", background_shell_levels=8,
-                                          background_subdivision_level=0)
-        self.assertEqual(events, ["native.clear", "optimizer.clear_replay", "cache.clear",
-                                   "sync", "flush", "training.plan", "transition.plan"])
+                                          background_subdivision_level=0, background_adaptive=False)
+            self.assertEqual(snapshot.call_count, 2 if reclaimed else 1)
+        expected_events = ["native.clear", "optimizer.clear_replay", "sync", "training.plan",
+                           "memory.snapshot", "transition.plan"]
+        if reclaimed:
+            expected_events += ["cache.clear", "sync", "flush", "sync",
+                                "memory.snapshot", "transition.plan"]
+        self.assertEqual(events, expected_events)
         self.assertEqual(len(state["refinement_memory_plans"]), 1)
         record = state["refinement_memory_plans"][0]
         self.assertIs(record["training"], ordinary)
         self.assertIs(record["transition"], transition)
         self.assertEqual(record["active_voxels"], proposed["active_voxels"])
         self.assertEqual(record["exact_count"], proposed["exact_count"])
+        self.assertEqual(record["cache_reclaimed"], reclaimed)
+        self.assertGreaterEqual(record["guard_seconds"], 0)
+        self.assertEqual(bool(cache.entries), not reclaimed)
         self.assertEqual(state["checkpoint"], report()["checkpoint"])
         self.assertEqual(cache.capacity_bytes, 4096 * MIB)
         np.testing.assert_array_equal(current.parameters, original_parameters)
@@ -211,15 +231,20 @@ class TrainingMemoryGuardTests(unittest.TestCase):
         self.assertEqual(asdict(config), config_before)
         self.assertEqual(proposed, proposed_before)
 
-    def test_successful_refinement_guard_changes_only_caches_and_diagnostics(self):
+    def test_successful_refinement_guard_keeps_images_and_allocator_cache(self):
         self.exercise_refinement()
+
+    def test_refinement_reclaims_and_rechecks_pressure_or_unknown_memory(self):
+        for reclaim in ("pressure", "unknown", "unknown_stays"):
+            with self.subTest(reclaim=reclaim):
+                self.exercise_refinement(reclaim=reclaim)
 
     def test_either_refinement_plan_can_refuse_without_mutating_parameters_or_adam(self):
         for refused in ("training", "transition"):
             with self.subTest(refused=refused):
                 self.exercise_refinement(refused=refused)
 
-    def exercise_topology_commit(self, *, failure=None, stage="growth_commit"):
+    def exercise_topology_commit(self, *, failure=None, stage="growth_commit", reclaim=None):
         config, current, state = configuration(), model(), report()
         config_before = asdict(config)
         current.parameters = np.array([.2, .3, .4], np.float32)
@@ -247,17 +272,25 @@ class TrainingMemoryGuardTests(unittest.TestCase):
             live["dedicated_free_bytes"] = 2 * 1024**3 - 1
         if failure == "missing_live":
             live = None
+        first_live = (dict(live, dedicated_free_bytes=2 * 1024**3)
+                      if reclaim == "pressure" else None if reclaim == "unknown" else live)
+        reclaimed = bool(failure or reclaim)
+        snapshots = iter([first_live, live] if reclaimed else [first_live])
+
+        def memory_snapshot(_gpu):
+            events.append("memory.snapshot")
+            return next(snapshots)
 
         def training_plan(*args, **kwargs):
             events.append("training.plan")
             self.assertEqual(kwargs["active_voxels"], count)
             self.assertEqual(kwargs["known_index_bytes"], 321 * MIB)
-            self.assertEqual(cache.entries, {})
+            self.assertIn("image", cache.entries)
             return ordinary
 
         with patch.object(train, "training_memory_plan", side_effect=training_plan), \
              patch.object(train, "estimate_spatial_index_bytes", return_value=321 * MIB) as index, \
-             patch.object(train, "refinement_memory_snapshot", return_value=live):
+             patch.object(train, "refinement_memory_snapshot", side_effect=memory_snapshot) as snapshot:
             if failure:
                 with self.assertRaises(TrainingMemoryError) as caught:
                     train.prepare_topology_commit_memory(config, current, optimizer, cache,
@@ -267,15 +300,22 @@ class TrainingMemoryGuardTests(unittest.TestCase):
                     replay, state, 255, proposed, dr)
                 self.assertIs(result, state["topology_commit_memory_plans"][-1])
             index.assert_called_once_with(count, 1024, allocator_policy="cuda_2m", background_shell_levels=0,
-                                          background_subdivision_level=0)
-        self.assertEqual(events, ["native.clear", "optimizer.clear_replay", "cache.clear",
-                                  "sync", "flush", "sync", "training.plan"])
+                                          background_subdivision_level=0, background_adaptive=False)
+            self.assertEqual(snapshot.call_count, 2 if reclaimed else 1)
+        expected_events = ["native.clear", "optimizer.clear_replay", "sync", "training.plan",
+                           "memory.snapshot"]
+        if reclaimed:
+            expected_events += ["cache.clear", "sync", "flush", "sync", "memory.snapshot"]
+        self.assertEqual(events, expected_events)
         self.assertEqual(len(state["topology_commit_memory_plans"]), 1)
         record = state["topology_commit_memory_plans"][0]
         transition = record["transition"]
         self.assertIs(record["training"], ordinary)
         self.assertEqual(record["stage"], stage)
         self.assertEqual(record["active_voxels"], count)
+        self.assertEqual(record["cache_reclaimed"], reclaimed)
+        self.assertGreaterEqual(record["guard_seconds"], 0)
+        self.assertEqual(bool(cache.entries), not reclaimed)
         self.assertEqual(transition["largest_replacement_field_bytes"], field_bytes)
         self.assertEqual(transition["additional_required_bytes"], field_bytes + 1024**3)
         self.assertEqual(transition["supported"], failure not in ("missing_live", "largest_field"))
@@ -303,6 +343,13 @@ class TrainingMemoryGuardTests(unittest.TestCase):
             with self.subTest(stage=stage):
                 self.exercise_topology_commit(stage=stage)
 
+    def test_topology_commit_reclaims_before_deciding_to_stage(self):
+        # The first sample can accommodate host staging only. Reclaiming makes
+        # the direct path viable; choosing staging before the retry is wasteful.
+        for reclaim in ("pressure", "unknown"):
+            with self.subTest(reclaim=reclaim):
+                self.exercise_topology_commit(reclaim=reclaim)
+
     def test_topology_commit_guard_refuses_missing_live_or_future_or_replacement_budget(self):
         for failure in ("missing_live", "future", "largest_field"):
             with self.subTest(failure=failure):
@@ -320,10 +367,13 @@ class TrainingMemoryGuardTests(unittest.TestCase):
         dr = SimpleNamespace(sync_thread=lambda: None, flush_malloc_cache=lambda: None)
         live = {"free_bytes": int(3.68 * 1024**3), "total_bytes": 32 * 1024**3}
         with patch.object(train, "training_memory_plan", return_value={"supported": True}), \
-             patch.object(train, "refinement_memory_snapshot", return_value=live):
+             patch.object(train, "refinement_memory_snapshot", return_value=live) as snapshot:
             result = train.prepare_topology_commit_memory(config, current, optimizer,
                 Cache(events), replay, state, 255, proposed, dr)
             self.assertEqual(result["migration_mode"], "host_staged")
+            self.assertTrue(result["cache_reclaimed"])
+            self.assertEqual(snapshot.call_count, 2)
+            self.assertEqual(events, ["cache.clear"])
             transition = result["transition"]
             self.assertTrue(transition["supported"])
             self.assertGreater(transition["additional_required_bytes"], transition["available_bytes"])

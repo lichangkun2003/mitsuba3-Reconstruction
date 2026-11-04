@@ -21,7 +21,7 @@ from reconstruction_dataset import prepare_colmap
 from reconstruction_world_shell import (
     background_cells_numpy, configure_world_shell_model, leaf_boxes_numpy, shell_coordinates_numpy,
     validate_shell_levels, validate_world_shell_layout, world_shell_ray_maxt,
-    world_shell_metadata_geometry,
+    world_shell_metadata_geometry, WORLD_SHELL_VERSION,
 )
 from test_reconstruction_dataset import write_fixture
 
@@ -133,7 +133,7 @@ class WorldShellLayoutTests(unittest.TestCase):
         configure_world_shell_model(model, 5, "uniform", 2)
         self.assertEqual(changes, [(5, 2)])
         self.assertEqual((model.background_refinement, model.background_subdivision_level,
-                          model.world_shell_version), ("uniform", 2, 7))
+                          model.world_shell_version), ("uniform", 2, WORLD_SHELL_VERSION))
         configure_world_shell_model(model, 5, "fixed", 0, "occupied_cell")
         self.assertEqual(model.background_geometry, "occupied_cell")
         self.assertEqual(geometry_changes, [False])
@@ -322,7 +322,7 @@ class WorldShellDatasetTests(unittest.TestCase):
         self.assertEqual(initial["version"], 8)
         self.assertEqual(initial["background_refinement"], "uniform")
         self.assertEqual(initial["background_subdivision_level"], 0)
-        self.assertEqual(initial["world_shell_version"], 7)
+        self.assertEqual(initial["world_shell_version"], WORLD_SHELL_VERSION)
         self.assertEqual(initial["background_geometry"], "ellipsoid")
         self.assertEqual(initial["background_shell_levels"], 5)
         self.assertEqual(initial["background_voxels"], 280)

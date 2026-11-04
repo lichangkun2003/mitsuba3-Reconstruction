@@ -48,14 +48,14 @@ public:
     /// RGB removal evidence includes world-space background leaves.
     static constexpr uint32_t background_rgb_deletion_version = 1;
     /// Mixed-size world-space cube shells in the unified occupancy tree.
-    static constexpr uint32_t world_shell_version = 7;
+    static constexpr uint32_t world_shell_version = 8;
     static constexpr uint32_t cell_index_bits = 64;
     /// Point-pair L1 depth distortion with exact fixed-hit continuous gradients.
     static constexpr uint32_t distortion_version = 1;
     /// Linear-RGB whole-image Gaussian SSIM with an explicit image adjoint.
     static constexpr uint32_t dssim_version = 1;
     /// Progressive radiance SH with dormant coefficients and Adam degree clocks.
-    static constexpr uint32_t sh_schedule_version = 1;
+    static constexpr uint32_t sh_schedule_version = 2;
     /// GPU occupancy octree, including separately tagged hypothetical leaves.
     static constexpr uint32_t octree_version = 1;
     /// Device-resident compact Adam, including transactional moment updates.
@@ -174,6 +174,7 @@ public:
     bool native_background_use_ellipsoid() const { return m_background_use_ellipsoid; }
     /// Limit evaluated/trainable radiance coefficients without changing storage.
     void set_active_sh_count(uint32_t count);
+    void set_active_opacity_sh_count(uint32_t count);
     std::string native_scene_mapping() const { return m_scene_mapping; }
 
     struct TrainingResult {
@@ -263,6 +264,8 @@ public:
     uint32_t sh_count() const { return m_sh_count; }
     uint32_t active_sh_count() const { return m_active_sh_count; }
     uint32_t opacity_sh_count() const { return m_opacity_sh_count; }
+    uint32_t active_opacity_sh_count() const { return m_active_opacity_sh_count; }
+    bool native_core_adaptive() const { return m_core_adaptive; }
     std::array<float, 3> grid_min() const { return m_min; }
     std::array<float, 3> grid_max() const { return m_max; }
     std::array<float, 3> voxel_size() const { return m_size; }
@@ -290,7 +293,7 @@ private:
         Float exit;
         DRJIT_STRUCT(RaySegment, origin, direction, exit)
     };
-    uint32_t tree_core_resolution() const { return m_background_adaptive ? 1024u : m_resolution; }
+    uint32_t tree_core_resolution() const { return (m_background_adaptive || m_core_adaptive) ? 1024u : m_resolution; }
     uint32_t root_resolution() const { return tree_core_resolution() << m_background_shell_levels; }
     uint32_t core_offset() const { return (root_resolution() - tree_core_resolution()) / 2; }
     float tree_cell_size(uint32_t axis) const { return (m_max[axis]-m_min[axis])/tree_core_resolution(); }
@@ -345,10 +348,11 @@ private:
                           Mask active, const UInt32 &log_size) const;
 
     uint32_t m_resolution, m_core_resolution, m_active_count, m_sh_count, m_active_sh_count,
-             m_opacity_sh_count;
+             m_opacity_sh_count, m_active_opacity_sh_count;
     std::string m_scene_mapping = "bounded";
     uint32_t m_background_shell_levels = 0, m_background_subdivision_level = 0;
     bool m_background_use_ellipsoid = true, m_background_adaptive = false;
+    bool m_core_adaptive = false;
     std::array<float, 3> m_min, m_max, m_size;
     std::map<std::string, uint64_t> m_statistics;
     CellBuffer m_cells;

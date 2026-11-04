@@ -145,6 +145,22 @@ def bounded_shell_reference(checkpoint, config):
 
 
 class WorldRefinementTests(unittest.TestCase):
+    def test_public_uniform_refinement_rejects_adaptive_core_before_touching_arrays(self):
+        metadata = dict(fixture()["model_metadata"], foreground_refinement="adaptive",
+                        foreground_max_resolution=1024)
+        # No state arrays or GPU runtime are supplied: rejection must happen
+        # before any conversion, allocation, fitting or parameter access.
+        checkpoint = dict(model_metadata=metadata, model_state=object())
+        fit = Mock(side_effect=AssertionError("Uniform fitter must not run"))
+        for callback in (
+            lambda: refine_world_numpy(checkpoint, CoarseToFineConfig(), 1000, fit, np),
+            lambda: refine_world_device(checkpoint, CoarseToFineConfig(), 1000, fit, object()),
+            lambda: refine_state(checkpoint, CoarseToFineConfig(), 1000),
+        ):
+            with self.assertRaisesRegex(ValueError, "adaptive foreground.*selective leaf"):
+                callback()
+        fit.assert_not_called()
+
     def test_uint64_background_and_cooldown_do_not_alias_core_growth_cells(self):
         from reconstruction_topology import TopologyManager
         checkpoint, manager = growth_address_alias_fixture()

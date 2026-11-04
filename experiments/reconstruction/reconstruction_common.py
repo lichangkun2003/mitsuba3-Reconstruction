@@ -123,6 +123,9 @@ def prepare_dataset(config, np, *, load_points=True):
     schedule = getattr(config, "schedule", None)
     start = schedule.start_resolution if schedule and schedule.enabled else config.model.grid_resolution
     target = schedule.target_resolution if schedule and schedule.enabled else start
+    foreground_refinement = getattr(schedule, "refinement", "uniform") if schedule else "uniform"
+    if foreground_refinement == "adaptive" and mode != "unbounded":
+        raise ValueError("Unified adaptive foreground currently requires a COLMAP world-shell scene")
     options = dict(scene_mode=mode, background_opacity=config.data.background_opacity,
                    background_shell_levels=config.data.background_shell_levels,
                    background_initial_resolution=config.data.background_initial_resolution,
@@ -131,6 +134,8 @@ def prepare_dataset(config, np, *, load_points=True):
                    background_initial_pixel_threshold=config.data.background_initial_pixel_threshold,
                    background_max_resolution=config.data.background_max_resolution,
                    background_resolution_mode=config.data.background_resolution_mode)
+    if foreground_refinement == "adaptive":
+        options.update(foreground_refinement="adaptive", foreground_max_resolution=target)
     prepared = prepare_colmap(dataset, split=_colmap_split(config.data.cameras), images_dir=config.data.images,
         point_cloud=config.data.point_cloud, initialization=config.data.initialization,
         start_core_resolution=start, target_core_resolution=target,
@@ -415,6 +420,9 @@ def restore_model(checkpoint, mi):
     if mapping == "world_shell":
         require_world_shell_native(mi.VoxelReconstruction)
         mode = metadata.get("background_resolution_mode")
+        if (metadata.get("foreground_refinement") == "adaptive"
+                and getattr(mi.VoxelReconstruction, "world_shell_version", 0) < 8):
+            raise RuntimeError("Rebuild this checkout: adaptive foreground requires native world_shell_version 8")
         required = 7 if mode == "core" else 6
         if (mode in ("core_parent", "core")
                 and getattr(mi.VoxelReconstruction, "world_shell_version", 0) < required):
@@ -440,6 +448,9 @@ def restore_model(checkpoint, mi):
             model.background_resolution_mode = metadata.get("background_resolution_mode", "per_shell")
             model.background_max_resolution = int(metadata.get("background_max_resolution",
                 1024 if model.background_resolution_mode == "core" else 512))
+            if metadata.get("foreground_refinement") == "adaptive":
+                model.foreground_refinement = "adaptive"
+                model.foreground_max_resolution = int(metadata["foreground_max_resolution"])
     return model
 
 

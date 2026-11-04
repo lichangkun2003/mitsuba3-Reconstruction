@@ -109,6 +109,7 @@ class NativeLossReplay:
             int(getattr(model, "growth_candidate_count", 0)),
             int(model.sh_count), int(getattr(model, "active_sh_count", model.sh_count)),
             int(model.opacity_sh_count),
+            int(getattr(model, "active_opacity_sh_count", model.opacity_sh_count)),
             tuple(float(x) for x in model.grid_min),
             tuple(float(x) for x in model.grid_max),
             tuple(float(x) for x in model.voxel_size),
