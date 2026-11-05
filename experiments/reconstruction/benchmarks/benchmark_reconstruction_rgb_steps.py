@@ -117,7 +117,8 @@ def execute_round(state, views, references, config, round_index, mi, dr, np, *, 
         # the next native call allocates its output buffers.
         del gradients, result
     validation_started = time.perf_counter()
-    measurements = checks.read(rgb_only=True, distortion_weight=config.gradient.distortion_loss_weight)
+    measurements = checks.read(rgb_only=True, distortion_weight=config.gradient.distortion_loss_weight,
+                               dssim_weight=config.gradient.dssim_loss_weight)
     validation_seconds = time.perf_counter() - validation_started
     sync_started = time.perf_counter()
     dr.sync_thread()

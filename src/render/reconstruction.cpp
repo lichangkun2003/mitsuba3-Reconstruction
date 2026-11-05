@@ -15,6 +15,22 @@ NAMESPACE_BEGIN(mitsuba)
 
 namespace {
 
+/// Encode a completed linear pixel for image supervision. The extension below
+/// zero and above one intentionally avoids clipping away corrective gradients.
+/// Keep the inactive power branch finite at zero and for negative estimators.
+template <typename Color>
+Color reconstruction_linear_to_srgb(const Color &linear) {
+    return dr::select(linear <= .0031308f, 12.92f * linear,
+        1.055f * dr::pow(dr::maximum(linear, .0031308f), 1.f / 2.4f) - .055f);
+}
+
+template <typename Color>
+Color reconstruction_srgb_derivative(const Color &linear, const Color &encoded) {
+    // Reuse the encoded power instead of evaluating a second fractional power.
+    return dr::select(linear <= .0031308f, Color(12.92f),
+        (encoded + .055f) / (2.4f * dr::maximum(linear, .0031308f)));
+}
+
 /// Keep v5/v6 addresses canonical through depth 17. Only shell 9 can reach
 /// depth 18 on the native world grid. Its v7 addresses use the otherwise
 /// unused top nibble 0xf, a 6-bit local root and 54 Morton bits; the sentinel
@@ -1753,7 +1769,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         {"transmittance_threshold", .01f}, {"max_hits", 16.f},
         {"max_candidates", 16.f}, {"entry_offset_fraction", 0.f},
         {"profile_stages", 0.f}, {"profile_traversal", 0.f},
-        {"use_octree", 1.f}, {"rgb_only", 0.f},
+        {"use_octree", 1.f}, {"rgb_only", 0.f}, {"rgb_loss_srgb", 0.f},
         {"collect_rgb_deletion_evidence", 0.f},
         {"collect_adaptive_priority", 0.f},
         {"collect_growth_evidence", 0.f}, {"max_growth_hits", 8.f},
@@ -1766,6 +1782,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         cfg[key] = value;
     }
     const bool rgb_only = cfg["rgb_only"] != 0.f;
+    const bool rgb_loss_srgb = cfg["rgb_loss_srgb"] != 0.f;
+    if (cfg["rgb_loss_srgb"] != 0.f && cfg["rgb_loss_srgb"] != 1.f)
+        Throw("VoxelReconstruction.loss_and_grad(): rgb_loss_srgb must be 0 or 1.");
+    if (rgb_loss_srgb && !rgb_only)
+        Throw("VoxelReconstruction.loss_and_grad(): sRGB image loss requires RGB-only mode.");
     // This is a storage/recomputation policy, not a different estimator. Keep
     // the legacy alpha path unchanged; its suffix alpha proxy is still live.
     const bool compact_path_records = rgb_only && cfg["compact_path_records"] != 0.f;
@@ -1861,7 +1882,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         result.alpha = result.raw_alpha;
         Color3f target = rgb_only ? reference_rgb :
             reference_rgb*reference_alpha + Color3f(1.f)*(1.f-reference_alpha);
-        result.rgb_loss = dr::squared_norm(result.rgb-target);
+        Color3f loss_rgb = rgb_loss_srgb ? reconstruction_linear_to_srgb(result.rgb) : result.rgb;
+        Color3f loss_target = rgb_loss_srgb ? reconstruction_linear_to_srgb(target) : target;
+        result.rgb_loss = dr::squared_norm(loss_rgb-loss_target);
         result.distortion_loss = dr::zeros<Float>(width);
         result.loss = result.rgb_loss;
         if (!rgb_only)
@@ -1894,7 +1917,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 profiler.begin();
             }
             result.dssim_enabled = true;
-            auto image_loss = dssim_image_loss_and_grad(result.rgb, target, image_width, image_height);
+            auto image_loss = dssim_image_loss_and_grad(loss_rgb, loss_target, image_width, image_height);
             // A device guard preserves frozen replay and avoids synchronizing
             // every view just to validate the uniform sampling contract.
             result.dssim_loss = dr::select(dr::all(inverse_pdf == 1.f), image_loss.first,
@@ -2398,7 +2421,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     result.alpha=result.raw_alpha*weight;
     Color3f target=rgb_only ? reference_rgb :
         reference_rgb*reference_alpha+Color3f(1.f)*(1.f-reference_alpha);
-    Color3f delta=result.rgb-target,dcolor=2.f*delta;
+    // Rendering, path prefixes/suffixes and references remain linear. Only the
+    // complete, sampling-weighted image and target enter the selected loss space.
+    Color3f loss_rgb=rgb_loss_srgb ? reconstruction_linear_to_srgb(result.rgb) : result.rgb;
+    Color3f loss_target=rgb_loss_srgb ? reconstruction_linear_to_srgb(target) : target;
+    Color3f delta=loss_rgb-loss_target,dcolor=2.f*delta;
     Float dalpha(0.f),deletion_dalpha(0.f);
     Color3f deletion_dcolor(0.f);
     Mask is_background(false),is_foreground(false);
@@ -2419,7 +2446,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         result.loss += distortion_weight*result.distortion_loss;
     if (dssim_enabled) {
         result.dssim_enabled = true;
-        auto image_loss = dssim_image_loss_and_grad(result.rgb, target, image_width, image_height);
+        auto image_loss = dssim_image_loss_and_grad(loss_rgb, loss_target, image_width, image_height);
         Mask uniform = dr::all(inverse_pdf == 1.f);
         result.dssim_loss = dr::select(uniform, image_loss.first,
                                        std::numeric_limits<float>::quiet_NaN());
@@ -2433,6 +2460,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             profiler.begin();
         }
     }
+    // The native backward is explicit, so apply the transfer Jacobian once to
+    // the combined L2 + D-SSIM image adjoint before all appearance/geometry uses.
+    // Distortion and alpha supervision retain their independent derivatives.
+    if (rgb_loss_srgb)
+        dcolor *= reconstruction_srgb_derivative(result.rgb, loss_rgb);
     if (growth_requested) {
         result.growth_sums["growth_gain"] = dr::zeros<FloatBuffer>(m_growth_count);
         result.growth_counts["growth_observed"] = dr::zeros<UIntBuffer>(m_growth_count);
@@ -2491,7 +2523,16 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     radiance = dr::maximum(clean(radiance),0.f);
                     Float opacity = dr::rcp(1.f+dr::exp(-logit));
                     Color3f change = opacity*(before*radiance-(result.raw_rgb-prefix));
-                    Float gain = -2.f*dr::dot(result.raw_rgb-reference_rgb,change)-dr::squared_norm(change);
+                    Color3f gain_change = change, gain_residual = result.raw_rgb-reference_rgb;
+                    if (rgb_loss_srgb) {
+                        // Only weight==1 baselines can be known evidence. The
+                        // nonlinear transfer requires the full counterfactual,
+                        // not its first-order Jacobian. Expand in encoded space
+                        // to retain small gains without subtracting two losses.
+                        gain_change = reconstruction_linear_to_srgb(result.raw_rgb+change)-loss_rgb;
+                        gain_residual = delta;
+                    }
+                    Float gain = -2.f*dr::dot(gain_residual,gain_change)-dr::squared_norm(gain_change);
                     Mask known = hit & complete & dr::isfinite(gain) &
                         (state.transmittance*(1.f-opacity)>cfg["transmittance_threshold"]);
                     dr::scatter_reduce(ReduceOp::Add,gains,dr::detach(gain),id,known);
@@ -2659,7 +2700,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                             (weight==1.f) & dr::isfinite(inverse_pdf) &
                             dr::all(dr::isfinite(result.raw_rgb)) &
                             dr::all(dr::isfinite(reference_rgb));
-        deletion_residual = result.raw_rgb-reference_rgb;
+        deletion_residual = rgb_loss_srgb ? delta : result.raw_rgb-reference_rgb;
     }
     struct ReverseState {
         Int32 hit;
@@ -2685,6 +2726,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
          ray_count,hit_stride,lane,clean,dcolor,dalpha,d,weight,is_background,
          is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry,rgb_only,
          collect_rgb_deletion,collect_adaptive_priority,deletion_complete,deletion_residual,distortion_enabled,
+         rgb_loss_srgb,deletion_rgb=result.raw_rgb,deletion_encoded_rgb=loss_rgb,
          distortion_weight,diagonal,quaternion,rotate,world_shell,
          total_mass=state.distortion_mass,total_moment=state.distortion_moment,
          gradient_row,gradient_rows,appearance,compact_path_records,hit_before_field,
@@ -2832,7 +2874,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 // Use the existing reverse suffix directly, including when
                 // alpha approaches one; never divide by (1-alpha).
                 Color3f dc = before*opacity*(s.behind-radiance);
-                Float gain = -2.f*dr::dot(deletion_residual,dc)-dr::squared_norm(dc);
+                Color3f gain_change = rgb_loss_srgb ?
+                    reconstruction_linear_to_srgb(deletion_rgb+dc)-deletion_encoded_rgb : dc;
+                Float gain = -2.f*dr::dot(deletion_residual,gain_change)-dr::squared_norm(gain_change);
                 // Projective background hits use the same complete-ray RGB
                 // removal test as core hits. Truncated suffixes remain unknown.
                 Mask eligible=valid;

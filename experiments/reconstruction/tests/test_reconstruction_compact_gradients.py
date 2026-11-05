@@ -183,6 +183,47 @@ class CompactGradientTests(unittest.TestCase):
             model.loss_and_grad(*arguments, options | {"compact_gradient_capacity": count}), count)
         self.assertGreater(int(actual["voxel_count"][0]), 1)
 
+    def test_radiance16_opacity9_dc_and_all_dense_compact_Adam_match(self):
+        payload, inputs = bounded_fixture()
+        state, metadata = payload["model_state"], payload["model_metadata"]
+        count = len(state["cell_indices"])
+        rng = np.random.default_rng(851)
+        radiance = rng.normal(0., .03, (count, 16, 3)).astype(np.float32)
+        radiance[:, :metadata["sh_count"], :] = state["radiance_sh"].reshape(count, -1, 3)
+        opacity = rng.normal(0., .02, (count, 9)).astype(np.float32)
+        opacity[:, 0] = state["opacity_sh"].reshape(count, -1)[:, 0]
+        state.update(radiance_sh=radiance.ravel(), opacity_sh=opacity.ravel())
+        metadata.update(sh_count=16, opacity_sh_count=9)
+        models = [restore_model(copy.deepcopy(payload), mi) for _ in range(2)]
+        optimizers = [FalcorOptimizer(model, OptimizerConfig(), sparse_updates=True,
+            replay_updates=True, radiance_degree_steps=True, opacity_degree_steps=True) for model in models]
+        replay = NativeLossReplay(dr)
+        options = dict(rgb_only=1., distortion_loss_weight=.1, max_hits=8., max_candidates=8.,
+                       dssim_loss_weight=.2, image_width=16., image_height=16.)
+        for iteration, (radiance_count, opacity_count) in enumerate(((1, 1), (1, 1), (16, 9), (16, 9))):
+            with self.subTest(iteration=iteration, radiance=radiance_count, opacity=opacity_count):
+                for model in models:
+                    model.set_active_sh_count(radiance_count)
+                    model.set_active_opacity_sh_count(opacity_count)
+                arguments = (*inputs(.03 * iteration), options)
+                dense = models[0].loss_and_grad(*arguments)
+                compact = native_gradient_result(models[1], arguments, replay, count, np)
+                compact_host = self.compare(dense, compact, count)
+                self.assertGreater(int(compact_host["voxel_count"][0]), 1)
+                for name, stored, channels, active in (("radiance_sh", 16, 3, radiance_count),
+                                                        ("opacity_sh", 9, 1, opacity_count)):
+                    gradient = compact_host["gradients"][name].reshape(-1, stored, channels)
+                    np.testing.assert_array_equal(gradient[:, active:], 0.)
+                    if iteration >= 2:
+                        self.assertTrue(np.any(gradient[:, 9 if name == "radiance_sh" else 1:] != 0.))
+                for model, optimizer, out in zip(models, optimizers, (dense, compact)):
+                    updated = optimizer.step(model, out, sample_count=1, epoch=1300 + iteration,
+                                             update_allowed=mi.Bool(True))
+                    self.assertTrue(bool(np.array(updated["accepted"])[0]))
+                optimizer_tests.assert_equal(self, *(optimizer_tests.capture(model, optimizer)
+                    for model, optimizer in zip(models, optimizers)))
+        self.assertGreaterEqual(replay.statistics()["replays"], 2)
+
     def test_frozen_replay_handles_changing_touched_rows_without_sync_or_compress(self):
         payload, inputs = bounded_fixture()
         model = restore_model(payload, mi)

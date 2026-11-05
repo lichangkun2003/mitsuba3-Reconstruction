@@ -18,8 +18,8 @@ def validate_sh_schedule(config):
             or weights[0] == 0 or weights[2] == 0):
         raise ValueError("training.sh_degree_weights must contain three integers: "
                          "positive first/last weights and a nonnegative middle weight")
-    if training.sh_degree_progression and config.model.sh_count > 9:
-        raise ValueError("Progressive radiance SH supports at most 9 stored coefficients (degree 2)")
+    if training.sh_degree_progression and not 1 <= config.model.sh_count <= 16:
+        raise ValueError("Progressive radiance SH supports 1 through 16 stored coefficients (up to degree 3)")
 
 
 def active_sh_count_for_epoch(config, completed_epochs, sh_count=None):
@@ -31,9 +31,10 @@ def active_sh_count_for_epoch(config, completed_epochs, sh_count=None):
     total = config.training.num_epochs
     first = total * weights[0] // sum(weights)
     second = total * (weights[0] + weights[1]) // sum(weights)
-    # A zero middle weight skips the degree-1-only stage: both higher
-    # bands become active at the same global epoch, for core and background.
-    count = 1 if completed_epochs < first else 4 if completed_epochs < second else 9
+    # Three time windows do not limit storage to three SH bands. The last
+    # window enables every stored radiance coefficient, including degree 3.
+    # A zero middle weight enables all higher bands at the same global epoch.
+    count = 1 if completed_epochs < first else 4 if completed_epochs < second else stored
     return min(stored, count)
 
 
@@ -55,7 +56,8 @@ def sh_schedule_protocol(config):
                 weights=list(weights), progress="total completed training epochs",
                 transition_completed_epochs=[total * weights[0] // sum(weights),
                     total * (weights[0] + weights[1]) // sum(weights)],
-                active_coefficient_counts=[min(config.model.sh_count, count) for count in (1, 4, 9)],
+                active_coefficient_counts=[min(config.model.sh_count, count)
+                                           for count in (1, 4, config.model.sh_count)],
                 stored_coefficients=config.model.sh_count,
                 opacity_enabled=getattr(config.training, "opacity_sh_degree_progression", False),
                 opacity_stored_coefficients=getattr(config.model, "opacity_sh_count", 1),

@@ -176,7 +176,8 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
                              distortion=True, dssim=False, lifecycle_epoch_bytes=4,
                              rgb_only=True, known_index_bytes=0,
                              allocator_policy="cuda_2m", reference_image_pixels=None,
-                             radiance_degree_steps=False, opacity_degree_steps=False, path_record_layout_version=0):
+                             radiance_degree_steps=False, opacity_degree_steps=False, path_record_layout_version=0,
+                             compact_path_records=True, srgb_loss=False):
     """Return named logical/allocated bytes for one view, excluding its cache.
 
     ``compact_capacity=0`` is the original N-row gradient layout. A positive
@@ -210,13 +211,13 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         raise ValueError("Reference image pixels must fit UInt32")
     if isinstance(lifecycle_epoch_bytes, bool) or lifecycle_epoch_bytes not in (4, 8):
         raise ValueError("lifecycle_epoch_bytes must be 4 or 8")
-    if not all(isinstance(value, bool) for value in (distortion, dssim, rgb_only, radiance_degree_steps, opacity_degree_steps)):
-        raise ValueError("distortion, dssim, rgb_only and radiance_degree_steps must be booleans")
+    if not all(isinstance(value, bool) for value in (distortion, dssim, rgb_only, radiance_degree_steps, opacity_degree_steps, compact_path_records, srgb_loss)):
+        raise ValueError("distortion, dssim, rgb_only, SH clock, path record and srgb_loss flags must be booleans")
     round_cuda_allocation(0, allocator_policy)
 
     n = active_voxels
     compact = compact_capacity > 0
-    compact_records = rgb_only and path_record_layout_version >= 1
+    compact_records = rgb_only and path_record_layout_version >= 1 and compact_path_records
     k = min(n, compact_capacity) if compact else n
     gradient_width = 3 * sh_count + opacity_sh_count + 9
     # Model rotations are quaternions (four floats), while gradients/moments
@@ -263,6 +264,11 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         # No statistics are cached per camera. This is a conservative
         # single-view workspace allowance, not another hit record.
         buffers["dssim_image_workspace"] = [(reference_image_pixels * 4, 48)]
+    if srgb_loss:
+        # Encoded prediction/reference, transfer derivative, and chained RGB
+        # adjoint. JIT fusion can eliminate some planes; reserve them once per
+        # ray batch, never per voxel/hit or cached reference image.
+        buffers["srgb_loss_workspace"] = [(ray_count * 4, 12)]
     if n:
         # Layout v1 replays RGB/opacity from the unchanged model: four hit
         # fields disappear and RGB reverse suffix needs only three floats.
@@ -492,7 +498,8 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
                          device_reserve_mib=1024, known_index_bytes=0,
                          pressure_cache_cap_mib=256, cache_quantum_mib=128,
                          allocator_policy="cuda_2m", reference_image_pixels=None,
-                         radiance_degree_steps=False, opacity_degree_steps=False, path_record_layout_version=0):
+                         radiance_degree_steps=False, opacity_degree_steps=False, path_record_layout_version=0,
+                         compact_path_records=True, srgb_loss=False):
     """Recommend a reference-cache cap without changing training algorithms.
 
     ``gpu`` is the runtime report containing ``memory_mib`` (number or numeric
@@ -522,13 +529,14 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
     estimate = estimate_training_memory(
         active_voxels=active_voxels, sh_count=sh_count, opacity_sh_count=opacity_sh_count,
         compact_capacity=compact_capacity, ray_count=ray_count, max_hits=max_hits,
-        max_candidates=max_candidates, distortion=distortion, dssim=dssim,
+        max_candidates=max_candidates, distortion=distortion, dssim=dssim, srgb_loss=srgb_loss,
         lifecycle_epoch_bytes=lifecycle_epoch_bytes, rgb_only=rgb_only,
         known_index_bytes=known_index_bytes, allocator_policy=allocator_policy,
         reference_image_pixels=reference_image_pixels,
         radiance_degree_steps=radiance_degree_steps,
         opacity_degree_steps=opacity_degree_steps,
-        path_record_layout_version=path_record_layout_version)
+        path_record_layout_version=path_record_layout_version,
+        compact_path_records=compact_path_records)
     image_pixels = estimate["reference_image_pixels"]
     image_bytes = image_pixels * (3 if rgb_only else 4) * 4
     image_allocated_bytes = round_cuda_allocation(image_pixels * 4, allocator_policy) * (3 if rgb_only else 4)

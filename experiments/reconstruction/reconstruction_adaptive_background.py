@@ -315,6 +315,51 @@ def _balanced_parent_pool(pool, rows, cells, maximum, background_maximum, np, *,
     return pool[np.r_[reserved, rest]]
 
 
+def _ranked_prefix(scores, cells, maximum, np):
+    """Exact stable lexsort prefix without sorting the unselected population.
+
+    Partition the score first, then the address at the boundary. Equal score
+    and address pairs retain their original order, just like ``np.lexsort``.
+    """
+    maximum = min(max(0, int(maximum)), len(scores))
+    if not maximum:
+        return np.empty(0, np.int64)
+    if 2*maximum >= len(scores):
+        return np.lexsort((cells, -scores))[:maximum]
+    cutoff = np.partition(scores, len(scores)-maximum)[len(scores)-maximum]
+    better = np.flatnonzero(scores > cutoff)
+    tied = np.flatnonzero(scores == cutoff)
+    remaining = maximum-len(better)
+    if remaining < len(tied):
+        keys = cells[tied]
+        boundary = np.partition(keys, remaining-1)[remaining-1]
+        smaller = tied[keys < boundary]
+        tied = np.r_[smaller, tied[keys == boundary][:remaining-len(smaller)]]
+    selected = np.r_[better, tied]
+    # The partition subsets are not necessarily in source order. Explicitly
+    # include it as the least significant key for stable duplicate ties.
+    return selected[np.lexsort((selected, cells[selected], -scores[selected]))]
+
+
+def _ranked_parent_pool(candidates, rows, cells, scores, maximum, background_maximum, np,
+                        *, unified):
+    if not unified:
+        return candidates[_ranked_prefix(scores, cells[rows[candidates]], maximum, np)]
+    # A pool of K can never use more than K foreground or K background rows.
+    # Keep those prefixes separately so that reserving foreground capacity has
+    # exactly the same result even when background scores dominate globally.
+    candidate_cells = cells[rows[candidates]]
+    background = candidate_cells >= ADAPTIVE_TAG
+    pieces = []
+    for mask, limit in ((~background, maximum),
+                        (background, maximum if background_maximum is None else min(maximum, background_maximum))):
+        positions = np.flatnonzero(mask)
+        pieces.append(positions[_ranked_prefix(scores[positions], candidate_cells[positions], limit, np)])
+    selected = np.concatenate(pieces)
+    order = np.lexsort((selected, candidate_cells[selected], -scores[selected]))
+    return _balanced_parent_pool(candidates[selected[order]], rows, cells, maximum, background_maximum, np)
+
+
 def select_adaptive_background(checkpoint, cameras, signals, np, *, pixel_threshold=8.,
                                 max_new_leaves=100000, max_depth=8, projection_cache=None, projector=None,
                                 max_background_new_leaves=None):
@@ -344,12 +389,10 @@ def select_adaptive_background(checkpoint, cameras, signals, np, *, pixel_thresh
     candidates = np.flatnonzero(valid)
     # Optimization evidence and camera undersampling jointly rank parents.
     score = projection[candidates] * np.sqrt(values[rows[candidates]])
-    order = np.lexsort((cells[rows[candidates]], -score))
-    ordered = candidates[order]
     background_parents = (None if max_background_new_leaves is None else max(0, max_background_new_leaves)//7)
-    pool = (_balanced_parent_pool(ordered, rows, cells, 4*(max_new_leaves//7),
-                                  None if background_parents is None else 4*background_parents, np)
-            if unified else ordered[:4*(max_new_leaves//7)])
+    pool = _ranked_parent_pool(candidates, rows, cells, score, 4*(max_new_leaves//7),
+                              None if background_parents is None else 4*background_parents, np,
+                              unified=unified)
     if all(name in state for name in ("centers", "log_scales", "rotations")) and len(pool):
         subset = {name: np.asarray(state[name]).reshape(len(cells), width)[rows[pool]].ravel()
                   for name, width in (("cell_indices",1),("centers",3),("log_scales",3),("rotations",4))}
@@ -385,9 +428,83 @@ def adaptive_child_coverage_counts(state, metadata, np):
     result = np.zeros(len(cells),np.uint8)
     for octant in range(8):
         lower = .5*np.array([(octant>>axis)&1 for axis in range(3)])-centers
-        value, _ = _closest_box(metric,lower,lower+.5,np,inverse)
-        result += value <= 1.+1e-9
+        upper = lower+.5
+        # This is the first feasible point used by _closest_box itself. If it
+        # already intersects, searching the remaining faces/edges cannot change
+        # the contact decision. Broad initial ellipsoids often pass all eight
+        # children here; thin rotated ellipsoids still use the exact solver.
+        point = np.clip(np.zeros_like(lower), lower, upper)
+        contact = np.einsum("ni,nij,nj->n", point, metric, point) <= 1.+1e-9
+        unresolved = np.flatnonzero(~contact)
+        if len(unresolved):
+            value, _ = _closest_box(metric[unresolved], lower[unresolved], upper[unresolved], np,
+                                   inverse[unresolved])
+            contact[unresolved] = value <= 1.+1e-9
+        result += contact
     return result
+
+
+def _refinement_rows_device(cells, priority, metadata, max_depth, background_budget, dr):
+    """Discard unobserved/finest leaves before copying candidate rows to CPU.
+
+    Address validation remains global: an invalid or negative-priority row must
+    not silently disappear just because it would otherwise be ineligible.
+    """
+    U, C, I = dr.cuda.UInt32, dr.cuda.UInt64, dr.cuda.Int32
+    cells = C(cells)
+    count = len(cells)
+    if len(priority) != count:
+        raise ValueError("Adaptive priorities must contain one finite nonnegative scalar per active row")
+    if not count:
+        return dr.empty(U, 0)
+    background = cells >= ADAPTIVE_TAG
+    unified = metadata.get("foreground_refinement") == "adaptive"
+    region = dr.full(dr.cuda.Bool, True, count) if unified else background
+
+    extended = (cells & ADAPTIVE_EXTENDED_TAG) != 0
+    deepest = (cells >> 60) == 15
+    coarse = dr.select(extended, (cells >> ADAPTIVE_PATH_BITS) & 1023,
+                       (cells & (ADAPTIVE_TAG-1)) >> 32)
+    coarse = dr.select(deepest, 504+((cells >> 54) & 63), coarse)
+    path = cells & dr.select(extended, C((1 << ADAPTIVE_PATH_BITS)-1), C(2**32-1))
+    path = dr.select(deepest, C(1 << 54) | (cells & ((1 << 54)-1)), path)
+    # An adaptive address contains exactly one sentinel bit above its Morton
+    # payload; integer leading-zero count avoids scanning all 19 possible depths.
+    highest = I(63)-I(dr.lzcnt(path))
+    depth = dr.maximum(highest, 0)//3
+    valid = ((path != 0) & (highest == 3*depth) & (coarse < 56*metadata["background_shell_levels"])
+             & (extended == (depth > ADAPTIVE_LEGACY_MAX_DEPTH)) & (deepest == (depth == 18)))
+    shell = I(coarse//56)
+    limit = I(adaptive_depth_limit(metadata, shell))
+    if metadata.get("background_resolution_mode", "per_shell") == "per_shell":
+        limit = dr.minimum(limit, max_depth)
+
+    if unified:
+        core_path = cells & ((1 << 31)-1)
+        core_highest = I(63)-I(dr.lzcnt(core_path))
+        core_depth = dr.maximum(core_highest, 0)//3
+        tagged = (cells & CORE_ADAPTIVE_TAG) != 0
+        valid_core = dr.select(tagged,
+            ((cells & C(~((1 << 31)-1) & ((1 << 64)-1))) == CORE_ADAPTIVE_TAG)
+            & (core_path != 0) & (core_highest == 3*core_depth) & (core_depth >= 1),
+            cells < metadata["resolution"]**3)
+        core_depth = dr.select(tagged, core_depth, int(metadata["resolution"]).bit_length()-1)
+        valid = dr.select(background, valid, valid_core)
+        depth = dr.select(background, depth, core_depth)
+        limit = dr.select(background, limit,
+                          int(metadata.get("foreground_max_resolution", 1024)).bit_length()-1)
+    invalid_address = dr.any(region & ~valid)
+    invalid_priority = dr.any(region & (~dr.isfinite(priority) | (priority < 0)))
+    eligible = region & valid & (priority > 0) & (depth < limit)
+    if background_budget is not None and background_budget < 7:
+        eligible &= ~background
+    rows = dr.compress(eligible)
+    dr.eval(rows, invalid_address, invalid_priority)
+    if bool(invalid_address):
+        raise ValueError("Invalid adaptive cell address")
+    if bool(invalid_priority):
+        raise ValueError("Adaptive priorities must contain one finite nonnegative scalar per active row")
+    return rows
 
 
 def select_adaptive_background_device(checkpoint, cameras, signals, dr, *, pixel_threshold=8.,
@@ -397,32 +514,42 @@ def select_adaptive_background_device(checkpoint, cameras, signals, dr, *, pixel
     from reconstruction_adaptive_projection_gpu import make_adaptive_projector
     projector = make_adaptive_projector(dr,np)
     U, C, F = dr.cuda.UInt32, dr.cuda.UInt64, dr.cuda.Float32
+    metadata = checkpoint["model_metadata"]
+    if metadata.get("background_refinement") != "adaptive":
+        raise ValueError("Adaptive selection requires adaptive model metadata")
+    if max_new_leaves < 0 or not 0 <= max_depth <= ADAPTIVE_MAX_DEPTH or pixel_threshold <= 0:
+        raise ValueError("Invalid adaptive refinement budget")
     cells = checkpoint["model_state"]["cell_indices"]
-    rows = (dr.arange(U, len(cells)) if checkpoint["model_metadata"].get("foreground_refinement") == "adaptive"
-            else dr.compress(C(cells) >= ADAPTIVE_TAG))
-    selected_cells = dr.gather(C, C(cells), rows)
+    if max_new_leaves < 7 or not len(cells):
+        return dr.empty(U, 0)
     source = signals.get("adaptive_priority", dr.zeros(F, len(cells))) if isinstance(signals, dict) else signals
     # Native loss statistics use mi.Float (cuda.ad.Float), while selection is
     # detached topology work. Gather requires its source to match the dtype.
-    priority = dr.gather(F, F(source), rows)
+    source = F(source)
+    rows = _refinement_rows_device(cells, source, metadata, max_depth, max_background_new_leaves, dr)
+    selected_cells = dr.gather(C, C(cells), rows)
+    priority = dr.gather(F, source, rows)
     dr.eval(rows, selected_cells, priority)
     # Transfer addresses and one accumulated scalar only, never the full SH or geometry.
+    host_cells, host_priority = np.asarray(selected_cells), np.asarray(priority)
     light = dict(model_metadata=checkpoint["model_metadata"],
-                 model_state={"cell_indices": np.asarray(selected_cells)})
-    prune_projection_cache(projection_cache,light["model_state"]["cell_indices"],np)
-    pool = select_adaptive_background(light, cameras, np.asarray(priority), np,
+                 model_state={"cell_indices": host_cells})
+    # Cache only currently eligible addresses. Losing an unobserved entry can
+    # require a later recomputation, but never changes the projection result.
+    prune_projection_cache(projection_cache, host_cells, np)
+    pool = select_adaptive_background(light, cameras, host_priority, np,
         pixel_threshold=pixel_threshold, max_new_leaves=4*max_new_leaves, max_depth=max_depth,
         projection_cache=projection_cache,projector=projector,
         max_background_new_leaves=None if max_background_new_leaves is None else 4*max_background_new_leaves)
     parent_rows = dr.gather(U, rows, U(pool))
-    geometry = {"cell_indices": np.asarray(selected_cells)[pool]}
+    geometry = {"cell_indices": host_cells[pool]}
     from reconstruction_topology_gpu import take_rows
-    for name,width in (("centers",3),("log_scales",3),("rotations",4)):
-        values = take_rows(checkpoint["model_state"][name],parent_rows,width)
-        dr.eval(values)
-        geometry[name] = np.asarray(values)
+    gathered = {name:take_rows(checkpoint["model_state"][name],parent_rows,width)
+                for name,width in (("centers",3),("log_scales",3),("rotations",4))}
+    dr.eval(*gathered.values())
+    geometry.update({name:np.asarray(values) for name,values in gathered.items()})
     chosen = select_adaptive_background(dict(model_metadata=checkpoint["model_metadata"],model_state=geometry),
-        cameras,np.asarray(priority)[pool],np,pixel_threshold=pixel_threshold,
+        cameras,host_priority[pool],np,pixel_threshold=pixel_threshold,
         max_new_leaves=max_new_leaves,max_depth=max_depth,projection_cache=projection_cache,projector=projector,
         max_background_new_leaves=max_background_new_leaves)
     return dr.gather(U,parent_rows,U(chosen))

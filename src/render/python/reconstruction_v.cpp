@@ -258,7 +258,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
             result["dcolor"] = values.second;
             return result;
         }, "rgb"_a, "reference"_a, "width"_a, "height"_a,
-           "Per-pixel linear-RGB 1-SSIM and derivative of its pixel sum; "
+           "Per-pixel RGB 1-SSIM and derivative of its pixel sum in the supplied color space; "
            "11x11 sigma-1.5 Gaussian, zero padding, no ray traversal.")
         .def("loss_and_grad", [](const Model &model, const Ray3f &ray,
                  const Color3f &reference_rgb, const Float &reference_alpha,
@@ -336,6 +336,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("cell_index_bits") = nb::int_(Model::cell_index_bits);
     cls.attr("distortion_version") = nb::int_(Model::distortion_version);
     cls.attr("dssim_version") = nb::int_(Model::dssim_version);
+    cls.attr("rgb_loss_srgb_version") = nb::int_(Model::rgb_loss_srgb_version);
     cls.attr("sh_schedule_version") = nb::int_(Model::sh_schedule_version);
     cls.attr("octree_version") = nb::int_(Model::octree_version);
     cls.attr("optimizer_device_version") = nb::int_(Model::optimizer_device_version);

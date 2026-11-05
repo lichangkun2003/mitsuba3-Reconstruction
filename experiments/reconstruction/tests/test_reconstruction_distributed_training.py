@@ -92,8 +92,12 @@ class HostPipeCollective:
         self.batches += 1
         return result, loss, finite
 
-    def broadcast_arrays(self, fields, *, root, uint_keys=()):
+    def broadcast_arrays(self, fields, *, root, uint_keys=(), cell_keys=()):
         assert 0 <= root < self.world_size
+        uint_keys, cell_keys = set(uint_keys), set(cell_keys)
+        assert (uint_keys | cell_keys).issubset(fields)
+        if "cell_indices" in fields:
+            cell_keys.add("cell_indices")
         if not fields:
             return {}
         local = ({name: self.np.asarray(value).copy() for name, value in fields.items()}
@@ -101,7 +105,8 @@ class HostPipeCollective:
         gathered = self.control.gather(local)
         values = self.control.broadcast(gathered[root] if self.rank == 0 else None)
         self.broadcasts += 1
-        return {name: (self.mi.UInt32 if name in uint_keys else self.mi.Float)(value)
+        return {name: (self.mi.UInt64 if name in cell_keys else
+                      self.mi.UInt32 if name in uint_keys else self.mi.Float)(value)
                 for name, value in values.items()}
 
     def statistics(self):

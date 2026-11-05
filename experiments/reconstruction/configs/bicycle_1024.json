@@ -30,7 +30,7 @@
     ],
     "bounds_padding": 1.02,
     "opacity_threshold": 0.05,
-    "sh_count": 9,
+    "sh_count": 16,
     "opacity_sh_count": 9
   },
   "render": {
@@ -62,6 +62,8 @@
     "profile_stages": false,
     "reference_cache_mib": 8192,
     "gpu_reference_cache_mib": 4096,
+    "prefer_dense_gradients": true,
+    "compact_path_records": true,
     "freeze_native": true,
     "sync_view_checks": false,
     "batch_reduction": "auto",
@@ -71,6 +73,7 @@
     "output": null
   },
   "gradient": {
+    "loss_color_space": "srgb",
     "alpha_loss_weight": 0.0,
     "distortion_loss_weight": 0.2,
     "dssim_loss_weight": 0.2,

@@ -17,6 +17,19 @@ from reconstruction_memory import (GIB, MIB, estimate_training_memory,
 
 
 class MemoryBudgetTests(unittest.TestCase):
+    def test_full_records_budget_all_restored_fields_even_with_new_native(self):
+        arguments = self.inputs(path_record_layout_version=1)
+        compact = estimate_training_memory(**arguments)
+        full = estimate_training_memory(**arguments, compact_path_records=False)
+        self.assertTrue(compact["compact_path_records"])
+        self.assertFalse(full["compact_path_records"])
+        pixels, hits, candidates = arguments["ray_count"], arguments["max_hits"], arguments["max_candidates"]
+        self.assertEqual(full["known_logical_bytes"] - compact["known_logical_bytes"],
+                         pixels * hits * 5 * 4 + pixels * candidates * 4)
+        # An old native build always uses full records, regardless of preference.
+        old = estimate_training_memory(**dict(arguments, path_record_layout_version=0))
+        self.assertEqual(old["known_logical_bytes"], full["known_logical_bytes"])
+
     def inputs(self, **overrides):
         values = dict(active_voxels=100, sh_count=9, opacity_sh_count=1,
                       compact_capacity=30, ray_count=20, max_hits=16, max_candidates=16)
@@ -261,6 +274,19 @@ class MemoryBudgetTests(unittest.TestCase):
         self.assertEqual(plan["recommended_reference_cache_mib"], 4096)
         self.assertEqual(plan["reason_code"], "requested_cache_fits")
         self.assertEqual(gpu, before)
+
+    def test_srgb_loss_workspace_scales_with_batch_not_voxels_or_reference_cache(self):
+        baseline = self.plan()
+        enabled = self.plan(srgb_loss=True)
+        workspace = enabled["components_bytes"]["srgb_loss_workspace"]
+        self.assertEqual(enabled["known_logical_bytes"] - baseline["known_logical_bytes"], workspace)
+        for changes in ({"active_voxels": 500}, {"reference_image_count": 1000},
+                        {"reference_image_pixels": 1000000}, {"max_hits": 32}):
+            self.assertEqual(self.plan(srgb_loss=True, **changes)["components_bytes"]["srgb_loss_workspace"], workspace)
+        narrow = estimate_training_memory(**self.inputs(ray_count=7), srgb_loss=True)
+        self.assertEqual(narrow["components_bytes"]["srgb_loss_workspace"], 7 * 4 * 12)
+        with self.assertRaises(ValueError):
+            self.plan(srgb_loss=1)
 
     def test_dataset_size_limits_residency_not_configured_capacity(self):
         plan = self.plan(reference_image_count=2, ray_count=1024, gpu={"memory_mib": 4096})

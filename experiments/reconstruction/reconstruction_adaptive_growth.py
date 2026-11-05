@@ -222,6 +222,33 @@ def _sorted_membership_gpu(ordered,queries,dr):
     return (at<limit)&(dr.gather(C,ordered,dr.minimum(at,limit-1))==queries)
 
 
+def _target_batch_begins_numpy(index, start, end, batch, np):
+    """Keep original parent groups whose neighbor volume meets a target."""
+    _, overlap = _query_numpy(index, start, end, np)
+    return np.unique(np.flatnonzero(overlap) // batch) * batch
+
+
+def _target_batch_begins_gpu(index, start, end, batch, dr):
+    """Read only relevant batch offsets, without regrouping their parents.
+
+    Removing individual parents would move batch boundaries and change which
+    children survive the bounded frontier expansion. Entire unrelated batches
+    produce no requested targets, so skipping only those preserves the exact
+    old enumeration, including its low-budget truncation and support counts.
+    """
+    import numpy as np
+    U = dr.cuda.UInt32
+    _, overlap = _query_gpu(index, start, end, dr)
+    rows = dr.compress(overlap)
+    if not dr.width(rows):
+        return []
+    groups = rows // batch
+    row = dr.arange(U, dr.width(groups))
+    first = (row == 0) | (groups != dr.gather(U, groups, dr.maximum(row, 1)-1))
+    starts = dr.gather(U, groups, dr.compress(first)) * batch
+    return np.asarray(starts).tolist()
+
+
 def filter_nonoverlapping_growth_numpy(cells, metadata, np):
     """Keep finest disjoint proposals; equal cells keep their first input row."""
     cells=np.asarray(cells,dtype=np.uint64)
@@ -335,11 +362,19 @@ def generate_adaptive_growth_numpy(manager, checkpoint, boundary, target_cells=N
     remaining=cap
     pieces=[]
     unified=metadata.get('foreground_refinement') == 'adaptive'
+    target_index = (_index_numpy(np.asarray(target_cells, dtype=np.uint64), metadata, np)
+                    if target_cells is not None else None)
     # Separate core/core enumeration preserves its original unlimited capacity.
     for extra in ((True,) if unified else (False,True)):
         for offset in offsets:
             ids=np.flatnonzero(eligible)
-            for begin in range(0,len(ids),2048):
+            begins = range(0, len(ids), 2048)
+            if target_index is not None:
+                initial = [xyz[a][ids]+offset[a]*np.left_shift(1, logs[ids]) for a in range(3)]
+                _, anchor, leaf_l, _, _ = _canonical(initial, logs[ids], metadata, op)
+                begins = _target_batch_begins_numpy(target_index,
+                    *_interval(anchor, leaf_l, metadata, op), 2048, np)
+            for begin in begins:
                 parents=ids[begin:begin+2048]
                 if not extra:
                     parents=parents[cells[parents]<ADAPTIVE_TAG]
@@ -624,6 +659,7 @@ def generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells=Non
     U,C,I,D,F,B=dr.cuda.UInt32,dr.cuda.UInt64,dr.cuda.Int32,dr.cuda.Float64,dr.cuda.Float32,dr.cuda.Bool
     op=_Ops(dr,True)
     timings=manager.growth_generation_stage_seconds={}
+    work=manager.growth_generation_batch_counts={'available': 0, 'selected': 0, 'processed': 0}
     started=time.perf_counter()
     state,metadata,cfg=checkpoint['model_state'],checkpoint['model_metadata'],manager.settings
     state={k:C(v) if k=='cell_indices' else F(v) for k,v in state.items()}
@@ -676,8 +712,10 @@ def generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells=Non
         blocked=(dr.concat([occupied,C(cooldown_cells)]) if dr.width(occupied) else C(cooldown_cells))
     index=_index_gpu(blocked,metadata,dr)
     selected_targets=dr.sort(C(target_cells)) if target_cells is not None else None
+    target_index = None
     if selected_targets is not None:
         dr.eval(selected_targets)
+        target_index = _index_gpu(selected_targets, metadata, dr)
     timings['mixed_index']=time.perf_counter()-started
     started=time.perf_counter()
     batch=min(max(1,parent_batch_size),2048)
@@ -694,12 +732,22 @@ def generate_adaptive_growth_gpu(manager, checkpoint, boundary, target_cells=Non
             initial_valid&=(dr.gather(C,occupied,parent_ids)>=ADAPTIVE_TAG)|(initial_cells>=ADAPTIVE_TAG)
         initial_start,initial_end=_interval(initial_xyz,initial_l,metadata,op)
         initial_covered,_=_query_gpu(index,initial_start,initial_end,dr)
-        exposed=dr.gather(U,parent_ids,dr.compress(initial_valid&~initial_covered))
+        exposed_rows=dr.compress(initial_valid&~initial_covered)
+        exposed=dr.gather(U,parent_ids,exposed_rows)
         dr.eval(exposed)
+        begins = range(0, dr.width(exposed), batch)
+        work['available'] += len(begins)
+        if target_index is not None:
+            begins = _target_batch_begins_gpu(target_index,
+                dr.gather(C, initial_start, exposed_rows),
+                dr.gather(C, initial_end, exposed_rows), batch, dr)
+        work['selected'] += len(begins)
+        del exposed_rows
         del initial_l,initial_xyz,initial_cells,initial_valid,initial_start,initial_end,initial_covered
-        for begin in range(0,dr.width(exposed),batch):
+        for begin in begins:
             if remaining<=0:
                 break
+            work['processed'] += 1
             parents=dr.gather(U,exposed,dr.arange(U,min(batch,dr.width(exposed)-begin))+dr.opaque(U,begin))
             level=dr.gather(I,logs,parents)
             active=[dr.gather(I,xyz[a],parents)+offset[a]*(I(1)<<I(level)) for a in range(3)]

@@ -52,8 +52,10 @@ public:
     static constexpr uint32_t cell_index_bits = 64;
     /// Point-pair L1 depth distortion with exact fixed-hit continuous gradients.
     static constexpr uint32_t distortion_version = 1;
-    /// Linear-RGB whole-image Gaussian SSIM with an explicit image adjoint.
+    /// Whole-image Gaussian SSIM with an explicit image adjoint.
     static constexpr uint32_t dssim_version = 1;
+    /// Optional sRGB image supervision with linear rendering and topology gains.
+    static constexpr uint32_t rgb_loss_srgb_version = 1;
     /// Progressive radiance SH with dormant coefficients and Adam degree clocks.
     static constexpr uint32_t sh_schedule_version = 2;
     /// GPU occupancy octree, including separately tagged hypothetical leaves.
@@ -205,7 +207,7 @@ public:
 
     /// Per-pixel 1 - mean_RGB(SSIM), and the derivative of its pixel SUM.
     /// Images are complete row-major arrays. The 11-tap sigma-1.5 Gaussian
-    /// uses zero padding and data_range=1, without clipping input linear RGB.
+    /// uses zero padding and data_range=1, without clipping input RGB values.
     /// Negative roundoff variances and SSIM outside [-1, 1] are clipped;
     /// the returned derivative includes these stabilization masks.
     static std::pair<Float, Color3f> dssim_image_loss_and_grad(
@@ -221,6 +223,10 @@ public:
     /// are off. collect_rgb_deletion_evidence explicitly enables RGB-only
     /// single-removal evidence using the existing reverse traversal.
     /// Internal opacity, transmittance, and returned rendered alpha remain active.
+    /// rgb_loss_srgb=1 selects sRGB L2/D-SSIM and RGB topology gains in RGB-only
+    /// mode. Rendered colors and references remain linear; the completed pixel
+    /// is encoded without clipping, and the image adjoint is chained through
+    /// the transfer function. The default 0 preserves linear supervision.
     /// distortion_loss_weight optionally adds pairwise L1 separation of the
     /// recorded hard-hit contributions. Depth is the clipped ellipsoid-metric
     /// closest point, normalized by the fixed grid diagonal for legacy models.
@@ -233,7 +239,7 @@ public:
     /// validity counters in sorted voxel_ids order, with a device voxel_count.
     /// Topology evidence retains full model indexing. Unused capacity is ignored;
     /// an overflow never writes outside the buffers and must not be optimized.
-    /// dssim_loss_weight > 0 adds the whole-image linear-RGB loss above, using
+    /// dssim_loss_weight > 0 adds the whole-image loss in the selected RGB space, using
     /// image_width/image_height and the same forward records. It requires
     /// RGB-only, complete row-major images and unit inverse_pdf. Invalid device
     /// weights produce nonfinite loss/gradients for the caller's finite guard.

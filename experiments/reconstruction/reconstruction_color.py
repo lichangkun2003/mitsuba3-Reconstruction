@@ -2,7 +2,8 @@
 
 The ``srgb`` convention matches the encoded PNG/alpha compositing used by
 NeRF-Synthetic benchmarks, then decodes the composited color for this renderer's
-linear-space optimization. Already-linear sources (for example EXR) retain
+linear renderer. Image losses may encode completed pixels back to sRGB without
+changing these cached targets. Already-linear sources (for example EXR) retain
 linear compositing under either convention.
 """
 

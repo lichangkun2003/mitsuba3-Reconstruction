@@ -1,4 +1,4 @@
-"""CPU regression checks for saved reference compositing and linear training."""
+"""CPU regression checks for independent reference and training-loss protocols."""
 
 from __future__ import annotations
 
@@ -70,8 +70,10 @@ class ReferenceProtocolTests(unittest.TestCase):
         old_data = {"dataset": "datasets/lego"}
         explicit_linear = {**old_data, "reference_compositing": "linear"}
         explicit_srgb = {**old_data, "reference_compositing": "srgb"}
-        self.assertEqual(train.normalized_algorithm_group("data", old_data), explicit_linear)
-        self.assertNotEqual(train.normalized_algorithm_group("data", old_data), explicit_srgb)
+        self.assertEqual(train.normalized_algorithm_group("data", old_data),
+                         train.normalized_algorithm_group("data", explicit_linear))
+        self.assertNotEqual(train.normalized_algorithm_group("data", old_data),
+                            train.normalized_algorithm_group("data", explicit_srgb))
         self.assertEqual(old_data, {"dataset": "datasets/lego"})
 
     def test_invalid_protocols_are_rejected_before_loading_images(self):
@@ -91,11 +93,12 @@ class ReferenceProtocolTests(unittest.TestCase):
     def test_legacy_supervision_never_silently_uses_new_target_semantics(self):
         with patch.object(sys, "argv", ["train.py", "--no-rgb-only"]):
             arguments = train.parse_arguments()
-        config = deepcopy(train.CONFIG)
+        config = train.TrainConfig()
+        config.data.reference_compositing = "srgb"
         train.apply_arguments(config, arguments, {})
         self.assertEqual(config.data.reference_compositing, "linear")
         train.validate(config)
-        config = deepcopy(train.CONFIG)
+        config = train.TrainConfig()
         train.apply_arguments(config, arguments, {"data": {"reference_compositing": "srgb"}})
         with self.assertRaisesRegex(ValueError, "RGB-only"):
             train.validate(config)
@@ -154,6 +157,17 @@ class ReferenceProtocolTests(unittest.TestCase):
             protocol = evaluate.reference_metric_protocol(mode, "checkpoint")
             self.assertEqual(protocol["reference_compositing"], mode)
             self.assertEqual(protocol["training_loss_color_space"], "linear")
+
+    def test_reporting_uses_saved_loss_space_independently_of_reference_mode(self):
+        for mode in ("linear", "srgb"):
+            for loss_space in ("linear", "srgb"):
+                saved = {"gradient": {"loss_color_space": loss_space}}
+                protocol = evaluate.reference_metric_protocol(mode, "checkpoint", saved)
+                self.assertEqual(protocol["reference_compositing"], mode)
+                self.assertEqual(protocol["training_loss_color_space"], loss_space)
+        with self.assertRaisesRegex(ValueError, "training loss color space"):
+            evaluate.reference_metric_protocol("srgb", "checkpoint", {
+                "gradient": {"loss_color_space": "unsupported"}})
 
 
 if __name__ == "__main__":

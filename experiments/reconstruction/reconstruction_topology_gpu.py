@@ -514,8 +514,13 @@ class GPUTopologyLifecycle:
         if not len(ids):
             return None
         from reconstruction_growth_candidates_gpu import generate_growth_gpu
+        revalidation_started = time.perf_counter()
         current = generate_growth_gpu(m, checkpoint, boundary, target_cells=targets,
             eligible=self.eligible(boundary), cooldown_cells=self.forbidden(boundary))
+        detail['geometry_revalidation_seconds'] = time.perf_counter()-revalidation_started
+        if checkpoint['model_metadata'].get('background_refinement') == 'adaptive':
+            detail['geometry_revalidation_stage_seconds'] = dict(m.growth_generation_stage_seconds)
+            detail['geometry_revalidation_batch_counts'] = dict(m.growth_generation_batch_counts)
         # Sorted (cell,parent-cell) keys let us map frozen proposals to current
         # parent row IDs without constructing any Python tuples or host arrays.
         U64 = dr.uint64_array_t(self.UInt)

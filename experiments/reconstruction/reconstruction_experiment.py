@@ -43,7 +43,8 @@ def _allocation_lock(workspace: Path):
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def allocate_training_output(dataset: str, workspace: Path, *, day: date | None = None) -> Path:
+def allocate_training_output(dataset: str, workspace: Path, *, day: date | None = None,
+                             output_root: Path | None = None) -> Path:
     """Reserve outputs/<scene>-MM.DD-E<index>/training across all scenes."""
     # Use the configured directory name, not a dataset symlink's target name.
     scene = Path(dataset.replace("\\", "/")).name
@@ -52,7 +53,7 @@ def allocate_training_output(dataset: str, workspace: Path, *, day: date | None 
         raise ValueError("data.dataset must end in a valid scene directory name")
     stamp = (day if day is not None else datetime.now(EXPERIMENT_TIMEZONE).date()).strftime("%m.%d")
     pattern = re.compile(r".+-" + re.escape(stamp) + r"-E([0-9]+)(?:-[0-9]+min)?")
-    root = (workspace / "outputs").resolve()
+    root = (Path(output_root) if output_root is not None else workspace / "outputs").resolve()
     with _allocation_lock(workspace):
         root.mkdir(parents=True, exist_ok=True)
         indices = [int(match[1]) for path in root.iterdir()

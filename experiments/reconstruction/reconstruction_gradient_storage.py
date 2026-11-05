@@ -24,6 +24,50 @@ def gradient_capacity(model, ray_count, *, enabled=True, requested=0):
     return int(capacity)
 
 
+def gradient_storage_key(model, ray_count, training):
+    """Invalidate a boundary decision when the model or storage options change."""
+    return (int(model.active_voxel_count), int(ray_count), int(model.sh_count), int(model.opacity_sh_count),
+            training.compact_gradients, training.compact_gradient_rows,
+            training.prefer_dense_gradients, training.compact_path_records)
+
+
+def planned_gradient_capacity(model, ray_count, training):
+    """Use the CPU memory plan, without a CUDA memory query per view.
+
+    Unplanned callers retain the bounded legacy behavior. The plan is only a
+    storage choice: dense and compact layouts feed the same sparse Adam rules.
+    """
+    key = gradient_storage_key(model, ray_count, training)
+    plan = getattr(model, "_training_gradient_storage", None)
+    if plan is not None and plan[0] == key:
+        return plan[1]
+    return gradient_capacity(model, ray_count, enabled=training.compact_gradients,
+                             requested=training.compact_gradient_rows)
+
+
+def choose_gradient_storage_plan(compact, dense):
+    """Spend spare memory on direct rows without sacrificing reference residency.
+
+    Keep an additional 20% of the device budget (at least 4 GiB) beyond the
+    ordinary-view workspace/device reserves. Topology allocation guards still
+    apply independently. Unknown budgets always retain the bounded layout.
+    """
+    budget = dense.get("budget_bytes")
+    headroom = max(4 * 1024**3, int(budget * .2)) if budget is not None else None
+    eligible = (dense["supported"] and budget is not None
+                and dense["recommended_reference_cache_mib"] == dense["requested_reference_cache_mib"]
+                and dense["estimated_budget_bytes"] <= budget - headroom)
+    chosen = dict(dense if eligible else compact)
+    chosen["gradient_storage_selection"] = {
+        "mode": "dense" if eligible else "compact",
+        "reason": "spare_memory_avoids_compaction_and_host_count" if eligible else "preserve_memory_headroom",
+        "extra_headroom_bytes": headroom,
+        "dense_estimated_bytes": dense["estimated_budget_bytes"],
+        "compact_estimated_bytes": compact["estimated_budget_bytes"],
+    }
+    return chosen
+
+
 def native_gradient_result(model, arguments, replay, capacity, np=None):
     """Return an exact batch; retry overflows before any persistent update."""
     if not capacity:

@@ -9,7 +9,8 @@ import weakref
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from reconstruction_gradient_storage import gradient_capacity, native_gradient_result
+from reconstruction_gradient_storage import (gradient_capacity, native_gradient_result,
+    planned_gradient_capacity)
 from reconstruction_replay import NativeLossReplay
 
 
@@ -18,6 +19,49 @@ class Result(dict):
 
 
 class GradientStorageTests(unittest.TestCase):
+    def test_auto_dense_plan_and_pressure_fallback_match_view_routing(self):
+        from train import TrainConfig, configure_training_memory
+        config = TrainConfig()
+        config.render.width, config.render.height = 1237, 822
+        config.render.max_hits = 32
+        config.training.rgb_only = True
+        config.training.chunk_size = 0
+        config.training.sh_degree_progression = True
+        config.training.opacity_sh_degree_progression = True
+        config.training.gpu_reference_cache_mib = 4096
+        model = SimpleNamespace(active_voxel_count=8_000_000, sh_count=16,
+            opacity_sh_count=9, compact_gradient_version=1, core_resolution=256,
+            resolution=256, path_record_layout_version=1)
+        cache = SimpleNamespace(capacity_bytes=4096 * 1024**2, resize=lambda capacity: None)
+        pixels = config.render.width * config.render.height
+        report = {"gpu": {"memory_mib": 32607}, "cuda_allocator": {"policy": "cuda_2m"}}
+        # Missing/invalidated plans remain bounded, without a per-view driver query.
+        self.assertEqual(planned_gradient_capacity(model, pixels, config.training), 2*pixels)
+        dense = configure_training_memory(config, model, cache, report, 169, emit=lambda *a, **kw: None)
+        self.assertEqual(dense["gradient_storage_selection"]["mode"], "dense")
+        self.assertEqual(planned_gradient_capacity(model, pixels, config.training), 0)
+        config.training.compact_path_records = False
+        self.assertEqual(planned_gradient_capacity(model, pixels, config.training), 2*pixels)
+        config.training.compact_path_records = True
+        # Do not reuse a plan after a changed model count or explicit options.
+        model.active_voxel_count += 1
+        self.assertEqual(planned_gradient_capacity(model, pixels, config.training), 2*pixels)
+        model.active_voxel_count -= 1
+        config.training.prefer_dense_gradients = False
+        self.assertEqual(planned_gradient_capacity(model, pixels, config.training), 2*pixels)
+        config.training.prefer_dense_gradients = True
+        # 16 GiB cannot provide the additional 4 GiB reserve; retain compaction.
+        report["gpu"]["memory_mib"] = 16384
+        compact = configure_training_memory(config, model, cache, report, 169, emit=lambda *a, **kw: None)
+        self.assertEqual(compact["gradient_storage_selection"]["mode"], "compact")
+        self.assertEqual(planned_gradient_capacity(model, pixels, config.training), 2*pixels)
+        # Explicit row hints are not silently overridden by the automatic choice.
+        report["gpu"]["memory_mib"] = 32607
+        config.training.compact_gradient_rows = 3_000_000
+        forced = configure_training_memory(config, model, cache, report, 169, emit=lambda *a, **kw: None)
+        self.assertEqual(forced["gradient_rows"], 3_000_000)
+        self.assertEqual(planned_gradient_capacity(model, pixels, config.training), 3_000_000)
+
     def test_training_driver_budgets_capacity_growth_before_resizing_cache(self):
         from train import TrainConfig, configure_training_memory
         config = TrainConfig()

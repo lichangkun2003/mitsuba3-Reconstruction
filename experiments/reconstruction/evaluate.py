@@ -85,7 +85,7 @@ def parse_config(workspace):
                         help="Override checkpoint traversal; legacy missing setting defaults to octree")
     parser.add_argument("--metric-color-space", choices=("linear", "srgb"))
     parser.add_argument("--reference-compositing", choices=("linear", "srgb"),
-                        help="Override checkpoint reference preprocessing; training always optimizes linear RGB")
+                        help="Override checkpoint reference preprocessing; independent of its saved training loss space")
     parser.add_argument("--background", nargs=3, type=float, metavar=("R", "G", "B"))
     parser.add_argument("--save-linear", action="store_true", default=None)
     parser.add_argument("--output-dir")
@@ -271,7 +271,11 @@ def checkpoint_data_config(saved):
     return data
 
 
-def reference_metric_protocol(mode, source):
+def reference_metric_protocol(mode, source, checkpoint_config=None):
+    saved_gradient = (checkpoint_config or {}).get("gradient", {})
+    loss_space = saved_gradient.get("loss_color_space", "linear")
+    if loss_space not in ("linear", "srgb"):
+        raise ValueError(f"Unsupported checkpoint training loss color space: {loss_space!r}")
     return {
         "reference_compositing": mode,
         "reference_compositing_source": source,
@@ -280,7 +284,7 @@ def reference_metric_protocol(mode, source):
             "linear sources: composite in linear RGB" if mode == "srgb" else
             "decode source RGB to linear RGB, then alpha composite with the linear background"),
         "reference_alpha_usage": "reference preparation only; no foreground/background labels or metric masks",
-        "training_loss_color_space": "linear",
+        "training_loss_color_space": loss_space,
     }
 
 
@@ -447,7 +451,7 @@ def _run_distributed_evaluation(config, distributed, progress_callback):
             "global_step": checkpoint["training_state"].get("global_step"), "provenance": checkpoint["provenance"]}
         saved = checkpoint["config"]
         reference_compositing, reference_source = resolve_reference_compositing(config, saved)
-        report["metric_protocol"].update(reference_metric_protocol(reference_compositing, reference_source))
+        report["metric_protocol"].update(reference_metric_protocol(reference_compositing, reference_source, saved))
         render = preview.RenderConfig()
         for key, value in saved.get("render", {}).items():
             if key not in {item.name for item in fields(render)}:
@@ -661,7 +665,7 @@ def run_evaluation(config: EvaluationConfig, *, progress_callback=None, distribu
                                  "provenance": checkpoint["provenance"]}
         saved = checkpoint["config"]
         reference_compositing, reference_source = resolve_reference_compositing(config, saved)
-        report["metric_protocol"].update(reference_metric_protocol(reference_compositing, reference_source))
+        report["metric_protocol"].update(reference_metric_protocol(reference_compositing, reference_source, saved))
         render = preview.RenderConfig()
         for key, value in saved.get("render", {}).items():
             if key not in {item.name for item in fields(render)}:

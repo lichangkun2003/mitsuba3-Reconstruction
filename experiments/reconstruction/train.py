@@ -44,7 +44,8 @@ from reconstruction_performance import PerformanceRecorder
 from reconstruction_progress import ProgressLine
 from reconstruction_reference import GPUReferenceCache
 from reconstruction_replay import NativeLossReplay
-from reconstruction_gradient_storage import gradient_capacity, native_gradient_result
+from reconstruction_gradient_storage import (gradient_capacity, native_gradient_result,
+    gradient_storage_key, planned_gradient_capacity, choose_gradient_storage_plan)
 from reconstruction_memory import (TrainingMemoryError, estimate_spatial_index_bytes,
     plan_refinement_memory, plan_training_memory, probe_cuda_allocator, query_cuda_memory,
     round_cuda_allocation)
@@ -71,8 +72,10 @@ class TrainingSettings:
     reference_cache_mib: int = 1024  # Decoded float32 RGBA in host RAM; 0 disables caching.
     gpu_reference_cache_mib: int = 1024  # Float32 reference planes on the GPU; 0 disables.
     freeze_native: bool = True  # Replay native GPU work between topology changes.
-    compact_gradients: bool = True  # Large single-GPU RGB full views use touched-voxel gradient rows.
+    compact_gradients: bool = True  # Allow bounded touched-voxel fallback for single-GPU RGB full views.
     compact_gradient_rows: int = 0  # 0: start with two rows per ray; overflow retries grow safely.
+    prefer_dense_gradients: bool = True  # Use spare memory to avoid compaction/count readback; retain bounded fallback.
+    compact_path_records: bool = True  # Recompute hit appearance in backward; false retains RGB/opacity.
     sync_view_checks: bool = False  # Diagnostic: read loss/validity after every view.
     batch_reduction: str = "auto"  # Multi-GPU RGB batches: exact sparse union, or dense diagnostic transport.
     seed: int = 42
@@ -83,9 +86,10 @@ class TrainingSettings:
 
 @dataclass
 class GradientSettings:
+    loss_color_space: str = "linear"  # Legacy schema default; new experiments use float sRGB image losses.
     alpha_loss_weight: float = .5
     distortion_loss_weight: float = 0.  # Legacy checkpoint/schema default; CONFIG enables it for new experiments.
-    dssim_loss_weight: float = 0.  # Additive linear-image 1-SSIM; zero retains the original native path.
+    dssim_loss_weight: float = 0.  # Additive image-space 1-SSIM; zero skips the SSIM filters.
     geometry_tau_voxel_fraction: float = .12
     geometry_grad_clamp: float = 5
     alpha_geometry_weight: float = .1
@@ -143,7 +147,7 @@ CONFIG.training.sh_degree_weights = (8, 0, 2)  # 前 80% 仅 DC，最后 20% 前
 CONFIG.data.dataset = "datasets/bicycle"
 CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
-CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再解码；渲染与损失仍在线性空间。
+CONFIG.data.reference_compositing = "srgb"  # 参考 PNG 先合成背景，再解码；缓存与渲染保持线性。
 CONFIG.data.scene_mode = "auto"  # 合成场景：有界白色背景；COLMAP：无界远景层、无白色背景尾项。
 CONFIG.data.background_shell_levels = 5  # 每壳从56个粗叶开始，按相机采样和训练证据自适应细分。
 CONFIG.data.background_resolution_mode = "core"  # 自适应外壳最细与当前前景体素边长一致。
@@ -159,6 +163,7 @@ CONFIG.render.max_hits = 128  # 背景同步细分后需要更多射线命中记
 CONFIG.training.rgb_only = True  # 参考 alpha 仅用于读图时合成 RGB，不进入训练或生长投票。
 CONFIG.model.opacity_sh_count = 9  # DC until the fixed-topology tail, then degrees 1 and 2.
 CONFIG.gradient.alpha_loss_weight = 0.
+CONFIG.gradient.loss_color_space = "srgb"  # 完整线性像素编码后计算 L2 / D-SSIM，并回传编码导数。
 CONFIG.gradient.alpha_geometry_weight = 0.
 CONFIG.gradient.background_carve_weight = 0.
 CONFIG.gradient.distortion_loss_weight = 0.1  # 新实验默认开启深度集中正则；--distortion-weight 0 显式关闭。
@@ -242,7 +247,7 @@ def update(config, values):
             apply_saved_background_defaults(group, entries)
 
 
-def parse_arguments():
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config")
     parser.add_argument("--resume", help="Resume a completed-epoch checkpoint")
@@ -251,7 +256,9 @@ def parse_arguments():
     parser.add_argument("--distortion-weight", type=float,
                         help="Nonnegative hard-hit distortion loss weight (CONFIG default: 0.1); 0 explicitly disables it")
     parser.add_argument("--dssim-weight", type=float,
-                        help="Additive linear RGB D-SSIM weight; 0 disables it (requires full-image RGB-only training)")
+                        help="Additive RGB D-SSIM weight in the selected loss color space; 0 disables it (requires full-image RGB-only training)")
+    parser.add_argument("--loss-color-space", choices=("linear", "srgb"),
+                        help="RGB L2 / D-SSIM and topology-gain color space; rendering remains linear")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--target-resolution", type=int, choices=(512, 1024),
                         help="Final core grid resolution (start remains 256 by default)")
@@ -295,7 +302,7 @@ def parse_arguments():
                         help="Evaluate the first N held-out test cameras (default: all); 0 evaluates all")
     parser.add_argument("--eval-max-views", type=int,
                         help="Deprecated: override BOTH train/test limits; 0 evaluates all. Prefer the split-specific options")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def apply_arguments(config, args, values):
@@ -323,6 +330,7 @@ def apply_arguments(config, args, values):
         (args.rgb_only, "training", "rgb_only"),
         (getattr(args, "distortion_weight", None), "gradient", "distortion_loss_weight"),
         (getattr(args, "dssim_weight", None), "gradient", "dssim_loss_weight"),
+        (getattr(args, "loss_color_space", None), "gradient", "loss_color_space"),
         (args.eval_spp, "evaluation", "spp"),
         (getattr(args, "eval_train_max_views", None), "evaluation", "train_max_views"),
         (getattr(args, "eval_test_max_views", None), "evaluation", "test_max_views"),
@@ -355,6 +363,12 @@ def apply_arguments(config, args, values):
     if (not config.training.rgb_only and
             "reference_compositing" not in values.get("data", {})):
         config.data.reference_compositing = "linear"
+    if ("loss_color_space" not in values.get("gradient", {})
+            and getattr(args, "loss_color_space", None) is None
+            and (not config.training.rgb_only or getattr(args, "config", None))):
+        # Existing JSON files and alpha-supervised experiments retain their
+        # original objective; only an explicit setting opts them into sRGB.
+        config.gradient.loss_color_space = "linear"
     config.schedule.total_epochs = config.training.num_epochs
     if (not getattr(args, "resume", None) and config.schedule.start_resolution == 256
             and config.schedule.target_resolution == 1024
@@ -504,6 +518,9 @@ def validate(config):
         raise ValueError("training.freeze_native must be a boolean")
     if not isinstance(config.training.compact_gradients, bool):
         raise ValueError("training.compact_gradients must be a boolean")
+    for name in ("prefer_dense_gradients", "compact_path_records"):
+        if not isinstance(getattr(config.training, name), bool):
+            raise ValueError(f"training.{name} must be a boolean")
     if not isinstance(config.training.sync_view_checks, bool):
         raise ValueError("training.sync_view_checks must be a boolean")
     if config.training.batch_reduction not in ("auto", "dense"):
@@ -512,7 +529,13 @@ def validate(config):
         raise ValueError("gradient.distortion_loss_weight must be finite and nonnegative")
     if isinstance(config.gradient.dssim_loss_weight, bool):
         raise ValueError("gradient.dssim_loss_weight must be finite and nonnegative")
+    if config.gradient.loss_color_space not in ("linear", "srgb"):
+        raise ValueError("gradient.loss_color_space must be 'linear' or 'srgb'")
+    if config.gradient.loss_color_space == "srgb" and not config.training.rgb_only:
+        raise ValueError("gradient.loss_color_space='srgb' requires RGB-only training")
     for name, value in asdict(config.gradient).items():
+        if name == "loss_color_space":
+            continue
         if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError(f"Invalid gradient.{name}: {value}")
     if config.gradient.dssim_loss_weight > 0:
@@ -707,7 +730,7 @@ def training_memory_plan(config, model, report, view_count, *, world_size=1,
                if world_size == 1 and config.training.rgb_only and effective_chunk_size(config) == pixels else 0)
     if compact_capacity_override is not None:
         compact = compact_capacity_override
-    return plan_training_memory(active_voxels=count,
+    arguments = dict(active_voxels=count,
         sh_count=int(model.sh_count), opacity_sh_count=int(model.opacity_sh_count),
         radiance_degree_steps=config.training.sh_degree_progression,
         opacity_degree_steps=config.training.opacity_sh_degree_progression,
@@ -717,11 +740,21 @@ def training_memory_plan(config, model, report, view_count, *, world_size=1,
         reference_cache_mib=config.training.gpu_reference_cache_mib,
         gpu=report.get("gpu"), distortion=config.gradient.distortion_loss_weight > 0,
         dssim=config.gradient.dssim_loss_weight > 0,
+        srgb_loss=config.gradient.loss_color_space == "srgb",
         reference_image_count=view_count, rgb_only=config.training.rgb_only,
         allocator_policy=report["cuda_allocator"]["policy"],
         known_index_bytes=(model_index_bytes(model, report["cuda_allocator"]["policy"])
                            if known_index_bytes is None else known_index_bytes),
-        path_record_layout_version=int(getattr(model, "path_record_layout_version", 0)))
+        path_record_layout_version=int(getattr(model, "path_record_layout_version", 0)),
+        compact_path_records=config.training.compact_path_records)
+    plan = plan_training_memory(**arguments)
+    # Explicit row budgets keep their prior meaning. Automatic selection runs
+    # only at initialization/topology boundaries, never for every camera.
+    if (compact and compact_capacity_override is None and config.training.prefer_dense_gradients
+            and not config.training.compact_gradient_rows):
+        dense = plan_training_memory(**dict(arguments, compact_capacity=0))
+        plan = choose_gradient_storage_plan(plan, dense)
+    return plan
 
 
 def configure_training_memory(config, model, cache, report, view_count, *, world_size=1, emit=print,
@@ -733,10 +766,18 @@ def configure_training_memory(config, model, cache, report, view_count, *, world
     report.setdefault("memory_plans", {})[core] = plan
     if not plan["supported"]:
         raise TrainingMemoryError(plan)
+    key = gradient_storage_key(model, config.render.width * config.render.height, config.training)
+    capacity = plan["gradient_rows"] if plan["compact_gradients"] else 0
+    previous = getattr(model, "_training_gradient_storage", None)
+    model._training_gradient_storage = (key, capacity)
     before = cache.capacity_bytes // (1024 * 1024)
     cache.resize(plan["recommended_reference_cache_mib"])
     if before != plan["recommended_reference_cache_mib"]:
         emit("Training memory plan:", plan["reason"], flush=True)
+    if previous != model._training_gradient_storage and plan.get("gradient_storage_selection"):
+        emit("Training gradient storage:", "compact" if capacity else "dense",
+             f"({plan['gradient_rows']:,} rows; planned {plan['estimated_budget_bytes'] / 1024**3:.2f} GiB)",
+             flush=True)
     return plan
 
 
@@ -982,6 +1023,27 @@ def resolve_resume_reference_compositing(config, checkpoint, overrides):
     config.data.reference_compositing = saved
 
 
+def resolve_resume_loss_color_space(config, checkpoint, overrides, cli_value=None):
+    """Preserve a saved image objective, including checkpoints predating sRGB loss."""
+    saved = checkpoint["config"].get("gradient", {}).get("loss_color_space", "linear")
+    requested = (cli_value if cli_value is not None else
+                 overrides.get("gradient", {}).get("loss_color_space", saved))
+    if saved not in ("linear", "srgb") or requested not in ("linear", "srgb"):
+        raise ValueError("gradient.loss_color_space must be 'linear' or 'srgb'")
+    if requested != saved:
+        raise ValueError("Cannot change gradient.loss_color_space while resuming; "
+                         "start a new experiment for a different image objective")
+    config.gradient.loss_color_space = saved
+
+
+def require_rgb_loss_color_space(config, native_model_type):
+    """Reject stale builds before training can silently use the linear objective."""
+    if (config.gradient.loss_color_space == "srgb"
+            and getattr(native_model_type, "rgb_loss_srgb_version", 0) < 1):
+        raise RuntimeError("sRGB image loss requires native rgb_loss_srgb_version >= 1; "
+                           "incrementally rebuild this Mitsuba source checkout")
+
+
 def require_background_rgb_deletion(config, native_model_type):
     """Reject stale native builds that omit world-space background votes."""
     world_shell = (config.data.initialization or {}).get("scene_mapping") == "world_shell"
@@ -994,6 +1056,9 @@ def require_background_rgb_deletion(config, native_model_type):
 
 def settings(config):
     result = asdict(config.gradient)
+    loss_color_space = result.pop("loss_color_space")
+    if loss_color_space == "srgb":
+        result["rgb_loss_srgb"] = True
     if config.gradient.distortion_loss_weight == 0:
         # The disabled path stays usable with existing native builds and keeps
         # its original replay key. The native default is also zero.
@@ -1010,6 +1075,8 @@ def settings(config):
         transmittance_threshold=config.render.transmittance_threshold,
         max_hits=config.render.max_hits, entry_offset_fraction=config.render.entry_offset_fraction,
         use_octree=config.render.traversal == "octree")
+    if not config.training.compact_path_records:
+        result["compact_path_records"] = False
     if getattr(config, "_collect_adaptive_priority", False):
         result["collect_adaptive_priority"] = True
     return result
@@ -1085,9 +1152,7 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
     rgb_deletion_requested = native_settings["collect_rgb_deletion_evidence"]
     # Different compact row sets cannot be summed elementwise across chunks or
     # ranks. Keep the existing dense transport for those paths.
-    compact_capacity = (gradient_capacity(model, count,
-        enabled=config.training.compact_gradients,
-        requested=config.training.compact_gradient_rows)
+    compact_capacity = (planned_gradient_capacity(model, count, config.training)
         if compact_gradients and pixel_begin == 0 and pixel_end == count and chunk_size == count else 0)
     for begin in range(pixel_begin, pixel_end, chunk_size):
         end = min(begin + chunk_size, pixel_end)
@@ -1540,6 +1605,7 @@ def run_training(distributed=None):
     if checkpoint is not None:
         validate_resume_supervision(config, checkpoint)
         resolve_resume_reference_compositing(config, checkpoint, overrides)
+        resolve_resume_loss_color_space(config, checkpoint, overrides, getattr(args, "loss_color_space", None))
         # Resolve new fields before the first validation/runtime check too.
         # The full immutable-settings check follows loading the saved config.
         saved_training = checkpoint["config"].get("training", {})
@@ -1648,6 +1714,7 @@ def run_training(distributed=None):
             apply_arguments(config, args, overrides)
             validate_resume_supervision(config, checkpoint)
             resolve_resume_reference_compositing(config, checkpoint, overrides)
+            resolve_resume_loss_color_space(config, checkpoint, overrides, getattr(args, "loss_color_space", None))
             resolve_resume_sh_schedule(config, checkpoint, overrides)
             # JSON may request automatic naming with null; keep the already
             # selected location instead of restoring null or a stale host path.
@@ -1712,6 +1779,8 @@ def run_training(distributed=None):
             not config.schedule.enabled or config.schedule.enable_coarse_growth)
         distortion_enabled = config.gradient.distortion_loss_weight > 0
         dssim_enabled = config.gradient.dssim_loss_weight > 0
+        loss_color_space = config.gradient.loss_color_space
+        require_rgb_loss_color_space(config, mi.VoxelReconstruction)
         if dssim_enabled and getattr(mi.VoxelReconstruction, "dssim_version", 0) < 1:
             raise RuntimeError("D-SSIM requires native dssim_version >= 1; "
                                "incrementally rebuild this Mitsuba source checkout")
@@ -1732,14 +1801,24 @@ def run_training(distributed=None):
                            + (" and RGB deletion from existing reverse paths" if rgb_deletion_enabled else "")
                            + (" and persistent low-opacity pruning" if low_opacity_deletion_enabled else "")
                            + (" and hard-hit distortion loss" if distortion_enabled else "")
-                           + (" and linear RGB D-SSIM" if dssim_enabled else "")
+                           + (f" and {loss_color_space} RGB D-SSIM" if dssim_enabled else "")
                            if config.training.rgb_only else "Legacy Falcor NoLightTransport alpha-supervised training")
         report["training_protocol"]["radiance_sh_schedule"] = sh_schedule_protocol(config)
         report["training_protocol"].update(
             rgb_only=config.training.rgb_only,
             render_color_space="linear",
             traversal=config.render.traversal,
-            loss_color_space="linear",
+            loss_color_space=loss_color_space,
+            image_loss_encoding={
+                "native_version": getattr(mi.VoxelReconstruction, "rgb_loss_srgb_version", 0),
+                "prediction": ("encode the completed linear RGB pixel with standard piecewise sRGB"
+                               if loss_color_space == "srgb" else "linear RGB"),
+                "reference": "encode linear reference RGB" if loss_color_space == "srgb" else "linear RGB",
+                "prediction_clamp": False, "quantization": False,
+                "gradient": ("L2 and D-SSIM adjoints multiplied by the sRGB encoding derivative; distortion independent"
+                             if loss_color_space == "srgb" else "linear image adjoint"),
+                "topology_evidence": "finite insertion/removal RGB L2 gain in the selected loss color space; excludes D-SSIM and distortion",
+            },
             dssim={
                 "enabled": dssim_enabled,
                 "weight": config.gradient.dssim_loss_weight,
@@ -1747,11 +1826,11 @@ def run_training(distributed=None):
                 "formula": "1 - mean(SSIM over RGB channels and image pixels); additive to original RGB L2",
                 "window_size": 11, "sigma": 1.5, "padding": "zero",
                 "data_range": 1.0, "C1": 0.0001, "C2": 0.0009,
-                "color_space": "linear", "prediction_clamp": False,
+                "color_space": loss_color_space, "prediction_clamp": False,
                 "numerical_stability": "variance >= 0, SSIM in [-1,1], derivatives follow clamps",
                 "estimator": "sum gradients, mean reported loss; full image per GPU at 1 spp",
                 "execution": "separable Gaussian and analytic image adjoint between one forward and existing reverse",
-                "topology_evidence": "RGB-only insertion/removal gains remain unchanged",
+                "topology_evidence": "RGB L2 insertion/removal gains use loss_color_space; D-SSIM is excluded",
                 "zero_weight": "not computed; logged D-SSIM values are zero, not measurements",
             },
             distortion={
@@ -1762,7 +1841,7 @@ def run_training(distributed=None):
                 "depth": "hard-hit ellipsoid quadratic-minimum depth, relative to ray-grid entry, divided by grid diagonal",
                 "samples": "actual recorded hard hits only; no residual environment sample or interval-width term",
                 "estimator": "one inverse_pdf factor; sum gradients, mean loss over all view pixels",
-                "topology_evidence": "RGB-only insertion/removal gains remain unchanged",
+                "topology_evidence": "RGB L2 insertion/removal gains use loss_color_space; distortion is excluded",
                 "zero_weight": "not computed; logged distortion values are zero, not measurements",
             },
             reference_compositing=config.data.reference_compositing,
@@ -1807,10 +1886,10 @@ def run_training(distributed=None):
             deletion_freeze_start_epoch=(max(1, config.training.num_epochs - config.topology.deletion_freeze_last_epochs + 1)
                                          if config.topology.deletion_freeze_last_epochs else None),
             deletion_batch_policy="independent online votes; not a guarantee of joint loss decrease" if rgb_deletion_enabled else None,
-            reported_loss=("mean pixel RGB squared-error sum over channels, then mean over views"
+            reported_loss=(f"mean pixel {loss_color_space} RGB squared-error sum over channels, then mean over views"
                            if config.training.rgb_only else "mean RGB plus alpha loss over pixels and views")
                           + (" + weight * mean hard-hit distortion" if distortion_enabled else "")
-                          + (" + weight * mean linear RGB D-SSIM" if dssim_enabled else ""))
+                          + (f" + weight * mean {loss_color_space} RGB D-SSIM" if dssim_enabled else ""))
         dataset = workspace_path(config.data.dataset, WORKSPACE)
         emit("Loading training views and checking reference files:", dataset, flush=True)
         prepared = prepare_dataset(config, np, load_points=checkpoint is None)
@@ -1882,9 +1961,12 @@ def run_training(distributed=None):
             sync_view_checks=config.training.sync_view_checks,
             optimizer_execution="device-counted sparse Adam; bounded batches; atomic native transaction",
             optimizer_compaction_sync="none; valid-row lists and counts stay on GPU",
-            native_gradient_storage=("bounded touched-voxel rows for large single-GPU RGB full views"
+            native_gradient_storage=("memory-budgeted dense rows with bounded compact fallback"
+                                     if config.training.compact_gradients and config.training.prefer_dense_gradients else
+                                     "bounded touched-voxel rows for large single-GPU RGB full views"
                                      if config.training.compact_gradients else "dense model rows"),
-            native_gradient_count_readback="one UInt32 per compact view; overflow retries before any update",
+            native_gradient_count_readback="none for dense rows; one UInt32 per compact view; exact overflow retries",
+            compact_path_records=config.training.compact_path_records,
             optimizer_replay_enabled=config.training.freeze_native,
             native_stage_profiling="synchronized sampled views only; bypasses frozen replay" if config.training.profile_stages else "disabled",
             freeze_native=config.training.freeze_native,
@@ -1926,11 +2008,11 @@ def run_training(distributed=None):
         emit("Training validity checks:", "synchronous per view" if config.training.sync_view_checks
              else "GPU guarded; loss/validity read at epoch and sampled-profile boundaries", flush=True)
         emit("Reference compositing:", config.data.reference_compositing,
-             "| rendering and RGB loss: linear", flush=True)
+             "| rendering: linear | RGB L2 / D-SSIM loss:", loss_color_space, flush=True)
         emit("Distortion loss:", f"weight={config.gradient.distortion_loss_weight:g}; "
              + ("hard-hit pairwise depth concentration" if distortion_enabled else "disabled"), flush=True)
         emit("D-SSIM loss:", f"weight={config.gradient.dssim_loss_weight:g}; "
-             + ("linear RGB, Gaussian 11x11, one forward" if dssim_enabled else "disabled"), flush=True)
+             + (f"{loss_color_space} RGB, Gaussian 11x11, one forward" if dssim_enabled else "disabled"), flush=True)
         emit("Training supervision:", (("RGB only; DC opacity until frozen topology, then directional opacity; "
              if config.training.opacity_sh_degree_progression else "RGB only; DC opacity; ")
              + "refinement" + (" + RGB growth" if rgb_growth_enabled else "")
@@ -2474,6 +2556,7 @@ def run_training(distributed=None):
                      "mean_dssim_loss": epoch_dssim_loss / len(views),
                      "mean_weighted_dssim_loss": config.gradient.dssim_loss_weight * epoch_dssim_loss / len(views),
                      "dssim_loss_weight": config.gradient.dssim_loss_weight,
+                     "loss_color_space": loss_color_space,
                      "rgb_only": config.training.rgb_only,
                      "seconds": time.perf_counter()-started, "resolution": int(model.resolution),
                      "training_resolution": training_resolution, "active_voxels_before": active_voxels_before,

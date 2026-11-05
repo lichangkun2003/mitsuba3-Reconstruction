@@ -24,18 +24,23 @@ from test_reconstruction_distortion import fixture as core_fixture
 from world_shell_fixture import fixture as shell_fixture, make_ray
 
 
-def expanded_fixture(np, *, world_shell):
+def expanded_fixture(np, *, world_shell, sh_count=9, opacity_sh_count=1):
     checkpoint = shell_fixture(np) if world_shell else core_fixture(np)
     count = len(checkpoint["model_state"]["cell_indices"])
     old = checkpoint["model_state"]["radiance_sh"].reshape(count, 3)
-    coefficients = np.random.default_rng(850).normal(0, .07, (count, 9, 3))
+    coefficients = np.random.default_rng(850).normal(0, .07, (count, sh_count, 3))
     coefficients[:, 0, :] = old
     checkpoint["model_state"]["radiance_sh"] = coefficients.ravel()
-    checkpoint["model_metadata"]["sh_count"] = 9
+    checkpoint["model_metadata"]["sh_count"] = sh_count
     # Include clamped dark radiance and nearly opaque/transparent hits.
     coefficients[0, 0] = -.2
     checkpoint["model_state"]["opacity_sh"][0] = 60.
     checkpoint["model_state"]["opacity_sh"][-1] = -60.
+    if opacity_sh_count > 1:
+        opacity = np.random.default_rng(851).normal(0, .15, (count, opacity_sh_count))
+        opacity[:, 0] = checkpoint["model_state"]["opacity_sh"]
+        checkpoint["model_state"]["opacity_sh"] = opacity.ravel()
+        checkpoint["model_metadata"]["opacity_sh_count"] = opacity_sh_count
     return checkpoint
 
 
@@ -90,15 +95,18 @@ def compare(expected, actual, np):
                                            equal_nan=True, err_msg=label)
 
 
-def run_checks(mi, dr, np):
+def run_case(mi, dr, np, *, sh_count, opacity_sh_count):
     checks = 0
     for world_shell in (False, True):
-        payload = expanded_fixture(np, world_shell=world_shell)
+        payload = expanded_fixture(np, world_shell=world_shell,
+                                   sh_count=sh_count, opacity_sh_count=opacity_sh_count)
         model = restore_model(payload, mi)
         if not world_shell:
             proposal = copy.deepcopy(core_fixture(np, 1)["model_state"])
             proposal["cell_indices"][:] = 53
-            proposal["radiance_sh"] = payload["model_state"]["radiance_sh"][:27].copy()
+            proposal["radiance_sh"] = payload["model_state"]["radiance_sh"][:sh_count * 3].copy()
+            if opacity_sh_count > 1:
+                proposal["opacity_sh"] = payload["model_state"]["opacity_sh"][:opacity_sh_count].copy()
             model.set_growth_candidates({name: (mi.UInt32(value) if name == "cell_indices" else mi.Float(value))
                                          for name, value in proposal.items()})
         ray, target = inputs(mi, np, world_shell=world_shell)
@@ -112,8 +120,14 @@ def run_checks(mi, dr, np):
             {"dssim_loss_weight": 0., "distortion_loss_weight": 0.},
             {"collect_rgb_deletion_evidence": 1., "collect_growth_evidence": 1.},
         ]
-        for active_sh in (1, 9):
+        stages = [(1, 1), (sh_count, opacity_sh_count)]
+        if opacity_sh_count > 1:
+            # Mixed activation and the l=2/l=3 boundary must use the same
+            # stored strides in both record layouts.
+            stages.extend(((1, opacity_sh_count), (sh_count, 1), (9, opacity_sh_count)))
+        for active_sh, active_opacity in stages:
             model.set_active_sh_count(active_sh)
+            model.set_active_opacity_sh_count(active_opacity)
             for options in scenarios:
                 old = host_result(run_native(model, ray, target, mi, dr, options, layout=0), np)
                 new = host_result(run_native(model, ray, target, mi, dr, options, layout=1), np)
@@ -121,7 +135,11 @@ def run_checks(mi, dr, np):
                 checks += 1
         # Frozen calls must consume updated parameters, including recomputed SH.
         replay = NativeLossReplay(dr)
-        for scale in (1., .93):
+        for scale, active_sh, active_opacity in ((1., sh_count, opacity_sh_count),
+                                                (.93, sh_count, opacity_sh_count),
+                                                (.9, 1, 1), (.87, sh_count, opacity_sh_count)):
+            model.set_active_sh_count(active_sh)
+            model.set_active_opacity_sh_count(active_opacity)
             model.set_parameters({"radiance_sh": mi.Float(payload["model_state"]["radiance_sh"] * scale),
                                   "opacity_sh": mi.Float(payload["model_state"]["opacity_sh"] * scale)})
             for _ in range(2):
@@ -130,7 +148,14 @@ def run_checks(mi, dr, np):
                 compare(old, new, np)
                 checks += 1
         assert replay.statistics()["replays"] >= 3
-    return {"core_world_shell_SH1_SH9_record_layout_differentials": checks,
+    return checks
+
+
+def run_checks(mi, dr, np):
+    legacy = run_case(mi, dr, np, sh_count=9, opacity_sh_count=1)
+    degree_three = run_case(mi, dr, np, sh_count=16, opacity_sh_count=9)
+    return {"core_world_shell_SH1_SH9_record_layout_differentials": legacy,
+            "core_world_shell_radiance16_opacity9_record_layout_differentials": degree_three,
             "forward_and_integer_counters": "exact", "status": "passed"}
 
 

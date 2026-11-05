@@ -252,14 +252,17 @@ def run_regression(root, build_dir, gpu):
     assert failed_worker["status"] == "failed" and "injected_reference_failure" in failed_worker
 
     training_config = root / "auto-training.json"
-    training_config.write_text(json.dumps({"data": {"dataset": str(dataset)},
+    training_config.write_text(json.dumps({"data": {"dataset": str(dataset), "scene_mode": "bounded",
+                                                  "background_refinement": "uniform"},
         "model": {"grid_resolution": 4, "bounds_min": [-1., -1., -1.], "bounds_max": [1., 1., 1.],
                   "sh_count": 1, "opacity_sh_count": 1},
         "render": {"width": 16, "height": 16, "spp": 1},
         "training": {"rgb_only": True, "num_epochs": 1, "save_count": 1,
+                     "sh_degree_progression": False, "opacity_sh_degree_progression": False,
                      "profile_views": 0, "profile_interval_epochs": 0},
-        "gradient": asdict(CONFIG.gradient),
-        "schedule": {"enabled": False}, "topology": {"enable_deletion": False, "enable_growth": False},
+        "gradient": {**asdict(CONFIG.gradient), "loss_color_space": "srgb", "dssim_loss_weight": .2},
+        "schedule": {"enabled": False, "refinement": "uniform"},
+        "topology": {"enable_deletion": False, "enable_growth": False},
         "optimizer": {"opacity_warmup_epochs": 0, "opacity_ramp_epochs": 0,
                       "lr_center": 0., "lr_log_scale": 0., "lr_rotation": 0.},
         "contour": {"enabled": False}, "evaluation": {"enabled": True, "spp": 64, "max_views": 2}}), encoding="utf-8")
@@ -268,6 +271,11 @@ def run_regression(root, build_dir, gpu):
     assert training_report["training_status"] == training_report["evaluation"]["status"] == "passed"
     assert training_report["status"] == "passed" and training_report["global_step"] == 5
     assert training_report["optimizer_step"] == 3
+    assert training_report["training_protocol"]["loss_color_space"] == "srgb"
+    assert training_report["training_protocol"]["render_color_space"] == "linear"
+    assert training_report["training_protocol"]["dssim"]["color_space"] == "srgb"
+    evaluation_report = json.loads((training.parent / "evaluation-report.json").read_text(encoding="utf-8"))
+    assert evaluation_report["metric_protocol"]["training_loss_color_space"] == "srgb"
     trained_model = training.parent / "model.npz"
     assert trained_model.exists()
     serial, _ = run_case("automatic-model-serial-64spp", "serial",

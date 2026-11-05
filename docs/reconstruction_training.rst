@@ -1,6 +1,47 @@
 体素重建训练、保存与评价
 ======================
 
+Mip-NeRF 360 串行批量实验
+------------------------
+
+``experiments/reconstruction/train_mipnerf360_batch.py`` 默认读取
+``configs/bicycle_1024.json``，扫描工作区 ``datasets`` 中已有的标准 360 场景。
+默认先室内后室外；当前顺序为 bonsai、counter、kitchen、room、bicycle、garden、stump。不存在的
+flowers、treehill 不会自动加入，NeRF-Synthetic 场景不会被选中。PowerShell 可在任意目录执行：
+
+.. code-block:: powershell
+
+   & "E:\lck\reconstruction\envs\mitsuba\python.exe" -u -I `
+     "E:\lck\reconstruction\mitsuba\experiments\reconstruction\train_mipnerf360_batch.py" `
+     --config "E:\lck\reconstruction\mitsuba\experiments\reconstruction\configs\bicycle_1024.json" `
+     --gpu 0
+
+默认自动选室外 ``images_4``、室内 ``images_2``。缺首选目录时先尝试更粗图像，
+再尝试更细图像，并打印实际选择及尺寸；不生成或缩放数据集文件。
+``--images 8`` 可统一选已有的 ``images_8``；``--scenes bonsai counter kitchen room garden stump``
+可只跑六个新增场景并指定顺序。相机内参仍由现有 COLMAP 加载器按实际图片宽高缩放。
+
+每场景都复制同一份模板、使用自身的 ``init_points.ply``（缺失时沿用加载器的稀疏点云回退），
+清除模板中的旧 ``data.initialization``，并由训练入口重新计算场景坐标归一化。
+损失、SH、拓扑规则、训练轮数和评价设置继承模板；``--epochs`` 可显式覆盖整批轮数。
+上一训练及评价子进程退出后才启动下一场景，使 CUDA 资源不会跨场景积累。
+
+批量入口相当于依次切换场景并运行同一个 ``train.py``，训练、保存和评价规则沿用配置。
+实验直接放在 ``outputs/<场景>-MM.DD-E<编号>-<耗时>min/``，与单次运行使用相同的编号分配规则。
+每个实验中的 ``model.npz``、``training/``、``train/`` 和 ``test/`` 保持原布局；
+额外保留 ``console.log`` 和 ``training/batch-config.json``。
+队列状态与平均 PSNR 记录在 ``outputs/mipnerf360-batch-时间戳.json``。
+``--output-dir`` 可指定其他实验根目录（自定义根目录不追加耗时），已有实验不会被覆盖。
+只为即将启动的场景创建目录；训练期间日志暂存在输出根目录，结束后移入对应实验。
+失败或 Ctrl+C 时停止队列，
+保留已完成结果及当前检查点，不自动跳过失败或重新启动已有实验。
+
+``--dry-run`` 只做 CPU 预检：检查相机、全部注册图像的文件与尺寸、配置和点云路径，
+不创建输出目录、不读取完整点云、不启动 GPU。
+``--smoke-test`` 使用同一批量入口，每个场景只跑第一轮完整训练、保存测试检查点并跳过评价，
+保持原总轮数与调度不变；报告为 ``smoke_passed``，不能当作完整实验结果。
+首轮验证包含图像读取和 JIT 初始化，耗时不代表后续普通轮速度，也不验证后期细分峰值或收敛质量。
+
 RGB-only 训练、在线生长与删除（当前默认）
 ----------------------------------------
 
@@ -21,8 +62,9 @@ RGB-only 训练、在线生长与删除（当前默认）
 
 ``training.sh_degree_weights=[8,0,2]`` 与
 ``training.opacity_sh_degree_progression=true`` 让 radiance 和 opacity 同时在最后 20%
-从 DC 开放到二阶。``model.opacity_sh_count=9`` 为标量 opacity 保存九个系数；radiance
-每个 RGB 通道各保存九个系数。未开启的高阶参数及其 Adam 状态保持零，开启时使用独立阶数时钟，
+从 DC 开放到各自存储的全部阶数。当前 JSON 中 ``model.sh_count=16`` 为 radiance
+每个 RGB 通道各保存十六个系数（到三阶），``model.opacity_sh_count=9`` 为标量 opacity
+保存九个系数（到二阶）。未开启的高阶参数及其 Adam 状态保持零，开启时使用独立阶数时钟，
 不重置已有 DC 或几何的优化历史。高阶 opacity 启用前必须已经冻结全部拓扑。
 
 当前统一模式复用 ``background_refine_*`` 参数作为两区域共同的细分间隔、像素阈值、比例与单轮预算。
@@ -75,7 +117,8 @@ RGB-only 训练、在线生长与删除（当前默认）
    CONFIG.schedule.enable_coarse_growth = True
    CONFIG.contour.enabled = False
 
-默认损失为线性 RGB 的平方误差；可显式开启下面的 Distortion 正则。
+新实验默认在线性空间合成完整像素，再编码为浮点 sRGB 计算 RGB 平方误差；
+``gradient.loss_color_space="linear"`` 保留旧目标。可显式开启下面的 Distortion 正则。
 新实验默认 ``data.reference_compositing="srgb"``：
 读取 sRGB RGBA 图片时，先将编码空间的 RGB 与所选背景按 alpha 合成，再解码为线性 RGB，
 随后只保留三个 RGB 通道；普通 RGB 图片直接解码为线性 RGB。
@@ -155,31 +198,38 @@ PatchMatch 会继续缺失的深度图。修改输入或算法选项时需用另
 渐进开启辐射颜色的 SH 阶数
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-新实验默认在前 80% 的训练轮数只开启辐射颜色的 0 阶，在最后 20% 同时开启 1、2 阶。
+新实验默认在前 80% 的训练轮数只开启辐射颜色的 0 阶，在最后 20% 同时开启所有存储的高阶。
 前景和世界空间背景共用同一阶数调度，方向性颜色使用世界空间射线方向。
-这里的三组是 ``l=0、1、2``，各有 ``1、3、5`` 个基函数；累计开启数为
-``1、4、9``。每个系数包含 RGB 三个颜色分量，因此完整颜色参数仍为每体素 27 个数。
-opacity 始终保持原来的单个 DC logit，不参与这个颜色阶数调度。
+``l=0、1、2、3`` 各有 ``1、3、5、7`` 个基函数，累计系数数为 ``1、4、9、16``。
+当前 bicycle JSON 使用 ``model.sh_count=16``，每个系数包含 RGB 三个颜色分量，
+即每体素保存 48 个颜色参数。``model.opacity_sh_count=9`` 独立保存九个标量系数；
+启用 ``opacity_sh_degree_progression`` 时，opacity 同样在拓扑冻结后从 DC 开放到二阶。
 
 在 JSON 中设置：
 
 .. code-block:: json
 
    {
+     "model": {
+       "sh_count": 16,
+       "opacity_sh_count": 9
+     },
      "training": {
        "sh_degree_progression": true,
+       "opacity_sh_degree_progression": true,
        "sh_degree_weights": [8, 0, 2]
      }
    }
 
 对于 ``num_epochs=1500``，第 1–1200 轮只优化 0 阶；第 1201–1500 轮同时优化
-0、1、2 阶，每通道的活跃系数从 1 个直接变成 9 个。切换点取总轮数的
-80% 向下取整，按已完成的 epoch 数判断下一轮的阶数。配合网格的 ``4:3:3``
-分辨率调度，1024 层级的第 1051–1200 轮仍为 DC，之后才开启方向性颜色。
-这个调度独立于网格分辨率，升层不会重新回到 0 阶；多卡的所有 rank 使用同一阶数。
-``sh_degree_weights`` 是 DC、0+1 阶、0+1+2 阶三个阶段的比例；首尾必须为正整数，
+0、1、2、3 阶 radiance，每通道的活跃系数从 1 个直接变成 16 个；opacity 从 1 个变成 9 个。
+切换点取总轮数的 80% 向下取整，按已完成的 epoch 数判断下一轮的阶数；
+当前自适应模式在同一边界冻结全部拓扑。这个调度独立于网格分辨率，
+细分不会重新回到 0 阶；多卡的所有 rank 使用同一阶数。
+``sh_degree_weights`` 是 DC、0+1 阶、全部存储阶数三个时间窗口的比例；首尾必须为正整数，
 中间允许为 0，表示跳过单独的 0+1 阶阶段。原来的 ``[4, 3, 3]`` 仍支持在
-40% 和 70% 分别开启 1、2 阶，旧 checkpoint 按保存的比例续训。关闭 ``sh_degree_progression``
+40% 开启 1 阶、70% 开启其余存储阶数，九系数模型的行为不变，旧 checkpoint 按保存的比例续训。
+三个时间窗口不限制 SH 存储只能有三个阶数。关闭 ``sh_degree_progression``
 则从第一轮使用模型中存储的全部 SH 系数。
 
 模型始终分配完整的 SH 参数、梯度与 Adam 动量缓冲区，不随阶段改变参数排列。
@@ -189,14 +239,15 @@ opacity 始终保持原来的单个 DC logit，不参与这个颜色阶数调度
 在线生长／删除证据、几何代理使用的颜色和 D-SSIM 反传同样遵守当前阶数。
 阶段变化会使前向及优化器重放重新录制，后续视角继续复用录制结果。
 渐进训练在网格升层时让子体素继承父体素的全部颜色 SH 系数，避免把已经学习的
-1 阶或 2 阶颜色清零；尚未开启的系数仍不参与渲染。未开启渐进训练的旧模型保留
+高阶颜色清零；尚未开启的系数仍不参与渲染。未开启渐进训练的旧模型保留
 原有核心区域仅继承 DC 的分裂规则。
 网格升层仍沿用原有的 Adam 重置策略；仅切换 SH 阶数时不会重置已开启阶的优化状态。
 
 快照保存当前 ``active_sh_count``，因此中途保存的模型在预览、评价和恢复时不会
 提前使用尚未开启的高阶颜色。续训保留动量与分阶更新计数，依据原总轮数和已完成
 轮数继续调度。旧 checkpoint 缺少渐进配置时保持原先的全阶行为；底层原生模型
-也默认使用全部已存系数。原生 SH 调度功能要求
+也默认使用全部已存系数。新的十六系数配置用于新实验；旧九系数 checkpoint
+不自动扩容，使用它自己的配置续训会保持九系数。原生 SH 调度功能要求
 ``mi.VoxelReconstruction.sh_schedule_version >= 1``；已有此构建时，修改阶段比例无需重新编译。
 
 可选 Distortion：约束沿射线分散的贡献
@@ -293,12 +344,40 @@ tangent 的导数。深度最小点位于网格段内部时使用解析导数；
 小型数值回归位于 ``tests/test_reconstruction_distortion.py``，包括独立路径公式、
 opacity／深度几何有限差分、分批及重放；完整场景的改善需另行验证。
 
-可选 D-SSIM：线性 RGB 的局部结构损失
+图像损失的颜色空间
+~~~~~~~~~~~~~~~~~~
+
+``gradient.loss_color_space`` 或 ``--loss-color-space`` 可选 ``srgb`` / ``linear``。
+当前 ``CONFIG`` 和 ``configs/bicycle_1024.json`` 使用 ``srgb``；缺少该字段的旧 JSON、
+通用 dataclass 和旧 checkpoint 保持 ``linear``。续训必须保持已保存的损失空间，
+不能把旧实验静默切换到新目标。sRGB 训练要求 RGB-only，并要求重新编译后的
+``mi.VoxelReconstruction.rgb_loss_srgb_version >= 1``；旧构建会明确拒绝启动。
+
+radiance、路径前缀／后缀、背景贡献、参考图缓存均保持线性 RGB。原生前向完成全部
+颜色累加后，将完整像素 ``C`` 与线性参考 ``R`` 分别编码为 ``f(C)``、``f(R)``，
+L2 和 D-SSIM 都在这个浮点空间计算，不经过 PNG 或 8 位量化。sRGB 使用标准分段
+传递函数：小于等于 ``0.0031308`` 的线性段为 ``12.92*C``，其余为
+``1.055*C^(1/2.4)-0.055``。训练不将预测硬裁剪到 ``[0,1]``，以保留过曝区域的
+修正梯度；负值延续线性段。输出 PNG 仍按已有规则裁剪并量化。
+
+先合并 L2 与 D-SSIM 对编码像素的梯度，再乘 ``f'(C)``，得到原有 radiance、opacity
+和几何代理反向所需的线性像素梯度；distortion 的独立梯度不乘该导数。
+生长／删除使用 ``||f(C)-f(R)||² - ||f(C+delta)-f(R)||²`` 的有限反事实收益，
+不能使用线性 L2 的二次展开或仅乘一个局部导数。该收益仍只包含 RGB L2，
+不包含 D-SSIM 或 distortion；完整路径／截断未知的保护规则不变。
+``linear`` 模式下 ``f`` 为恒等映射，保留原生计算与历史目标。
+
+训练当前为 1 spp；多 spp 出图先平均线性像素，再编码。sRGB 编码提高暗部误差的
+相对权重，也会改变梯度、几何 clamp 和生长删除阈值的有效尺度。颜色空间切换不保证
+几何正确或背景变清晰，应在一致的配置与采样下比较图像及 sRGB PSNR。
+日志／报告记录实际 ``loss_color_space``，``render_color_space`` 仍为 ``linear``。
+
+可选 D-SSIM：图像空间的局部结构损失
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 JSON 的 ``gradient.dssim_loss_weight`` 控制独立的加法权重，也可用
 ``--dssim-weight`` 覆盖。通用配置与旧 checkpoint 缺失该字段时使用 ``0``，
-保持原执行路径；``configs/bicycle_1024.json`` 显式设置 ``0.1``，可改为 ``0`` 做对照。
+保持原执行路径；``configs/bicycle_1024.json`` 显式设置 ``0.2``，可改为 ``0`` 做对照。
 启用需要重新编译 C++，要求 ``mi.VoxelReconstruction.dssim_version >= 1``。
 将下面字段加入现有 ``gradient`` 对象，保留其他已有参数：
 
@@ -306,6 +385,7 @@ JSON 的 ``gradient.dssim_loss_weight`` 控制独立的加法权重，也可用
 
    {
      "gradient": {
+       "loss_color_space": "srgb",
        "dssim_loss_weight": 0.1,
        "distortion_loss_weight": 0.1
      }
@@ -319,8 +399,9 @@ JSON 的 ``gradient.dssim_loss_weight`` 控制独立的加法权重，也可用
    L=\frac{1}{HW}\sum_p\left[\|\mathbf C_p-\mathbf R_p\|_2^2+
       \lambda_{\mathrm{ssim}}d_p+\lambda_{\mathrm{dist}}D_p\right].
 
-图像与参考均为已经准备好的**线性 RGB**，不转换到 sRGB，不读取 alpha，
-也不在计算前把大于 1 的预测颜色截断。RGB 项保留三通道平方误差的和，
+上式 ``C`` 与 ``R`` 是 ``gradient.loss_color_space`` 指定的图像空间值：
+``srgb`` 时为完整线性像素及参考的编码结果，``linear`` 时直接使用线性 RGB。
+不读取 alpha，也不在计算前把大于 1 的预测颜色截断。RGB 项保留三通道平方误差的和，
 D-SSIM 则在通道间平均；采用 ``1-SSIM`` 定义，没有再除以 2。
 它是现有 RGB 项上的独立加法权重，不是 3DGS 的 ``(1-lambda)*L1+lambda*(1-SSIM)``，
 相同 lambda 数值不能视为等强度。原生输出仍为逐像素损失以及按像素求和的梯度，
@@ -422,7 +503,10 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 .. code-block:: text
 
    delta = a * (T * r - (C - P))
-   gain  = -2 * dot(C - reference_rgb, delta) - dot(delta, delta)
+   gain  = ||f(C) - f(reference_rgb)||^2 - ||f(C + delta) - f(reference_rgb)||^2
+
+``C``、``P``、``r`` 始终为线性 RGB；``f`` 由 ``gradient.loss_color_space`` 决定。
+``linear`` 模式等价于原二次展开 ``-2*dot(C-reference_rgb,delta)-dot(delta,delta)``。
 
 它等于该固定候选单独插入时的同样本 RGB 平方误差减少量，包含候选对后方颜色的遮挡。
 这里不重新发射射线，不调用第二次整图前向，也不在提交前补一次确认渲染。
@@ -562,8 +646,10 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 .. code-block:: text
 
    dc   = T * a * (B - c)
-   gain = ||C - y||^2 - ||C + dc - y||^2
-        = -2 * dot(C - y, dc) - dot(dc, dc)
+   gain = ||f(C) - f(y)||^2 - ||f(C + dc) - f(y)||^2
+
+颜色增量在线性空间计算，``f`` 由 ``gradient.loss_color_space`` 决定。
+仅 ``linear`` 模式使用等价展开 ``-2*dot(C-y,dc)-dot(dc,dc)``。
 
 这里使用三个 RGB 通道平方误差的和，与训练原生 loss 一致，不额外除以 3。
 收益大于零表示在当前射线及参数下，单独删除降低误差；负收益表示保留更好。
@@ -788,7 +874,8 @@ NumPy PCG64 与 Falcor 的随机数序列不同；相同 seed 不代表与 Falco
 新 RGB-only 实验使用 ``data.reference_compositing="srgb"``。对于标记为 sRGB 的输入
 （通常为 PNG），设原始编码 RGB 为 ``s``、alpha 为 ``a``，sRGB 解码函数为 ``D``，
 白底参考为 ``D(a*s + (1-a))``；合成在输入编码空间进行，随后只把线性 RGB 送给训练。
-渲染、损失、梯度，以及生长和删除收益仍全部在线性空间计算，不在 sRGB 上优化。
+渲染与缓存保持线性；独立的 ``gradient.loss_color_space`` 决定图像损失和生长／删除
+收益在浮点 sRGB 还是线性空间计算。编码导数会回传到线性合成及模型参数。
 对于线性输入（如未标记 sRGB 的 EXR），继续在线性空间合成；不会给线性数据套用 sRGB 解码。
 背景参数仍表示线性 RGB；评价若指定非白背景，编码空间合成前先把背景编码到 sRGB。
 
@@ -863,7 +950,8 @@ B=2 的兼容模式初始化时所有背景叶子都分配为非空。
 相交或无法拟合的子叶不分配。B=2 的八壳背景容量上限为 ``448 -> 3584 -> 28672``，实际数量
 可更小。子叶继承全部 radiance SH，并像前景新子体素一样重置 Adam 状态。
 SH 激活仍按全局训练进度进行：``sh_degree_weights=[8,0,2]`` 时前 80% 只有 DC，
-最后 20% 前景、背景一起开启一阶和二阶；1500 轮对应第 1201 轮开始启用全部9系数。
+最后 20% 前景、背景一起开启全部存储的高阶；1500 轮对应第 1201 轮开始，
+九系数模型启用到二阶，十六系数模型启用到三阶。
 背景不做邻居生长或回填。现有 RGB 删除规则仍适用于背景，低 opacity 删除仍只在
 最高前景分辨率启用，因此已删除的父叶子不会因升层重新生成。
 
@@ -1204,6 +1292,33 @@ legacy 模式的 CPU 参考图仍用于 contour 和旧生长证据；当前 RGB 
 ``gpu_reference_cache`` 随逐轮日志、训练报告及性能汇总记录容量、驻留字节数、图片数、
 ``hits``、``misses``、``uploads``、``uploaded_bytes`` 和 ``evictions``。
 上传统计只计算显存缓存负责的上传；关闭缓存或单图过大时原路径的上传不计入该字段。
+
+按显存预算选择梯度存储
+----------------------
+
+``training.prefer_dense_gradients=true`` 在初始化及拓扑提交后，根据当前叶子数、
+SH 存储容量、图像与命中记录、Adam、空间索引和参考图缓存预算选择梯度布局。
+显存充足时使用按全局叶子 ID 直接寻址的梯度，省去触碰标记、前缀和以及每个视角的
+``voxel_count`` 主机回读；Adam 仍按原来的有效行规则更新，采样、损失和拓扑判据不变。
+这里的 dense 只描述梯度表，并不分配稠密空间网格。
+
+直接寻址需保留全部请求的参考缓存，并在既有设备／工作区预留之外，额外留出设备预算的
+20%（至少 4 GiB）。不满足条件时继续使用有界压紧梯度，溢出仍在任何更新之前重新检查预算
+并完整重算。选择属于静态预算，不是运行时 OOM 恢复；拓扑替换仍有独立显存预检。
+``prefer_dense_gradients=false`` 保留原来的自动行数阈值；显式设置
+``compact_gradient_rows>0`` 也保留原行数提示。``compact_gradients=false`` 则强制直接寻址。
+
+``training.compact_path_records=true`` 继续在反向阶段重算命中的 RGB／opacity。
+设置为 ``false`` 可以保留这些前向值，显存预算会同时计入完整命中与后缀记录；
+它是否更快取决于 SH 阶数、内存带宽和场景，不随显存余量自动开启。
+可用 ``benchmarks/benchmark_reconstruction_storage.py`` 对同一 checkpoint、相机顺序、
+随机种子和更新次数进行布局对照；工具只写指定的新目录，不修改来源实验。
+
+生长复核保留原父节点分批及批内截断顺序，仅跳过与目标空间区间无交集的整批。
+``geometry_revalidation_seconds``、阶段耗时及批次计数独立记录，便于区分候选准备和复核。
+自适应选择先在 GPU 排除零优先级／达到最大深度的叶子，再用精确部分排序保留候选前缀；
+分数、地址平局顺序、前景配额与背景上限保持一致。子格覆盖仍采用原精确椭球接触判定，
+只在原算法的初始可行点已经证明相交时跳过剩余搜索。
 
 原生调用重放
 ------------
@@ -2419,7 +2534,7 @@ COLMAP 数据集中的相机全局索引不一定为 0。
 全部视角，并保存每个视角的图片和 PSNR，分别汇总两个划分的平均 PSNR。
 这不限制训练视角或改变训练 1 spp。评价只读取 checkpoint，不更新模型或使用测试视角训练。
 默认主指标为实际保存并读回 PNG 的 ``psnr_srgb_png``，同时报告量化前的
-``psnr_srgb_float`` 和线性 RGB PSNR；这不改变线性训练损失。
+``psnr_srgb_float`` 和线性 RGB PSNR；评价选项不改变检查点记录的训练损失空间。
 评价的参考合成默认继承 checkpoint 中的 ``data.reference_compositing``，
 缺字段的旧 checkpoint 使用 ``linear``。单卡、双卡及训练后的自动评价共用此规则。
 
@@ -2546,8 +2661,8 @@ PNG 同时用于显示与可复算的正式指标。进行论文或其他实现�
 * 相机证据使用动态 bitset，支持不超过 32767 个视角；不采用 Falcor 默认编译容量 128。
 * 随机数序列、浮点归约顺序及跨 GPU 数值不同；不能声称逐位相同。
 * 按本次约定训练固定每视角 1 spp，未复制原训练多 spp 路径；训练入口强制白底。
-  新实验参考图采用 sRGB 输入先合成、再解码的协议，训练仍优化线性 RGB；
-  旧 ``linear`` 协议可显式选择。多 spp 及可配置背景用于独立评价。
+  新实验参考图采用 sRGB 输入先合成、再解码的协议；线性渲染后默认使用浮点 sRGB
+  图像损失。旧 ``linear`` 参考协议与线性损失分别可选。多 spp 及可配置背景用于独立评价。
 
 本地验证记录与复现命令
 ----------------------
