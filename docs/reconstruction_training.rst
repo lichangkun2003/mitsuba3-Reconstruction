@@ -68,6 +68,10 @@ RGB-only 训练、在线生长与删除（当前默认）
 不重置已有 DC 或几何的优化历史。高阶 opacity 启用前必须已经冻结全部拓扑。
 
 当前统一模式复用 ``background_refine_*`` 参数作为两区域共同的细分间隔、像素阈值、比例与单轮预算。
+当前 JSON 使用 ``background_refine_interval=20`` 和 ``background_refine_max_new_leaves=200000``：
+每 20 个 epoch 检查一次自适应细分，单次按最多增加 20 万片叶子的预算选择父体。
+这不是要求每次都新增 20 万片；投影阈值、成熟期、比例与容量限制仍生效，实际子体还取决于椭球覆盖。
+生长和删除仍保持各自的 10 轮周期，因此不是每个拓扑更新轮都在细分。最后 20% 的统一冻结规则不变。
 ``background_refine_pixel_threshold=6`` 指投影包围盒的最长边像素数，不是投影面积。
 存在前景候选时保留最多约 25% 的单轮分裂名额供前景使用，剩余名额按同一评分竞争；
 背景另受 ``background_max_active_voxels`` 限制，全部叶受 ``max_active_voxels`` 限制。
@@ -250,6 +254,33 @@ PatchMatch 会继续缺失的深度图。修改输入或算法选项时需用另
 不自动扩容，使用它自己的配置续训会保持九系数。原生 SH 调度功能要求
 ``mi.VoxelReconstruction.sh_schedule_version >= 1``；已有此构建时，修改阶段比例无需重新编译。
 
+分组学习率与固定拓扑阶段的衰减
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+当前 ``bicycle_1024.json`` 显式启用 ``optimizer.lr_schedule_enabled=true``。
+前期 radiance DC、中心、尺度、旋转学习率分别为 ``0.002``、``0.0015``、
+``0.003``、``0.00075``；opacity DC 保持 ``0.0005``。拓扑冻结前保持这些值，
+冻结后按全局 epoch 指数衰减，最后一轮达到峰值的 ``lr_final_factor=0.1``。
+1500 轮、``freeze_last_fraction=0.2`` 时，第 1201 轮开始进入衰减阶段。
+
+高阶 radiance 与 opacity 使用独立峰值 ``lr_radiance_sh=0.0002`` 和
+``lr_opacity_sh=0.00005``。每个 SH 阶从实际开启时单独计龄，
+``lr_sh_warmup_epochs=20`` 表示前 20 个活跃 epoch 线性预热到峰值，之后在
+固定拓扑阶段指数衰减，最后一轮达到该峰值的 10%，不再叠乘 DC 的衰减倍率。
+默认阶段 ``[8,0,2]`` 下，第 1201 轮开始预热，第 1220 轮达到高阶峰值。
+若实验尾段短于预热长度，会缩短预热以保留最后的衰减终点；只有一个剩余 epoch
+时直接采用终点倍率。没有拓扑冻结尾段时，已有参数不衰减，高阶预热后维持峰值。
+
+学习率以固定长度的 GPU 数组传入 Adam，数值变化不清空动量、分阶计数或已录制
+内核；SH 激活范围变化仍按原规则重新录制。学习率为零的阶不更新参数、动量和计数。
+``training.jsonl`` 的 ``learning_rate_schedule`` 记录每轮实际学习率，
+``training-report.json`` 保存调度协议。需要编译具备
+``mi.VoxelReconstruction.learning_rate_schedule_version >= 1`` 的原生模块。
+
+通用配置和旧 checkpoint 默认关闭该调度，保持原来的固定学习率。
+新调度的恢复从 checkpoint 的已完成 epoch 继续，预热不会重新开始；
+改变学习率配置应新建实验。D-SSIM、distortion 权重不随该调度变化。
+
 可选 Distortion：约束沿射线分散的贡献
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -341,8 +372,6 @@ tangent 的导数。深度最小点位于网格段内部时使用解析导数；
 检查 train/test 图、PSNR、洞口及厚层，而不只比较总 loss。
 该项鼓励有效贡献集中，但降低 opacity 同样可以降低它；它不能为零命中洞口创造
 候选，也不能证明留下的是正确表面。过强权重可能损失细结构或加重破洞。
-小型数值回归位于 ``tests/test_reconstruction_distortion.py``，包括独立路径公式、
-opacity／深度几何有限差分、分批及重放；完整场景的改善需另行验证。
 
 图像损失的颜色空间
 ~~~~~~~~~~~~~~~~~~
@@ -431,9 +460,6 @@ D-SSIM 则在通道间平均；采用 ``1-SSIM`` 定义，没有再除以 2。
 分段诊断另列 ``image_loss``；关闭时不执行 SSIM 滤波或分配其工作区。
 评价继续计算已有 ``psnr_srgb_png``，不把训练 loss 当作图像评价指标。
 
-``tests/test_reconstruction_dssim.py`` 使用独立 NumPy 二维卷积与有限差分检查
-常量图、小图、边界、超过 1 的预测颜色、图像梯度和原生颜色/opacity 梯度，
-并覆盖零权重、空模型、紧凑梯度、重放、拓扑证据不变及配置校验。
 完整场景的质量、速度和峰值显存需要实际对照实验。
 
 在线 RGB 生长：复用训练前向，不增加验证渲染
@@ -498,12 +524,21 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 合成 RGB ``P`` 和透射率 ``T``。候选并不参与当前渲染、真实命中计数或训练梯度。
 同格不同父体的提案共用该空格的 prefix 记录，但分别检查各自的椭球命中及虚拟收益；
 不将这些互斥提案当作同时插入的多个体素，也不把它们的收益合并成同格的一票。
-利用同次前向的最终颜色 ``C``、候选颜色 ``r``、opacity ``a``，计算单个候选的虚拟增量：
+利用同次前向的最终颜色 ``C``、候选颜色 ``r``、opacity ``a``，计算单个候选的虚拟增量。
+原生生长协议版本 5 同时保存实际命中的累计颜色和候选插入前的命中序号。
+插入只会降低后续透射率并增加一次实际命中，因此新的停止点不会晚于原停止点；
+在已有记录上二分查找新的透射率停止点，同时保留 ``max_hits`` 对插入后总命中数的限制。
+令 ``P_end``、``T_end`` 为新停止点处原有命中的累计颜色和透射率，``background`` 为终端背景：
 
 .. code-block:: text
 
-   delta = a * (T * r - (C - P))
+   C_end = P_end + T_end * background
+   delta = (C_end - C) + a * (T * r - (C_end - P))
    gain  = ||f(C) - f(reference_rgb)||^2 - ||f(C + delta) - f(reference_rgb)||^2
+
+若停止点不变，``C_end=C``，仍使用原来的 ``a * (T * r - (C - P))`` 小增量表达式。
+如果候选本身已触发透射率阈值或占用最后一个命中名额，直接在插入位置停止，
+不把原路径后方已经被截掉的颜色继续计入反事实图像。
 
 ``C``、``P``、``r`` 始终为线性 RGB；``f`` 由 ``gradient.loss_color_space`` 决定。
 ``linear`` 模式等价于原二次展开 ``-2*dot(C-reference_rgb,delta)-dot(delta,delta)``。
@@ -536,20 +571,18 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 等权，也不是把所有视角的射线合在一起求均值。少量 1 spp 射线可能产生较大的均值，
 多视角检查不能完全消除这种噪声。整个流程不读取参考 alpha、不按 RGB 是否接近白色分类射线。
 
-射线达到实际命中上限或透射率提前终止时，可能无法获得完整的候选后方信息。
-此时仅将对应的候选／射线记录计为 ``growth_unknown``，不额外追踪补齐。
+原射线因透射率或实际命中上限正常提前终止时，已记录候选仍可提供生长证据；
+原射线完整退出但插入后更早停止的情况也按上面的新停止点计算，不再整条弃权。
+``growth_unknown`` 保留给候选记录容量不足、非法遍历结束或非有限计算等无法可靠评价的记录。
 未知射线既不是支持票，也不是反对票，不进入可靠命中均值；同一候选在该视角的
 其他可靠射线，无论收益为正、负还是零，仍参与统计。没有任何可靠命中时该视角才因
 缺少观测而弃权；聚合收益非有限时仍按前述无效数值规则处理。
-候选记录容量溢出只使未能保存的记录未知，已保存记录在其他完整路径检查通过时继续
+候选记录容量溢出只使未能保存的记录未知，已保存记录在其他合法性检查通过时继续
 有效；记录溢出本身不改变真实前向的颜色、透射率或此前保存的 prefix。
-即使原射线完整，插入候选后可能触发命中上限或透射率终止时，对应记录也保守弃权。
-候选会将后方透射率乘以 ``1-a_child``。当前继承模式的出生上限为 0.3，
-旧固定 0.5 规则会将其再减半；即使使用较低出生值，有用候选仍可能因不满足完整路径条件
-而失去部分射线证据，需要在真实实验中结合未知计数检查。
+原射线结束后没有访问到的候选不产生投票，也不额外追踪补齐。
 当前仅支持均匀训练采样；原生证据遇到非单位采样权重同样弃权，不用于 contour 模式。
 
-上述均值是以“证据可靠”为条件的局部均值。路径能否完整、记录是否溢出与遮挡和深度
+上述均值是以“证据可靠”为条件的局部均值。候选能否被访问、记录是否溢出与遮挡和深度
 有关，未知并非随机缺失，因此不能将它称为完整视角收益的无偏估计。只剩少量可靠射线
 而大量记录未知时，即使均值很高，证据也可能不足。记录覆盖情况用于分析，不新增覆盖率
 硬阈值；多视角支持也不能证明未知部分的收益一定同号。
@@ -628,6 +661,15 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 分别为已遇到候选的可靠、未知命中数；未遇到任何候选时无此比例。射线提前结束后未访问
 的候选不在分母内，因此它仅反映已遇到证据的覆盖情况，不代表候选全部受影响射线的覆盖率。
 
+每轮日志的 ``evidence_vote_diagnostics`` 另存原生射线类别计数。
+``growth_vote_known_rays`` 表示至少提供一条可靠候选证据的射线；
+``growth_vote_recovered_stop_rays`` 是其中恢复了早停证据的射线，包含原路径早停或插入后停止点改变。
+``growth_vote_unknown_record_budget_rays``、``growth_vote_unknown_trace_rays``、
+``growth_vote_unknown_nonfinite_rays`` 分别标记记录容量、遍历合法性与非有限计算造成的未知。
+这些计数按“单视角内、每个类别去重的射线数”累计到整轮，同一条射线可以出现在多个类别中，
+不能相加当作总射线数。它们也不同于 ``growth_observed``／``growth_unknown`` 的候选与射线配对数：
+一条射线可命中多个候选，在后者中分别计数。原生统计留在 GPU，直到 epoch 边界才读回。
+
 单个候选收益不是多个候选同时加入的联合收益；批量提交仍可能出现候选相互遮挡、
 外层增厚或多层低 opacity 雾化。现有 RGB 优化可以降低错误候选的 opacity，但不保证
 一定淘汰它们。应通过生长数量、有效／未知证据、损失及图像对照评估此次实验。
@@ -657,12 +699,20 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 该除法的不稳定。删除不重新追踪、不延长已结束的 DDA、不额外保存一套后缀；但会增加
 GPU 上的算术、按体素归约和事件统计，并非零开销。
 
-确定收益仅来自正常离开网格或到达 ``ray.maxt`` 的完整基线路径，且采样权重为 1、
-相关数值有限。因透射率或实际命中容量提前停止的路径，在删除后可能露出未访问区域，
-相应命中只计 ``deletion_unknown``；未知按射线弃权，不取消其他可靠射线的证据。
-删除减少命中数并增加透射率，所以不套用生长的“新增一个命中的剩余容量”或
-“插入后最终透射率仍高于阈值”检查。没有命中、只有未知记录或聚合收益无效的视角
-不能提供删除支持；未知不是无害证明。
+原生删除协议版本 2 按每个实际命中判断证据是否可靠，要求原遍历合法、采样权重为 1、相关数值有限。
+正常离开场景根盒或到达 ``ray.maxt`` 的路径可直接判断。对于透射率或命中上限导致的早停，
+令 ``T_after`` 为反向循环中该命中之后已记录命中的剩余透射率乘积：
+
+.. code-block:: text
+
+   T_without = T * T_after
+   known = exited_scene_or_ray_maxt or (T_without <= transmittance_threshold)
+
+移除这个命中后，在原记录终点仍满足透射率终止条件，就可使用已有后缀给出收益。
+这里直接相乘，不用 ``T_final / (1-a)``，可处理接近不透明的命中。
+只有确实需要继续看到未访问区域的删除判断才计 ``deletion_unknown``；非法遍历或非有限计算也弃权。
+同一条早停射线可以为部分命中提供可靠证据，同时对另一些命中保持未知，不再整条射线弃权。
+不延长原射线、不补追后方区域。没有命中、只有未知记录或聚合收益无效的视角不能提供删除支持。
 
 每视角先 SUM 合并分批／多 GPU 的 ``deletion_gain``、``deletion_observed`` 和
 ``deletion_unknown``，再以可靠命中数归一化收益，正、负、零收益均参与。视角均值超过
@@ -734,6 +784,13 @@ RGB 分支不因没有观测、零收益或 opacity 较低而删除；持续低 
 这些拒绝原因可能重叠，不能求和当作被拒绝的唯一体素数。可靠比例仍仅覆盖已遇到的
 命中，未访问区域不在分母中。条件观测均值不能保证未知区域无损。
 
+``evidence_vote_diagnostics`` 中的 ``deletion_vote_known_rays`` 表示至少有一个可靠删除判断的射线，
+``deletion_vote_recovered_stop_rays`` 表示其中来自早停路径的射线。
+``deletion_vote_unknown_tail_rays`` 表示至少有一个命中需要额外后方信息；
+``deletion_vote_unknown_trace_rays`` 和 ``deletion_vote_unknown_nonfinite_rays`` 分别记录遍历与数值问题。
+它们与生长诊断使用相同的单视角、单类别去重单位；同一条射线可以既有可靠命中，又有需要额外信息的命中，
+所以 ``known_rays`` 和 ``unknown_tail_rays`` 可以重叠。这些诊断不改变已有支持、反对、保护期和连续确认门槛。
+
 训练仍然每视角更新一次参数，所以不同视角的证据对应不同的在线参数快照，不是
 同一个固定模型的全数据集联合删除损失。多个体素各自删除有益，也可能一起删除后
 损害图像；两窗口确认、反对票及新生保护降低误删风险，但不构成联合下降证明。
@@ -748,16 +805,17 @@ RGB 分支不因没有观测、零收益或 opacity 较低而删除；持续低 
 ``False``，继续使用已保存的固定 ``growth_initial_opacity``（旧默认 0.5）。
 新实验默认继承与上限不会悄悄改变旧实验的续训规则；比较新规则应从初始化重新训练。
 
-此前保留同格多个父体提案修改了原生候选索引、记录及收益计算，需要相应的 C++ 与绑定。
-RGB-only 启动会检查 ``mi.VoxelReconstruction.rgb_only_version``，启用生长还要求
-``rgb_growth_version >= 3``；**尚未同步该原生修正时必须增量编译，再启动新进程**，
-旧二进制不能只更新 Python 后继续使用。该修正保持生长间隔、0.05 外伸门槛、
-两个合法父体、0.7 形状缩小比例、warmup、分裂与损失定义不变。
-已有 RGB 删除要求 ``mi.VoxelReconstruction.rgb_deletion_version >= 1``；
-持续低 opacity 分支及出生 opacity 继承只修改 Python 调度与初始化，但尚未同步的多父体生长修正需要重新编译。
-checkpoint 保存内部证据版本，使用版本 2 或更早 RGB 生长证据规则的训练不能直接升级
-续训，应新开实验，避免把单父体证据与多父体证据混用；
-旧模型仍可独立评价，证据版本不改变已保存的体素渲染参数。
+当前早停证据修正修改了原生路径记录、插入反事实停止点和逐命中删除判断，需要相应的 C++ 与绑定。
+RGB-only 启动会检查 ``mi.VoxelReconstruction.rgb_only_version``；启用 RGB 生长要求
+``rgb_growth_version >= 5``，启用 RGB 删除要求 ``rgb_deletion_version >= 2``。
+**尚未同步这些原生修正时必须增量编译，再启动新进程**，旧二进制不能只更新 Python 后继续使用。
+此修正保留真实前向、图像损失、参数梯度、支持／反对及确认门槛；自适应细分的 20 轮间隔与
+20 万新增叶子预算是当前 JSON 中另行显式设置的调度变化。
+checkpoint 同时保存内部生长证据版本 5 和删除证据版本 2；启用对应分支的旧算法 checkpoint
+不能直接升级续训，即使当前没有未完成的投票窗口，也不能混入旧算法的确认状态。
+比较新规则应新开实验；继续原实验则使用其原代码和配置。旧模型仍可独立评价，
+证据版本不改变已保存的体素渲染参数。性能诊断可以只恢复模型并新建临时生命周期，
+但这不等于恢复原训练，也不应覆盖原实验。
 可兼容旧 checkpoint 缺少 ``use_rgb_deletion`` 时恢复为 ``False``，保留原来已保存的
 删除开关与调度，原先关闭删除的 RGB 实验不会自动启用新删除。要比较新规则，使用
 当前配置新开实验，不在旧 checkpoint 上切换算法。
@@ -801,34 +859,6 @@ RGB-only checkpoint 同样不能切回旧监督模式。旧模型仍可通过
 配置类 ``TrainConfig()`` 及原生接口的默认行为保留 legacy 语义；新实验默认由上面的
 ``CONFIG`` 显式开启，不能把类默认值当作当前实验配置。
 
-编译后的生成场景 GPU 数值回归命令：
-
-.. code-block:: bash
-
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_only.py
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_growth.py
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_growth_lifecycle.py
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_growth_training.py
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_deletion.py
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_deletion_driver.py
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_deletion_lifecycle.py
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_low_opacity_deletion.py
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_rgb_deletion_training.py
-
-该测试不打开真实数据集或既有实验，覆盖参考 alpha 不变性、RGB L2 的颜色与 opacity
-有限差分、白色目标及 miss 的几何梯度、DC opacity、三通道缓存、1 → 2 分裂及负 loss
-拒绝。负平方误差会直接报错，不会被 clamp 为零；这项检查不能替代对双卡归约异常的调查。
-RGB 生长测试另外使用小型合成场景，对照显式插入候选的独立渲染验证虚拟收益，检查
-正／负／中性证据、参考 alpha 不变性、原图与梯度不变性、截断弃权、未知与可靠射线共存、
-溢出时保留已保存记录、分片先求和后
-归一化、局部归一化不随无关像素数变化、可靠视角分母、不限 1024／128 的生长规模、
-旧归一化兼容与证据版本不匹配时的续训拒绝，以及粗细层 warmup。
-测试中的独立渲染仅是数值验证的参照，
-训练投票不执行这些额外渲染。
-RGB 删除回归以实际移除体素后重新渲染的结果校验收益，覆盖正／负／零收益、
-提前终止与完整边界、未知与可靠射线混合、接近不透明的命中、禁用时的图像与梯度
-不变性、分片 SUM、原生重放、空模型和非法设置。生成场景检查不替代真实 Lego 的
-删除效果或多卡服务器吞吐测试。
 下文保留通用运行细节与旧实现说明，其中 alpha 监督、contour 和旧生长／删除规则
 属于 legacy 配置；当前实验以本节及当前 ``CONFIG`` 为准。
 
@@ -1253,7 +1283,8 @@ JSON 的 ``schedule.level_weights`` 若已显式给定，则不会被自动替�
 参考图内存与显存缓存
 --------------------
 
-默认 ``training.reference_cache_mib=1024``，以 MiB 为单位限制训练参考图的 CPU 缓存。
+当前新实验的 ``training.reference_cache_mib=8192``，以 MiB 为单位限制训练参考图的 CPU 缓存；
+兼容 schema 中的默认值仍为 1024。
 第一次访问一个视角时，仍通过原来的读取流程解码为线性 RGBA float32，并检查尺寸和有限值；
 后续访问直接复用只读数组，避免每个 epoch 重复读取和解码 PNG。这层缓存使用 CPU 内存；
 参考数据的重复上传由独立的显存缓存处理。100 张 800 × 800 RGBA float32 约占 976.6 MiB，
@@ -1274,10 +1305,19 @@ JSON 的 ``schedule.level_weights`` 若已显式给定，则不会被自动替�
 命中、未命中与淘汰次数从本次进程开始累计，未命中表示实际调用了图片读取流程。
 关闭缓存时所有访问均为未命中，驻留图片数及字节数保持零。
 
-默认 ``training.gpu_reference_cache_mib=1024`` 将参考图另外保存在 GPU：当前 RGB-only
+当前新实验及 ``bicycle_1024.json`` 使用 ``training.gpu_reference_cache_mib="auto"``，
+按图像实际宽高、训练视角数和通道数请求完整训练集的 GPU 参考缓存。RGB-only
 使用三个 float32 通道，legacy 模式额外保留参考 alpha，共四通道。
-整图直接复用，分批则在 GPU 上读取对应像素。使用
-``--gpu-reference-cache-mib 2048`` 调整容量，或 ``--gpu-reference-cache-mib 0``
+自动容量取 ``ceil(宽×高×训练视角数×通道数×4 / 2^20)`` MiB，分批训练也按完整参考图计算。
+例如 bonsai 的 255 张 1559×1039 RGB 图需要 4727 MiB 逻辑容量；固定 4096 MiB
+只能驻留 220 张，随机遍历时会反复淘汰和上传。自动模式仍逐图加载，不预先分配全部缓存。
+模型初始化及拓扑变化时继续执行显存预检，计入每个通道的分配器粒度、模型、梯度、
+射线路径和工作区；预算不足时沿用现有缩减或关闭缓存的策略，不绕过显存保护。
+配置保存请求值 ``"auto"``，当前实际容量和可驻留图片数记录在 ``memory_plans`` 中。
+旧检查点的明确整数容量保留；缺字段时使用 schema 默认值 1024。
+
+整图直接复用，分批则在 GPU 上读取对应像素。使用 ``--gpu-reference-cache-mib auto``
+显式请求自动容量，``--gpu-reference-cache-mib 2048`` 指定整数上限，或 ``--gpu-reference-cache-mib 0``
 恢复原来的逐视角上传；CPU 缓存开关不受影响。容量不足时按最近使用顺序淘汰，单图超过
 总容量则使用原上传路径。两个缓存都开启时，100 张 800 × 800 图在 RGB-only 下分别占约
 732.4 MiB 内存和显存，legacy RGBA 为 976.6 MiB。这里限制的是缓存持有图像的逻辑字节数，
@@ -1311,8 +1351,6 @@ SH 存储容量、图像与命中记录、Adam、空间索引和参考图缓存�
 ``training.compact_path_records=true`` 继续在反向阶段重算命中的 RGB／opacity。
 设置为 ``false`` 可以保留这些前向值，显存预算会同时计入完整命中与后缀记录；
 它是否更快取决于 SH 阶数、内存带宽和场景，不随显存余量自动开启。
-可用 ``benchmarks/benchmark_reconstruction_storage.py`` 对同一 checkpoint、相机顺序、
-随机种子和更新次数进行布局对照；工具只写指定的新目录，不修改来源实验。
 
 生长复核保留原父节点分批及批内截断顺序，仅跳过与目标空间区间无交集的整批。
 ``geometry_revalidation_seconds``、阶段耗时及批次计数独立记录，便于区分候选准备和复核。
@@ -1447,16 +1485,10 @@ GPU 完成，不包含前向或反向。两组有效掩码相同，比例分别�
      - 7.47
      - 8.88
 
-可在目标机器重现测试和微基准：
-
-.. code-block:: powershell
-
-   & ..\envs\mitsuba\Scripts\python.exe -I `
-     experiments/reconstruction/tests/test_reconstruction_sparse_optimizer.py --benchmark
 
 2026-10-23 的设备端版本另以 262,144 个体素、9 个 radiance SH 系数、1 个 opacity
 系数测量，仍使用 RTX 4060 Laptop。每组预热 5 次，三条实现交替执行，各测量 7 次，
-计时包含 GPU 完成。当前工具同时输出整表、旧主机长度压紧及新设备端重放的结果：
+计时包含 GPU 完成。历史测量对比了整表、旧主机长度压紧及新设备端重放：
 
 .. list-table:: 设备端 Adam 与旧压紧实现，中位数
    :header-rows: 1
@@ -1477,7 +1509,6 @@ GPU 完成，不包含前向或反向。两组有效掩码相同，比例分别�
      - 6.615
      - 4.377
 
-复现此规模可在上面的命令后加 ``--benchmark-voxels 262144 --benchmark-iterations 7``。
 48 次设备端调用共录制 1 次、重放 47 次；禁止同步的回归同时覆盖首次录制、空有效集合、
 单体素与后续有效数量变化。实际训练入口及连续视角测试比较损失、参数、Adam 状态和随机序列，
 不在新路径视角之间插入快照回读。单体素的标量缓冲读取使用设备端副本，避免原位写入与
@@ -1525,13 +1556,6 @@ RGB 删除对应 ``rgb_deletion_device_views``、``rgb_deletion_cpu_views`` 和
 ``view_stage_seconds.topology_observation``、``epoch_topology_seconds`` 以及总 ``seconds``。
 本地生成场景回归不能代替双 A100 的实际吞吐和 NCCL 验证。
 
-新增的生成数据回归在仓库根目录运行，测试临时文件写在系统临时目录：
-
-.. code-block:: powershell
-
-   & '..\envs\mitsuba\Scripts\python.exe' -I experiments/reconstruction/tests/test_reconstruction_growth_filter.py
-   & '..\envs\mitsuba\Scripts\python.exe' -I experiments/reconstruction/tests/test_reconstruction_growth_device.py
-   & '..\envs\mitsuba\Scripts\python.exe' -I experiments/reconstruction/tests/test_reconstruction_topology_device.py
 
 2026-10-19 本地 RTX 4060 Laptop 的独立合成对照：先预热一次，三个重复取中位数，
 计时结束等待 GPU 完成。128 万体素、100 个视角的删除证据累积由约 1.976 秒降为
@@ -1645,15 +1669,6 @@ RGB 删除对应 ``rgb_deletion_device_views``、``rgb_deletion_cpu_views`` 和
 不会放宽其他算法参数的恢复限制。Dr.Jit 重放键包含遍历开关和模型拓扑版本；
 同一模型的候选集合变化也会清除旧记录，避免复用旧占用结构。
 
-使用生成场景检查 DDA / 八叉树输出、梯度、拓扑证据和重放一致性：
-
-.. code-block:: bash
-
-   python -I experiments/reconstruction/tests/test_reconstruction_octree.py
-   python -I experiments/reconstruction/tests/test_reconstruction_octree.py --benchmark
-
-后一个命令另做生成稀疏场景的预热后性能比较；它不训练真实数据集，不改写已有实验。
-诊断计数仅由测试显式请求，普通训练不会增加逐视角计数回读。
 
 以下为 2026-10-21 第一版的历史测量，空块内部当时仍采用寄存器细步进循环，
 不能代表当前直接跨越空块的性能。本地 Windows Release、RTX 4060 Laptop、``cuda_ad_rgb`` 验证通过：
@@ -1819,69 +1834,12 @@ legacy 生长证据期间，每批冻结候选的中心和六个轴向采样点�
 训练预算、采样数、GPU 型号和测量设置一致，并分别查看预热后的普通轮次和拓扑变化轮次。
 是否值得增加 CPU、优化单卡或进一步设计多 GPU 梯度汇总，应据这些实测结果判断。
 
-固定输入的短基准
-----------------
+固定输入的历史测量
+------------------
 
-``experiments/reconstruction/benchmarks/benchmark_reconstruction_forward.py`` 用于比较原生实现版本，默认读取
-``datasets/lego``，按点云初始化固定的 256³ 网格，测试训练相机索引 0、21、56
-（从 0 开始），每个视角为 800 × 800、1 spp。固定随机种子生成射线与参考输入，
-在计时前完成输入上传。脚本不更新参数或拓扑，不运行 epoch，也不生成图片或模型结果。
 
-在已完成源码编译的 HPC Slurm 终端执行：
-
-.. code-block:: bash
-
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/benchmarks/benchmark_reconstruction_forward.py \
-     --dataset datasets/lego
-
-Windows 在 ``reconstruction`` 工作区父目录执行：
-
-.. code-block:: powershell
-
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\benchmarks\benchmark_reconstruction_forward.py `
-     --dataset datasets/lego
-
-默认先预热 3 次，再记录 7 次普通原生调用的墙钟时间；这项时间覆盖完整
-``loss_and_grad`` 及其 GPU 计算完成等待，包含反向工作，不是纯前向时间。
-输入上传、参考图读取、射线生成、结果回读、优化器和拓扑更新均不在该计时范围。
-随后独立预热并记录 3 次分段诊断，提供 ``forward``、``hit_backward`` 和
-``candidate_backward`` 的指标；这些分段同步会改变执行方式，应与普通调用分别比较。
-报告还提供 ``ordinary_kernel_history_samples`` 与 ``ordinary_kernel_history_medians``：
-在关闭 ``profile_stages`` 的完整原生调用上独立预热 1 次、抽样 3 次，记录整体内核统计；
-这些抽样与无内核记录的普通墙钟样本分开，不把不同测量方式的时间相加。
-
-终端打印输出位置，默认在系统临时目录创建独立目录并保留 ``benchmark.json``，
-不占用重建实验的 E 编号。``--output-dir`` 可指定源码仓库外的报告目录；
-``--save-arrays`` 可额外保存每个相机的原生结果和梯度数组，供不同版本数值对照。
-``--cameras``、``--warmup`` 和 ``--repeats`` 可调整相机或重复次数。比较版本时保持
-这些设置、数据和硬件一致；此短基准不替代完整训练的逐轮耗时、收敛与最终评价验证。
-
-调用重放与显存缓存另有完整视角更新基准：
-
-.. code-block:: bash
-
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/benchmarks/benchmark_reconstruction_execution.py \
-     --dataset datasets/lego --ablations
-
-该脚本默认使用相同的三个 800 × 800、1 spp Lego 视角，以及固定的初始化 256³ 拓扑。
-它计时 ``train_view`` 和一次 Adam 更新，包括 CPU 采样、射线构造、参考上传或缓存访问、
-原生前向/反向、标量检查回读以及 GPU 完成等待；不包含 PNG 解码、模型初始化、拓扑操作、
-checkpoint 或最终评价。一轮只遍历选定相机，不是完整 epoch。
-
-默认对比全部关闭和全部开启；``--ablations`` 额外测量仅开启重放、仅开启显存缓存。
-每种模式从相同模型、空 Adam 状态及相同随机种子开始，视角顺序一致，模式执行顺序轮换；
-预热更新在各模式中同样保留。默认预热 1 轮、测量 3 轮，报告同时核对 loss、最终模型和
-Adam 状态的数值误差。可调整 ``--cameras``、``--warmup``、``--repeats``、``--chunk-size``；
-``--gpu-cache-mib`` 必须足以容纳所有选定参考图。输出默认写入系统临时目录的
-``benchmark.json``，不生成重建实验或图片，不占用 E 编号。这个基准用于区分两项优化的
-收益，不能直接外推完整 1000 epoch 或跨设备的加速比。
-
-``--repeat-baseline`` 增加一组独立的原执行路径重复实验，可与 ``--ablations`` 合用，
-用于区分原路径自身的数值波动与新路径的差异。比较保留严格阈值，并记录每个数组的
-超差元素数、RMS、最大误差及对应数值；超差时报告 ``numerical_mismatch`` 并返回非零退出码，
-即使计时已经完成也不会把它标成数值验证通过。
-
-2026-10-19 本地 RTX 4060 Laptop、源码 CUDA 构建实测：以上三视角预热 2 轮、计时 5 轮，
+2026-10-19 本地 RTX 4060 Laptop、源码 CUDA 构建实测：Lego 固定初始化模型的
+相机 0、21、56，800 × 800、1 spp，预热 2 轮、计时 5 轮，
 每模式共更新 21 次，其中 15 次参与计时。完整步骤墙钟中位数如下；该对照使用同一个已合并
 参数校验的 C++ 构建，不单独测量参数校验合并的收益。
 
@@ -2043,7 +2001,7 @@ HPC Slurm
 ----------
 
 先在本地提交并推送代码，再在服务器同步。下面命令用于已经获得 GPU 分配的 Slurm
-作业步骤，包含 pull、增量编译和生成场景的性能回归。本次包含 C++ 改动，编译不可省略。
+作业步骤，包含 pull、增量编译和运行环境设置。本次包含 C++ 改动，编译不可省略。
 若同一源码/构建目录还有训练进程运行，先等该实验结束，再更新和编译；不要在其运行期间
 替换正在使用的源码与原生库。若主动中断，应从已有完整 epoch checkpoint 恢复，未保存
 的进度需要重算。
@@ -2058,10 +2016,9 @@ HPC Slurm
    git submodule sync --recursive &&
    git submodule update --init --recursive &&
    cmake --build build --parallel "${SLURM_CPUS_PER_TASK:-1}" &&
-   source build/setpath.sh &&
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_performance.py
+   source build/setpath.sh
 
-回归通过后，在同一终端开启新的完整实验：
+编译完成后，在同一终端开启新的完整实验：
 
 .. code-block:: bash
 
@@ -2073,7 +2030,7 @@ HPC Slurm
 这里显式选择整图提交，并诊断最先处理的三个视角及每第 10 轮的首个视角，
 便于区分前向与两类反向开销。省略这两个 profile 参数时，恢复默认的分辨率/每 50 轮抽样。
 测量重放收益时添加 ``--no-profile-stages``，保留内核总统计并让抽样视角也执行重放。
-普通训练默认已开启 ``--freeze-native`` 和 1024 MiB 显存参考缓存。
+普通新实验默认已开启 ``--freeze-native`` 和按场景自动规划的显存参考缓存。
 对照旧执行路径可添加 ``--no-freeze-native --gpu-reference-cache-mib 0``，其他配置应相同。
 已经运行的 HPC 进程不会自动加载新脚本，
 需同步后重新启动；如恢复已有实验，应使用已保存的完整 epoch checkpoint 和 ``--resume``，
@@ -2180,19 +2137,10 @@ checkpoint 仍只由 rank 0 保存一份，但训练状态新增 ``update_protoc
 旧逐视角／像素分片 checkpoint 可以沿原单卡路径继续，不能作为 N>1 新批次训练的续训点；
 这些兼容限制不妨碍独立加载最终模型评价。
 
-本地生成场景检查覆盖分批、尾批、平均梯度、证据独立及协议恢复；测试主机只有一张 GPU，
-不能验证真实多 A100 的 NCCL 吞吐、并发显存或完整收敛。旧像素分片的单卡等价测试仍可
-作为旧路径回归，不能代替当前视角批次的数学与通信验证。加速幅度必须在实际分配上测量。
+历史上的本地生成场景检查覆盖分批、尾批、平均梯度、证据独立及协议恢复；测试主机只有一张 GPU，
+不能验证真实多 A100 的 NCCL 吞吐、并发显存或完整收敛。旧像素分片的单卡等价检查也不能
+代替当前视角批次的数学与通信验证。加速幅度必须在实际分配上测量。
 
-通信实现的本地数值／生命周期检查为
-``tests/test_reconstruction_rgb_collective.py --cuda`` 和
-``tests/test_reconstruction_cuda_owners.py --cuda``；它们使用同一张 GPU，不能验证 NCCL
-跨卡通信。HPC 的 ``tests/test_reconstruction_nccl.py --workers N`` 同时覆盖 auto／dense、
-空闲尾批、稀疏与稠密并集及异常数值保护，作为实际跨卡通信检查；还连续执行原生前向、
-NCCL 和重放 Adam，最后统一回读验证，避免逐批读回掩盖连续训练中的依赖问题。
-该检查还包含百万体素规模的 dense 已知值归约，以覆盖小场景无法触及的大消息传输。
-``tests/test_reconstruction_compact_optimizer.py`` 检查紧凑 Adam 与整表参考的参数、历史矩、
-时钟、变化行数和非法输入保护；它在本地单卡 CUDA 上运行，不能替代 HPC 的真实 NCCL 检查。
 
 完整训练结束后，N 个进程继续执行最终 train/test 评价，默认训练集和测试集全部视角，
 每视角 64 spp。评价把已选中的 train/test 视角合并为任务列表，再交错分给 N 个 rank；
@@ -2201,14 +2149,6 @@ NCCL 和重放 Adam，最后统一回读验证，避免逐批读回掩盖连续�
 只有 rank 0 写共享配置、汇总指标和报告，合并后的视角记录恢复为各划分原相机顺序，
 汇总指标由逐视角结果重新计算，不直接平均各 rank 的平均 PSNR。
 
-``test_reconstruction_distributed_evaluation.py`` 已在本地用两个进程共享一张 RTX 4060
-验证：奇数视角数、无任务的第二进程、对端参考图失败、主进程独占共享报告，以及训练后
-两个进程自动执行 64 spp 评价。生成场景的 PNG、线性数组和指标与单进程结果一致。
-测试使用临时目录，不占用实验 outputs；它验证分工及数值，不代表双 A100 的加速幅度。
-
-.. code-block:: powershell
-
-   & '..\envs\mitsuba\Scripts\python.exe' -I experiments/reconstruction/tests/test_reconstruction_distributed_evaluation.py
 
 先申请同一节点的一项任务和两张 GPU，例如：
 
@@ -2248,14 +2188,6 @@ module 或系统库；若库不在默认搜索路径，
 Python 环境中的 NVIDIA NCCL 包也会被搜索。启动器不会自动安装依赖，不需要为本功能
 预先安装 PyTorch、CUDA Toolkit 或其他大型工具链；找不到库时明确报错。
 
-在这项双 GPU Slurm 分配内先运行实际 NCCL 通信检查：
-
-.. code-block:: bash
-
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_nccl.py
-
-该检查与 CPU 模拟测试 ``test_reconstruction_collective.py`` 不同；它使用本次分配的实际
-CUDA 设备，N>1 时需要上述 NCCL 库。通信检查通过后再运行短训练，检查真实场景的行为与吞吐。
 
 先保持 Bicycle 总计 1500 轮的完整分辨率调度，执行前 10 轮并保存恢复点。
 省略 ``--workers`` 即使用本次分配的全部 GPU；以下单卡与多卡命令使用相同的新背景层数策略：
@@ -2374,17 +2306,7 @@ CPU 与 GPU 采用相同规则。核心拟合临时数组在出现更大的外�
 日志 ``topology.refinement_backend="cuda"`` 及 ``refinement_stage_seconds`` 分别报告
 拟合、可选旧层存档和重置阶段；外层 ``epoch_topology_seconds`` 还包含后续模型替换等工作。
 
-本地对照命令：
-
-.. code-block:: powershell
-
-   & ..\envs\mitsuba\Scripts\python.exe -I `
-     experiments/reconstruction/tests/test_reconstruction_refinement_gpu.py --benchmark
-
-检查覆盖旋转／各向异性／相切与内含子格、opacity 阈值和极端 logit、连续两次升层、
-容量拒绝、空模型、生命周期／Adam 重置及旧层保存。地址及顺序严格一致，浮点参数以
-``rtol=4e-6, atol=3e-7`` 对照；不同 FP64 运算顺序仍不承诺逐位一致。
-RTX 4060 Laptop 的 8192 父体素→60320 子体素合成拟合，CPU 1.535 秒、GPU 0.250 秒，
+历史测量中，RTX 4060 Laptop 的 8192 父体素→60320 子体素合成拟合，CPU 1.535 秒、GPU 0.250 秒，
 含输入上传，不含原生模型／八叉树重建。这个局部数据不能外推完整 Bicycle 升层或 A100 加速比。
 
 Checkpoint 与恢复
@@ -2664,8 +2586,8 @@ PNG 同时用于显示与可复算的正式指标。进行论文或其他实现�
   新实验参考图采用 sRGB 输入先合成、再解码的协议；线性渲染后默认使用浮点 sRGB
   图像损失。旧 ``linear`` 参考协议与线性损失分别可选。多 spp 及可配置背景用于独立评价。
 
-本地验证记录与复现命令
-----------------------
+本地验证历史记录
+----------------
 
 2026-10-15，本地 Windows Release 源码构建成功，在 NVIDIA RTX 4060 Laptop GPU
 上使用 ``cuda_ad_rgb`` 完成以下检查；CPU 与模拟环境检查单独列出：
@@ -2711,72 +2633,6 @@ PNG 同时用于显示与可复算的正式指标。进行论文或其他实现�
        结果位于 ``outputs/lego-10.15-E0``；本次未触发体素增删或升到 512³，
        尚未完成全部视角评价或验证收敛。
 
-在 ``reconstruction`` 工作区父目录 PowerShell 中，完成上述源码编译后可分别复现。
-以下前向与几何测试的显式 ``--build-dir`` 相对于当前终端目录；其他新入口的默认
-构建路径固定相对于工作区父目录，因此这里统一从父目录运行：
-
-.. code-block:: powershell
-
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction.py `
-     --build-dir .\mitsuba\build\Release --variant cuda_ad_rgb
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_gradients.py `
-     --build-dir .\mitsuba\build\Release --variant cuda_ad_rgb
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_gradients.py `
-     --build-dir .\mitsuba\build\Release --variant scalar_rgb
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_optimization.py
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_training.py
-
-新训练闭环测试自行生成小场景，不使用 lego 或下载数据集；重新运行时报告默认写入
-``outputs/mitsuba/training-tests/training-tests.json``；优化器/拓扑检查位于
-``outputs/mitsuba/optimization-tests``，几何检查位于
-``outputs/reconstruction-tests/gradients``。这些可重新生成的测试产物已从当前
-``outputs`` 中清理，不属于上面的场景重建结果。
-
-Checkpoint 与 PSNR 的 CPU 单元测试不导入 GPU 后端，也不渲染数据集：
-
-.. code-block:: powershell
-
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_checkpoint.py
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_runtime.py
-
-该测试覆盖模型/优化器/随机数状态往返、空数组与标量布局、原子替换失败保留旧文件、
-校验和破坏、pickle 拒绝、元数据与形状错误，以及已知 PSNR、聚合定义和 sRGB 转换。
-也检查 contour 提案归一化、PDF 校正后的常量/alpha 积分、仅选中 bin 的原始 alpha
-历史更新，以及恢复随机数和历史状态后的采样与射线一致性；这些检查在 CPU 上执行。
-
-调用重放、显存参考缓存和参数校验另有生成数据回归。从已编译的仓库目录运行：
-
-.. code-block:: bash
-
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_replay.py &&
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_reference.py &&
-   "$HOME/envs/mitsuba/bin/python" -I experiments/reconstruction/tests/test_reconstruction_parameters.py
-
-Windows 在工作区父目录将解释器替换为 ``.\envs\mitsuba\Scripts\python.exe``，
-脚本路径改为 ``.\mitsuba\experiments\reconstruction\tests\...``。三个测试都只使用生成的数据和自动清理的临时目录，
-不写实验 ``outputs``。重放测试对照变化的相机、参考、参数、分批尾部、连续 Adam 更新、
-contour 状态、不同拓扑/边界/SH 和分段诊断旁路；显存缓存测试检查全图/分批数值一致、
-LRU 淘汰、容量统计和关闭路径；参数测试覆盖标量与 CUDA、非有限值/尺寸/键错误、
-失败事务不改变任何参数、部分更新及空模型。真实场景的吞吐仍使用上面的执行基准和训练日志测量。
-
-整图提交和相机内核复用有独立的 CUDA 小场景回归，可从工作区父目录运行：
-
-.. code-block:: powershell
-
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_performance.py
-
-.. code-block:: bash
-
-   "$HOME/envs/mitsuba/bin/python" -I mitsuba/experiments/reconstruction/tests/test_reconstruction_performance.py
-
-该检查使用生成的数据和临时目录，比较整图/分批的数值结果，检查按需回读、非有限值拒绝，
-以及更换相机后的 JIT 内核缓存命中。它不代表真实 Lego 数据集或 A100 的吞吐量测试。
-早期 RTX 4060 CUDA 检查中，16 × 16 整图与每批 37 条射线的梯度最大绝对差为
-``1.90735e-6``，参数更新与 contour 历史在测试容差内一致；默认关闭 contour/growth
-图像回读时只传回两个统计标量。改变相机位置、方向及视场角后，原生损失/梯度计算的
-唯一 JIT 内核哈希保持一致，第二个相机全部命中缓存、后端编译耗时为零。
-加入原生记录写入的 ``NoConflicts`` 优化后，相同生成场景的唯一内核数从 66 降至 18。
-相同采样下分批方式改变浮点归约顺序，不保证逐位相同。
 
 原生记录布局改动后，另以 24 × 24 多命中场景对照修改前的原生实现，所比较数值的
 最大绝对差为 ``2.384185791e-7``。本地 RTX 4060 Laptop 的合成 800 × 800、512 个体素
@@ -2802,9 +2658,6 @@ Slurm 上的实际运行，需要在目标数据和硬件上完成验证。
 嵌套内核统计完整保留，空模型的两个反向阶段为零。生成场景的训练、恢复及分段日志汇总检查
 通过，另有三项纯 CPU 汇总测试覆盖旧日志兼容和分辨率分组。这些检查不代表 A100 的实际阶段耗时。
 
-.. code-block:: powershell
-
-   & '.\envs\mitsuba\Scripts\python.exe' -I .\mitsuba\experiments\reconstruction\tests\test_reconstruction_performance_summary.py
 
 前向条件分支与候选提前拒绝的本地对照
 ----------------------------------

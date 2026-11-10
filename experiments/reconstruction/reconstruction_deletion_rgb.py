@@ -13,7 +13,8 @@ from reconstruction_growth_rgb import (
     observe_numpy as _observe_growth_numpy)
 
 
-RGB_DELETION_EVIDENCE_VERSION = 1
+# Version 2 restores per-hit votes when removal still stops within the records.
+RGB_DELETION_EVIDENCE_VERSION = 2
 
 
 def initialize_pending(count, boundary, resolution, np):

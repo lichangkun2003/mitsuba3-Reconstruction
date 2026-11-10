@@ -521,10 +521,10 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device(
     const std::map<std::string, FloatBuffer *> &squared_means,
     const std::map<std::string, UIntBuffer *> &steps,
     const std::map<std::string, double> &settings, const Mask &allowed,
-    bool check_moments) {
+    bool check_moments, const FloatBuffer &learning_rates) {
     return optimizer_step_device_impl(gradients, appearance_valid, geometry_valid,
         background_carve_valid, means, squared_means, steps, settings, allowed,
-        check_moments, nullptr, nullptr);
+        check_moments, learning_rates, nullptr, nullptr);
 }
 
 MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
@@ -537,10 +537,10 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_compact_device(
     const std::map<std::string, FloatBuffer *> &squared_means,
     const std::map<std::string, UIntBuffer *> &steps,
     const std::map<std::string, double> &settings, const Mask &allowed,
-    bool check_moments) {
+    bool check_moments, const FloatBuffer &learning_rates) {
     return optimizer_step_device_impl(gradients, appearance_valid, geometry_valid,
         background_carve_valid, means, squared_means, steps, settings, allowed,
-        check_moments, &indices, &row_count);
+        check_moments, learning_rates, &indices, &row_count);
 }
 
 MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Mask
@@ -552,11 +552,15 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
     const std::map<std::string, FloatBuffer *> &squared_means,
     const std::map<std::string, UIntBuffer *> &steps,
     const std::map<std::string, double> &settings, const Mask &allowed,
-    bool check_moments, const UIntBuffer *compact_indices,
+    bool check_moments, const FloatBuffer &learning_rates, const UIntBuffer *compact_indices,
     const UInt32 *compact_count) {
     if constexpr (!dr::is_jit_v<Float>) {
         Throw("VoxelReconstruction.optimizer_step_device(): requires a JIT variant.");
     } else {
+        const bool scheduled_rates = learning_rates.size() != 0;
+        if (scheduled_rates && (learning_rates.size() != 10 || m_opacity_sh_count > 9))
+            Throw("VoxelReconstruction.optimizer_step_device(): learning_rates must have 10 entries "
+                  "and scheduled opacity supports at most 9 SH coefficients.");
         auto setting = [&](const char *name) {
             auto found = settings.find(name);
             if (found == settings.end() || !std::isfinite(found->second))
@@ -580,18 +584,19 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
             bool geometry;
             FloatBuffer *parameter;
             float rate, limit;
+            uint32_t rate_offset;
         };
         const std::array<Group, 5> groups = {{
             {"radiance_sh", m_sh_count * 3, false, &m_radiance,
-                setting("lr_radiance"), setting("radiance_step_limit")},
+                setting("lr_radiance"), setting("radiance_step_limit"), 0},
             {"opacity_sh", m_opacity_sh_count, false, &m_opacity,
-                setting("lr_opacity"), setting("opacity_step_limit")},
+                setting("lr_opacity"), setting("opacity_step_limit"), 4},
             {"centers", 3, true, &m_centers,
-                setting("lr_center"), setting("center_step_limit")},
+                setting("lr_center"), setting("center_step_limit"), 7},
             {"log_scales", 3, true, &m_log_scales,
-                setting("lr_log_scale"), setting("log_scale_step_limit")},
+                setting("lr_log_scale"), setting("log_scale_step_limit"), 8},
             {"rotation_tangent", 3, true, &m_rotations,
-                setting("lr_rotation"), rotation_limit}
+                setting("lr_rotation"), rotation_limit, 9}
         }};
         const size_t input_rows = compact_indices ? compact_indices->size() : m_active_count;
         const uint32_t radiance_degrees = uint32_t(std::ceil(std::sqrt(double(m_sh_count))));
@@ -613,11 +618,13 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                    clock->second->size() == size_t(m_active_count) * radiance_degrees) &&
                  !(std::string(group.name) == "opacity_sh" &&
                    clock->second->size() == size_t(m_active_count) * opacity_degrees)) ||
-                (group.rate > 0.f && (gradient == gradients.end() ||
+                ((scheduled_rates || group.rate > 0.f) && (gradient == gradients.end() ||
                                      gradient->second.size() != input_rows * group.size)))
                 Throw("VoxelReconstruction.optimizer_step_device(): invalid group %s.", group.name);
         }
         Mask accepted = allowed;
+        if (scheduled_rates)
+            accepted &= (dr::isfinite(learning_rates) & (learning_rates >= 0.f)).all_async_();
         if (compact_indices) {
             if (!input_rows)
                 return accepted & (*compact_count == 0u);
@@ -659,8 +666,8 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
         };
         std::pair<UIntBuffer, UInt32> appearance, geometry;
         if (!compact_indices) {
-            appearance = compact(appearance_valid, groups[0].rate > 0.f || groups[1].rate > 0.f);
-            geometry = compact(geometry_valid, groups[2].rate > 0.f || groups[3].rate > 0.f ||
+            appearance = compact(appearance_valid, scheduled_rates || groups[0].rate > 0.f || groups[1].rate > 0.f);
+            geometry = compact(geometry_valid, scheduled_rates || groups[2].rate > 0.f || groups[3].rate > 0.f ||
                                                groups[4].rate > 0.f);
         }
         const uint32_t batch_size = std::min(m_active_count, uint32_t(32768));
@@ -679,7 +686,7 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
             if (pass == 1)
                 dr::eval(accepted);
             for (const Group &group : groups) {
-                if (group.rate <= 0.f)
+                if (!scheduled_rates && group.rate <= 0.f)
                     continue;
                 const bool rotation = std::string(group.name) == "rotation_tangent";
                 const bool radiance = std::string(group.name) == "radiance_sh";
@@ -703,14 +710,43 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                 const uint32_t clock_width = clock_target.size() == m_active_count ? 1 : degree_count;
                 const uint32_t active_clocks = clock_width == 1 ? 1 :
                     uint32_t(std::ceil(std::sqrt(double(active_coefficients))));
+                const uint32_t active_degrees = (radiance || opacity) ?
+                    uint32_t(std::ceil(std::sqrt(double(active_coefficients)))) : 1u;
+                std::vector<Float> rates;
+                Mask group_enabled(true);
+                if (scheduled_rates) {
+                    group_enabled = Mask(false);
+                    rates.reserve(active_degrees);
+                    for (uint32_t degree = 0; degree < active_degrees; ++degree) {
+                        rates.push_back(dr::gather<Float>(learning_rates, UInt32(group.rate_offset + degree)));
+                        group_enabled |= rates.back() > 0.f;
+                    }
+                }
+                auto component_degree = [&](uint32_t component) {
+                    return (radiance || opacity) ?
+                        uint32_t(std::sqrt(double(component / (radiance ? 3u : 1u)))) : 0u;
+                };
                 auto component_clock = [&](uint32_t component) {
-                    return clock_width == 1 ? 0u : uint32_t(std::sqrt(double(component / (radiance ? 3u : 1u))));
+                    return clock_width == 1 ? 0u : component_degree(component);
+                };
+                auto component_rate = [&](uint32_t component) {
+                    return scheduled_rates ? rates[component_degree(component)] : Float(group.rate);
+                };
+                auto component_mask = [&](uint32_t component, const Mask &active) {
+                    return scheduled_rates ? active & (component_rate(component) > 0.f) : active;
+                };
+                auto clock_mask = [&](uint32_t degree, const Mask &active) {
+                    // Legacy one-clock groups advance when any active band runs.
+                    // Progressive groups freeze each degree independently.
+                    return scheduled_rates ?
+                        active & (clock_width == 1 ? group_enabled : rates[degree] > 0.f) : active;
                 };
                 auto clock_biases = [&](const UIntBuffer &buffer, const UInt32 &ids, const Mask &active) {
                     std::vector<std::tuple<UInt32, Float, Float>> result;
                     result.reserve(active_clocks);
                     for (uint32_t degree = 0; degree < active_clocks; ++degree) {
-                        UInt32 next = dr::gather<UInt32>(buffer, ids * clock_width + degree, active) + 1u;
+                        UInt32 next = dr::gather<UInt32>(buffer, ids * clock_width + degree,
+                                                       clock_mask(degree, active)) + 1u;
                         Float exponent(next);
                         result.emplace_back(next,
                             dr::maximum(1.f - dr::pow(Float(beta1), exponent), 1e-8f),
@@ -728,13 +764,14 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                 };
                 auto adam = [&](const UInt32 &gradient_index, const UInt32 &index, const Mask &active,
                                 const FloatBuffer &mean_buffer, const FloatBuffer &square_buffer,
-                                const Float &bias1, const Float &bias2, const Float &scale) {
+                                const Float &bias1, const Float &bias2, const Float &scale,
+                                const Float &rate) {
                     Float original = clean(dr::gather<Float>(gradient, gradient_index, active) * gradient_factor);
                     Float grad = dr::clip(original, -clip, clip);
                     Float mean = beta1 * dr::gather<Float>(mean_buffer, index, active) + weight1 * grad;
                     Float square = beta2 * dr::gather<Float>(square_buffer, index, active) +
                                    weight2 * dr::square(grad);
-                    Float delta = clean(group.rate * (mean / bias1) /
+                    Float delta = clean(rate * (mean / bias1) /
                         (dr::sqrt(dr::maximum(square / bias2, 0.f)) + epsilon));
                     if (group.geometry && direction_guard) {
                         Mask blocked = (original == 0.f) | (mean * original < 0.f);
@@ -794,9 +831,9 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                         DRJIT_STRUCT(ValidateState, ordinal, finite)
                     } state{lanes, dr::full<Mask>(true, batch_size)};
                     dr::tie(state) = dr::while_loop(dr::make_tuple(std::move(state)),
-                        [&](const ValidateState &s) { return (s.ordinal < count) & accepted; },
+                        [&](const ValidateState &s) { return (s.ordinal < count) & accepted & group_enabled; },
                         [&](ValidateState &s) {
-                            Mask active = (s.ordinal < count) & accepted;
+                            Mask active = (s.ordinal < count) & accepted & group_enabled;
                             UInt32 ids = dr::gather<UInt32>(rows, s.ordinal, active);
                             UInt32 input_row = compact_indices ? s.ordinal : ids;
                             if (compact_indices)
@@ -808,17 +845,19 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                             Float scale = row_scale(input_row, active);
                             std::array<Float, 3> rotation_delta;
                             for (uint32_t component = 0; component < component_count; ++component) {
+                                Mask enabled = component_mask(component, active);
                                 const auto &[next_clock, bias1, bias2] = clocks[component_clock(component)];
                                 auto [mean, square, delta] = adam(input_row * group.size + component,
                                     ids * group.size + component,
-                                    active, mean_target, square_target, bias1, bias2, scale);
+                                    enabled, mean_target, square_target, bias1, bias2, scale,
+                                    component_rate(component));
                                 if (check_moments)
-                                    s.finite &= !active | (dr::isfinite(mean) & dr::isfinite(square));
+                                    s.finite &= !enabled | (dr::isfinite(mean) & dr::isfinite(square));
                                 if (rotation)
                                     rotation_delta[component] = delta;
                                 else
-                                    s.finite &= !active | dr::isfinite(update_component(
-                                        *group.parameter, ids, component, delta, active));
+                                    s.finite &= !enabled | dr::isfinite(update_component(
+                                        *group.parameter, ids, component, delta, enabled));
                             }
                             if (rotation)
                                 for (const Float &value : update_rotation(*group.parameter, ids, rotation_delta, active))
@@ -854,9 +893,9 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                     // Move owners into/out of the loop state. Holding an extra
                     // array copy here would force full-table COW on every view.
                     dr::tie(state) = dr::while_loop(dr::make_tuple(std::move(state)),
-                        [&](const CommitState &s) { return (s.ordinal < count) & accepted; },
+                        [&](const CommitState &s) { return (s.ordinal < count) & accepted & group_enabled; },
                         [&](CommitState &s) {
-                            Mask active = (s.ordinal < count) & accepted;
+                            Mask active = (s.ordinal < count) & accepted & group_enabled;
                             UInt32 ids = dr::gather<UInt32>(rows, s.ordinal, active);
                             UInt32 input_row = compact_indices ? s.ordinal : ids;
                             if (compact_indices)
@@ -871,11 +910,13 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                             next_squares.reserve(component_count);
                             next_parameters.reserve(rotation ? 4 : component_count);
                             for (uint32_t component = 0; component < component_count; ++component) {
+                                Mask enabled = component_mask(component, active);
                                 const auto &[next_clock, bias1, bias2] = clocks[component_clock(component)];
                                 UInt32 index = ids * group.size + component;
-                                auto [mean, square, delta] = adam(input_row * group.size + component, index, active,
+                                auto [mean, square, delta] = adam(input_row * group.size + component, index, enabled,
                                     scalar_mean.size() ? scalar_mean : s.mean,
-                                    scalar_square.size() ? scalar_square : s.square, bias1, bias2, scale);
+                                    scalar_square.size() ? scalar_square : s.square, bias1, bias2, scale,
+                                    component_rate(component));
                                 next_means.push_back(std::move(mean));
                                 next_squares.push_back(std::move(square));
                                 if (rotation)
@@ -883,7 +924,7 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                                 else
                                     next_parameters.push_back(update_component(
                                         scalar_parameter.size() ? scalar_parameter : s.parameter,
-                                        ids, component, delta, active));
+                                        ids, component, delta, enabled));
                             }
                             if (rotation) {
                                 auto values = update_rotation(s.parameter, ids, rotation_delta, active);
@@ -894,16 +935,18 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                             // Compact IDs are unique, and different coefficient
                             // addresses are disjoint, so NoConflicts is exact.
                             for (uint32_t component = 0; component < component_count; ++component) {
+                                Mask enabled = component_mask(component, active);
                                 UInt32 index = ids * group.size + component;
-                                dr::scatter(s.mean, dr::detach(next_means[component]), index, active, ReduceMode::NoConflicts);
-                                dr::scatter(s.square, dr::detach(next_squares[component]), index, active, ReduceMode::NoConflicts);
+                                dr::scatter(s.mean, dr::detach(next_means[component]), index, enabled, ReduceMode::NoConflicts);
+                                dr::scatter(s.square, dr::detach(next_squares[component]), index, enabled, ReduceMode::NoConflicts);
                             }
                             for (uint32_t component = 0; component < next_parameters.size(); ++component)
                                 dr::scatter(s.parameter, dr::detach(next_parameters[component]),
-                                    ids * (rotation ? 4u : group.size) + component, active, ReduceMode::NoConflicts);
+                                    ids * (rotation ? 4u : group.size) + component,
+                                    component_mask(component, active), ReduceMode::NoConflicts);
                             for (uint32_t degree = 0; degree < active_clocks; ++degree)
                                 dr::scatter(s.clock, std::get<0>(clocks[degree]), ids * clock_width + degree,
-                                            active, ReduceMode::NoConflicts);
+                                            clock_mask(degree, active), ReduceMode::NoConflicts);
                             s.ordinal += batch_size;
                         }, "Voxel reconstruction Adam commit");
                     mean_target = std::move(state.mean);
@@ -1841,7 +1884,10 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         Throw("VoxelReconstruction.loss_and_grad(): D-SSIM requires exactly image_width*image_height rays in row-major order.");
     const uint32_t hit_before_field = compact_path_records ? 4u : 8u;
     const uint32_t hit_depth_field = hit_before_field + 1u;
-    const uint32_t hit_fields = hit_depth_field + (distortion_enabled ? 2u : 0u);
+    const uint32_t hit_prefix_field = hit_depth_field + (distortion_enabled ? 2u : 0u);
+    // Growth evidence alone needs cumulative RGB after each actual hit. The
+    // existing T_before plane supplies every internal transmittance boundary.
+    const uint32_t hit_fields = hit_prefix_field + (collect_growth ? 3u : 0u);
     if (width == 0 || width * std::max(max_hits, std::max(max_candidates,
         collect_growth ? max_growth_hits : 1u)) * hit_fields > UINT32_MAX)
         Throw("VoxelReconstruction.loss_and_grad(): ray batch is empty or too large.");
@@ -1902,11 +1948,19 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             result.growth_sums["growth_gain"] = dr::zeros<FloatBuffer>(0);
             result.growth_counts["growth_observed"] = dr::zeros<UIntBuffer>(0);
             result.growth_counts["growth_unknown"] = dr::zeros<UIntBuffer>(0);
+            for (const auto *name : {"growth_vote_known_rays", "growth_vote_recovered_stop_rays",
+                 "growth_vote_unknown_record_budget_rays", "growth_vote_unknown_trace_rays",
+                 "growth_vote_unknown_nonfinite_rays"})
+                result.counters[name] = dr::zeros<UIntBuffer>(1);
         }
         if (collect_rgb_deletion) {
             result.deletion_sums["deletion_gain"] = dr::zeros<FloatBuffer>(0);
             result.deletion_counts["deletion_observed"] = dr::zeros<UIntBuffer>(0);
             result.deletion_counts["deletion_unknown"] = dr::zeros<UIntBuffer>(0);
+            for (const auto *name : {"deletion_vote_known_rays", "deletion_vote_recovered_stop_rays",
+                 "deletion_vote_unknown_tail_rays", "deletion_vote_unknown_trace_rays",
+                 "deletion_vote_unknown_nonfinite_rays"})
+                result.counters[name] = dr::zeros<UIntBuffer>(1);
         }
         if (collect_adaptive_priority)
             result.deletion_sums["adaptive_priority"] = dr::zeros<FloatBuffer>(0);
@@ -1960,20 +2014,21 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     };
     struct GrowthBuffers {
         FloatBuffer values;
-        UIntBuffer ids, unknown;
+        UIntBuffer ids, front, unknown;
     };
     struct Records {
         FloatBuffer hit;
         UIntBuffer hit_id;
         Candidates candidates;
         FloatBuffer growth_values;
-        UIntBuffer growth_ids, growth_unknown;
-        DRJIT_STRUCT(Records, hit, hit_id, candidates, growth_values, growth_ids, growth_unknown)
+        UIntBuffer growth_ids, growth_front, growth_unknown;
+        DRJIT_STRUCT(Records, hit, hit_id, candidates, growth_values, growth_ids, growth_front, growth_unknown)
     } records{dr::zeros<FloatBuffer>(width*max_hits*hit_fields),
               dr::zeros<UIntBuffer>(width*max_hits),
               std::vector<Candidate>(max_candidates,
                   Candidate{Vector3f(0.f), Float(0.f), Float(0.f), Float(0.f), UInt32(0), UInt32(0)}),
               dr::zeros<FloatBuffer>(collect_growth ? width*max_growth_hits*6 : 1),
+              dr::zeros<UIntBuffer>(collect_growth ? width*max_growth_hits : 1),
               dr::zeros<UIntBuffer>(collect_growth ? width*max_growth_hits : 1),
               dr::zeros<UIntBuffer>(collect_growth ? m_growth_count : 1)};
     const uint32_t growth_stride = collect_growth ? ray_count*max_growth_hits : 0;
@@ -2083,6 +2138,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     RaySegment first{ray.o,d,exit};
     struct State {
         Mask active;
+        Mask growth_record_overflow;
         Vector3i cell;
         Vector3f next;
         Float entry, transmittance;
@@ -2093,11 +2149,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         SpatialAnchor tree_anchor, growth_anchor;
         Float distortion_mass, distortion_moment, distortion;
         RaySegment segment;
-        DRJIT_STRUCT(State,active,cell,next,entry,transmittance,color,hits,candidates,
+        DRJIT_STRUCT(State,active,growth_record_overflow,cell,next,entry,transmittance,color,hits,candidates,
                      iterations,growth_hits,traversal_steps,traversal_skipped,
                      traversal_leaves,traversal_queries,tree_node,tree_level,growth_node,growth_level,
                      tree_anchor,growth_anchor,distortion_mass,distortion_moment,distortion,segment)
-    } state{active,cell,next,entry,Float(1.f),Color3f(0.f),UInt32(0),UInt32(0),
+    } state{active,Mask(false),cell,next,entry,Float(1.f),Color3f(0.f),UInt32(0),UInt32(0),
             UInt32(0),UInt32(0),UInt32(0),UInt32(0),UInt32(0),UInt32(0),
             UInt32(m_tree.root),UInt32(m_tree.depth),UInt32(m_growth_tree.root),UInt32(m_growth_tree.depth),
             SpatialAnchor(0),SpatialAnchor(0),
@@ -2155,7 +2211,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 Mask proposal = s.active & (signed_id <= -2);
                 UInt32 growth_id = UInt32(-dr::minimum(signed_id, Int32(-2)) - 2);
                 auto buffers = std::make_shared<GrowthBuffers>(
-                    GrowthBuffers{r.growth_values, r.growth_ids, r.growth_unknown});
+                    GrowthBuffers{r.growth_values, r.growth_ids, r.growth_front, r.growth_unknown});
                 s = dr::if_stmt(dr::make_tuple(s, growth_id, end, proposal, s.segment.origin, d), proposal,
                     [this, growth_intersects, buffers, lane, ray_count, growth_stride, max_growth_hits](
                         State s, const UInt32 &head,
@@ -2180,8 +2236,10 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                                 id = dr::gather<UInt32>(m_growth_next,id,valid);
                             },"Voxel reconstruction growth cell intersections");
                         Mask stored = any_hit & !full;
+                        s.growth_record_overflow |= any_hit & full;
                         UInt32 slot = dr::minimum(s.growth_hits,max_growth_hits-1)*ray_count+lane;
                         dr::scatter(buffers->ids,head,slot,stored);
+                        dr::scatter(buffers->front,s.hits,slot,stored);
                         for (uint32_t j=0; j<3; ++j)
                             dr::scatter(buffers->values,s.color[j],j*growth_stride+slot,stored);
                         dr::scatter(buffers->values,s.transmittance,3*growth_stride+slot,stored);
@@ -2195,6 +2253,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     "Voxel reconstruction hypothetical growth hit");
                 r.growth_values = buffers->values;
                 r.growth_ids = buffers->ids;
+                r.growth_front = buffers->front;
                 r.growth_unknown = buffers->unknown;
             }
             // Keep empty cells out of geometry, appearance, and candidate work.
@@ -2206,7 +2265,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 dr::make_tuple(s,r.candidates,id,end,occupied,s.segment.origin,d),occupied,
                 [this,rotate,quaternion,appearance,ray_count,hit_stride,lane,
                  max_candidates,diagonal,hit_buffers,distortion_enabled,world_d,world_shell,
-                 compact_path_records,hit_before_field,hit_depth_field,
+                 compact_path_records,hit_before_field,hit_depth_field,collect_growth,hit_prefix_field,
                  grid_entry=entry](State s,Candidates candidates,const UInt32 &id,
                     const Float &end,const Mask &occupied,const Point3f &origin,
                     const Vector3f &direction) {
@@ -2270,7 +2329,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     s=dr::if_stmt(
                         dr::make_tuple(s,id,relative_star,gmin,hit,direction,depth,depth_chain),hit,
                         [appearance,ray_count,hit_stride,lane,hit_buffers,distortion_enabled,world_d,
-                         compact_path_records,hit_before_field,hit_depth_field](State s,
+                         compact_path_records,hit_before_field,hit_depth_field,collect_growth,hit_prefix_field](State s,
                             const UInt32 &id,const Vector3f &relative_star,
                             const Float &gmin,const Mask &hit,const Vector3f &direction,
                             const Float &depth,const Float &depth_chain) {
@@ -2299,6 +2358,10 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                                 s.distortion_moment += contribution*depth;
                             }
                             s.color += s.transmittance*hit_alpha*emission;
+                            if (collect_growth)
+                                for (uint32_t j=0; j<3; ++j)
+                                    dr::scatter(hit_buffers->hit,s.color[j],
+                                                (hit_prefix_field+j)*hit_stride+slot,hit);
                             s.transmittance *= 1.f-hit_alpha;
                             s.hits += dr::select(hit,1u,0u);
                             return s;
@@ -2470,24 +2533,31 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         result.growth_counts["growth_observed"] = dr::zeros<UIntBuffer>(m_growth_count);
         result.growth_counts["growth_unknown"] = collect_growth ?
             records.growth_unknown : dr::zeros<UIntBuffer>(m_growth_count);
+        for (const auto *name : {"growth_vote_known_rays", "growth_vote_recovered_stop_rays",
+             "growth_vote_unknown_record_budget_rays", "growth_vote_unknown_trace_rays",
+             "growth_vote_unknown_nonfinite_rays"})
+            result.counters[name] = dr::zeros<UIntBuffer>(1);
     }
     if (collect_growth) {
-        // No second forward pass: an insertion changes the final color by
-        // alpha * (T_before * radiance - already-weighted baseline suffix).
-        // Empty candidate cells cannot reorder existing clipped-cell hits.
-        // A stopped path has no reliable full suffix, and inserting a hit can
-        // itself trigger the cap/early exit. Be conservative and report unknown
-        // for both cases instead of extending traversal or inventing evidence.
+        // Insertion only decreases subsequent T and adds one actual hit. Its
+        // stop cannot be later than the baseline's stop, including a baseline
+        // terminated by opacity or max_hits. Empty candidate cells preserve
+        // the ordering of the recorded clipped-cell hits. Shared RGB prefixes
+        // and a binary search over T recover the exact truncated insertion;
+        // there is no per-proposal tree traversal or full hit replay.
         Mask exited =
             (!dr::all(state.cell>=0) | !dr::all(state.cell<int(root_resolution())) | (state.entry>=exit));
-        Mask complete = exited & (state.iterations<=3*root_resolution()+3) &
-                        (state.hits+1u<max_hits) &
-                        (weight==1.f) & dr::all(dr::isfinite(result.raw_rgb)) &
-                        dr::all(dr::isfinite(reference_rgb));
+        Mask trace_valid = (state.iterations<=3*root_resolution()+3) &
+            (exited | (state.transmittance<=cfg["transmittance_threshold"]) | (state.hits>=max_hits)) &
+            (weight==1.f) & dr::isfinite(inverse_pdf);
+        Mask baseline_finite = dr::all(dr::isfinite(result.raw_rgb)) &
+            dr::all(dr::isfinite(reference_rgb)) & dr::isfinite(state.transmittance);
+        Mask known_rays(false), recovered_rays(false), invalid_trace_rays(false), nonfinite_rays(false);
         for (uint32_t k=0; k<max_growth_hits; ++k) {
             Mask stored = k<state.growth_hits;
             UInt32 slot = k*ray_count+lane;
             UInt32 head=dr::gather<UInt32>(records.growth_ids,slot,stored);
+            UInt32 front=dr::gather<UInt32>(records.growth_front,slot,stored);
             UInt32 id=dr::select(stored,head,UInt32(UINT32_MAX));
             Color3f prefix;
             for (uint32_t j=0; j<3; ++j)
@@ -2500,13 +2570,17 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             // or actual rendering, and an arbitrary number of siblings can be
             // evaluated without consuming the per-ray cell-record capacity.
             dr::tie(id,result.growth_sums["growth_gain"],result.growth_counts["growth_observed"],
-                    result.growth_counts["growth_unknown"]) = dr::while_loop(
+                    result.growth_counts["growth_unknown"],known_rays,recovered_rays,
+                    invalid_trace_rays,nonfinite_rays) = dr::while_loop(
                 dr::make_tuple(id,result.growth_sums["growth_gain"],
-                    result.growth_counts["growth_observed"],result.growth_counts["growth_unknown"]),
-                [](const UInt32 &id,const FloatBuffer &,const UIntBuffer &,const UIntBuffer &) {
+                    result.growth_counts["growth_observed"],result.growth_counts["growth_unknown"],
+                    known_rays,recovered_rays,invalid_trace_rays,nonfinite_rays),
+                [](const UInt32 &id,const FloatBuffer &,const UIntBuffer &,const UIntBuffer &,
+                   const Mask &,const Mask &,const Mask &,const Mask &) {
                     return id!=UInt32(UINT32_MAX);
                 },
-                [&](UInt32 &id,FloatBuffer &gains,UIntBuffer &observed,UIntBuffer &unknown) {
+                [&](UInt32 &id,FloatBuffer &gains,UIntBuffer &observed,UIntBuffer &unknown,
+                    Mask &known_ray,Mask &recovered_ray,Mask &invalid_trace,Mask &nonfinite) {
                     Mask valid = id!=UInt32(UINT32_MAX);
                     Mask hit = growth_intersects(id,segment_entry,segment_end,ray.o,d,valid);
                     Color3f radiance(0.f);
@@ -2522,25 +2596,65 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     }
                     radiance = dr::maximum(clean(radiance),0.f);
                     Float opacity = dr::rcp(1.f+dr::exp(-logit));
-                    Color3f change = opacity*(before*radiance-(result.raw_rgb-prefix));
+                    Float remaining = 1.f-opacity;
+                    Mask record_valid = (front<=state.hits) & (front<max_hits);
+                    Mask evaluate = hit & trace_valid & record_valid & baseline_finite;
+                    UInt32 limit = dr::minimum(state.hits,max_hits-1u);
+                    // A boundary m means m original hits have been included.
+                    // T_m is stored as the next hit's T_before, or final T.
+                    // The insertion itself can terminate immediately at front.
+                    auto boundary_t = [&](const UInt32 &m) {
+                        Mask has_next = evaluate & (m<state.hits);
+                        return dr::select(has_next,dr::gather<Float>(records.hit,
+                            hit_before_field*hit_stride+m*ray_count+lane,has_next),state.transmittance);
+                    };
+                    UInt32 stop = dr::binary_search<UInt32>(0u,max_hits,
+                        [&](const UInt32 &m) {
+                            return (m<front) | ((m<limit) &
+                                (boundary_t(m)*remaining>cfg["transmittance_threshold"]));
+                        });
+                    Float terminal_t = boundary_t(stop);
+                    UInt32 previous = dr::maximum(stop,1u)-1u;
+                    Color3f terminal_prefix(0.f);
+                    for (uint32_t channel=0; channel<3; ++channel)
+                        terminal_prefix[channel] = dr::gather<Float>(records.hit,
+                            (hit_prefix_field+channel)*hit_stride+previous*ray_count+lane,
+                            evaluate & (stop>0));
+                    // Preserve the original small-gain expression when the
+                    // counterfactual retains the baseline endpoint. Otherwise
+                    // remove the discarded suffix before inserting the hit.
+                    Color3f terminal = terminal_prefix+terminal_t*background;
+                    terminal = dr::select(stop==state.hits,result.raw_rgb,terminal);
+                    Color3f change = (terminal-result.raw_rgb)+
+                        opacity*(before*radiance-(terminal-prefix));
                     Color3f gain_change = change, gain_residual = result.raw_rgb-reference_rgb;
                     if (rgb_loss_srgb) {
-                        // Only weight==1 baselines can be known evidence. The
-                        // nonlinear transfer requires the full counterfactual,
+                        // The nonlinear transfer requires the full counterfactual,
                         // not its first-order Jacobian. Expand in encoded space
                         // to retain small gains without subtracting two losses.
                         gain_change = reconstruction_linear_to_srgb(result.raw_rgb+change)-loss_rgb;
                         gain_residual = delta;
                     }
                     Float gain = -2.f*dr::dot(gain_residual,gain_change)-dr::squared_norm(gain_change);
-                    Mask known = hit & complete & dr::isfinite(gain) &
-                        (state.transmittance*(1.f-opacity)>cfg["transmittance_threshold"]);
+                    Mask finite = baseline_finite & dr::isfinite(before) &
+                        dr::all(dr::isfinite(prefix)) & dr::isfinite(opacity) &
+                        dr::isfinite(terminal_t) & dr::all(dr::isfinite(terminal)) & dr::isfinite(gain);
+                    Mask known = hit & trace_valid & record_valid & finite;
+                    known_ray |= known;
+                    recovered_ray |= known & (!exited | (stop!=state.hits));
+                    invalid_trace |= hit & !(trace_valid & record_valid);
+                    nonfinite |= hit & !finite;
                     dr::scatter_reduce(ReduceOp::Add,gains,dr::detach(gain),id,known);
                     dr::scatter_reduce(ReduceOp::Add,observed,UInt32(1),id,known);
                     dr::scatter_reduce(ReduceOp::Add,unknown,UInt32(1),id,hit&!known);
                     id = dr::gather<UInt32>(m_growth_next,id,valid);
                 },"Voxel reconstruction growth cell evidence");
         }
+        result.counters["growth_vote_known_rays"] = dr::sum(UInt32(known_rays));
+        result.counters["growth_vote_recovered_stop_rays"] = dr::sum(UInt32(recovered_rays));
+        result.counters["growth_vote_unknown_record_budget_rays"] = dr::sum(UInt32(state.growth_record_overflow));
+        result.counters["growth_vote_unknown_trace_rays"] = dr::sum(UInt32(invalid_trace_rays));
+        result.counters["growth_vote_unknown_nonfinite_rays"] = dr::sum(UInt32(nonfinite_rays));
     }
     result.compact_gradients = compact_gradients;
     UIntBuffer gradient_slots = dr::zeros<UIntBuffer>(1);
@@ -2686,20 +2800,20 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
 
     // Hit records stay read-only inside the symbolic reverse loop. Separate
     // suffix storage avoids a gather-after-scatter evaluation at every hit.
-    Mask deletion_complete(false);
+    Mask deletion_exited(false), deletion_trace_valid(false), deletion_baseline_finite(false);
     Color3f deletion_residual(0.f);
     if (collect_rgb_deletion) {
-        // Removing an actual hit can reveal an untraced suffix after opacity
-        // or capacity termination. Only a normally exited baseline certifies
-        // that the recorded suffix is complete; no extra traversal is done.
-        // Removal reduces hit count and increases T, so insertion's spare-hit
-        // capacity and reduced-final-T checks do not apply.
-        Mask exited =
+        // Removal can expose an untraced suffix. A complete exit is sufficient,
+        // but not necessary: each hit can also be judged if its removal still
+        // satisfies the opacity stop at the recorded endpoint. Hits that need
+        // a longer suffix abstain individually; no extra traversal is done.
+        deletion_exited =
             (!dr::all(state.cell>=0) | !dr::all(state.cell<int(root_resolution())) | (state.entry>=exit));
-        deletion_complete = exited & (state.iterations<=3*root_resolution()+3) &
-                            (weight==1.f) & dr::isfinite(inverse_pdf) &
-                            dr::all(dr::isfinite(result.raw_rgb)) &
-                            dr::all(dr::isfinite(reference_rgb));
+        deletion_trace_valid = (state.iterations<=3*root_resolution()+3) &
+            (deletion_exited | (state.transmittance<=cfg["transmittance_threshold"]) | (state.hits>=max_hits)) &
+            (weight==1.f) & dr::isfinite(inverse_pdf);
+        deletion_baseline_finite = dr::all(dr::isfinite(result.raw_rgb)) &
+            dr::all(dr::isfinite(reference_rgb)) & dr::isfinite(state.transmittance);
         deletion_residual = rgb_loss_srgb ? delta : result.raw_rgb-reference_rgb;
     }
     struct ReverseState {
@@ -2712,20 +2826,24 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         GradientMap deletion_sums;
         CounterMap deletion_counts;
         Float distortion_mass, distortion_moment, distortion_weight_derivative;
+        Mask deletion_known, deletion_recovered, deletion_unknown_tail,
+             deletion_unknown_trace, deletion_nonfinite;
         DRJIT_STRUCT(ReverseState,hit,behind,after,suffix,gradients,counters,
                      deletion_sums,deletion_counts,distortion_mass,
-                     distortion_moment,distortion_weight_derivative)
+                     distortion_moment,distortion_weight_derivative,deletion_known,
+                     deletion_recovered,deletion_unknown_tail,deletion_unknown_trace,deletion_nonfinite)
     } reverse{dr::full<Int32>(int(max_hits)-1,width),background,Float(1.f),
               dr::zeros<FloatBuffer>(size_t(hit_stride)*(compact_path_records ? 3u : 4u)),
               std::move(result.gradients),std::move(result.counters),
               std::move(result.deletion_sums),std::move(result.deletion_counts),
-              Float(0.f),Float(0.f),Float(0.f)};
+              Float(0.f),Float(0.f),Float(0.f),Mask(false),Mask(false),Mask(false),Mask(false),Mask(false)};
     dr::tie(reverse)=dr::while_loop(dr::make_tuple(std::move(reverse)),
         [](const ReverseState &s) { return s.hit>=0; },
         [this,hit_records=records.hit,hit_ids=records.hit_id,hit_count=state.hits,
          ray_count,hit_stride,lane,clean,dcolor,dalpha,d,weight,is_background,
          is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry,rgb_only,
-         collect_rgb_deletion,collect_adaptive_priority,deletion_complete,deletion_residual,distortion_enabled,
+         collect_rgb_deletion,collect_adaptive_priority,deletion_exited,deletion_trace_valid,
+         deletion_baseline_finite,deletion_residual,distortion_enabled,
          rgb_loss_srgb,deletion_rgb=result.raw_rgb,deletion_encoded_rgb=loss_rgb,
          distortion_weight,diagonal,quaternion,rotate,world_shell,
          total_mass=state.distortion_mass,total_moment=state.distortion_moment,
@@ -2869,7 +2987,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     visible&is_background&(delta_loss<-cfg.at("min_removal_loss_delta")));
             }
             if (collect_rgb_deletion) {
-                // Exact single-removal color change on a complete baseline:
+                // Exact single-removal color change when the recorded endpoint
+                // remains valid after removing this particular hit:
                 // C_without - C = T_before * alpha * (suffix - radiance).
                 // Use the existing reverse suffix directly, including when
                 // alpha approaches one; never divide by (1-alpha).
@@ -2877,13 +2996,22 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 Color3f gain_change = rgb_loss_srgb ?
                     reconstruction_linear_to_srgb(deletion_rgb+dc)-deletion_encoded_rgb : dc;
                 Float gain = -2.f*dr::dot(deletion_residual,gain_change)-dr::squared_norm(gain_change);
-                // Projective background hits use the same complete-ray RGB
-                // removal test as core hits. Truncated suffixes remain unknown.
+                // The reverse suffix gives the remaining product without a
+                // division by (1-alpha), even for an opaque removed hit.
+                Float without_t = before*s.after;
+                Mask tail_available = deletion_exited |
+                    (without_t<=cfg.at("transmittance_threshold"));
                 Mask eligible=valid;
-                Mask known = eligible & deletion_complete & dr::isfinite(before) &
+                Mask finite = deletion_baseline_finite & dr::isfinite(before) &
                              dr::isfinite(opacity) & dr::all(dr::isfinite(radiance)) &
                              dr::all(dr::isfinite(s.behind)) &
-                             dr::all(dr::isfinite(dc)) & dr::isfinite(gain);
+                             dr::all(dr::isfinite(dc)) & dr::isfinite(gain) & dr::isfinite(without_t);
+                Mask known = eligible & deletion_trace_valid & tail_available & finite;
+                s.deletion_known |= known;
+                s.deletion_recovered |= known & !deletion_exited;
+                s.deletion_unknown_tail |= eligible & deletion_trace_valid & finite & !tail_available;
+                s.deletion_unknown_trace |= eligible & !deletion_trace_valid;
+                s.deletion_nonfinite |= eligible & !finite;
                 dr::scatter_reduce(ReduceOp::Add,s.deletion_sums["deletion_gain"],
                     dr::detach(gain),id,known);
                 dr::scatter_reduce(ReduceOp::Add,s.deletion_counts["deletion_observed"],
@@ -2910,6 +3038,13 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     result.counters=std::move(reverse.counters);
     result.deletion_sums=std::move(reverse.deletion_sums);
     result.deletion_counts=std::move(reverse.deletion_counts);
+    if (collect_rgb_deletion) {
+        result.counters["deletion_vote_known_rays"] = dr::sum(UInt32(reverse.deletion_known));
+        result.counters["deletion_vote_recovered_stop_rays"] = dr::sum(UInt32(reverse.deletion_recovered));
+        result.counters["deletion_vote_unknown_tail_rays"] = dr::sum(UInt32(reverse.deletion_unknown_tail));
+        result.counters["deletion_vote_unknown_trace_rays"] = dr::sum(UInt32(reverse.deletion_unknown_trace));
+        result.counters["deletion_vote_unknown_nonfinite_rays"] = dr::sum(UInt32(reverse.deletion_nonfinite));
+    }
     // Loop traversal includes maps, while schedule() needs their buffers
     // explicitly. Materialize all reverse outputs at the existing stage boundary.
     if constexpr (dr::is_jit_v<Float>) {

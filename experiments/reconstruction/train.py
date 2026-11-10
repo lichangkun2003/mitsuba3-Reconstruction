@@ -48,11 +48,16 @@ from reconstruction_gradient_storage import (gradient_capacity, native_gradient_
     gradient_storage_key, planned_gradient_capacity, choose_gradient_storage_plan)
 from reconstruction_memory import (TrainingMemoryError, estimate_spatial_index_bytes,
     plan_refinement_memory, plan_training_memory, probe_cuda_allocator, query_cuda_memory,
-    round_cuda_allocation)
+    round_cuda_allocation, resolve_reference_cache_mib, validate_reference_cache_mib)
 from reconstruction_sh_schedule import (apply_sh_schedule, sh_schedule_protocol,
     validate_sh_schedule, resolve_resume_sh_schedule)
+from reconstruction_lr_schedule import (learning_rate_schedule, learning_rate_schedule_protocol,
+    validate_learning_rate_schedule)
 from reconstruction_sampling import PrefetchedUniformSampler
 from reconstruction_growth_rgb import RGB_GROWTH_EVIDENCE_VERSION
+from reconstruction_deletion_rgb import RGB_DELETION_EVIDENCE_VERSION
+from reconstruction_evidence_diagnostics import (EVIDENCE_RAY_KEYS, accumulate_evidence_rays,
+                                                read_evidence_rays)
 from reconstruction_topology import (TopologyManager, TopologySettings, CoarseToFineConfig,
                                      level_budgets, validate_growth_opacity)
 
@@ -70,7 +75,7 @@ class TrainingSettings:
     profile_interval_epochs: int = 50  # Sample one view periodically and on entering each resolution; 0 disables.
     profile_stages: bool = True  # Synchronize native phase boundaries only in sampled views.
     reference_cache_mib: int = 1024  # Decoded float32 RGBA in host RAM; 0 disables caching.
-    gpu_reference_cache_mib: int = 1024  # Float32 reference planes on the GPU; 0 disables.
+    gpu_reference_cache_mib: int | str = 1024  # Legacy default; "auto" requests all images, 0 disables.
     freeze_native: bool = True  # Replay native GPU work between topology changes.
     compact_gradients: bool = True  # Allow bounded touched-voxel fallback for single-GPU RGB full views.
     compact_gradient_rows: int = 0  # 0: start with two rows per ray; overflow retries grow safely.
@@ -205,7 +210,7 @@ CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译�
 CONFIG.training.profile_interval_epochs = 50  # 每 50 轮及首次进入各分辨率时抽样记录内核耗时；0 关闭。
 CONFIG.training.profile_stages = True  # 仅在抽样视角细分前向、命中反向和候选梯度；会增加诊断开销。
 CONFIG.training.reference_cache_mib = 8192  # RAM 上限；容纳 bonsai 的全部 RGB 参考（约 4727 MiB），避免每轮重新解码。
-CONFIG.training.gpu_reference_cache_mib = 4096  # 显存缓存上限，按需分配；容纳全部参考图以避免反复上传，0 关闭。
+CONFIG.training.gpu_reference_cache_mib = "auto"  # 按场景请求完整参考图缓存；显存预检可缩减，0 关闭。
 CONFIG.training.freeze_native = True  # 重放原生计算；拓扑变化后重新记录，分段诊断时旁路。
 
 CONFIG.schedule.enabled = True
@@ -285,7 +290,8 @@ def parse_arguments(argv=None):
     parser.add_argument("--profile-stages", action=argparse.BooleanOptionalAction, default=None,
                         help="Synchronize and time native phases in sampled views; --no-profile-stages keeps only aggregate kernel profiling")
     parser.add_argument("--reference-cache-mib", type=int, help=f"RAM budget for decoded reference images in MiB (default: {CONFIG.training.reference_cache_mib}); 0 disables caching")
-    parser.add_argument("--gpu-reference-cache-mib", type=int, help=f"GPU reference-image cache budget in MiB (default: {CONFIG.training.gpu_reference_cache_mib}); 0 disables caching")
+    parser.add_argument("--gpu-reference-cache-mib", type=lambda value: value if value == "auto" else int(value),
+                        help=f"GPU reference-image cache: auto requests the full split subject to memory preflight; integer sets a MiB limit, 0 disables (default: {CONFIG.training.gpu_reference_cache_mib})")
     parser.add_argument("--freeze-native", action=argparse.BooleanOptionalAction, default=None,
                         help="Replay native GPU work without repeated tracing (default: enabled); stage diagnostics run directly")
     parser.add_argument("--sync-view-checks", action=argparse.BooleanOptionalAction, default=None,
@@ -400,6 +406,7 @@ def validate(config):
     if config.render.max_hits > 128:
         raise ValueError("Training render.max_hits must be an integer in [1, 128]")
     validate_sh_schedule(config)
+    validate_learning_rate_schedule(config)
     if config.data.background_refinement == "adaptive":
         if config.data.background_resolution_mode in ("core_parent", "core"):
             from reconstruction_world_shell import adaptive_max_depth
@@ -506,10 +513,11 @@ def validate(config):
         value = getattr(config.training, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"training.{name} must be a positive integer")
-    for name in ("chunk_size", "sampling_workers", "profile_views", "profile_interval_epochs", "reference_cache_mib", "gpu_reference_cache_mib", "compact_gradient_rows"):
+    for name in ("chunk_size", "sampling_workers", "profile_views", "profile_interval_epochs", "reference_cache_mib", "compact_gradient_rows"):
         value = getattr(config.training, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"training.{name} must be a nonnegative integer")
+    validate_reference_cache_mib(config.training.gpu_reference_cache_mib)
     if config.training.seed < 0:
         raise ValueError("training.seed must be nonnegative")
     if not isinstance(config.training.profile_stages, bool):
@@ -732,8 +740,8 @@ def training_memory_plan(config, model, report, view_count, *, world_size=1,
         compact = compact_capacity_override
     arguments = dict(active_voxels=count,
         sh_count=int(model.sh_count), opacity_sh_count=int(model.opacity_sh_count),
-        radiance_degree_steps=config.training.sh_degree_progression,
-        opacity_degree_steps=config.training.opacity_sh_degree_progression,
+        radiance_degree_steps=config.training.sh_degree_progression or config.optimizer.lr_schedule_enabled,
+        opacity_degree_steps=config.training.opacity_sh_degree_progression or config.optimizer.lr_schedule_enabled,
         compact_capacity=compact, ray_count=effective_chunk_size(config),
         reference_image_pixels=pixels, max_hits=config.render.max_hits,
         max_candidates=config.gradient.max_candidates,
@@ -746,7 +754,10 @@ def training_memory_plan(config, model, report, view_count, *, world_size=1,
         known_index_bytes=(model_index_bytes(model, report["cuda_allocator"]["policy"])
                            if known_index_bytes is None else known_index_bytes),
         path_record_layout_version=int(getattr(model, "path_record_layout_version", 0)),
-        compact_path_records=config.training.compact_path_records)
+        compact_path_records=config.training.compact_path_records,
+        growth_evidence=config.topology.enable_growth and config.topology.use_rgb_growth and
+                        (not config.schedule.enabled or config.schedule.enable_coarse_growth),
+        max_growth_hits=config.gradient.max_growth_hits)
     plan = plan_training_memory(**arguments)
     # Explicit row budgets keep their prior meaning. Automatic selection runs
     # only at initialization/topology boundaries, never for every camera.
@@ -822,8 +833,8 @@ def prepare_refinement_memory(config, model, optimizer, cache, native_replay, re
     def transition_plan(live):
         return plan_refinement_memory(request, gpu=report.get("gpu"),
             live_memory=live, allocator_policy=policy, known_index_bytes=known_index_bytes,
-            radiance_degree_steps=config.training.sh_degree_progression,
-            opacity_degree_steps=config.training.opacity_sh_degree_progression)
+            radiance_degree_steps=config.training.sh_degree_progression or config.optimizer.lr_schedule_enabled,
+            opacity_degree_steps=config.training.opacity_sh_degree_progression or config.optimizer.lr_schedule_enabled)
 
     live = refinement_memory_snapshot(report.get("gpu"))
     transition = transition_plan(live)
@@ -1224,6 +1235,9 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
                 accumulator[key] = accumulator.get(key, 0) + result[key]
             if dr.width(result["deletion_gain"]):
                 finite &= dr.all(dr.isfinite(result["deletion_gain"]))
+        for key in EVIDENCE_RAY_KEYS:
+            if key in result:
+                accumulator[key] = accumulator.get(key, 0) + result[key]
         # Materialize per-chunk sums; never retain all image path records/graphs.
         dr.eval(total_loss, finite, *[x for x in (raw_alpha, estimated_alpha) if x is not None],
                 *accumulator["gradients"].values(),
@@ -1473,7 +1487,7 @@ def normalized_algorithm_group(name, values):
             key: value for key, value in values.items()
             if key not in ("images", "initialization") or value is not None}}
         return normalized
-    defaults = {"topology": TopologySettings, "gradient": GradientSettings}
+    defaults = {"topology": TopologySettings, "gradient": GradientSettings, "optimizer": OptimizerConfig}
     if values is not None and name in defaults:
         normalized = {**asdict(defaults[name]()), **values}
         if name == "topology":
@@ -1603,6 +1617,11 @@ def run_training(distributed=None):
     checkpoint = load_checkpoint(resume_path) if resume_path is not None else None
     prior_seconds, time_complete = resumed_reconstruction_time(checkpoint)
     if checkpoint is not None:
+        # New schedules must not leak into a legacy resume, or silently change
+        # its optimizer. Explicit overrides still face the immutable check.
+        config.optimizer = OptimizerConfig()
+        update(config, {"optimizer": checkpoint["config"].get("optimizer", {})})
+        update(config, {"optimizer": overrides.get("optimizer", {})})
         validate_resume_supervision(config, checkpoint)
         resolve_resume_reference_compositing(config, checkpoint, overrides)
         resolve_resume_loss_color_space(config, checkpoint, overrides, getattr(args, "loss_color_space", None))
@@ -1703,9 +1722,11 @@ def run_training(distributed=None):
             config.topology = TopologySettings()
             config.schedule = CoarseToFineConfig()
             config.gradient = GradientSettings()
+            config.optimizer = OptimizerConfig()
             config.training.sh_degree_progression = False
             config.training.opacity_sh_degree_progression = False
             config.training.sh_degree_weights = (4, 3, 3)
+            config.training.gpu_reference_cache_mib = TrainingSettings().gpu_reference_cache_mib
             update(config, checkpoint["config"])
             # The field did not exist in legacy checkpoints. Do not inherit a
             # newer CONFIG default when loading their algorithm settings.
@@ -1745,6 +1766,10 @@ def run_training(distributed=None):
                             != normalized_algorithm_group(group, previous_json[group])):
                         raise ValueError("Resume output belongs to a different configuration; choose a new --output-dir")
         validate_traversal(config.render, mi, report)
+        if (config.optimizer.lr_schedule_enabled
+                and getattr(mi.VoxelReconstruction, "learning_rate_schedule_version", 0) < 1):
+            raise RuntimeError("Learning-rate scheduling requires a rebuilt native optimizer; "
+                               "incrementally rebuild this Mitsuba source checkout")
         world_size = distributed.world_size if distributed is not None else 1
         if config.data.background_refinement == "adaptive" and world_size != 1:
             raise ValueError("Adaptive background training currently requires a single GPU")
@@ -1788,12 +1813,12 @@ def run_training(distributed=None):
             raise RuntimeError("Distortion loss requires native distortion_version >= 1; "
                                "incrementally rebuild this Mitsuba source checkout")
         if rgb_growth_enabled and getattr(mi.VoxelReconstruction, "rgb_growth_version", 0) < RGB_GROWTH_EVIDENCE_VERSION:
-            raise RuntimeError("Multi-parent RGB growth evidence requires native rgb_growth_version >= 3; "
+            raise RuntimeError(f"Early-stop RGB growth evidence requires native rgb_growth_version >= {RGB_GROWTH_EVIDENCE_VERSION}; "
                                "incrementally rebuild this checkout")
         rgb_deletion_enabled = config.topology.use_rgb_deletion and config.topology.enable_deletion
         low_opacity_deletion_enabled = config.topology.use_low_opacity_deletion and config.topology.enable_deletion
-        if rgb_deletion_enabled and getattr(mi.VoxelReconstruction, "rgb_deletion_version", 0) < 1:
-            raise RuntimeError("RGB deletion evidence requires native rgb_deletion_version >= 1; "
+        if rgb_deletion_enabled and getattr(mi.VoxelReconstruction, "rgb_deletion_version", 0) < RGB_DELETION_EVIDENCE_VERSION:
+            raise RuntimeError(f"Per-hit RGB deletion evidence requires native rgb_deletion_version >= {RGB_DELETION_EVIDENCE_VERSION}; "
                                "incrementally rebuild this checkout")
         report["requested_config"] = asdict(config)
         report["scope"] = ("RGB-only: DC opacity, bidirectional geometry surrogate, refinement"
@@ -1804,6 +1829,7 @@ def run_training(distributed=None):
                            + (f" and {loss_color_space} RGB D-SSIM" if dssim_enabled else "")
                            if config.training.rgb_only else "Legacy Falcor NoLightTransport alpha-supervised training")
         report["training_protocol"]["radiance_sh_schedule"] = sh_schedule_protocol(config)
+        report["training_protocol"]["learning_rate_schedule"] = learning_rate_schedule_protocol(config)
         report["training_protocol"].update(
             rgb_only=config.training.rgb_only,
             render_color_space="linear",
@@ -1862,16 +1888,16 @@ def run_training(distributed=None):
                     config.topology.growth_initial_opacity,
             },
             growth_evidence_version=(mi.VoxelReconstruction.rgb_growth_version if rgb_growth_enabled else None),
-            growth_unknown_policy="exclude unknown rays; retain reliable rays from the same view"
+            growth_unknown_policy="recompute inserted-path stop from recorded hits; exclude record overflow, invalid trace and nonfinite evidence"
                                   if rgb_growth_enabled else None,
             growth_freeze_last_epochs=config.topology.growth_freeze_last_epochs,
             growth_freeze_start_epoch=(max(1, config.training.num_epochs - config.topology.growth_freeze_last_epochs + 1)
                                        if config.topology.growth_freeze_last_epochs else None),
-            deletion_evidence=("single-removal RGB gain from complete normal training paths; no extra trace"
+            deletion_evidence=("single-removal RGB gain from complete paths or stops justified by recorded hits; no extra trace"
                                if rgb_deletion_enabled else "disabled" if config.training.rgb_only else "legacy alpha evidence"),
             deletion_evidence_version=(mi.VoxelReconstruction.rgb_deletion_version if rgb_deletion_enabled else None),
             deletion_normalization="reliable-hit mean per view, then reliable-view mean" if rgb_deletion_enabled else None,
-            deletion_unknown_policy="RGB evidence: unknown rays abstain individually; unobserved gives no removal vote" if rgb_deletion_enabled else None,
+            deletion_unknown_policy="per-hit abstention if removal needs an unseen suffix or invalid trace; unobserved gives no removal vote" if rgb_deletion_enabled else None,
             deletion_confirmation_windows=config.topology.deletion_rgb_confirmation_windows if rgb_deletion_enabled else None,
             low_opacity_deletion={
                 "enabled": low_opacity_deletion_enabled,
@@ -1988,8 +2014,10 @@ def run_training(distributed=None):
                                              config.training.reference_cache_mib,
                                              rgb_only=config.training.rgb_only, background=config.render.background,
                                              reference_compositing=config.data.reference_compositing)
+        requested_reference_cache_mib = resolve_reference_cache_mib(
+            config.training.gpu_reference_cache_mib, ray_count, len(views), rgb_only=config.training.rgb_only)
         gpu_reference_cache = GPUReferenceCache(config.render.width, config.render.height, mi, dr, np,
-                                                config.training.gpu_reference_cache_mib,
+                                                0 if config.training.gpu_reference_cache_mib == "auto" else requested_reference_cache_mib,
                                                 rgb_only=config.training.rgb_only)
         native_replay = NativeLossReplay(dr, enabled=config.training.freeze_native)
         def guard_gradient_capacity(current_model, capacity):
@@ -2002,7 +2030,8 @@ def run_training(distributed=None):
             dr.flush_malloc_cache()
         native_replay.gradient_capacity_guard = guard_gradient_capacity
         emit(f"Reference image cache: {config.training.reference_cache_mib} MiB RAM, "
-              f"{config.training.gpu_reference_cache_mib} MiB GPU, "
+              f"{config.training.gpu_reference_cache_mib} GPU request "
+              f"({requested_reference_cache_mib} MiB before memory preflight, {len(views)} images), "
               "loaded on first use; dataset must remain unchanged during training", flush=True)
         emit("Native GPU replay:", "enabled" if config.training.freeze_native else "disabled", flush=True)
         emit("Training validity checks:", "synchronous per view" if config.training.sync_view_checks
@@ -2070,8 +2099,8 @@ def run_training(distributed=None):
                                   world_size=world_size, emit=emit)
         performance.metadata["memory_plans"] = report["memory_plans"]
         optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native,
-                                   radiance_degree_steps=config.training.sh_degree_progression,
-                                   opacity_degree_steps=config.training.opacity_sh_degree_progression)
+                                   radiance_degree_steps=config.training.sh_degree_progression or config.optimizer.lr_schedule_enabled,
+                                   opacity_degree_steps=config.training.opacity_sh_degree_progression or config.optimizer.lr_schedule_enabled)
         if not callable(getattr(model, "optimizer_step_device", None)):
             raise RuntimeError("Device sparse Adam requires a rebuilt native optimizer_step_device binding; "
                                "incrementally rebuild this checkout before training")
@@ -2217,8 +2246,8 @@ def run_training(distributed=None):
             if not primary:
                 model = restore_model(initial, mi)
                 optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native,
-                                           radiance_degree_steps=config.training.sh_degree_progression,
-                                           opacity_degree_steps=config.training.opacity_sh_degree_progression)
+                                           radiance_degree_steps=config.training.sh_degree_progression or config.optimizer.lr_schedule_enabled,
+                                           opacity_degree_steps=config.training.opacity_sh_degree_progression or config.optimizer.lr_schedule_enabled)
                 optimizer.load_state_dict(initial["optimizer_state"])
                 rng.bit_generator.state = initial["rng_state"]
                 sampler.load_state_dict(initial["contour_state"])
@@ -2273,6 +2302,8 @@ def run_training(distributed=None):
             previous_opacity_sh_count = int(getattr(model, "active_opacity_sh_count", model.opacity_sh_count))
             active_sh_count = apply_sh_schedule(model, config, epoch)
             active_opacity_sh_count = int(getattr(model, "active_opacity_sh_count", model.opacity_sh_count))
+            lr_state = learning_rate_schedule(config, epoch)
+            optimizer.set_learning_rates(lr_state["rates"])
             if active_sh_count != previous_sh_count or active_opacity_sh_count != previous_opacity_sh_count:
                 native_replay.clear()
                 optimizer.clear_replay()
@@ -2283,6 +2314,11 @@ def run_training(distributed=None):
                 emit(f"Opacity SH: {active_opacity_sh_count}/{int(model.opacity_sh_count)} coefficients active "
                      f"from epoch {epoch + 1}; topology {'frozen' if topology.topology_frozen(epoch + 1) else 'adaptive'}",
                      flush=True)
+            if lr_state["enabled"] and (epoch == completed or epoch == lr_state["freeze_start_epoch"]
+                    or epoch == config.training.num_epochs - 1
+                    or active_sh_count != previous_sh_count or active_opacity_sh_count != previous_opacity_sh_count):
+                emit(f"Learning rates at epoch {epoch + 1} (radiance l0..3, opacity l0..2, center/scale/rotation):",
+                     json.dumps(lr_state["rates"]), flush=True)
             training_resolution = int(model.resolution)
             active_voxels_before = int(model.active_voxel_count)
             entering_resolution = last_training_resolution != training_resolution
@@ -2329,6 +2365,7 @@ def run_training(distributed=None):
             epoch_dssim_loss = 0.
             deferred_checks = (None if config.training.sync_view_checks else DeferredViewChecks(mi, dr, np))
             stage_totals = dict(reference=0., gradients=0., topology_observation=0., optimizer=0.)
+            evidence_ray_totals = {}
             communication_before = collective.statistics() if collective is not None else None
             progress_line.update(f"Epoch {epoch+1}/{config.training.num_epochs} | view 0/{len(views)} (0%) "
                                  f"| grid={int(model.resolution)}", force=True)
@@ -2356,6 +2393,7 @@ def run_training(distributed=None):
                 processed_views = batch_result["processed_views"]
                 global_step = batch_result["global_step"]
                 optimizer_step = batch_result["optimizer_step"]
+                evidence_ray_totals = batch_result["evidence_ray_totals"]
             else:
                 for progress, index in enumerate(order, 1):
                     view = views[int(index)]
@@ -2398,6 +2436,7 @@ def run_training(distributed=None):
                                 reference_alpha=gpu_reference.alpha if gpu_reference is not None else rgba[..., 3],
                                 rendered_alpha=rendered_alpha,
                                 image_shape=(config.render.height, config.render.width))
+                        accumulate_evidence_rays(evidence_ray_totals, gradients, mi, dr)
                         # These native evidence tables have no optimizer
                         # consumer. Release them before Adam's scratch buffers.
                         for name in ("growth_gain", "growth_observed", "growth_unknown",
@@ -2520,8 +2559,8 @@ def run_training(distributed=None):
                 model = restore_model(new_state, mi)
                 if not primary:
                     optimizer = FalcorOptimizer(model, config.optimizer, replay_updates=config.training.freeze_native,
-                                               radiance_degree_steps=config.training.sh_degree_progression,
-                                               opacity_degree_steps=config.training.opacity_sh_degree_progression)
+                                               radiance_degree_steps=config.training.sh_degree_progression or config.optimizer.lr_schedule_enabled,
+                                               opacity_degree_steps=config.training.opacity_sh_degree_progression or config.optimizer.lr_schedule_enabled)
                     optimizer.load_state_dict(new_optimizer)
             # Release borrowed state before updates resume: retaining a full
             # model/Adam transfer snapshot would force native copy-on-write.
@@ -2539,12 +2578,14 @@ def run_training(distributed=None):
                 configure_training_memory(config, model, gpu_reference_cache, report, len(views),
                                           world_size=world_size, emit=emit)
                 event["topology_cache_release_seconds"] = release_topology_cache(model, dr)
+            evidence_ray_report = read_evidence_rays(evidence_ray_totals)
             entry = {"epoch": epoch+1, "global_step": global_step, "mean_loss": epoch_loss / len(views),
                      "active_sh_count": active_sh_count,
                      "active_sh_degree": math.isqrt(active_sh_count - 1),
                      "active_opacity_sh_count": active_opacity_sh_count,
                      "active_opacity_sh_degree": math.isqrt(active_opacity_sh_count - 1),
                      "topology_frozen": topology.topology_frozen(epoch + 1),
+                     "learning_rate_schedule": lr_state,
                      "foreground_refinement": getattr(model, "foreground_refinement", "uniform"),
                      "maximum_foreground_resolution": int(getattr(model, "foreground_max_resolution", model.resolution)),
                      "optimizer_step": optimizer_step, "views_per_update": world_size,
@@ -2564,6 +2605,7 @@ def run_training(distributed=None):
                      "rgb_growth_evidence_requested": rgb_growth_requested,
                      "deletion_evidence_collected": deletion_evidence_collected,
                      "rgb_deletion_evidence_requested": rgb_deletion_enabled and deletion_evidence_collected,
+                     "evidence_vote_diagnostics": evidence_ray_report,
                      "active_voxels": int(model.active_voxel_count), "topology": event,
                      "reference_cache": reference_cache.statistics(),
                      "gpu_reference_cache": gpu_reference_cache.statistics(),

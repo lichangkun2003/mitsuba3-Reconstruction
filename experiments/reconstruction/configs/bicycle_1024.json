@@ -1,6 +1,6 @@
 {
   "data": {
-    "dataset": "datasets/bicycle",
+    "dataset": "datasets/stump",
     "point_cloud": "init_points.ply",
     "cameras": "transforms_train.json",
     "camera_index": 0,
@@ -17,7 +17,7 @@
     "background_opacity": 0.5
   },
   "model": {
-    "grid_resolution": 256,
+    "grid_resolution": 32,
     "bounds_min": [
       -1.6,
       -1.6,
@@ -52,7 +52,7 @@
   "training": {
     "rgb_only": true,
     "sh_degree_progression": true,
-    "opacity_sh_degree_progression": true,
+    "opacity_sh_degree_progression"                                  : true,
     "sh_degree_weights": [8, 0, 2],
     "num_epochs": 1500,
     "chunk_size": 0,
@@ -61,9 +61,7 @@
     "profile_interval_epochs": 0,
     "profile_stages": false,
     "reference_cache_mib": 8192,
-    "gpu_reference_cache_mib": 4096,
-    "prefer_dense_gradients": true,
-    "compact_path_records": true,
+    "gpu_reference_cache_mib": "auto",
     "freeze_native": true,
     "sync_view_checks": false,
     "batch_reduction": "auto",
@@ -91,11 +89,16 @@
     "max_growth_hits": 8
   },
   "optimizer": {
-    "lr_radiance": 0.001,
+    "lr_radiance": 0.002,
     "lr_opacity": 0.0005,
-    "lr_center": 0.001,
-    "lr_log_scale": 0.002,
-    "lr_rotation": 0.0005,
+    "lr_center": 0.0015,
+    "lr_log_scale": 0.003,
+    "lr_rotation": 0.00075,
+    "lr_schedule_enabled": true,
+    "lr_final_factor": 0.1,
+    "lr_sh_warmup_epochs": 20,
+    "lr_radiance_sh": 0.0002,
+    "lr_opacity_sh": 0.00005,
     "beta1": 0.9,
     "beta2": 0.999,
     "epsilon": 1e-08,
@@ -162,8 +165,8 @@
     "deletion_interval": 10,
     "max_active_voxels": 67108864,
     "gpu_topology": true,
-    "background_refine_interval": 10,
-    "background_refine_max_new_leaves": 100000,
+    "background_refine_interval": 20,
+    "background_refine_max_new_leaves": 200000,
     "background_refine_pixel_threshold": 6.0,
     "background_refine_fraction": 0.05,
     "background_max_active_voxels": 12000000,
@@ -172,7 +175,7 @@
   "schedule": {
     "enabled": true,
     "refinement": "adaptive",
-    "start_resolution": 256,
+    "start_resolution": 32,
     "target_resolution": 1024,
     "parent_opacity_threshold": 0.0,
     "opacity_optical_depth_scale": 0.65,

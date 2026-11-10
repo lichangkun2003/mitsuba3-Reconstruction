@@ -17,6 +17,7 @@ import sys
 import sysconfig
 import time
 
+from reconstruction_evidence_diagnostics import EVIDENCE_RAY_KEYS
 
 GRADIENT_KEYS = ("radiance_sh", "opacity_sh", "centers", "log_scales", "rotation_tangent")
 SUM_COUNTER_KEYS = ("appearance_valid", "geometry_valid", "background_carve_valid")
@@ -251,6 +252,9 @@ class NcclCollective:
         global_finite = prepare(finite, _NCCL_UINT32, _NCCL_MIN)
         global_raw = prepare(mi.Float(raw_alpha), _NCCL_FLOAT32, _NCCL_SUM) if raw_alpha is not None else None
         global_alpha = prepare(mi.Float(alpha), _NCCL_FLOAT32, _NCCL_SUM) if alpha is not None else None
+        ray_keys = tuple(key for key in EVIDENCE_RAY_KEYS if key in accumulator)
+        global_ray_counts = (prepare(dr.concat([mi.UInt32(accumulator[key]) for key in ray_keys]),
+                                     _NCCL_UINT32, _NCCL_SUM) if ray_keys else None)
         # Candidate IDs are broadcast once per growth window. Combine every
         # pixel shard before the primary rank classifies a full-view RGB vote.
         global_rgb_evidence = {}
@@ -300,6 +304,8 @@ class NcclCollective:
             result.update(self._unpack(global_validity, SUM_COUNTER_KEYS, validity_widths, mi.UInt32))
             result.update(self._unpack(global_evidence, MAX_COUNTER_KEYS, evidence_widths, mi.UInt32))
             result.update(global_rgb_evidence)
+            if ray_keys:
+                result.update(self._unpack(global_ray_counts, ray_keys, [1] * len(ray_keys), mi.UInt32))
             if component_names:
                 losses = self._unpack(global_losses, ("loss_sum", *component_names),
                                       [1] * (1 + len(component_names)), mi.Float)

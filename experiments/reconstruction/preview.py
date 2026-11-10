@@ -144,7 +144,6 @@ def source_provenance(repository: Path) -> dict:
         "experiments/reconstruction/reconstruction_color.py",
         "experiments/reconstruction/reconstruction_common.py",
         "experiments/reconstruction/reconstruction_dataset.py",
-        "experiments/reconstruction/tests/test_reconstruction.py",
     ):
         try:
             result["source_files_sha256"][relative] = file_sha256(repository / relative)

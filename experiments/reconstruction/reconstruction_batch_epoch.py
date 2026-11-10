@@ -12,6 +12,7 @@ import json
 import time
 
 from reconstruction_checks import DeferredViewChecks
+from reconstruction_evidence_diagnostics import EVIDENCE_RAY_KEYS, accumulate_evidence_rays
 from reconstruction_view_batch import batch_view_seeds, iter_view_batches, zero_view_partial
 
 
@@ -67,6 +68,7 @@ def run_view_batch_epoch(*, model, config, views, order, epoch, optimizer, topol
     checks = DeferredViewChecks(mi, dr, np)
     batch_sizes = []
     stage_totals = dict(reference=0., gradients=0., topology_observation=0., optimizer=0.)
+    evidence_ray_totals = {}
     interval = config.training.profile_interval_epochs
     progress = 0
     for batch_index, indices in enumerate(iter_view_batches(order, collective.world_size)):
@@ -126,6 +128,11 @@ def run_view_batch_epoch(*, model, config, views, order, epoch, optimizer, topol
                         evidence[key] = accumulator.pop(key)
                     else:
                         evidence[key] = dr.zeros(mi.Float if suffix == "gain" else mi.UInt32, count)
+            if evidence:
+                # One small vector shares the existing evidence broadcast.
+                # Idle tail ranks must supply the same field names and widths.
+                evidence["vote_ray_categories"] = dr.concat([
+                    mi.UInt32(accumulator.pop(key, 0)) for key in EVIDENCE_RAY_KEYS])
             reduced, loss_sum, finite = collective.reduce_batch(
                 accumulator, loss_sum, finite, rgb_only=True,
                 mode=getattr(config.training, "batch_reduction", "auto"), compact_output=True)
@@ -148,6 +155,11 @@ def run_view_batch_epoch(*, model, config, views, order, epoch, optimizer, topol
                 for source_rank, view_index in enumerate(indices):
                     camera_evidence = collective.broadcast_arrays(evidence, root=source_rank,
                                                                    uint_keys=uint_keys)
+                    if primary:
+                        categories = camera_evidence.pop("vote_ray_categories")
+                        counts = {key: dr.gather(mi.UInt32, categories, mi.UInt32(i))
+                                  for i, key in enumerate(EVIDENCE_RAY_KEYS)}
+                        accumulate_evidence_rays(evidence_ray_totals, counts, mi, dr)
                     if primary and rgb_growth_requested:
                         topology.observe_rgb_growth(model, camera_evidence, view_id=view_index,
                                                     epoch=epoch, pixel_count=ray_count)
@@ -213,5 +225,6 @@ def run_view_batch_epoch(*, model, config, views, order, epoch, optimizer, topol
         epoch_rgb_loss=sum(value["rgb_loss"] * count for value, count in zip(measurements, batch_sizes)),
         epoch_distortion_loss=sum(value["distortion_loss"] * count for value, count in zip(measurements, batch_sizes)),
         epoch_dssim_loss=sum(value["dssim_loss"] * count for value, count in zip(measurements, batch_sizes)),
-        stage_totals=stage_totals, validation_seconds=time.perf_counter() - validation_started,
+        stage_totals=stage_totals, evidence_ray_totals=evidence_ray_totals,
+        validation_seconds=time.perf_counter() - validation_started,
         processed_views=processed_views, global_step=global_step, optimizer_step=optimizer_step)

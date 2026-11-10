@@ -136,7 +136,8 @@ MI_PY_EXPORT(VoxelReconstruction) {
                  const typename Model::UIntBuffer &background_carve_valid,
                  const nb::dict &means, const nb::dict &squared_means,
                  const nb::dict &steps, const std::map<std::string, double> &settings,
-                 const typename Model::Mask &allowed, bool check_moments) {
+                 const typename Model::Mask &allowed, bool check_moments,
+                 const typename Model::FloatBuffer &learning_rates) {
             // Borrow the actual bound Dr.Jit objects. Casting arrays by value
             // would retain old full tables and trigger copy-on-write on scatter.
             std::map<std::string, typename Model::FloatBuffer *> mean_ptrs, square_ptrs;
@@ -152,10 +153,11 @@ MI_PY_EXPORT(VoxelReconstruction) {
                     nb::cast<typename Model::UIntBuffer *>(item.second);
             return model.optimizer_step_device(gradients, appearance_valid, geometry_valid,
                 background_carve_valid, mean_ptrs, square_ptrs, step_ptrs, settings,
-                allowed, check_moments);
+                allowed, check_moments, learning_rates);
         }, "gradients"_a, "appearance_valid"_a, "geometry_valid"_a,
            "background_carve_valid"_a, "means"_a, "squared_means"_a, "steps"_a,
            "settings"_a, "allowed"_a, "check_moments"_a = true,
+           "learning_rates"_a = typename Model::FloatBuffer(),
            "Device-resident sparse Adam; mutates borrowed moment arrays and returns a shared acceptance mask.")
         .def("optimizer_step_compact_device", [](Model &model,
                  const typename Model::UIntBuffer &indices,
@@ -166,7 +168,8 @@ MI_PY_EXPORT(VoxelReconstruction) {
                  const typename Model::UIntBuffer &background_carve_valid,
                  const nb::dict &means, const nb::dict &squared_means,
                  const nb::dict &steps, const std::map<std::string, double> &settings,
-                 const typename Model::Mask &allowed, bool check_moments) {
+                 const typename Model::Mask &allowed, bool check_moments,
+                 const typename Model::FloatBuffer &learning_rates) {
             std::map<std::string, typename Model::FloatBuffer *> mean_ptrs, square_ptrs;
             std::map<std::string, typename Model::UIntBuffer *> step_ptrs;
             for (auto item : means)
@@ -180,11 +183,11 @@ MI_PY_EXPORT(VoxelReconstruction) {
                     nb::cast<typename Model::UIntBuffer *>(item.second);
             return model.optimizer_step_compact_device(indices, row_count, gradients,
                 appearance_valid, geometry_valid, background_carve_valid, mean_ptrs,
-                square_ptrs, step_ptrs, settings, allowed, check_moments);
+                square_ptrs, step_ptrs, settings, allowed, check_moments, learning_rates);
         }, "indices"_a, "row_count"_a, "gradients"_a, "appearance_valid"_a,
            "geometry_valid"_a, "background_carve_valid"_a, "means"_a,
            "squared_means"_a, "steps"_a, "settings"_a, "allowed"_a,
-           "check_moments"_a = true,
+           "check_moments"_a = true, "learning_rates"_a = typename Model::FloatBuffer(),
            "Consume compact sorted gradient rows directly, updating full model and Adam storage in place.")
         .def("optimizer_update_scope_begin", [](Model &model, const nb::dict &means,
                  const nb::dict &squared_means, const nb::dict &steps) {
@@ -340,6 +343,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("sh_schedule_version") = nb::int_(Model::sh_schedule_version);
     cls.attr("octree_version") = nb::int_(Model::octree_version);
     cls.attr("optimizer_device_version") = nb::int_(Model::optimizer_device_version);
+    cls.attr("learning_rate_schedule_version") = nb::int_(Model::learning_rate_schedule_version);
     cls.attr("compact_optimizer_version") = nb::int_(Model::compact_optimizer_version);
     cls.attr("compact_gradient_version") = nb::int_(Model::compact_gradient_version);
     cls.attr("path_record_layout_version") = nb::int_(Model::path_record_layout_version);

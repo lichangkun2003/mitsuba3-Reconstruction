@@ -7,8 +7,9 @@ Only epoch boundaries/checkpoints materialize device statistics on the host.
 from __future__ import annotations
 
 
-# Version 4 retains 64-bit adaptive target addresses and records proposal heads.
-RGB_GROWTH_EVIDENCE_VERSION = 4
+# Version 5 recomputes each insertion's stop from recorded hits; v4 already
+# retained 64-bit adaptive target addresses and per-cell proposal heads.
+RGB_GROWTH_EVIDENCE_VERSION = 5
 
 RGB_STAT_FIELDS = ("gain_sum", "raw_gain_sum", "support_views", "conflict_views",
                    "observed_views", "unknown_views", "invalid_views",

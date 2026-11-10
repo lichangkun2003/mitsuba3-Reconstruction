@@ -91,22 +91,10 @@ Adam 默认按 ``appearance_valid`` / ``geometry_valid`` 分别压紧本视角�
 应使用整个 epoch 的 ``seconds``，不能只比较异步提交阶段的 ``gradients`` 数字。
 这项修改包含 C++，运行前需要 ``cmake --build build --config Release --parallel 8``。
 
-单独比较候选生成可使用以下只读工具（不训练、不写输出）：
-
-.. code-block:: powershell
-
-   & ..\envs\mitsuba\Scripts\python.exe -I `
-     experiments/reconstruction/tests/benchmark_growth_candidates_gpu.py `
-     ..\outputs\某次实验\model.npz
-
-该工具将全部父体素设为成熟、清空冷却，比较相同输入的 CPU/GPU 候选编号、顺序及
-双精度几何，并报告首次与预热后时间；它不代表整个实验或真实轮末状态的耗时。
 2026-10-23 的独立父体压紧对照使用 RTX 4060 Laptop、2,088,944 个合成体素
 （其中 8,192 个合格父体），生成 130,300 份提案；预热后三次中位数由 27.79 ms
 降为 12.10 ms，约 2.30 倍，提案、支持数和继承属性数组逐元素一致。
 这仅比较压紧前后的 GPU 候选生成与打包，不包含渲染、Adam 或完整训练，不能当作整轮加速比。
-普通轮对照工具为 ``tests/benchmark_training_checks.py``，使用生成场景、相同随机
-流与原生重放，计时含轮末 GPU 等待。减少主机同步不保证 GPU 已饱和时仍有明显提速。
 
 单卡 RGB 训练默认 ``--sampling-workers 2``，在 CPU 后台预取四个视角的均匀采样，
 让随机数生成与 GPU 训练重叠。每次消费才推进主 RNG，保持原有 PCG64 随机序列、
@@ -115,18 +103,6 @@ Adam 默认按 ``appearance_valid`` / ``geometry_valid`` 分别压紧本视角�
 线程数受运行时 CPU 配额限制，``sampling_execution`` 记录实际线程数和预取计数。
 默认额外保留四组采样数组，约每像素 48 字节，另有工作线程的临时数组。
 
-真实场景的固定初始拓扑对照可使用：
-
-.. code-block:: powershell
-
-   & ..\envs\mitsuba\python.exe -B -I `
-     experiments/reconstruction/benchmarks/benchmark_reconstruction_rgb_steps.py `
-     --dataset datasets/bicycle --gpu 0 --views 169 --warmup 2 --repeats 5 `
-     --sampling-workers 2
-
-改为 ``--sampling-workers 0`` 可测同步对照。每个视角仍更新一次 Adam，计时包含
-轮末 GPU 等待；预热、解码、拓扑变化、保存和评价不计入吞吐。
-``--cprofile`` 和 ``--kernel-history`` 在吞吐测量后单独记录诊断，避免混入基准时间。
 
 1024 层级的显存还取决于活跃体素数量。模型参数和 Adam 状态仍覆盖全部活跃体素，
 参数及一、二阶矩保持 FP32；8 层背景仍保留完整的 9 项颜色 SH。
@@ -170,26 +146,6 @@ Int64；保存 checkpoint 时仍写入原有 Int64 格式，保护期判断和�
 ``epoch_growth_prepare_stage_seconds`` 和拓扑事件的 ``topology_cache_prepare_seconds`` /
 ``topology_cache_release_seconds`` 中。
 
-从已有 checkpoint 检查升层后的工作集，可在独立进程运行：
-
-.. code-block:: powershell
-
-   & ..\envs\mitsuba\python.exe -B -I `
-     experiments/reconstruction/benchmarks/benchmark_reconstruction_memory.py `
-     --checkpoint outputs/bicycle-10.26-E1/training/epoch-01000.npz `
-     --refine --views 3 --rounds 2 --gpu-reference-cache-mib 0
-
-此工具只读取模型数组，细分一次后重置 Adam 和 GPU 生命周期状态，不覆盖原实验。
-每阶段同步并记录 allocator 水位、存活分配及 NVIDIA 显存采样；它不是正常吞吐基准，
-也不重现旧优化器仍存活时的完整升层峰值。``--retain-previous-gradient`` 可模拟旧视角
-引用保留方式，宜先在较小层级对照。``--max-device-gib`` 仅在阶段边界检查，无法阻止
-单次调用内部超额分配；诊断大模型时应由父进程设置超时。
-追加 ``--growth`` 可在 Adam 预热后运行一次真实生长/删除证据窗口，默认遍历全部训练相机，
-执行候选准备、证据累积、几何重验证和自然通过的拓扑提交。它使用重置的生命周期并推进
-到下一个生长边界，不能视为完整续训轨迹；是否实际新增体素以输出事件的 ``grown`` 为准。
-``--growth-views`` 可限制诊断相机数，但这会改变证据窗口，不能替代完整窗口的验证。
-``--growth-windows 2`` 可连续检查两个窗口；最后默认再执行一次普通视角更新，检查替换后的
-模型及 Adam，次数可由 ``--post-growth-views`` 调整。窗口之间推进调度轮次，不补跑中间训练。
 
 默认 ``CONFIG.render.traversal = "octree"`` 使用 GPU 八叉占用索引跳过空区域，
 预览、训练和评价均启用。正常叶子仍执行原有椭球求交、合成及 near-miss 几何梯度；
@@ -440,7 +396,7 @@ RGB 生长／删除证据按视角独立通过 NCCL 传送，再由 rank 0 投�
 ``--ntasks`` 始终为 1，启动器自行创建 N 个进程，CPU 配额按 N 均分。
 调度器的 GPU 可见列表与 Slurm 变量原样保留，不按本地物理编号重选卡。
 本机生成数据检查不能验证实际多 A100 的 NCCL 性能、完整训练质量或加速幅度。
-协议、恢复限制与更多测试命令见 ``docs/reconstruction_training.rst``。
+协议、恢复限制与更多运行命令见 ``docs/reconstruction_training.rst``。
 
 目录导航
 --------
@@ -458,16 +414,20 @@ RGB 生长／删除证据按视角独立通过 NCCL 传送，再由 rank 0 投�
      - 检查点云初始化和一个相机视角的前向结果，不执行训练。
    * - ``train_multigpu.py``
      - Linux Slurm 同节点 N GPU 训练／评价启动器；每卡一个视角，平均梯度后一起更新，不支持 Windows。
+   * - ``train_mipnerf360_batch.py``
+     - 按场景批量启动 Mip-NeRF 360 训练与评价。
+   * - ``generate_dense_points.py`` / ``generate_dense_points_all.py``
+     - 生成单场景或批量场景的稠密初始化点云。
+   * - ``visualize_voxels.py``
+     - 导出重建体素供交互查看。
+   * - ``render_sh_components.py``
+     - 指定模型和视角，以 64 spp 对比 DC、高阶 SH 与完整 SH。
    * - ``reconstruction_*.py``
      - 参考图、优化器、拓扑、checkpoint、性能记录等共用实现。
-   * - ``tests/``
-     - 数值与功能回归测试，不是日常实验入口。
-   * - ``benchmarks/``
-     - ``benchmark_reconstruction_rgb_steps.py`` 测真实场景 RGB 训练步；其他工具含旧 alpha 监督模式基准。完整训练速度用 ``train.py`` 短跑测量。
    * - ``tools/smoke_gpu.py``
      - 程序生成 Cornell box 的基础 CUDA 环境检查。
    * - ``tools/deploy_windows.ps1``
-     - Windows 源码部署：工具预检、独立 Python 环境、编译与单卡 CUDA／RGB-only 检查。
+     - Windows 源码部署：工具预检、独立 Python 环境、编译与单卡 CUDA 渲染检查。
 
 这些脚本调用本仓库的 C++ ``mi.VoxelReconstruction``。渲染与梯度核心仍在
 ``src/render/reconstruction.cpp``；目录整理没有将算法改成纯 Python 实现。
@@ -541,11 +501,10 @@ Git clone 只包含已推送的改动；本地新加的部署脚本也需同步�
 若检查发现从其他机器复制的缓存或不匹配的变体，会报告问题，由使用者另行保留、
 重命名旧构建目录后再运行。
 
-编译后依次运行 64×64 Cornell box CUDA／OptiX 渲染和六组 RGB-only 重建回归，
-验证源码导入位置、定制绑定、颜色／opacity 梯度、训练更新及体素分裂。
+编译后运行 64×64 Cornell box CUDA／OptiX 渲染，检查源码构建的导入位置和基础 GPU 渲染。
 检查无需 Lego 数据集；日志和基础渲染报告保存到仓库父目录的
 ``outputs/mitsuba/`` 下，以脚本打印的路径为准。
-只有两项检查都通过才报告部署成功；这不替代真实数据上的短跑或性能测量。
+基础渲染检查通过才报告部署成功；真实数据上的训练短跑和性能测量需单独执行。
 
 接着同步 ``datasets/lego``，包含 ``init_points.ply``、
 ``transforms_train.json``、``transforms_test.json`` 及 JSON 引用的训练／测试图片，
@@ -862,10 +821,6 @@ version 4 则根据最终层数安排起始壳层；这些版本均不再按 ``m
 仍优先覆盖两个划分；旧配置中的 ``max_views=10`` 必须移除或改为 ``null``，才能采用分划分默认。
 旧命令中的限制也会覆盖默认值，请改为 ``--eval-train-max-views 0 --eval-test-max-views 0``。
 
-源码编译及回归检查::
+源码编译::
 
    cmake --build build --config Release --parallel 8
-   & $python -m unittest discover -s experiments/reconstruction/tests -p test_reconstruction_dataset.py
-   & $python -m unittest discover -s experiments/reconstruction/tests -p test_reconstruction_core_resolution.py
-   & $python -u -I experiments/reconstruction/tests/test_reconstruction_points.py
-   & $python -u -I experiments/reconstruction/tests/test_reconstruction_colmap_training.py

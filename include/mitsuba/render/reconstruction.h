@@ -40,11 +40,12 @@ public:
 
     /// Version of the alpha-independent RGB training contract exposed to Python.
     static constexpr uint32_t rgb_only_version = 1;
-    /// Multiple independent parent proposals per empty cell; record capacity
-    /// counts intersected cells, and overflow only invalidates unstored cells.
-    static constexpr uint32_t rgb_growth_version = 4;
-    /// Per-hit single-removal RGB gains on complete baseline paths.
-    static constexpr uint32_t rgb_deletion_version = 1;
+    /// Recorded hypothetical insertions follow their own opacity/hit-cap stop,
+    /// sharing baseline prefixes rather than retracing the spatial index.
+    static constexpr uint32_t rgb_growth_version = 5;
+    /// Per-hit RGB removal gains also cover early stops whose recorded suffix
+    /// remains sufficient after deletion; missing tails still abstain.
+    static constexpr uint32_t rgb_deletion_version = 2;
     /// RGB removal evidence includes world-space background leaves.
     static constexpr uint32_t background_rgb_deletion_version = 1;
     /// Mixed-size world-space cube shells in the unified occupancy tree.
@@ -62,6 +63,8 @@ public:
     static constexpr uint32_t octree_version = 1;
     /// Device-resident compact Adam, including transactional moment updates.
     static constexpr uint32_t optimizer_device_version = 1;
+    /// Replayable device learning rates per radiance/opacity degree and geometry group.
+    static constexpr uint32_t learning_rate_schedule_version = 1;
     /// Pre-compacted gradient rows can feed Adam without dense reconstruction.
     static constexpr uint32_t compact_optimizer_version = 1;
     static constexpr uint32_t compact_gradient_version = 1;
@@ -120,6 +123,9 @@ public:
     /// table size. Radiance may use voxel-major clocks per SH degree instead
     /// of one clock per voxel; inactive degrees and their moments are frozen.
     /// Active coefficients retain zero-gradient momentum updates.
+    /// Optional device rates: radiance degrees 0..3, opacity degrees 0..2,
+    /// center, log scale, rotation. Empty preserves the settings-based rates;
+    /// a zero device rate freezes that degree's parameters, moments, and clock.
     Mask optimizer_step_device(
         const std::map<std::string, FloatBuffer> &gradients,
         const UIntBuffer &appearance_valid, const UIntBuffer &geometry_valid,
@@ -128,7 +134,7 @@ public:
         const std::map<std::string, FloatBuffer *> &squared_means,
         const std::map<std::string, UIntBuffer *> &steps,
         const std::map<std::string, double> &settings, const Mask &allowed,
-        bool check_moments = true);
+        bool check_moments = true, const FloatBuffer &learning_rates = FloatBuffer());
 
     /// Consume sorted global IDs with K-row gradients/counts directly. Model
     /// and moment storage remain full-sized; only the supplied valid rows are
@@ -143,7 +149,7 @@ public:
         const std::map<std::string, FloatBuffer *> &squared_means,
         const std::map<std::string, UIntBuffer *> &steps,
         const std::map<std::string, double> &settings, const Mask &allowed,
-        bool check_moments = true);
+        bool check_moments = true, const FloatBuffer &learning_rates = FloatBuffer());
 
     /// Enter before frozen recording/replay. Detach genuine external aliases,
     /// then stash the unique owners' reference counts so tracing's temporary
@@ -335,7 +341,7 @@ private:
         const std::map<std::string, FloatBuffer *> &squared_means,
         const std::map<std::string, UIntBuffer *> &steps,
         const std::map<std::string, double> &settings, const Mask &allowed,
-        bool check_moments, const UIntBuffer *compact_indices,
+        bool check_moments, const FloatBuffer &learning_rates, const UIntBuffer *compact_indices,
         const UInt32 *compact_count);
     void initialize_seeds(const reconstruction::Result &loaded);
     void rebuild_octree();

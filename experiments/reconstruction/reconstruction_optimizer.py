@@ -12,6 +12,10 @@ from dataclasses import asdict, dataclass
 import math
 
 
+LR_SCHEDULE_FIELDS = frozenset(("lr_schedule_enabled", "lr_final_factor",
+    "lr_sh_warmup_epochs", "lr_radiance_sh", "lr_opacity_sh"))
+
+
 @dataclass
 class OptimizerConfig:
     lr_radiance: float = 1e-3
@@ -34,9 +38,16 @@ class OptimizerConfig:
     log_scale_step_limit: float = .02
     rotation_step_limit: float = .02
     max_scale_voxels: float = 4.
+    lr_schedule_enabled: bool = False
+    lr_final_factor: float = .1
+    lr_sh_warmup_epochs: int = 20
+    lr_radiance_sh: float | None = None
+    lr_opacity_sh: float | None = None
 
     def validate(self):
         for name, value in asdict(self).items():
+            if name in ("lr_radiance_sh", "lr_opacity_sh") and value is None:
+                continue
             if isinstance(value, bool):
                 continue
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
@@ -48,6 +59,17 @@ class OptimizerConfig:
         for value in (self.opacity_warmup_epochs, self.opacity_ramp_epochs):
             if not isinstance(value, int):
                 raise ValueError("Opacity schedule lengths must be integers")
+        if type(self.lr_schedule_enabled) is not bool:
+            raise ValueError("optimizer.lr_schedule_enabled must be a boolean")
+        if (type(self.lr_final_factor) not in (int, float)
+                or not math.isfinite(self.lr_final_factor) or not 0 < self.lr_final_factor <= 1):
+            raise ValueError("optimizer.lr_final_factor must be finite and in (0, 1]")
+        if type(self.lr_sh_warmup_epochs) is not int or self.lr_sh_warmup_epochs < 0:
+            raise ValueError("optimizer.lr_sh_warmup_epochs must be a nonnegative integer")
+        for name in ("lr_radiance_sh", "lr_opacity_sh"):
+            value = getattr(self, name)
+            if value is not None and type(value) not in (int, float):
+                raise ValueError(f"optimizer.{name} must be None or a finite nonnegative number")
 
 
 class FalcorOptimizer:
@@ -77,23 +99,70 @@ class FalcorOptimizer:
         self._update_bypasses = self._update_clears = 0
         self._update_evictions = 0
         self._compact_calls = self._compact_rows = 0
+        self._learning_rates = None
+        self._learning_rate_values = None
         # All mutable buffers are explicit PyTree arguments. The closure must
         # not retain a model, its snapshot, or old optimizer state.
         def native_update(model, gradients, appearance, geometry, carving,
-                          means, squares, steps, settings, allowed, check_moments):
-            accepted = model.optimizer_step_device(gradients, appearance, geometry, carving,
-                means, squares, steps, settings, allowed, check_moments)
+                          means, squares, steps, settings, allowed, check_moments,
+                          learning_rates=None):
+            arguments = (gradients, appearance, geometry, carving,
+                         means, squares, steps, settings, allowed, check_moments)
+            if learning_rates is not None:
+                arguments += (learning_rates,)
+            accepted = model.optimizer_step_device(*arguments)
             dr.eval(accepted, *means.values(), *squares.values(), *steps.values())
             return accepted
         self._native_update = native_update
         def compact_update(model, ids, row_count, gradients, appearance, geometry, carving,
-                           means, squares, steps, settings, allowed, check_moments):
-            accepted = model.optimizer_step_compact_device(ids, row_count, gradients,
-                appearance, geometry, carving, means, squares, steps, settings, allowed, check_moments)
+                           means, squares, steps, settings, allowed, check_moments,
+                           learning_rates=None):
+            arguments = (ids, row_count, gradients, appearance, geometry, carving,
+                         means, squares, steps, settings, allowed, check_moments)
+            if learning_rates is not None:
+                arguments += (learning_rates,)
+            accepted = model.optimizer_step_compact_device(*arguments)
             dr.eval(accepted, *means.values(), *squares.values(), *steps.values())
             return accepted
         self._native_compact_update = compact_update
         self.reset(model)
+
+    def set_learning_rates(self, rates):
+        """Set per-epoch rates without specializing replay on their values.
+
+        Layout: radiance degrees 0..3, opacity degrees 0..2, center,
+        log-scale and rotation. None restores the original scalar-rate path.
+        """
+        if rates is None:
+            if self._learning_rates is not None:
+                self.clear_replay()
+            self._learning_rates = self._learning_rate_values = None
+            return
+        if (not isinstance(rates, (list, tuple)) or len(rates) != 10
+                or any(type(value) not in (int, float) or not math.isfinite(value)
+                       or not 0 <= value <= 3.4028234663852886e38 for value in rates)):
+            raise ValueError("Learning rates must contain ten finite nonnegative float32 values")
+        if self.sh_count > 16 or self.opacity_sh_count > 9:
+            raise ValueError("Learning-rate packs support up to 16 radiance and 9 opacity coefficients")
+        values = tuple(float(value) for value in rates)
+        if values == self._learning_rate_values:
+            return
+        if self._learning_rates is None:
+            self.clear_replay()
+        self._learning_rate_values = values
+        self._learning_rates = self.mi.Float(values)
+        self.dr.make_opaque(self._learning_rates)
+
+    def _group_rates(self, epoch, coarse_to_fine):
+        cfg, rates = self.config, self._learning_rate_values
+        if rates is None:
+            return {"radiance_sh": cfg.lr_radiance,
+                    "opacity_sh": self.effective_opacity_lr(epoch, coarse_to_fine),
+                    "centers": cfg.lr_center, "log_scales": cfg.lr_log_scale,
+                    "rotation_tangent": cfg.lr_rotation}
+        return {"radiance_sh": max(rates[:self.sh_degree_count]),
+                "opacity_sh": max(rates[4:4 + self.opacity_degree_count]),
+                "centers": rates[7], "log_scales": rates[8], "rotation_tangent": rates[9]}
 
     def clear_replay(self):
         """Release recorded buffers before replacing topology or optimizer state."""
@@ -169,7 +238,7 @@ class FalcorOptimizer:
             stored = getattr(self, stored_name)
             active = int(getattr(model, active_name, stored))
             setattr(self, active_name, active)
-            if active < stored and not getattr(self, flag):
+            if (active < stored or self._learning_rates is not None) and not getattr(self, flag):
                 # Legacy clocks represent bands that were already optimized.
                 # Keep that age when enabling independent clocks later.
                 setattr(self, flag, True)
@@ -206,6 +275,11 @@ class FalcorOptimizer:
         return valid
 
     def effective_opacity_lr(self, epoch: int, coarse_to_fine: bool) -> float:
+        if self._learning_rate_values is not None:
+            return self._learning_rate_values[4]
+        return self._legacy_opacity_lr(epoch, coarse_to_fine)
+
+    def _legacy_opacity_lr(self, epoch: int, coarse_to_fine: bool) -> float:
         cfg = self.config
         if cfg.lr_opacity <= 0 or coarse_to_fine:
             return cfg.lr_opacity
@@ -284,12 +358,23 @@ class FalcorOptimizer:
             lane = dr.arange(mi.UInt32, count * size)
             coefficient = lane % size // (3 if name == "radiance_sh" else 1)
             mask &= coefficient < active_coefficients
+        component_lr = lr
+        scheduled_sh = self._learning_rates is not None and name in ("radiance_sh", "opacity_sh")
+        if scheduled_sh:
+            coefficient_degree = dr.zeros(mi.UInt32, count * size)
+            for degree in range(1, step_size):
+                coefficient_degree += mi.UInt32(coefficient >= degree * degree)
+            rate_offset = 0 if name == "radiance_sh" else 4
+            component_lr = dr.gather(mi.Float, self._learning_rates, rate_offset + coefficient_degree)
+            mask &= component_lr > 0
         original = self._finite(gradient)
         gradient = dr.clip(original, -cfg.gradient_clip, cfg.gradient_clip)
         if step_size > 1:
             step_lane = dr.arange(mi.UInt32, count * step_size)
             degree = step_lane % step_size
             step_active = self._expand(active, step_size) & (degree * degree < active_coefficients)
+            if scheduled_sh:
+                step_active &= dr.gather(mi.Float, self._learning_rates, rate_offset + degree) > 0
             steps = state["steps"] + mi.UInt32(step_active)
             coefficient_degree = dr.zeros(mi.UInt32, count * size)
             for degree in range(1, step_size):
@@ -303,7 +388,7 @@ class FalcorOptimizer:
         square = cfg.beta2 * state["squared_mean"] + (1 - cfg.beta2) * dr.square(gradient)
         bias1 = dr.maximum(1 - dr.power(cfg.beta1, exponent), 1e-8)
         bias2 = dr.maximum(1 - dr.power(cfg.beta2, exponent), 1e-8)
-        step = lr * (mean / bias1) / (dr.sqrt(dr.maximum(square / bias2, 0.)) + cfg.epsilon)
+        step = component_lr * (mean / bias1) / (dr.sqrt(dr.maximum(square / bias2, 0.)) + cfg.epsilon)
         step = self._finite(step)
         if name in ("centers", "log_scales", "rotation_tangent") and cfg.geometry_direction_guard:
             blocked = (original == 0) | (mean * original < 0)
@@ -355,6 +440,10 @@ class FalcorOptimizer:
         self._prepare_sh_state(model)
         if not callable(getattr(model, "optimizer_step_device", None)):
             raise RuntimeError("Device sparse Adam requires optimizer_step_device; rebuild this source checkout")
+        if (self._learning_rates is not None
+                and getattr(model, "learning_rate_schedule_version", 0) < 1):
+            raise RuntimeError("Per-degree learning rates require learning_rate_schedule_version >= 1; "
+                               "rebuild this source checkout")
         if int(model.active_voxel_count) != self.count:
             raise ValueError("Topology changed: call optimizer.remap() or reset() before step")
         if sample_count < 1:
@@ -400,8 +489,11 @@ class FalcorOptimizer:
                 dr.eval(allowed)
             return {"effective_opacity_lr": opacity_lr, "backward_samples": sample_count,
                     "accepted": self.update_healthy}
-        settings = {name: float(value) for name, value in asdict(cfg).items()}
-        settings.update(lr_opacity=float(opacity_lr), gradient_factor=cfg.grad_scale / sample_count)
+        settings = {name: float(value) for name, value in asdict(cfg).items()
+                    if name not in LR_SCHEDULE_FIELDS}
+        settings.update(lr_opacity=float(cfg.lr_opacity if self._learning_rates is not None
+                                        else self._legacy_opacity_lr(epoch, coarse_to_fine)),
+                        gradient_factor=cfg.grad_scale / sample_count)
         means = {name: state["mean"] for name, state in self._state.items()}
         squares = {name: state["squared_mean"] for name, state in self._state.items()}
         steps = {name: state["steps"] for name, state in self._state.items()}
@@ -427,6 +519,8 @@ class FalcorOptimizer:
             arguments = (model, ids, device_row_count, gradients,
                          *counts, means, squares, steps, settings, allowed, guarded)
             native, cache = self._native_compact_update, self._compact_update_cache
+        if self._learning_rates is not None:
+            arguments += (self._learning_rates,)
         # Separate genuine external aliases before recording/replaying writes,
         # then stash the unique-owner reference counts across freeze's internal
         # temporary references. Without this scope freeze records a full-table
@@ -484,9 +578,7 @@ class FalcorOptimizer:
         if guarded:
             allowed &= self._check_external_state()
         opacity_lr = self.effective_opacity_lr(epoch, coarse_to_fine)
-        rates = {"radiance_sh": cfg.lr_radiance, "opacity_sh": opacity_lr,
-                 "centers": cfg.lr_center, "log_scales": cfg.lr_log_scale,
-                 "rotation_tangent": cfg.lr_rotation}
+        rates = self._group_rates(epoch, coarse_to_fine)
         limits = {"radiance_sh": cfg.radiance_step_limit, "opacity_sh": cfg.opacity_step_limit,
                   "centers": cfg.center_step_limit, "log_scales": cfg.log_scale_step_limit}
         if self.count == 0:
@@ -506,9 +598,9 @@ class FalcorOptimizer:
         # compress transfers only the list lengths, but DOES synchronize CUDA;
         # performance comparisons must include this cost and finish the queue.
         appearance_ids = dr.compress((appearance > 0) & allowed) if (
-            cfg.lr_radiance > 0 or opacity_lr > 0) else mi.UInt32([])
+            rates["radiance_sh"] > 0 or rates["opacity_sh"] > 0) else mi.UInt32([])
         geometry_ids = dr.compress((geometry > 0) & allowed) if (
-            cfg.lr_center > 0 or cfg.lr_log_scale > 0 or cfg.lr_rotation > 0) else mi.UInt32([])
+            any(rates[name] > 0 for name in ("centers", "log_scales", "rotation_tangent"))) else mi.UInt32([])
         geometry_scale = 1.
         if dr.width(geometry_ids):
             geometry_scale = 1 + (max(cfg.background_carve_multiplier, 1.) - 1) * dr.clip(
@@ -616,10 +708,7 @@ class FalcorOptimizer:
         geometry_lr_scale = 1 + (max(cfg.background_carve_multiplier, 1.) - 1) * dr.clip(
             mi.Float(carving) / dr.maximum(mi.Float(geometry), 1.), 0., 1.)
         parameters = {}
-        rates = {"radiance_sh": cfg.lr_radiance,
-                 "opacity_sh": self.effective_opacity_lr(epoch, coarse_to_fine),
-                 "centers": cfg.lr_center, "log_scales": cfg.lr_log_scale,
-                 "rotation_tangent": cfg.lr_rotation}
+        rates = self._group_rates(epoch, coarse_to_fine)
         limits = {"radiance_sh": cfg.radiance_step_limit, "opacity_sh": cfg.opacity_step_limit,
                   "centers": cfg.center_step_limit, "log_scales": cfg.log_scale_step_limit}
         for name, lr in rates.items():
@@ -665,7 +754,7 @@ class FalcorOptimizer:
         elif guarded:
             self.update_healthy = allowed
             dr.eval(self.update_healthy)
-        return {"effective_opacity_lr": rates["opacity_sh"], "backward_samples": sample_count,
+        return {"effective_opacity_lr": self.effective_opacity_lr(epoch, coarse_to_fine), "backward_samples": sample_count,
                 "accepted": self.update_healthy}
 
     def remap(self, survivors, new_count: int, *, reset_radiance: bool = False,

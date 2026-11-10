@@ -22,6 +22,30 @@ MIB = 1024**2
 GIB = 1024**3
 
 
+def validate_reference_cache_mib(value):
+    """Keep explicit limits/zero intact; auto requests the complete training split."""
+    if value != "auto":
+        _integer("gpu_reference_cache_mib", value)
+
+
+def resolve_reference_cache_mib(value, image_pixels, image_count, *, rgb_only=True):
+    """Resolve an auto logical-byte request; the memory planner still bounds it.
+
+    This computes a capacity, not an allocation or a guarantee that it fits.
+    Images remain lazy, and individual CUDA allocation buckets are budgeted by
+    ``plan_training_memory`` before reference uploads begin.
+    """
+    validate_reference_cache_mib(value)
+    if value != "auto":
+        return value
+    _integer("reference_image_pixels", image_pixels, 1)
+    _integer("reference_image_count", image_count)
+    if not isinstance(rgb_only, bool):
+        raise ValueError("rgb_only must be a boolean")
+    size = image_pixels * image_count * (3 if rgb_only else 4) * 4
+    return (size + MIB - 1) // MIB
+
+
 class TrainingMemoryError(RuntimeError):
     """A planned allocation was refused; resume only a complete checkpoint."""
 
@@ -177,7 +201,8 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
                              rgb_only=True, known_index_bytes=0,
                              allocator_policy="cuda_2m", reference_image_pixels=None,
                              radiance_degree_steps=False, opacity_degree_steps=False, path_record_layout_version=0,
-                             compact_path_records=True, srgb_loss=False):
+                             compact_path_records=True, srgb_loss=False,
+                             growth_evidence=False, max_growth_hits=8):
     """Return named logical/allocated bytes for one view, excluding its cache.
 
     ``compact_capacity=0`` is the original N-row gradient layout. A positive
@@ -192,15 +217,20 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
     the complete cached image size and defaults to ray_count for whole views.
     ``radiance_degree_steps`` allocates one radiance Adam clock per SH degree
     and voxel so newly enabled degrees start with independent bias correction.
+    ``growth_evidence`` includes candidate records and shared RGB hit prefixes
+    used to evaluate insertion-induced early stops (native evidence v5).
     """
     values = {
         "active_voxels": (active_voxels, 0), "sh_count": (sh_count, 1),
         "opacity_sh_count": (opacity_sh_count, 1), "compact_capacity": (compact_capacity, 0),
         "ray_count": (ray_count, 1), "max_hits": (max_hits, 1),
         "max_candidates": (max_candidates, 0), "known_index_bytes": (known_index_bytes, 0),
+        "max_growth_hits": (max_growth_hits, 1),
     }
     for name, (value, minimum) in values.items():
         _integer(name, value, minimum)
+    if max_growth_hits > 32:
+        raise ValueError("max_growth_hits must be between 1 and 32")
     _integer("path_record_layout_version", path_record_layout_version)
     if reference_image_pixels is None:
         reference_image_pixels = ray_count
@@ -211,7 +241,7 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         raise ValueError("Reference image pixels must fit UInt32")
     if isinstance(lifecycle_epoch_bytes, bool) or lifecycle_epoch_bytes not in (4, 8):
         raise ValueError("lifecycle_epoch_bytes must be 4 or 8")
-    if not all(isinstance(value, bool) for value in (distortion, dssim, rgb_only, radiance_degree_steps, opacity_degree_steps, compact_path_records, srgb_loss)):
+    if not all(isinstance(value, bool) for value in (distortion, dssim, rgb_only, radiance_degree_steps, opacity_degree_steps, compact_path_records, srgb_loss, growth_evidence)):
         raise ValueError("distortion, dssim, rgb_only, SH clock, path record and srgb_loss flags must be booleans")
     round_cuda_allocation(0, allocator_policy)
 
@@ -269,7 +299,9 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         # adjoint. JIT fusion can eliminate some planes; reserve them once per
         # ray batch, never per voxel/hit or cached reference image.
         buffers["srgb_loss_workspace"] = [(ray_count * 4, 12)]
-    if n:
+    # Empty active models can still trace insertion candidates. The native
+    # empty-scene fast path applies only when growth evidence is also absent.
+    if n or growth_evidence:
         # Layout v1 replays RGB/opacity from the unchanged model: four hit
         # fields disappear and RGB reverse suffix needs only three floats.
         # Candidate score is released before backward, but budget all seven
@@ -281,6 +313,13 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
             reverse_suffix=[(ray_count * max_hits * (3 if compact_records else 4) * 4, 1)],
             geometric_candidate_state=[(ray_count * 4, max_candidates * (7 if compact_records else 8))],
         )
+        if growth_evidence:
+            buffers.update(
+                growth_candidate_records=[(ray_count * max_growth_hits * 6 * 4, 1)],
+                growth_candidate_ids=[(ray_count * max_growth_hits * 4, 1)],
+                growth_insertion_hit_indices=[(ray_count * max_growth_hits * 4, 1)],
+                growth_hit_rgb_prefixes=[(ray_count * max_hits * 3 * 4, 1)],
+            )
     else:
         buffers.update(hit_record_floats=[(0, 1)], hit_record_ids=[(0, 1)],
                        reverse_suffix=[(0, 1)], geometric_candidate_state=[(0, 1)])
@@ -301,6 +340,7 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         "opacity_degree_steps": opacity_degree_steps,
         "path_record_layout_version": path_record_layout_version,
         "compact_path_records": compact_records,
+        "growth_evidence_records": growth_evidence,
         "allocator_policy": allocator_policy,
         "allocator_policy_requires_patched_runtime": allocator_policy == "cuda_2m",
         "buffer_groups": {name: [{"logical_bytes_each": size, "count": count}
@@ -311,12 +351,14 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         "known_allocated_bytes": sum(allocated.values()),
         "legacy_allocated_components_bytes": legacy,
         "legacy_power_of_two_bytes": sum(legacy.values()),
-        "scope": "ordinary view per-buffer allocation plan; not measured dedicated VRAM or a topology-boundary peak",
+        "scope": ("view with growth records" if growth_evidence else "ordinary view") +
+                 " per-buffer allocation plan; not measured dedicated VRAM or a topology-boundary peak",
         "unmodeled_storage": [
             "ray-generation inputs, native loop temporaries, and optimizer transaction workspace",
             "allocator caches, alignment, JIT buffers, and retained external aliases",
             "octree/spatial index bytes not supplied through known_index_bytes",
-            "growth/deletion evidence, candidate models, cooldowns, and refinement old/new model overlap",
+            "growth/deletion vote tables, candidate models, cooldowns, and refinement old/new model overlap",
+            *([] if growth_evidence else ["growth candidate and RGB-prefix ray records"]),
         ],
     }
 
@@ -499,7 +541,8 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
                          pressure_cache_cap_mib=256, cache_quantum_mib=128,
                          allocator_policy="cuda_2m", reference_image_pixels=None,
                          radiance_degree_steps=False, opacity_degree_steps=False, path_record_layout_version=0,
-                         compact_path_records=True, srgb_loss=False):
+                         compact_path_records=True, srgb_loss=False,
+                         growth_evidence=False, max_growth_hits=8):
     """Recommend a reference-cache cap without changing training algorithms.
 
     ``gpu`` is the runtime report containing ``memory_mib`` (number or numeric
@@ -510,14 +553,16 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
     rounded down in 128 MiB increments, or disables it if necessary. The
     reported available budget is separate from this deliberate pressure cap.
 
+    The string ``auto`` requests enough logical MiB for the complete training
+    split; it requires a known image count and uses the same pressure policy.
     Known image count bounds cache residency even when its configured limit is
     larger than the dataset. One extra active reference is already in the
     ledger. No GPU runtime is imported and no cache object is mutated.
     Pass the full image size through ``reference_image_pixels`` when ray_count
     describes a smaller submitted ray batch.
     """
+    validate_reference_cache_mib(reference_cache_mib)
     for name, value in (
-        ("reference_cache_mib", reference_cache_mib),
         ("workspace_reserve_mib", workspace_reserve_mib),
         ("device_reserve_mib", device_reserve_mib),
         ("pressure_cache_cap_mib", pressure_cache_cap_mib),
@@ -536,10 +581,14 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         radiance_degree_steps=radiance_degree_steps,
         opacity_degree_steps=opacity_degree_steps,
         path_record_layout_version=path_record_layout_version,
-        compact_path_records=compact_path_records)
+        compact_path_records=compact_path_records,
+        growth_evidence=growth_evidence, max_growth_hits=max_growth_hits)
     image_pixels = estimate["reference_image_pixels"]
     image_bytes = image_pixels * (3 if rgb_only else 4) * 4
     image_allocated_bytes = round_cuda_allocation(image_pixels * 4, allocator_policy) * (3 if rgb_only else 4)
+    configured_reference_cache_mib = reference_cache_mib
+    reference_cache_mib = resolve_reference_cache_mib(reference_cache_mib, image_pixels,
+        reference_image_count, rgb_only=rgb_only)
 
     def cache_residency(capacity_mib):
         image_capacity = capacity_mib * MIB // image_bytes
@@ -556,6 +605,10 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         **estimate, "gpu_total_bytes": total,
         "workspace_reserve_bytes": workspace, "device_reserve_bytes": device,
         "budget_bytes": None if total is None else max(0, total - device),
+        "configured_reference_cache_mib": configured_reference_cache_mib,
+        "reference_cache_mode": "auto" if configured_reference_cache_mib == "auto" else "explicit",
+        "full_reference_cache_mib": ((reference_image_count * image_bytes + MIB - 1) // MIB
+                                     if reference_image_count is not None else None),
         "requested_reference_cache_mib": reference_cache_mib,
         "requested_reference_resident_bytes": requested_resident,
         "requested_reference_allocated_bytes": requested_allocated,
@@ -567,6 +620,7 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         "available_reference_bytes": 0, "recommended_reference_cache_mib": 0,
         "recommended_reference_resident_bytes": 0,
         "recommended_reference_allocated_bytes": 0,
+        "recommended_reference_image_count": 0,
         "estimated_budget_bytes": fixed,
         "supported": False, "reason_code": None, "reason": None,
     }
@@ -596,12 +650,15 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
             cap = max(0, cap - cache_quantum_mib)
         reason_code = "reference_cache_reduced" if cap else "reference_cache_disabled"
     resident, resident_allocated = cache_residency(cap)
+    request_label = f"auto ({reference_cache_mib})" if configured_reference_cache_mib == "auto" else str(reference_cache_mib)
     report.update(supported=True, reason_code=reason_code,
         recommended_reference_cache_mib=cap,
         recommended_reference_resident_bytes=resident,
         recommended_reference_allocated_bytes=resident_allocated,
+        recommended_reference_image_count=resident // image_bytes,
         estimated_budget_bytes=fixed + resident_allocated,
-        reason=(f"Reference cache {reference_cache_mib} -> {cap} MiB; "
+        reason=(f"Reference cache {request_label} -> {cap} MiB; "
+                f"{resident // image_bytes}/{reference_image_count if reference_image_count is not None else 'unknown'} reference images fit; "
                 f"allocator buckets, cached references, and workspace reserve total "
                 f"{(fixed + resident_allocated) / GIB:.2f} GiB within a "
                 f"{(total - device) / GIB:.2f} GiB budget. "

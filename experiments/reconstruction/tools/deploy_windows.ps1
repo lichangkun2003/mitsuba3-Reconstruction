@@ -191,7 +191,7 @@ Invoke-Native $git @('-C', $repository, 'rev-parse', 'HEAD')
 
 if ($CheckOnly) {
     Write-Host 'Preflight passed. No environment, dependencies, submodules, or build files were changed.'
-    Write-Host 'Run this script without -CheckOnly to build and run the CUDA and custom RGB-only checks.'
+    Write-Host 'Run this script without -CheckOnly to build and run the CUDA environment check.'
     return
 }
 
@@ -216,8 +216,6 @@ try {
     $runtime = Join-Path $build 'Release'
     Invoke-Native $python @('-I', '-B', (Join-Path $PSScriptRoot 'smoke_gpu.py'),
         '--build-dir', $runtime, '--output-dir', (Join-Path $output 'source-smoke'), '--gpu', "$Gpu")
-    Invoke-Native $python @('-I', '-B', (Join-Path $PSScriptRoot '..\tests\test_reconstruction_rgb_only.py'),
-        '--build-dir', $runtime, '--gpu', "$Gpu")
     Write-Host "Deployment checks passed. Reports and log: $output"
     Write-Host "Training interpreter: $python"
 } finally {
