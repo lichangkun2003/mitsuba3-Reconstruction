@@ -340,6 +340,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("distortion_version") = nb::int_(Model::distortion_version);
     cls.attr("dssim_version") = nb::int_(Model::dssim_version);
     cls.attr("rgb_loss_srgb_version") = nb::int_(Model::rgb_loss_srgb_version);
+    cls.attr("rgb_loss_reduction_version") = nb::int_(Model::rgb_loss_reduction_version);
     cls.attr("sh_schedule_version") = nb::int_(Model::sh_schedule_version);
     cls.attr("octree_version") = nb::int_(Model::octree_version);
     cls.attr("optimizer_device_version") = nb::int_(Model::optimizer_device_version);

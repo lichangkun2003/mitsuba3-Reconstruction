@@ -57,6 +57,8 @@ public:
     static constexpr uint32_t dssim_version = 1;
     /// Optional sRGB image supervision with linear rendering and topology gains.
     static constexpr uint32_t rgb_loss_srgb_version = 1;
+    /// RGB channel-mean MSE with matching adjoints and topology evidence.
+    static constexpr uint32_t rgb_loss_reduction_version = 1;
     /// Progressive radiance SH with dormant coefficients and Adam degree clocks.
     static constexpr uint32_t sh_schedule_version = 2;
     /// GPU occupancy octree, including separately tagged hypothetical leaves.
@@ -233,6 +235,9 @@ public:
     /// mode. Rendered colors and references remain linear; the completed pixel
     /// is encoded without clipping, and the image adjoint is chained through
     /// the transfer function. The default 0 preserves linear supervision.
+    /// rgb_loss_channel_mean=1 (default) averages RGB squared error over the
+    /// three channels, including its adjoints and RGB topology gains. Explicit
+    /// 0 retains the historical channel sum. Other loss terms are unchanged.
     /// distortion_loss_weight optionally adds pairwise L1 separation of the
     /// recorded hard-hit contributions. Depth is the clipped ellipsoid-metric
     /// closest point, normalized by the fixed grid diagonal for legacy models.

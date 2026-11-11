@@ -112,6 +112,7 @@ RGB-only 训练、自适应细分与低 opacity 删除（当前默认）
    CONFIG.training.opacity_sh_degree_progression = True
    CONFIG.training.sh_degree_weights = (8, 0, 2)
    CONFIG.gradient.alpha_loss_weight = 0
+   CONFIG.gradient.rgb_loss_channel_mean = True
    CONFIG.gradient.alpha_geometry_weight = 0
    CONFIG.gradient.background_carve_weight = 0
    CONFIG.gradient.geometry_transition_only = False
@@ -143,7 +144,7 @@ RGB-only 训练、自适应细分与低 opacity 删除（当前默认）
    CONFIG.schedule.coarse_growth_interval = 50
    CONFIG.contour.enabled = False
 
-新实验默认在线性空间合成完整像素，再编码为浮点 sRGB 计算 RGB 平方误差；
+新实验默认在线性空间合成完整像素，再编码为浮点 sRGB 计算 RGB 通道均方误差；
 ``gradient.loss_color_space="linear"`` 保留旧目标。可显式开启下面的 Distortion 正则。
 新实验默认 ``data.reference_compositing="srgb"``：
 读取 sRGB RGBA 图片时，先将编码空间的 RGB 与所选背景按 alpha 合成，再解码为线性 RGB，
@@ -405,6 +406,26 @@ tangent 的导数。深度最小点位于网格段内部时使用解析导数；
 不能把旧实验静默切换到新目标。sRGB 训练要求 RGB-only，并要求重新编译后的
 ``mi.VoxelReconstruction.rgb_loss_srgb_version >= 1``；旧构建会明确拒绝启动。
 
+``gradient.rgb_loss_channel_mean=True`` 是新实验的通道归一化设置：每像素先对三个 RGB
+通道的平方误差取均值，再在日志中按像素和训练视角平均，即常规 RGB MSE。
+``CONFIG`` 与 ``bicycle_1024.json`` 默认开启；部分 JSON 未指定此字段时继承新实验默认值。
+通用 ``GradientSettings`` 的兼容默认值为 ``False``，缺失该字段的旧 checkpoint
+与从旧模型启动的独立 radiance 优化保留原 RGB 通道求和。续训不能更改此字段。
+
+只有 RGB L2 及对应 RGB 生长／删除收益乘以 ``1/3``；D-SSIM、distortion、alpha 项的
+定义与权重保持不变。像素梯度仍按像素求和，没有额外除以 ``HW``，学习率和
+``grad_scale`` 也保持原值。当前 JSON 预设因此为
+``RGB MSE + 0.2 * (1-SSIM) + 0.2 * distortion``，旧日志的 RGB loss 与总 loss
+不能和新定义直接比较。报告和每轮日志记录实际通道归一化。
+这项改动需要先增量编译原生模块及绑定：
+
+.. code-block:: powershell
+
+   cmake --build build --config Release --parallel 8
+
+训练入口要求 ``mi.VoxelReconstruction.rgb_loss_reduction_version >= 1``，
+包括显式使用 ``False`` 的旧通道和续训；归一化始终显式传给原生，避免采用错误默认值。
+
 radiance、路径前缀／后缀、背景贡献、参考图缓存均保持线性 RGB。原生前向完成全部
 颜色累加后，将完整像素 ``C`` 与线性参考 ``R`` 分别编码为 ``f(C)``、``f(R)``，
 L2 和 D-SSIM 都在这个浮点空间计算，不经过 PNG 或 8 位量化。sRGB 使用标准分段
@@ -414,7 +435,8 @@ L2 和 D-SSIM 都在这个浮点空间计算，不经过 PNG 或 8 位量化。s
 
 先合并 L2 与 D-SSIM 对编码像素的梯度，再乘 ``f'(C)``，得到原有 radiance、opacity
 和几何代理反向所需的线性像素梯度；distortion 的独立梯度不乘该导数。
-生长／删除使用 ``||f(C)-f(R)||² - ||f(C+delta)-f(R)||²`` 的有限反事实收益，
+生长／删除使用 ``q * (||f(C)-f(R)||² - ||f(C+delta)-f(R)||²)`` 的有限反事实收益，
+``q`` 在通道均值模式为 ``1/3``，旧通道和模式为 ``1``，沿用原配置中的收益阈值。
 不能使用线性 L2 的二次展开或仅乘一个局部导数。该收益仍只包含 RGB L2，
 不包含 D-SSIM 或 distortion；完整路径／截断未知的保护规则不变。
 ``linear`` 模式下 ``f`` 为恒等映射，保留原生计算与历史目标。
@@ -448,12 +470,13 @@ JSON 的 ``gradient.dssim_loss_weight`` 控制独立的加法权重，也可用
 .. math::
 
    d_p=1-\frac{1}{3}\sum_{c\in\{R,G,B\}}\operatorname{SSIM}_{p,c},\qquad
-   L=\frac{1}{HW}\sum_p\left[\|\mathbf C_p-\mathbf R_p\|_2^2+
+   L=\frac{1}{HW}\sum_p\left[\frac{1}{3}\|\mathbf C_p-\mathbf R_p\|_2^2+
       \lambda_{\mathrm{ssim}}d_p+\lambda_{\mathrm{dist}}D_p\right].
 
 上式 ``C`` 与 ``R`` 是 ``gradient.loss_color_space`` 指定的图像空间值：
 ``srgb`` 时为完整线性像素及参考的编码结果，``linear`` 时直接使用线性 RGB。
-不读取 alpha，也不在计算前把大于 1 的预测颜色截断。RGB 项保留三通道平方误差的和，
+不读取 alpha，也不在计算前把大于 1 的预测颜色截断。上式对应新实验的 RGB 通道均值；
+旧 checkpoint 的 ``rgb_loss_channel_mean=False`` 则去掉 RGB 项前的 ``1/3``。
 D-SSIM 则在通道间平均；采用 ``1-SSIM`` 定义，没有再除以 2。
 它是现有 RGB 项上的独立加法权重，不是 3DGS 的 ``(1-lambda)*L1+lambda*(1-SSIM)``，
 相同 lambda 数值不能视为等强度。原生输出仍为逐像素损失以及按像素求和的梯度，
@@ -717,12 +740,12 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 .. code-block:: text
 
    dc   = T * a * (B - c)
-   gain = ||f(C) - f(y)||^2 - ||f(C + dc) - f(y)||^2
+   gain = q * (||f(C) - f(y)||^2 - ||f(C + dc) - f(y)||^2)
 
 颜色增量在线性空间计算，``f`` 由 ``gradient.loss_color_space`` 决定。
-仅 ``linear`` 模式使用等价展开 ``-2*dot(C-y,dc)-dot(dc,dc)``。
+仅 ``linear`` 模式使用等价展开 ``q*(-2*dot(C-y,dc)-dot(dc,dc))``。
 
-这里使用三个 RGB 通道平方误差的和，与训练原生 loss 一致，不额外除以 3。
+``q=1/3`` 对应新实验的 RGB 通道均值，旧通道和模式为 ``q=1``，与训练原生 loss 一致。
 收益大于零表示在当前射线及参数下，单独删除降低误差；负收益表示保留更好。
 ``B`` 已由反向合成提供，不通过除以 ``1-a`` 反推，因此不会在 opacity 接近 1 时引入
 该除法的不稳定。删除不重新追踪、不延长已结束的 DDA、不额外保存一套后缀；但会增加

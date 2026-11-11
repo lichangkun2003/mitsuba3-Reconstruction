@@ -92,6 +92,7 @@ class TrainingSettings:
 @dataclass
 class GradientSettings:
     loss_color_space: str = "linear"  # Legacy schema default; new experiments use float sRGB image losses.
+    rgb_loss_channel_mean: bool = False  # Legacy checkpoints sum RGB channels; CONFIG enables their mean.
     alpha_loss_weight: float = .5
     distortion_loss_weight: float = 0.  # Legacy checkpoint/schema default; CONFIG enables it for new experiments.
     dssim_loss_weight: float = 0.  # Additive image-space 1-SSIM; zero skips the SSIM filters.
@@ -169,6 +170,7 @@ CONFIG.training.rgb_only = True  # 参考 alpha 仅用于读图时合成 RGB，�
 CONFIG.model.opacity_sh_count = 9  # DC until the fixed-topology tail, then degrees 1 and 2.
 CONFIG.gradient.alpha_loss_weight = 0.
 CONFIG.gradient.loss_color_space = "srgb"  # 完整线性像素编码后计算 L2 / D-SSIM，并回传编码导数。
+CONFIG.gradient.rgb_loss_channel_mean = True  # RGB 平方误差按三个通道取均值；其他损失权重保持原值。
 CONFIG.gradient.alpha_geometry_weight = 0.
 CONFIG.gradient.background_carve_weight = 0.
 CONFIG.gradient.distortion_loss_weight = 0.1  # 新实验默认开启深度集中正则；--distortion-weight 0 显式关闭。
@@ -561,6 +563,8 @@ def validate(config):
         raise ValueError("gradient.loss_color_space must be 'linear' or 'srgb'")
     if config.gradient.loss_color_space == "srgb" and not config.training.rgb_only:
         raise ValueError("gradient.loss_color_space='srgb' requires RGB-only training")
+    if not isinstance(config.gradient.rgb_loss_channel_mean, bool):
+        raise ValueError("gradient.rgb_loss_channel_mean must be a boolean")
     for name, value in asdict(config.gradient).items():
         if name == "loss_color_space":
             continue
@@ -1075,6 +1079,26 @@ def require_rgb_loss_color_space(config, native_model_type):
                            "incrementally rebuild this Mitsuba source checkout")
 
 
+def resolve_resume_rgb_loss_reduction(config, checkpoint, overrides):
+    """Keep saved channel reduction; a pre-field checkpoint uses channel sums."""
+    saved = checkpoint["config"].get("gradient", {}).get("rgb_loss_channel_mean", False)
+    requested = overrides.get("gradient", {}).get("rgb_loss_channel_mean", saved)
+    if not isinstance(saved, bool) or not isinstance(requested, bool):
+        raise ValueError("gradient.rgb_loss_channel_mean must be a boolean")
+    if requested != saved:
+        raise ValueError("Cannot change gradient.rgb_loss_channel_mean while resuming; "
+                         "start a new experiment for a different RGB loss reduction")
+    config.gradient.rgb_loss_channel_mean = saved
+
+
+def require_rgb_loss_reduction(native_model_type):
+    """The native setting is explicit for both new means and legacy sums."""
+    if getattr(native_model_type, "rgb_loss_reduction_version", 0) < 1:
+        raise RuntimeError("RGB loss channel reduction requires native rgb_loss_reduction_version >= 1, "
+                           "including legacy channel-sum resumes; incrementally rebuild "
+                           "this Mitsuba source checkout")
+
+
 def require_background_rgb_deletion(config, native_model_type):
     """Reject stale native builds that omit world-space background votes."""
     world_shell = (config.data.initialization or {}).get("scene_mapping") == "world_shell"
@@ -1086,6 +1110,8 @@ def require_background_rgb_deletion(config, native_model_type):
 
 
 def settings(config):
+    # Keep rgb_loss_channel_mean explicit even when False, since the native
+    # default is a mean while legacy saved experiments require channel sums.
     result = asdict(config.gradient)
     loss_color_space = result.pop("loss_color_space")
     if loss_color_space == "srgb":
@@ -1647,6 +1673,7 @@ def run_training(distributed=None):
         validate_resume_supervision(config, checkpoint)
         resolve_resume_reference_compositing(config, checkpoint, overrides)
         resolve_resume_loss_color_space(config, checkpoint, overrides, getattr(args, "loss_color_space", None))
+        resolve_resume_rgb_loss_reduction(config, checkpoint, overrides)
         # Resolve new fields before the first validation/runtime check too.
         # The full immutable-settings check follows loading the saved config.
         saved_training = checkpoint["config"].get("training", {})
@@ -1759,6 +1786,7 @@ def run_training(distributed=None):
             validate_resume_supervision(config, checkpoint)
             resolve_resume_reference_compositing(config, checkpoint, overrides)
             resolve_resume_loss_color_space(config, checkpoint, overrides, getattr(args, "loss_color_space", None))
+            resolve_resume_rgb_loss_reduction(config, checkpoint, overrides)
             resolve_resume_sh_schedule(config, checkpoint, overrides)
             # JSON may request automatic naming with null; keep the already
             # selected location instead of restoring null or a stale host path.
@@ -1828,7 +1856,9 @@ def run_training(distributed=None):
         distortion_enabled = config.gradient.distortion_loss_weight > 0
         dssim_enabled = config.gradient.dssim_loss_weight > 0
         loss_color_space = config.gradient.loss_color_space
+        rgb_channel_reduction = "mean" if config.gradient.rgb_loss_channel_mean else "sum"
         require_rgb_loss_color_space(config, mi.VoxelReconstruction)
+        require_rgb_loss_reduction(mi.VoxelReconstruction)
         if dssim_enabled and getattr(mi.VoxelReconstruction, "dssim_version", 0) < 1:
             raise RuntimeError("D-SSIM requires native dssim_version >= 1; "
                                "incrementally rebuild this Mitsuba source checkout")
@@ -1858,6 +1888,16 @@ def run_training(distributed=None):
             render_color_space="linear",
             traversal=config.render.traversal,
             loss_color_space=loss_color_space,
+            rgb_loss_channel_mean=config.gradient.rgb_loss_channel_mean,
+            rgb_loss_reduction={
+                "native_version": getattr(mi.VoxelReconstruction, "rgb_loss_reduction_version", 0),
+                "channels": rgb_channel_reduction,
+                "channel_scale": 1. / 3. if config.gradient.rgb_loss_channel_mean else 1.,
+                "reported_pixels": "mean over all image pixels",
+                "reported_views": "mean over training views",
+                "gradient_pixels": "sum over pixels; no hit-count normalization",
+                "other_losses": "D-SSIM and distortion definitions and weights unchanged",
+            },
             image_loss_encoding={
                 "native_version": getattr(mi.VoxelReconstruction, "rgb_loss_srgb_version", 0),
                 "prediction": ("encode the completed linear RGB pixel with standard piecewise sRGB"
@@ -1879,7 +1919,7 @@ def run_training(distributed=None):
                 "numerical_stability": "variance >= 0, SSIM in [-1,1], derivatives follow clamps",
                 "estimator": "sum gradients, mean reported loss; full image per GPU at 1 spp",
                 "execution": "separable Gaussian and analytic image adjoint between one forward and existing reverse",
-                "topology_evidence": "RGB L2 insertion/removal gains use loss_color_space; D-SSIM is excluded",
+                "topology_evidence": "RGB L2 insertion/removal gains use the same color space and channel reduction; D-SSIM is excluded",
                 "zero_weight": "not computed; logged D-SSIM values are zero, not measurements",
             },
             distortion={
@@ -1890,7 +1930,7 @@ def run_training(distributed=None):
                 "depth": "hard-hit ellipsoid quadratic-minimum depth, relative to ray-grid entry, divided by grid diagonal",
                 "samples": "actual recorded hard hits only; no residual environment sample or interval-width term",
                 "estimator": "one inverse_pdf factor; sum gradients, mean loss over all view pixels",
-                "topology_evidence": "RGB L2 insertion/removal gains use loss_color_space; distortion is excluded",
+                "topology_evidence": "RGB L2 insertion/removal gains use the same color space and channel reduction; distortion is excluded",
                 "zero_weight": "not computed; logged distortion values are zero, not measurements",
             },
             reference_compositing=config.data.reference_compositing,
@@ -1945,7 +1985,7 @@ def run_training(distributed=None):
             deletion_freeze_start_epoch=(max(1, config.training.num_epochs - config.topology.deletion_freeze_last_epochs + 1)
                                          if config.topology.deletion_freeze_last_epochs else None),
             deletion_batch_policy="independent online votes; not a guarantee of joint loss decrease" if rgb_deletion_enabled else None,
-            reported_loss=(f"mean pixel {loss_color_space} RGB squared-error sum over channels, then mean over views"
+            reported_loss=(f"mean pixel {loss_color_space} RGB squared-error {rgb_channel_reduction} over channels, then mean over views"
                            if config.training.rgb_only else "mean RGB plus alpha loss over pixels and views")
                           + (" + weight * mean hard-hit distortion" if distortion_enabled else "")
                           + (f" + weight * mean {loss_color_space} RGB D-SSIM" if dssim_enabled else ""))
@@ -2071,6 +2111,8 @@ def run_training(distributed=None):
              else "GPU guarded; loss/validity read at epoch and sampled-profile boundaries", flush=True)
         emit("Reference compositing:", config.data.reference_compositing,
              "| rendering: linear | RGB L2 / D-SSIM loss:", loss_color_space, flush=True)
+        emit("RGB L2 channel reduction:", rgb_channel_reduction,
+             "| reported loss: mean pixels/views; gradients: sum pixels", flush=True)
         emit("Distortion loss:", f"weight={config.gradient.distortion_loss_weight:g}; "
              + ("hard-hit pairwise depth concentration" if distortion_enabled else "disabled"), flush=True)
         emit("D-SSIM loss:", f"weight={config.gradient.dssim_loss_weight:g}; "
@@ -2635,6 +2677,7 @@ def run_training(distributed=None):
                      "mean_weighted_dssim_loss": config.gradient.dssim_loss_weight * epoch_dssim_loss / len(views),
                      "dssim_loss_weight": config.gradient.dssim_loss_weight,
                      "loss_color_space": loss_color_space,
+                     "rgb_loss_channel_mean": config.gradient.rgb_loss_channel_mean,
                      "rgb_only": config.training.rgb_only,
                      "seconds": time.perf_counter()-started, "resolution": int(model.resolution),
                      "training_resolution": training_resolution, "active_voxels_before": active_voxels_before,

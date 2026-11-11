@@ -1813,6 +1813,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         {"max_candidates", 16.f}, {"entry_offset_fraction", 0.f},
         {"profile_stages", 0.f}, {"profile_traversal", 0.f},
         {"use_octree", 1.f}, {"rgb_only", 0.f}, {"rgb_loss_srgb", 0.f},
+        {"rgb_loss_channel_mean", 1.f},
         {"collect_rgb_deletion_evidence", 0.f},
         {"collect_adaptive_priority", 0.f},
         {"collect_growth_evidence", 0.f}, {"max_growth_hits", 8.f},
@@ -1826,6 +1827,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     }
     const bool rgb_only = cfg["rgb_only"] != 0.f;
     const bool rgb_loss_srgb = cfg["rgb_loss_srgb"] != 0.f;
+    if (cfg["rgb_loss_channel_mean"] != 0.f && cfg["rgb_loss_channel_mean"] != 1.f)
+        Throw("VoxelReconstruction.loss_and_grad(): rgb_loss_channel_mean must be 0 or 1.");
+    // Each returned loss is per ray. Python averages rays for reporting;
+    // parameter adjoints retain the existing sum-over-rays convention.
+    const float rgb_loss_scale = cfg["rgb_loss_channel_mean"] != 0.f ? 1.f / 3.f : 1.f;
     if (cfg["rgb_loss_srgb"] != 0.f && cfg["rgb_loss_srgb"] != 1.f)
         Throw("VoxelReconstruction.loss_and_grad(): rgb_loss_srgb must be 0 or 1.");
     if (rgb_loss_srgb && !rgb_only)
@@ -1930,7 +1936,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             reference_rgb*reference_alpha + Color3f(1.f)*(1.f-reference_alpha);
         Color3f loss_rgb = rgb_loss_srgb ? reconstruction_linear_to_srgb(result.rgb) : result.rgb;
         Color3f loss_target = rgb_loss_srgb ? reconstruction_linear_to_srgb(target) : target;
-        result.rgb_loss = dr::squared_norm(loss_rgb-loss_target);
+        result.rgb_loss = rgb_loss_scale * dr::squared_norm(loss_rgb-loss_target);
         result.distortion_loss = dr::zeros<Float>(width);
         result.loss = result.rgb_loss;
         if (!rgb_only)
@@ -2488,11 +2494,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     // complete, sampling-weighted image and target enter the selected loss space.
     Color3f loss_rgb=rgb_loss_srgb ? reconstruction_linear_to_srgb(result.rgb) : result.rgb;
     Color3f loss_target=rgb_loss_srgb ? reconstruction_linear_to_srgb(target) : target;
-    Color3f delta=loss_rgb-loss_target,dcolor=2.f*delta;
+    Color3f delta=loss_rgb-loss_target,dcolor=(2.f*rgb_loss_scale)*delta;
     Float dalpha(0.f),deletion_dalpha(0.f);
     Color3f deletion_dcolor(0.f);
     Mask is_background(false),is_foreground(false);
-    result.rgb_loss=dr::squared_norm(delta);
+    result.rgb_loss=rgb_loss_scale*dr::squared_norm(delta);
     result.distortion_loss=distortion_enabled ?
         dr::select(state.hits>1u,state.distortion*weight,0.f) :
         dr::zeros<Float>(width);
@@ -2500,7 +2506,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     if (!rgb_only) {
         dalpha=2.f*cfg["alpha_loss_weight"]*(result.alpha-reference_alpha);
         result.loss+=cfg["alpha_loss_weight"]*dr::square(result.alpha-reference_alpha);
-        deletion_dcolor=2.f*(result.raw_rgb-target);
+        deletion_dcolor=(2.f*rgb_loss_scale)*(result.raw_rgb-target);
         deletion_dalpha=2.f*cfg["alpha_loss_weight"]*(result.raw_alpha-reference_alpha);
         is_background=reference_alpha<=cfg["background_alpha_max"];
         is_foreground=!is_background & (reference_alpha>=cfg["foreground_alpha_min"]);
@@ -2635,7 +2641,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                         gain_change = reconstruction_linear_to_srgb(result.raw_rgb+change)-loss_rgb;
                         gain_residual = delta;
                     }
-                    Float gain = -2.f*dr::dot(gain_residual,gain_change)-dr::squared_norm(gain_change);
+                    Float gain = rgb_loss_scale * (-2.f*dr::dot(gain_residual,gain_change)-dr::squared_norm(gain_change));
                     Mask finite = baseline_finite & dr::isfinite(before) &
                         dr::all(dr::isfinite(prefix)) & dr::isfinite(opacity) &
                         dr::isfinite(terminal_t) & dr::all(dr::isfinite(terminal)) & dr::isfinite(gain);
@@ -2841,7 +2847,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         [](const ReverseState &s) { return s.hit>=0; },
         [this,hit_records=records.hit,hit_ids=records.hit_id,hit_count=state.hits,
          ray_count,hit_stride,lane,clean,dcolor,dalpha,d,weight,is_background,
-         is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry,rgb_only,
+         is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry,rgb_only,rgb_loss_scale,
          collect_rgb_deletion,collect_adaptive_priority,deletion_exited,deletion_trace_valid,
          deletion_baseline_finite,deletion_residual,distortion_enabled,
          rgb_loss_srgb,deletion_rgb=result.raw_rgb,deletion_encoded_rgb=loss_rgb,
@@ -2979,7 +2985,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             if(!rgb_only && cfg.at("collect_deletion_evidence")!=0.f) {
                 Color3f dc=before*opacity*(s.behind-radiance);
                 Float da=-before*opacity*s.after;
-                Float delta_loss=clean(dr::dot(deletion_dcolor,dc)+dr::squared_norm(dc)+deletion_dalpha*da+cfg.at("alpha_loss_weight")*da*da);
+                Float delta_loss=clean(dr::dot(deletion_dcolor,dc)+rgb_loss_scale*dr::squared_norm(dc)+deletion_dalpha*da+cfg.at("alpha_loss_weight")*da*da);
                 Mask visible=valid & (before>=cfg.at("min_evidence_transmittance"));
                 dr::scatter_reduce(ReduceOp::Or,s.counters["foreground_evidence"],UInt32(1),id,
                     visible&is_foreground&(delta_loss>cfg.at("min_removal_loss_delta")));
@@ -2995,7 +3001,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 Color3f dc = before*opacity*(s.behind-radiance);
                 Color3f gain_change = rgb_loss_srgb ?
                     reconstruction_linear_to_srgb(deletion_rgb+dc)-deletion_encoded_rgb : dc;
-                Float gain = -2.f*dr::dot(deletion_residual,gain_change)-dr::squared_norm(gain_change);
+                Float gain = rgb_loss_scale * (-2.f*dr::dot(deletion_residual,gain_change)-dr::squared_norm(gain_change));
                 // The reverse suffix gives the remaining product without a
                 // division by (1-alpha), even for an opaque removed hit.
                 Float without_t = before*s.after;

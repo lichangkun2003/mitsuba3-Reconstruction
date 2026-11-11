@@ -12,6 +12,19 @@
 RGB 收益删除与旧 alpha 证据删除默认关闭。1500 轮时，第 1200 轮为最后一次拓扑机会，
 第 1201 轮起启用 radiance 与 opacity 各自存储的全部 SH 系数。旧 checkpoint 继续使用保存的规则。
 
+新实验默认 ``gradient.rgb_loss_channel_mean=True``：RGB 平方误差先平均三个通道，
+再按像素与视角平均，得到常规 RGB MSE。D-SSIM、distortion 的定义、权重、学习率和
+像素梯度求和规则保持原值；``bicycle_1024.json`` 的目标为
+``RGB MSE + 0.2 * (1-SSIM) + 0.2 * distortion``。旧 checkpoint 缺少该字段时按
+``False`` 恢复原通道求和，续训不能切换归一化；旧 loss 数值不能直接与新实验比较。
+这项改动包含原生实现和绑定，启动前先增量编译（包括保留旧通道和的续训）：
+
+.. code-block:: powershell
+
+   cmake --build build --config Release --parallel 8
+
+入口要求 ``mi.VoxelReconstruction.rgb_loss_reduction_version >= 1``，旧构建会明确报错。
+
 新实验默认 ``data.scene_mode="auto"``：合成场景有界白底，COLMAP 场景无界黑底。
 可用 ``--scene-mode bounded`` / ``--scene-mode unbounded`` 显式指定；当前无界初始化
 要求 COLMAP 数据，合成相机 JSON 不能直接强制启用无界模式。背景只是剩余透射率的
@@ -281,7 +294,8 @@ NumPy 对照路径的候选生成每次只建立一次占用／冷却查询索�
 可靠射线均值带有条件选择偏差，不是完整视角收益的无偏估计。日志记录已遇到候选命中的
 可靠比例，未访问的候选不计入覆盖率；该比例仅用于分析，不设置新门槛。
 以下 RGB 删除收益说明仅用于显式开启 ``use_rgb_deletion=True`` 的兼容模式，当前默认关闭。
-删除收益为 ``dc=T*a*(B-c)``、``gain=-2*dot(C-reference_rgb,dc)-dot(dc,dc)``：
+删除收益为 ``dc=T*a*(B-c)``、``gain=q*(-2*dot(C-reference_rgb,dc)-dot(dc,dc))``：
+``q`` 在新实验的通道均值模式为 ``1/3``，旧通道和模式为 ``1``。
 ``B`` 是已有反向中的后方合成颜色，``T`` 为命中前透射率，``a``／``c`` 是该体素的
 opacity／颜色。不需要除以 ``1-a``，也不重新追踪，但会增加 GPU 算术与统计归约。
 仅正常退出网格或到达 ``ray.maxt`` 的完整路径、单位采样权重和有限数值提供证据；
