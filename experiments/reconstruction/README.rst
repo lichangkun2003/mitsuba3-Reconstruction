@@ -13,8 +13,8 @@ RGB 收益删除与旧 alpha 证据删除默认关闭。1500 轮时，第 1200 �
 第 1201 轮起启用 radiance 与 opacity 各自存储的全部 SH 系数。旧 checkpoint 继续使用保存的规则。
 
 新实验默认 ``gradient.rgb_loss_channel_mean=True``：RGB 平方误差先平均三个通道，
-再按像素与视角平均，得到常规 RGB MSE。D-SSIM、distortion 的定义、权重、学习率和
-像素梯度求和规则保持原值；``bicycle_1024.json`` 的目标为
+再按像素与视角平均，得到常规 RGB MSE。通道归一化本身不联动调整学习率；
+D-SSIM、distortion 的定义、权重和像素梯度求和规则保持原值；``bicycle_1024.json`` 的目标为
 ``RGB MSE + 0.2 * (1-SSIM) + 0.2 * distortion``。旧 checkpoint 缺少该字段时按
 ``False`` 恢复原通道求和，续训不能切换归一化；旧 loss 数值不能直接与新实验比较。
 这项改动包含原生实现和绑定，启动前先增量编译（包括保留旧通道和的续训）：
@@ -24,6 +24,14 @@ RGB 收益删除与旧 alpha 证据删除默认关闭。1500 轮时，第 1200 �
    cmake --build build --config Release --parallel 8
 
 入口要求 ``mi.VoxelReconstruction.rgb_loss_reduction_version >= 1``，旧构建会明确报错。
+
+新实验的 ``CONFIG`` 与 JSON 使用相同的 Adam 学习率：radiance DC ``0.04``、高阶
+``0.004``，opacity DC ``0.01``、高阶峰值 ``0.001``，中心 ``0.015``、
+log-scale ``0.03``、旋转 ``0.0075``。单次更新上限为 radiance ``1.0``、opacity ``0.2``、
+中心与 log-scale ``0.2``；旋转切向量的范数上限为 ``0.2`` 弧度。
+原始梯度裁剪 ``10`` 与几何标量梯度裁剪 ``5`` 保留。前 80% 仍只开启 DC；
+高阶开启后预热 20 轮，最后 20% 按原调度衰减到峰值的 ``0.1``。
+已有 checkpoint 继续采用保存的优化器参数，不自动应用这些新学习率与上限。
 
 新实验默认 ``data.scene_mode="auto"``：合成场景有界白底，COLMAP 场景无界黑底。
 可用 ``--scene-mode bounded`` / ``--scene-mode unbounded`` 显式指定；当前无界初始化

@@ -281,19 +281,26 @@ PatchMatch 会继续缺失的深度图。修改输入或算法选项时需用另
 分组学习率与固定拓扑阶段的衰减
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-当前 ``bicycle_1024.json`` 显式启用 ``optimizer.lr_schedule_enabled=true``。
-前期 radiance DC、中心、尺度、旋转学习率分别为 ``0.002``、``0.0015``、
-``0.003``、``0.00075``；opacity DC 保持 ``0.0005``。拓扑冻结前保持这些值，
+当前新实验的 ``CONFIG`` 与 ``bicycle_1024.json`` 都显式启用
+``optimizer.lr_schedule_enabled=true``，并使用相同的分组学习率。
+前期 radiance DC、中心、log-scale、旋转学习率分别为 ``0.04``、``0.015``、
+``0.03``、``0.0075``；opacity DC 为 ``0.01``。拓扑冻结前保持这些值，
 冻结后按全局 epoch 指数衰减，最后一轮达到峰值的 ``lr_final_factor=0.1``。
-1500 轮、``freeze_last_fraction=0.2`` 时，第 1201 轮开始进入衰减阶段。
+3000 轮、``freeze_last_fraction=0.2`` 时，第 2401 轮开始进入衰减阶段。
 
-高阶 radiance 与 opacity 使用独立峰值 ``lr_radiance_sh=0.0002`` 和
-``lr_opacity_sh=0.00005``。每个 SH 阶从实际开启时单独计龄，
+高阶 radiance 与 opacity 使用独立峰值 ``lr_radiance_sh=0.004`` 和
+``lr_opacity_sh=0.001``。每个 SH 阶从实际开启时单独计龄，
 ``lr_sh_warmup_epochs=20`` 表示前 20 个活跃 epoch 线性预热到峰值，之后在
 固定拓扑阶段指数衰减，最后一轮达到该峰值的 10%，不再叠乘 DC 的衰减倍率。
-默认阶段 ``[8,0,2]`` 下，第 1201 轮开始预热，第 1220 轮达到高阶峰值。
+阶段 ``[8,0,2]`` 的 3000 轮示例中，第 2401 轮开始预热，第 2420 轮达到高阶峰值。
 若实验尾段短于预热长度，会缩短预热以保留最后的衰减终点；只有一个剩余 epoch
 时直接采用终点倍率。没有拓扑冻结尾段时，已有参数不衰减，高阶预热后维持峰值。
+
+Adam 单次更新上限同步设置为 radiance ``1.0``、opacity ``0.2``、中心 ``0.2``、
+log-scale ``0.2``；radiance 与 opacity 的 DC／高阶分别共用各自的组上限。
+旋转使用切向量更新，其范数上限为 ``0.2`` 弧度。原始梯度裁剪
+``gradient_clip=10`` 与几何代理标量裁剪 ``geometry_grad_clamp=5`` 保留。
+这些是更新上限，不保证每次 Adam 更新都会达到该值；已有参数有效范围约束也保留。
 
 学习率以固定长度的 GPU 数组传入 Adam，数值变化不清空动量、分阶计数或已录制
 内核；SH 激活范围变化仍按原规则重新录制。学习率为零的阶不更新参数、动量和计数。
@@ -301,7 +308,8 @@ PatchMatch 会继续缺失的深度图。修改输入或算法选项时需用另
 ``training-report.json`` 保存调度协议。需要编译具备
 ``mi.VoxelReconstruction.learning_rate_schedule_version >= 1`` 的原生模块。
 
-通用配置和旧 checkpoint 默认关闭该调度，保持原来的固定学习率。
+通用 ``OptimizerConfig`` 类保留兼容默认值；旧 checkpoint 沿用保存的优化器参数与调度，
+不会自动应用新实验的学习率或步长上限。旧 checkpoint 缺少调度开关时仍按关闭恢复。
 新调度的恢复从 checkpoint 的已完成 epoch 继续，预热不会重新开始；
 改变学习率配置应新建实验。D-SSIM、distortion 权重不随该调度变化。
 
@@ -413,8 +421,8 @@ tangent 的导数。深度最小点位于网格段内部时使用解析导数；
 与从旧模型启动的独立 radiance 优化保留原 RGB 通道求和。续训不能更改此字段。
 
 只有 RGB L2 及对应 RGB 生长／删除收益乘以 ``1/3``；D-SSIM、distortion、alpha 项的
-定义与权重保持不变。像素梯度仍按像素求和，没有额外除以 ``HW``，学习率和
-``grad_scale`` 也保持原值。当前 JSON 预设因此为
+定义与权重保持不变。像素梯度仍按像素求和，没有额外除以 ``HW``；
+通道归一化本身不联动调整学习率或 ``grad_scale``。当前 JSON 预设因此为
 ``RGB MSE + 0.2 * (1-SSIM) + 0.2 * distortion``，旧日志的 RGB loss 与总 loss
 不能和新定义直接比较。报告和每轮日志记录实际通道归一化。
 这项改动需要先增量编译原生模块及绑定：
