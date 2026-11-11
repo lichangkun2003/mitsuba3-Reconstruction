@@ -1,4 +1,4 @@
-"""GPU-resident RGB topology lifecycle.
+"""GPU-resident RGB growth and RGB/low-opacity deletion lifecycle.
 
 Ordinary topology updates retain rows, proposals, cooldowns and Adam on CUDA.
 When a complete replacement field would exceed free device memory, an exact
@@ -716,7 +716,7 @@ class GPUTopologyLifecycle:
             "growth_rgb_normalization": cfg.growth_rgb_normalization, "growth_warmup_epochs": m.growth_warmup,
             "growth_warmup_active": boundary - m.level_start_epoch <= m.growth_warmup,
             "growth_evidence_requested": m._growth_due(boundary),
-            "deletion_mode": "rgb_online+low_opacity" if cfg.use_low_opacity_deletion else "rgb_online",
+            "deletion_mode": m.deletion_mode,
             "deletion_level_epoch": boundary - m.level_start_epoch,
             "deletion_warmup_epochs": cfg.deletion_warmup_epochs,
             "deletion_warmup_active": boundary - m.level_start_epoch <= cfg.deletion_warmup_epochs,
@@ -938,9 +938,10 @@ class GPUTopologyLifecycle:
 
 
 def get_gpu_lifecycle(manager, model):
-    """Use the resident path only for the RGB algorithm, preserving legacy CPU semantics."""
+    """Keep RGB growth resident, retaining legacy evidence deletion on CPU."""
     cfg = manager.settings
-    if (not getattr(cfg, "gpu_topology", True) or not cfg.use_rgb_growth or not cfg.use_rgb_deletion
+    if (not getattr(cfg, "gpu_topology", True) or not cfg.use_rgb_growth
+            or (cfg.enable_deletion and manager.legacy_deletion_enabled)
             or type(model).__module__.split(".")[0] != "mitsuba"):
         return None
     device = getattr(manager, "_gpu_lifecycle", None)

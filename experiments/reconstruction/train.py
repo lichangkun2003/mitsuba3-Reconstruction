@@ -148,7 +148,7 @@ class TrainConfig:
 CONFIG = TrainConfig()
 CONFIG.training.sh_degree_progression = True
 CONFIG.training.opacity_sh_degree_progression = True
-CONFIG.training.sh_degree_weights = (8, 0, 2)  # 前 80% 仅 DC，最后 20% 前景／背景同时开启 1、2 阶。
+CONFIG.training.sh_degree_weights = (8, 0, 2)  # 前 80% 仅 DC，最后 20% 开启全部已配置高阶。
 CONFIG.data.dataset = "datasets/bicycle"
 CONFIG.data.point_cloud = "init_points.ply"
 CONFIG.data.cameras = "transforms_train.json"
@@ -175,36 +175,40 @@ CONFIG.gradient.distortion_loss_weight = 0.1  # 新实验默认开启深度集�
 CONFIG.gradient.geometry_transition_only = False  # hit/miss 均保留正负 RGB 几何信号。
 CONFIG.gradient.geometry_two_sided_boundary = False  # 保留原 sigmoid，不叠加额外带宽门控。
 CONFIG.contour.enabled = False  # 所有像素均匀采样，不读取 alpha 轮廓标签。
-CONFIG.topology.enable_growth = True
+CONFIG.topology.enable_growth = False  # 暂停生长，保留自适应细分与低透明度删除。
 CONFIG.topology.enable_deletion = True
-CONFIG.topology.use_rgb_deletion = True  # 复用正常反向合成，按移除单体素的 RGB 收益投票。
-CONFIG.topology.use_low_opacity_deletion = True  # 补充清理持续低不透明度体素，不要求正 RGB 删除收益。
-CONFIG.topology.deletion_opacity_threshold = .1  # 实际 sigmoid(Y0*b0) < 0.1；仍需成熟保护和连续窗口确认。
-CONFIG.topology.deletion_opacity_confirmation_windows = 2  # 连续两个删除检查窗口低于阈值才清理。
-CONFIG.topology.deletion_warmup_epochs = 20  # 每个层级先优化 20 轮，再按周期收集一轮全部视角。
-CONFIG.topology.deletion_interval = 10
+CONFIG.topology.use_rgb_deletion = False  # 删除只检查模型不透明度，不收集 RGB 删除收益。
+CONFIG.topology.use_legacy_deletion = False  # 不启用旧 alpha 证据删除。
+CONFIG.topology.use_low_opacity_deletion = True
+CONFIG.topology.deletion_opacity_threshold = .01  # 实际 sigmoid(Y0*b0) < 0.01；保留新生保护。
+CONFIG.topology.deletion_opacity_confirmation_windows = 1  # 单次达标即可删除。
+CONFIG.topology.deletion_warmup_epochs = 0  # 取消全局启动等待；新子体素仍单独保护 20 轮。
+CONFIG.topology.deletion_interval = 20
+CONFIG.topology.interval_alignment = "global"  # 删除从全局第 20、40、60…轮检查。
 CONFIG.topology.deletion_protection_epochs = 20  # 新生体素先优化 20 轮。
-CONFIG.topology.deletion_freeze_last_epochs = 0  # 不在末尾冻结删除，继续按周期清理至训练结束。
+CONFIG.topology.deletion_freeze_last_epochs = 0  # 统一由后 20% 拓扑冻结控制。
 CONFIG.topology.deletion_rgb_confirmation_windows = 2  # 连续两个证据窗口达标才删除。
 CONFIG.topology.deletion_rgb_min_support_views = 3
 CONFIG.topology.deletion_rgb_max_conflict_views = 1  # 一个可靠反对视角即可阻止本窗口删除。
 CONFIG.topology.deletion_rgb_gain_epsilon = 1e-7
 CONFIG.topology.deletion_rgb_min_mean_gain = 1e-7
 CONFIG.topology.use_growth_evidence = False
-CONFIG.topology.use_rgb_growth = True  # 复用训练前向的 RGB 收益票，不额外渲染。
+CONFIG.topology.use_rgb_growth = True  # 保留算法选择；生长由 enable_growth 开关控制。
 CONFIG.topology.growth_inherit_opacity = True
 CONFIG.topology.growth_opacity_scale = .8  # 出生 opacity 继承父体素概率值的 80%，不是缩放 logit。
 CONFIG.topology.growth_initial_opacity = .3  # 继承模式的出生上限：min(0.3, 0.8 * parent_opacity)。
 CONFIG.topology.growth_rgb_normalization = "observed"  # 有效命中射线均值，再对可靠观测视角求均值。
-CONFIG.topology.growth_warmup_epochs = 20  # 最粗层级先优化 20 轮，再按生长周期检查。
-CONFIG.topology.growth_fine_warmup_epochs = 20  # 每个后续层级重新 warmup。
-CONFIG.topology.growth_freeze_last_epochs = 50  # 最后 50 轮停止生长，继续优化和删除；0 关闭生长冻结。
+CONFIG.topology.growth_warmup_epochs = 0  # 取消全局生长启动等待；当前生长关闭。
+CONFIG.topology.growth_fine_warmup_epochs = 0
+CONFIG.topology.growth_freeze_last_epochs = 0  # 统一由后 20% 拓扑冻结控制。
+CONFIG.topology.growth_interval = 50
 CONFIG.topology.growth_rgb_min_support_views = 3
 CONFIG.topology.growth_rgb_max_conflict_views = 2  # 达到 2 个反对视角则拒绝。
 CONFIG.topology.growth_rgb_gain_epsilon = 1e-7  # 有效命中射线的平均 RGB 收益票阈值（保留数值，单位已变）。
 CONFIG.topology.growth_rgb_min_mean_gain = 1e-7  # 可靠观测视角的带符号平均收益门槛。
 CONFIG.gradient.max_growth_hits = 8  # 单条射线的候选格记录容量；同格多父提案共享记录，溢出则弃权。
-CONFIG.schedule.enable_coarse_growth = True  # 分层训练的生长开关；分裂规则保持不变。
+CONFIG.schedule.enable_coarse_growth = False  # 关闭分层生长；分裂规则保持不变。
+CONFIG.schedule.coarse_growth_interval = 50
 CONFIG.training.chunk_size = 0  # 0 = 整图提交；显存不足时可显式改为 65536 等。
 CONFIG.training.profile_views = 0  # 设为 3 可记录前三个视角的编译、缓存和 GPU 耗时。
 CONFIG.training.profile_interval_epochs = 50  # 每 50 轮及首次进入各分辨率时抽样记录内核耗时；0 关闭。
@@ -358,6 +362,16 @@ def apply_arguments(config, args, values):
     if (not config.training.rgb_only and
             "use_rgb_deletion" not in values.get("topology", {})):
         config.topology.use_rgb_deletion = False
+    if (not config.training.rgb_only and not getattr(args, "resume", None) and
+            "use_legacy_deletion" not in values.get("topology", {})):
+        config.topology.use_legacy_deletion = True
+    if (getattr(args, "config", None) and not getattr(args, "resume", None) and
+            (not config.training.rgb_only or values.get("topology", {}).get("use_rgb_deletion") is True)):
+        # Explicit historical modes retain their prior mode and cadence.
+        # Partial JSON overrides inherit the current experiment's defaults.
+        for name in ("use_legacy_deletion", "interval_alignment"):
+            if name not in values.get("topology", {}):
+                setattr(config.topology, name, getattr(TopologySettings(), name))
     if (not config.training.rgb_only and
             "use_low_opacity_deletion" not in values.get("topology", {})):
         config.topology.use_low_opacity_deletion = False
@@ -452,6 +466,10 @@ def validate(config):
         raise ValueError("RGB growth evidence requires training.rgb_only=true")
     if not isinstance(config.topology.use_rgb_deletion, bool):
         raise ValueError("topology.use_rgb_deletion must be a boolean")
+    if not isinstance(config.topology.use_legacy_deletion, bool):
+        raise ValueError("topology.use_legacy_deletion must be a boolean")
+    if config.topology.interval_alignment not in ("warmup", "global"):
+        raise ValueError("topology.interval_alignment must be warmup or global")
     if not isinstance(config.topology.gpu_topology, bool):
         raise ValueError("topology.gpu_topology must be a boolean")
     if not isinstance(config.topology.use_low_opacity_deletion, bool):
@@ -498,7 +516,9 @@ def validate(config):
         if enabled:
             raise ValueError("RGB-only training requires these settings to be zero/false: " + ", ".join(enabled))
         if config.topology.enable_deletion and not config.topology.use_rgb_deletion:
-            raise ValueError("RGB-only deletion requires topology.use_rgb_deletion=true; legacy alpha deletion is unavailable")
+            if config.topology.use_legacy_deletion or not config.topology.use_low_opacity_deletion:
+                raise ValueError("RGB-only deletion requires RGB evidence or low-opacity-only deletion "
+                                 "(use_low_opacity_deletion=true, use_legacy_deletion=false)")
         if not config.topology.use_rgb_growth and (config.topology.enable_growth or config.schedule.enable_coarse_growth):
             raise ValueError("RGB-only growth requires topology.use_rgb_growth=true; legacy alpha growth is unavailable")
     validate_growth_opacity(config.topology, config.model.opacity_sh_count,
@@ -1081,7 +1101,8 @@ def settings(config):
     result.update(rgb_only=config.training.rgb_only,
         foreground_alpha_min=config.topology.foreground_alpha_min,
         background_alpha_max=config.topology.background_alpha_max,
-        collect_deletion_evidence=config.topology.enable_deletion and not config.topology.use_rgb_deletion,
+        collect_deletion_evidence=(config.topology.enable_deletion and config.topology.use_legacy_deletion
+                                   and not config.topology.use_rgb_deletion),
         collect_rgb_deletion_evidence=config.topology.enable_deletion and config.topology.use_rgb_deletion,
         transmittance_threshold=config.render.transmittance_threshold,
         max_hits=config.render.max_hits, entry_offset_fraction=config.render.entry_offset_fraction,
@@ -1158,7 +1179,8 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
     if collect_deletion_evidence is not None:
         # The topology schedule decides whether these counters have a consumer.
         # Disabling unused counters does not disable loss/appearance/geometry terms.
-        native_settings["collect_deletion_evidence"] = bool(collect_deletion_evidence) and not config.topology.use_rgb_deletion
+        native_settings["collect_deletion_evidence"] = (bool(collect_deletion_evidence)
+            and config.topology.use_legacy_deletion and not config.topology.use_rgb_deletion)
         native_settings["collect_rgb_deletion_evidence"] = bool(collect_deletion_evidence) and config.topology.use_rgb_deletion
     rgb_deletion_requested = native_settings["collect_rgb_deletion_evidence"]
     # Different compact row sets cannot be summed elementwise across chunks or
@@ -1630,8 +1652,9 @@ def run_training(distributed=None):
         saved_training = checkpoint["config"].get("training", {})
         saved_schedule = checkpoint["config"].get("schedule", {})
         config.schedule.refinement = overrides.get("schedule", {}).get("refinement", saved_schedule.get("refinement", "uniform"))
-        config.topology.freeze_last_fraction = overrides.get("topology", {}).get("freeze_last_fraction",
-            checkpoint["config"].get("topology", {}).get("freeze_last_fraction", 0.))
+        config.topology = TopologySettings()
+        update(config, {"topology": checkpoint["config"].get("topology", {})})
+        update(config, {"topology": overrides.get("topology", {})})
         config.model.opacity_sh_count = overrides.get("model", {}).get("opacity_sh_count",
             checkpoint["config"].get("model", {}).get("opacity_sh_count", 1))
         for name, default in (("sh_degree_progression", False), ("opacity_sh_degree_progression", False),
@@ -1824,7 +1847,7 @@ def run_training(distributed=None):
         report["scope"] = ("RGB-only: DC opacity, bidirectional geometry surrogate, refinement"
                            + (" and one-pass RGB growth" if rgb_growth_enabled else "")
                            + (" and RGB deletion from existing reverse paths" if rgb_deletion_enabled else "")
-                           + (" and persistent low-opacity pruning" if low_opacity_deletion_enabled else "")
+                           + (" and low-opacity pruning" if low_opacity_deletion_enabled else "")
                            + (" and hard-hit distortion loss" if distortion_enabled else "")
                            + (f" and {loss_color_space} RGB D-SSIM" if dssim_enabled else "")
                            if config.training.rgb_only else "Legacy Falcor NoLightTransport alpha-supervised training")
@@ -1891,6 +1914,12 @@ def run_training(distributed=None):
             growth_unknown_policy="recompute inserted-path stop from recorded hits; exclude record overflow, invalid trace and nonfinite evidence"
                                   if rgb_growth_enabled else None,
             growth_freeze_last_epochs=config.topology.growth_freeze_last_epochs,
+            topology_interval_alignment=config.topology.interval_alignment,
+            growth_check_interval_epochs=(config.schedule.coarse_growth_interval
+                if config.schedule.enabled else config.topology.growth_interval),
+            topology_freeze_start_epoch=(math.floor(config.training.num_epochs *
+                (1. - config.topology.freeze_last_fraction)) + 1
+                if config.topology.freeze_last_fraction else None),
             growth_freeze_start_epoch=(max(1, config.training.num_epochs - config.topology.growth_freeze_last_epochs + 1)
                                        if config.topology.growth_freeze_last_epochs else None),
             deletion_evidence=("single-removal RGB gain from complete paths or stops justified by recorded hits; no extra trace"
@@ -1905,7 +1934,11 @@ def run_training(distributed=None):
                 "threshold": config.topology.deletion_opacity_threshold,
                 "confirmation_windows": config.topology.deletion_opacity_confirmation_windows,
                 "check_interval_epochs": config.topology.deletion_interval,
-                "policy": "consecutive epoch-end parameter checks; OR with RGB deletion; no extra trace",
+                "policy": ("parameter-only epoch-end checks; no RGB/alpha removal votes"
+                           if not config.topology.use_rgb_deletion and not config.topology.use_legacy_deletion else
+                           "epoch-end parameter checks; OR with enabled evidence deletion; no extra trace"),
+                "interval_alignment": config.topology.interval_alignment,
+                "newborn_protection_epochs": config.topology.deletion_protection_epochs,
                 "readback": "only DC opacity parameters at scheduled checks",
                 "loss_guarantee": "heuristic pruning; no guarantee of joint RGB loss decrease"},
             deletion_freeze_last_epochs=config.topology.deletion_freeze_last_epochs,
@@ -2052,6 +2085,9 @@ def run_training(distributed=None):
             emit("RGB growth warmup (epochs per level):", config.topology.growth_warmup_epochs,
                  "coarse,", config.topology.growth_fine_warmup_epochs,
                  "fine; no extra forward render", flush=True)
+            emit("RGB growth checks:", (config.schedule.coarse_growth_interval
+                 if config.schedule.enabled else config.topology.growth_interval),
+                 "epoch interval; alignment:", config.topology.interval_alignment, flush=True)
             if config.topology.growth_freeze_last_epochs:
                 emit("RGB growth final freeze:", config.topology.growth_freeze_last_epochs,
                      "epochs; no growth from epoch", report["training_protocol"]["growth_freeze_start_epoch"],
@@ -2066,8 +2102,9 @@ def run_training(distributed=None):
                      "through", config.training.num_epochs, flush=True)
         if low_opacity_deletion_enabled:
             emit("Low-opacity deletion: opacity <", config.topology.deletion_opacity_threshold,
-                 "at", config.topology.deletion_opacity_confirmation_windows, "consecutive checks;",
+                 "at", config.topology.deletion_opacity_confirmation_windows, "qualifying check(s);",
                  config.topology.deletion_interval, "epoch interval;",
+                 "alignment:", config.topology.interval_alignment, ";",
                  config.topology.deletion_warmup_epochs, "warmup epochs per level;",
                  config.topology.deletion_protection_epochs, "newborn protection epochs", flush=True)
         rng = np.random.default_rng(config.training.seed)

@@ -29,6 +29,9 @@ class TopologySettings:
     # Optional RGB-only removal evidence. Historical checkpoints retain the
     # foreground/background deletion rule unless this field is explicitly set.
     use_rgb_deletion: bool = False
+    # Historical alpha-supervised deletion remains opt-in for new RGB runs.
+    # True preserves checkpoints that predate this explicit mode selector.
+    use_legacy_deletion: bool = True
     # Independent cleanup of persistently transparent, isotropic voxels. The
     # default preserves the behavior of checkpoints predating this lifecycle.
     use_low_opacity_deletion: bool = False
@@ -53,6 +56,9 @@ class TopologySettings:
     growth_freeze_last_epochs: int = 0
     # A single global tail freezes refinement, growth and every deletion rule.
     freeze_last_fraction: float = 0.0
+    # Old checkpoints offset checks from per-level warmup; new experiments use
+    # global epoch multiples without changing their warmup/protection gates.
+    interval_alignment: str = "warmup"
     # Missing fields in historical checkpoints retain their old loss units.
     # The current training CONFIG explicitly selects "observed".
     growth_rgb_normalization: str = "full_image"
@@ -654,6 +660,10 @@ class TopologyManager:
             raise ValueError("topology.use_rgb_growth must be a boolean")
         if not isinstance(cfg.use_rgb_deletion, bool):
             raise ValueError("topology.use_rgb_deletion must be a boolean")
+        if not isinstance(cfg.use_legacy_deletion, bool):
+            raise ValueError("topology.use_legacy_deletion must be a boolean")
+        if cfg.interval_alignment not in ("warmup", "global"):
+            raise ValueError("topology.interval_alignment must be warmup or global")
         if not isinstance(cfg.use_low_opacity_deletion, bool):
             raise ValueError("topology.use_low_opacity_deletion must be a boolean")
         active_opacity = self._model_active_opacity_sh_count
@@ -691,7 +701,7 @@ class TopologyManager:
                 isinstance(cfg.growth_freeze_last_epochs, bool) or cfg.growth_freeze_last_epochs < 0):
             raise ValueError("topology.growth_freeze_last_epochs must be a nonnegative integer")
         for name, value in asdict(cfg).items():
-            if isinstance(value, bool) or name == "growth_rgb_normalization":
+            if isinstance(value, bool) or name in ("growth_rgb_normalization", "interval_alignment"):
                 continue
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"topology.{name} must be finite and nonnegative")
@@ -813,12 +823,36 @@ class TopologyManager:
         return self.level_start_epoch if self.schedule.enabled else self.opacity_warmup + self.opacity_ramp
 
     def collect_deletion(self, epoch):
-        if self.deletion_frozen(int(epoch) + 1):
+        if not self.settings.enable_deletion or self.deletion_frozen(int(epoch) + 1):
             return False
         if self.settings.use_rgb_deletion:
             return self._rgb_deletion_due(int(epoch) + 1)
+        if not self.legacy_deletion_enabled:
+            return False  # Low-opacity deletion consumes parameters, not rays.
         return (self.settings.enable_deletion and epoch >= self.evidence_start and
                 (not self.uniform_refinement or self.core_resolution == self.schedule.target_resolution))
+
+    @property
+    def legacy_deletion_enabled(self):
+        return self.settings.use_legacy_deletion and not self.settings.use_rgb_deletion
+
+    @property
+    def deletion_mode(self):
+        cfg = self.settings
+        if not cfg.enable_deletion:
+            return "disabled"
+        modes = (["rgb_online"] if cfg.use_rgb_deletion else
+                 ["legacy"] if self.legacy_deletion_enabled else [])
+        if cfg.use_low_opacity_deletion:
+            modes.append("low_opacity")
+        return "+".join(modes) or "disabled"
+
+    def _interval_due(self, boundary, interval, warmup):
+        local_epoch = boundary - self.level_start_epoch
+        if local_epoch <= warmup:
+            return False
+        origin = 0 if self.settings.interval_alignment == "global" else self.level_start_epoch + warmup
+        return (boundary - origin) % interval == 0
 
     def topology_frozen(self, boundary):
         fraction = self.settings.freeze_last_fraction
@@ -851,8 +885,7 @@ class TopologyManager:
                 local_epoch >= self.level_budget):
             return False
         return (1 <= boundary <= self.schedule.total_epochs and
-                local_epoch > cfg.deletion_warmup_epochs and
-                (local_epoch - cfg.deletion_warmup_epochs) % cfg.deletion_interval == 0)
+                self._interval_due(boundary, cfg.deletion_interval, cfg.deletion_warmup_epochs))
 
     def growth_frozen(self, boundary):
         """Whether a one-based epoch lies in the global growth-free training tail.
@@ -873,7 +906,7 @@ class TopologyManager:
             interval = schedule.coarse_growth_interval if schedule.enabled else cfg.growth_interval
             final = local_epoch >= self.level_budget
             warmup = self.growth_warmup
-            return enabled and not final and local_epoch > warmup and (local_epoch - warmup) % interval == 0
+            return enabled and not final and self._interval_due(boundary, interval, warmup)
         enabled = schedule.enable_coarse_growth if schedule.enabled else cfg.enable_growth
         interval = schedule.coarse_growth_interval if schedule.enabled else cfg.growth_interval
         final = (boundary - self.level_start_epoch >= self.level_budget if schedule.enabled else boundary >= schedule.total_epochs)
@@ -1357,7 +1390,7 @@ class TopologyManager:
         np = self.np
         if not 0 <= view_id < self.view_count or int(model.active_voxel_count) != self.count:
             raise ValueError("Unexpected view ID or model topology")
-        if not self.settings.use_rgb_deletion and self.collect_deletion(epoch):
+        if self.legacy_deletion_enabled and self.collect_deletion(epoch):
             dr = _cuda_array(out["foreground_evidence"])
             if dr is not None and _cuda_array(out["background_evidence"]) is not None:
                 if self._deletion_device is None:
@@ -1404,7 +1437,7 @@ class TopologyManager:
 
     def _evaluate_deletion(self, boundary):
         np, cfg = self.np, self.settings
-        if cfg.use_rgb_deletion:
+        if not self.legacy_deletion_enabled:
             return False
         if not self.collect_deletion(boundary - 1) or boundary <= self.evidence_start or (boundary - self.evidence_start) % cfg.evidence_interval:
             return False
@@ -1579,10 +1612,8 @@ class TopologyManager:
                          growth_warmup_epochs=self.growth_warmup,
                          growth_warmup_active=boundary - self.level_start_epoch <= self.growth_warmup,
                          growth_evidence_requested=self._growth_due(boundary))
-        if cfg.use_rgb_deletion or cfg.use_low_opacity_deletion:
-            mode = ("rgb_online+low_opacity" if cfg.use_rgb_deletion else "legacy+low_opacity"
-                    ) if cfg.use_low_opacity_deletion else "rgb_online"
-            event.update(deletion_mode=mode,
+        if cfg.use_rgb_deletion or cfg.use_low_opacity_deletion or self.legacy_deletion_enabled:
+            event.update(deletion_mode=self.deletion_mode,
                          deletion_level_epoch=boundary - self.level_start_epoch,
                          deletion_warmup_epochs=cfg.deletion_warmup_epochs,
                          deletion_warmup_active=boundary - self.level_start_epoch <= cfg.deletion_warmup_epochs,
@@ -1628,11 +1659,12 @@ class TopologyManager:
                       if cfg.use_rgb_deletion else None)
         opacity_delete = self._evaluate_low_opacity_deletion(model, boundary, event)
         event["evidence_window_evaluated"] = (
-            rgb_delete is not None if cfg.use_rgb_deletion else self._evaluate_deletion(boundary))
+            rgb_delete is not None if cfg.use_rgb_deletion else
+            self._evaluate_deletion(boundary) if self.legacy_deletion_enabled else False)
         final = level_done if schedule.enabled else boundary >= schedule.total_epochs
         first = self.evidence_start + 2 * cfg.evidence_interval
         periodic = boundary >= first and (boundary - first) % cfg.deletion_interval == 0
-        legacy_delete = (self.candidates if not cfg.use_rgb_deletion and
+        legacy_delete = (self.candidates if self.legacy_deletion_enabled and
                          (periodic or final) and self.collect_deletion(boundary - 1) else None)
         if legacy_delete is not None and self.scene_mapping == "world_shell":
             legacy_delete = legacy_delete & self._core_region_numpy(model)
@@ -1914,14 +1946,9 @@ class TopologyManager:
         self.low_opacity_deletion_streak = opacity_streak.astype(self.np.uint32, copy=True)
         last = self.low_opacity_deletion_last_boundary
         if last is not None:
-            local_epoch = last - self.level_start_epoch if isinstance(last, int) else -1
             if (not isinstance(last, int) or isinstance(last, bool) or
                     not 1 <= last <= self.schedule.total_epochs or
-                    local_epoch <= self.settings.deletion_warmup_epochs or
-                    (local_epoch - self.settings.deletion_warmup_epochs) % self.settings.deletion_interval or
-                    self.deletion_frozen(last) or
-                    (self.uniform_refinement and self.core_resolution < self.schedule.target_resolution and
-                     local_epoch >= self.level_budget)):
+                    not self._scheduled_deletion_due(last)):
                 raise ValueError("Low-opacity deletion previous boundary is not a scheduled window")
         elif self.np.any(self.low_opacity_deletion_streak):
             raise ValueError("Low-opacity deletion confirmation requires a previous boundary")
