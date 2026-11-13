@@ -305,7 +305,9 @@ MI_PY_EXPORT(VoxelReconstruction) {
            "Explicit gradients summed over rays. With settings['rgb_only']=1, reference_rgb "
            "is the composited target, reference_alpha is ignored, and alpha supervision, "
            "background carving, legacy deletion evidence, and geometry direction gates are disabled. "
-           "collect_rgb_deletion_evidence enables RGB-only removal evidence without another trace.")
+           "collect_rgb_deletion_evidence enables RGB-only removal evidence without another trace. "
+           "collect_max_contribution returns the per-voxel maximum recorded T_before*alpha "
+           "and a one-element max_contribution_truncated_rays counter without another trace.")
         .def("trace", &Model::trace, "ray"_a, "background"_a = Color3f(0.f),
              "transmittance_threshold"_a = .01f, "max_hits"_a = 16,
              "entry_offset_fraction"_a = 0.f, "use_octree"_a = true)
@@ -341,6 +343,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("dssim_version") = nb::int_(Model::dssim_version);
     cls.attr("rgb_loss_srgb_version") = nb::int_(Model::rgb_loss_srgb_version);
     cls.attr("rgb_loss_reduction_version") = nb::int_(Model::rgb_loss_reduction_version);
+    cls.attr("max_contribution_version") = nb::int_(Model::max_contribution_version);
     cls.attr("sh_schedule_version") = nb::int_(Model::sh_schedule_version);
     cls.attr("octree_version") = nb::int_(Model::octree_version);
     cls.attr("optimizer_device_version") = nb::int_(Model::optimizer_device_version);

@@ -74,6 +74,7 @@ class TrainingSettings:
     profile_views: int = 0  # Record JIT/cache/device timings for the first N views.
     profile_interval_epochs: int = 50  # Sample one view periodically and on entering each resolution; 0 disables.
     profile_stages: bool = True  # Synchronize native phase boundaries only in sampled views.
+    preview_interval_epochs: int = 0  # 0 disables periodic training-view-0 PNGs; independent of checkpoints.
     reference_cache_mib: int = 1024  # Decoded float32 RGBA in host RAM; 0 disables caching.
     gpu_reference_cache_mib: int | str = 1024  # Legacy default; "auto" requests all images, 0 disables.
     freeze_native: bool = True  # Replay native GPU work between topology changes.
@@ -159,7 +160,8 @@ CONFIG.data.background_shell_levels = 5  # 每壳从56个粗叶开始，按相�
 CONFIG.data.background_resolution_mode = "core"  # 自适应外壳最细与当前前景体素边长一致。
 CONFIG.data.background_max_resolution = 1024
 CONFIG.data.background_refinement = "adaptive"
-CONFIG.data.background_opacity = 0.5  # 远景新生体素 opacity；允许后续优化和删除。
+CONFIG.data.background_opacity = 0.1  # 初始远景 opacity；减弱早期遮挡，允许更多后方命中。
+CONFIG.model.initial_opacity = 0.1  # 点云种子的实际 opacity；高阶仍从零开始。
 
 CONFIG.render.width = 800
 CONFIG.render.height = 800
@@ -174,12 +176,13 @@ CONFIG.gradient.rgb_loss_channel_mean = True  # RGB 平方误差按三个通道�
 CONFIG.gradient.alpha_geometry_weight = 0.
 CONFIG.gradient.background_carve_weight = 0.
 CONFIG.gradient.distortion_loss_weight = 0.1  # 新实验默认开启深度集中正则；--distortion-weight 0 显式关闭。
+CONFIG.gradient.dssim_loss_weight = 0.1  # 常规 RGB MSE 上叠加 0.1 * (1 - SSIM)。
 CONFIG.gradient.geometry_transition_only = False  # hit/miss 均保留正负 RGB 几何信号。
 CONFIG.gradient.geometry_two_sided_boundary = False  # 保留原 sigmoid，不叠加额外带宽门控。
 CONFIG.optimizer.lr_schedule_enabled = True  # 与 JSON 模板一致：高阶独立峰值，后 20% 沿用现有衰减。
-CONFIG.optimizer.lr_radiance = .04
+CONFIG.optimizer.lr_radiance = .08
 CONFIG.optimizer.lr_radiance_sh = .004
-CONFIG.optimizer.lr_opacity = .01
+CONFIG.optimizer.lr_opacity = .02
 CONFIG.optimizer.lr_opacity_sh = .001  # 高阶 opacity 在原峰值 .00005 上提高 20 倍。
 CONFIG.optimizer.lr_center = .015
 CONFIG.optimizer.lr_log_scale = .03
@@ -190,16 +193,19 @@ CONFIG.optimizer.center_step_limit = .2
 CONFIG.optimizer.log_scale_step_limit = .2
 CONFIG.optimizer.rotation_step_limit = .2  # 旋转切空间向量范数上限，单位为弧度。
 CONFIG.contour.enabled = False  # 所有像素均匀采样，不读取 alpha 轮廓标签。
-CONFIG.topology.enable_growth = False  # 暂停生长，保留自适应细分与低透明度删除。
+CONFIG.topology.enable_growth = False  # 暂停生长，保留自适应细分与删除。
 CONFIG.topology.enable_deletion = True
-CONFIG.topology.use_rgb_deletion = False  # 删除只检查模型不透明度，不收集 RGB 删除收益。
+CONFIG.topology.use_rgb_deletion = False  # 不收集反事实 RGB 删除收益。
 CONFIG.topology.use_legacy_deletion = False  # 不启用旧 alpha 证据删除。
 CONFIG.topology.use_low_opacity_deletion = True
+CONFIG.topology.use_low_contribution_deletion = True
+CONFIG.topology.deletion_contribution_threshold = 1e-4  # 全部训练视角中 max(T*alpha) 低于此值。
 CONFIG.topology.deletion_opacity_threshold = .01  # 实际 sigmoid(Y0*b0) < 0.01；保留新生保护。
 CONFIG.topology.deletion_opacity_confirmation_windows = 1  # 单次达标即可删除。
-CONFIG.topology.deletion_warmup_epochs = 0  # 取消全局启动等待；新子体素仍单独保护 20 轮。
+CONFIG.topology.deletion_warmup_epochs = 0  # 不额外延后细分；删除另按总轮数比例启动。
+CONFIG.topology.deletion_start_fraction = .2  # 前 20% 不删除，不影响自适应细分。
 CONFIG.topology.deletion_interval = 20
-CONFIG.topology.interval_alignment = "global"  # 删除从全局第 20、40、60…轮检查。
+CONFIG.topology.interval_alignment = "global"  # 删除启动后仍按全局 20 轮倍数检查。
 CONFIG.topology.deletion_protection_epochs = 20  # 新生体素先优化 20 轮。
 CONFIG.topology.deletion_freeze_last_epochs = 0  # 统一由后 20% 拓扑冻结控制。
 CONFIG.topology.deletion_rgb_confirmation_windows = 2  # 连续两个证据窗口达标才删除。
@@ -290,12 +296,14 @@ def parse_arguments(argv=None):
                         help="Positive epoch weights per level: 6 4 for 256->512, or 4 3 3 for 256->512->1024")
     parser.add_argument("--stop-after-epochs", type=int,
                         help="Stop after N additional complete epochs, saving a resumable checkpoint without changing the full schedule or publishing model.npz")
+    parser.add_argument("--preview-every", type=int,
+                        help="Render the first training view every N completed epochs using evaluation spp; 0 disables")
     parser.add_argument("--dataset")
     parser.add_argument("--scene-mode", choices=("auto", "bounded", "unbounded"),
                         help="auto: bounded synthetic / unbounded COLMAP; override for a new scene")
     parser.add_argument("--background-shell-levels", type=int,
                         help="Fixed world-space cubical shells, each with 56 leaves (default: 5)")
-    parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (default: 0.5)")
+    parser.add_argument("--background-opacity", type=float, help="Initial far-field voxel opacity (new experiment default: 0.1)")
     parser.add_argument("--output-dir", help="Override automatic outputs/SCENE-MM.DD-Eindex/training; on resume the default reuses the checkpoint's experiment")
     parser.add_argument("--build-dir")
     parser.add_argument("--gpu", type=int, help="Local physical index; ignored under Slurm")
@@ -333,6 +341,7 @@ def parse_arguments(argv=None):
 def apply_arguments(config, args, values):
     update(config, values)
     for value, group, key in ((args.epochs, "training", "num_epochs"),
+        (getattr(args, "preview_every", None), "training", "preview_interval_epochs"),
         (getattr(args, "target_resolution", None), "schedule", "target_resolution"),
         (getattr(args, "level_weights", None), "schedule", "level_weights"),
         (args.dataset, "data", "dataset"), (args.output_dir, "training", "output"),
@@ -384,12 +393,15 @@ def apply_arguments(config, args, values):
             (not config.training.rgb_only or values.get("topology", {}).get("use_rgb_deletion") is True)):
         # Explicit historical modes retain their prior mode and cadence.
         # Partial JSON overrides inherit the current experiment's defaults.
-        for name in ("use_legacy_deletion", "interval_alignment"):
+        for name in ("use_legacy_deletion", "interval_alignment", "deletion_start_fraction"):
             if name not in values.get("topology", {}):
                 setattr(config.topology, name, getattr(TopologySettings(), name))
     if (not config.training.rgb_only and
             "use_low_opacity_deletion" not in values.get("topology", {})):
         config.topology.use_low_opacity_deletion = False
+    if (not config.training.rgb_only and
+            "use_low_contribution_deletion" not in values.get("topology", {})):
+        config.topology.use_low_contribution_deletion = False
     if (not config.training.rgb_only and not getattr(args, "resume", None) and
             "growth_inherit_opacity" not in values.get("topology", {})):
         config.topology.growth_inherit_opacity = False
@@ -489,6 +501,16 @@ def validate(config):
         raise ValueError("topology.gpu_topology must be a boolean")
     if not isinstance(config.topology.use_low_opacity_deletion, bool):
         raise ValueError("topology.use_low_opacity_deletion must be a boolean")
+    if not isinstance(config.topology.use_low_contribution_deletion, bool):
+        raise ValueError("topology.use_low_contribution_deletion must be a boolean")
+    fraction = config.topology.deletion_start_fraction
+    if (isinstance(fraction, bool) or not isinstance(fraction, (int, float))
+            or not math.isfinite(fraction) or not 0 <= fraction < 1):
+        raise ValueError("topology.deletion_start_fraction must be finite and in [0, 1)")
+    threshold = config.topology.deletion_contribution_threshold
+    if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+            or not math.isfinite(threshold) or not 0 < threshold < 1):
+        raise ValueError("topology.deletion_contribution_threshold must be finite and strictly between 0 and 1")
     if config.topology.use_rgb_deletion and not config.training.rgb_only:
         raise ValueError("RGB deletion evidence requires training.rgb_only=true")
     for name in ("deletion_warmup_epochs", "deletion_protection_epochs", "deletion_freeze_last_epochs"):
@@ -531,9 +553,10 @@ def validate(config):
         if enabled:
             raise ValueError("RGB-only training requires these settings to be zero/false: " + ", ".join(enabled))
         if config.topology.enable_deletion and not config.topology.use_rgb_deletion:
-            if config.topology.use_legacy_deletion or not config.topology.use_low_opacity_deletion:
-                raise ValueError("RGB-only deletion requires RGB evidence or low-opacity-only deletion "
-                                 "(use_low_opacity_deletion=true, use_legacy_deletion=false)")
+            if config.topology.use_legacy_deletion or not (config.topology.use_low_opacity_deletion
+                                                         or config.topology.use_low_contribution_deletion):
+                raise ValueError("RGB-only deletion requires RGB evidence, low opacity or low contribution "
+                                 "with use_legacy_deletion=false")
         if not config.topology.use_rgb_growth and (config.topology.enable_growth or config.schedule.enable_coarse_growth):
             raise ValueError("RGB-only growth requires topology.use_rgb_growth=true; legacy alpha growth is unavailable")
     validate_growth_opacity(config.topology, config.model.opacity_sh_count,
@@ -548,7 +571,7 @@ def validate(config):
         value = getattr(config.training, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"training.{name} must be a positive integer")
-    for name in ("chunk_size", "sampling_workers", "profile_views", "profile_interval_epochs", "reference_cache_mib", "compact_gradient_rows"):
+    for name in ("chunk_size", "sampling_workers", "profile_views", "profile_interval_epochs", "preview_interval_epochs", "reference_cache_mib", "compact_gradient_rows"):
         value = getattr(config.training, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"training.{name} must be a nonnegative integer")
@@ -705,6 +728,32 @@ def save_epoch_checkpoint(config, model, views, model_path, output, mi, dr, np, 
     return dict(checkpoint=checkpoint, render=rendered)
 
 
+def periodic_training_view_due(config, completed_epochs):
+    interval = config.training.preview_interval_epochs
+    return (config.evaluation.enabled and interval > 0 and completed_epochs > 0
+            and completed_epochs % interval == 0)
+
+
+def save_periodic_training_view(config, model, views, model_path, mi, dr, np, *,
+                                completed_epochs, global_step, primary=True, existing_render=None):
+    """Render one completed epoch without adding a model checkpoint.
+
+    Reuse only matching metadata from this run's checkpoint render, never an
+    image found on disk from a previous run or an earlier resume attempt.
+    """
+    if not primary or not periodic_training_view_due(config, completed_epochs):
+        return None
+    path = model_path.parent / "train" / f"0000-epoch-{completed_epochs:05d}.png"
+    if (existing_render is not None and existing_render.get("status") == "passed"
+            and existing_render.get("completed_epochs") == completed_epochs
+            and existing_render.get("global_step") == global_step
+            and existing_render.get("image") == str(path)
+            and existing_render.get("spp") == config.evaluation.spp):
+        return dict(existing_render, reused_checkpoint_render=True)
+    return _save_training_view_zero(config, model, views, path, mi, dr, np,
+                                    completed_epochs=completed_epochs, global_step=global_step)
+
+
 def _save_training_view_zero(config, model, views, path, mi, dr, np, *,
                              completed_epochs, global_step):
     """Use evaluation camera/seed settings without consuming training RNG."""
@@ -794,6 +843,7 @@ def training_memory_plan(config, model, report, view_count, *, world_size=1,
         compact_path_records=config.training.compact_path_records,
         growth_evidence=config.topology.enable_growth and config.topology.use_rgb_growth and
                         (not config.schedule.enabled or config.schedule.enable_coarse_growth),
+        contribution_evidence=config.topology.enable_deletion and config.topology.use_low_contribution_deletion,
         max_growth_hits=config.gradient.max_growth_hits)
     plan = plan_training_memory(**arguments)
     # Explicit row budgets keep their prior meaning. Automatic selection runs
@@ -1150,6 +1200,8 @@ def settings(config):
         result["compact_path_records"] = False
     if getattr(config, "_collect_adaptive_priority", False):
         result["collect_adaptive_priority"] = True
+    if getattr(config, "_collect_max_contribution", False):
+        result["collect_max_contribution"] = True
     return result
 
 
@@ -1278,6 +1330,17 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
                 raise RuntimeError("Adaptive subdivision statistics require rebuilding this checkout")
             accumulator["adaptive_priority"] = accumulator.get("adaptive_priority", 0) + result["adaptive_priority"]
             finite &= dr.all(dr.isfinite(result["adaptive_priority"]))
+        if native_settings.get("collect_max_contribution", False):
+            if "max_contribution" not in result or "max_contribution_truncated_rays" not in result:
+                raise RuntimeError("Low-contribution deletion requires rebuilding this checkout")
+            weights = result["max_contribution"]
+            if dr.width(weights) != int(model.active_voxel_count):
+                raise RuntimeError("Contribution statistics must use the complete voxel layout")
+            finite &= dr.all(dr.isfinite(weights) & (weights >= 0) & (weights <= 1))
+            accumulator["max_contribution"] = (dr.maximum(accumulator["max_contribution"], weights)
+                                               if "max_contribution" in accumulator else weights)
+            key = "max_contribution_truncated_rays"
+            accumulator[key] = accumulator.get(key, 0) + result[key]
         for key in ("appearance_valid", "geometry_valid", "background_carve_valid"):
             accumulator[key] = accumulator.get(key, 0) + result[key]
         for key in ("foreground_evidence", "background_evidence"):
@@ -1308,6 +1371,7 @@ def compute_view_shard(model, view, rgba, config, offsets, inverse_pdf, token, m
         # which would otherwise keep the previous full gradient table alive.
         del result, arguments, ray, indices, pdf, reference_rgb, reference_alpha
         value = None  # The gradient-loop variable can independently retain a table.
+        weights = None
     for gradient in accumulator["gradients"].values():
         if dr.width(gradient):
             finite &= dr.all(dr.isfinite(gradient))
@@ -1537,6 +1601,8 @@ def prepare_training_output(config, resume_path=None, checkpoint_config=None):
 
 def normalized_algorithm_group(name, values):
     """Compare legacy saves with explicit defaults, without changing algorithms."""
+    if name == "model" and values is not None:
+        return {"initial_opacity": ModelConfig().initial_opacity, **values}
     if name == "render" and values is not None:
         # Traversal is an acceleration choice and can change on resume; it does
         # not change leaf shading, gradients, candidate evidence, or sampling.
@@ -1697,6 +1763,8 @@ def run_training(distributed=None):
         update(config, {"topology": overrides.get("topology", {})})
         config.model.opacity_sh_count = overrides.get("model", {}).get("opacity_sh_count",
             checkpoint["config"].get("model", {}).get("opacity_sh_count", 1))
+        config.model.initial_opacity = overrides.get("model", {}).get("initial_opacity",
+            checkpoint["config"].get("model", {}).get("initial_opacity", ModelConfig().initial_opacity))
         for name, default in (("sh_degree_progression", False), ("opacity_sh_degree_progression", False),
                               ("sh_degree_weights", (4, 3, 3))):
             setattr(config.training, name, overrides.get("training", {}).get(
@@ -1837,6 +1905,9 @@ def run_training(distributed=None):
         world_size = distributed.world_size if distributed is not None else 1
         if config.data.background_refinement == "adaptive" and world_size != 1:
             raise ValueError("Adaptive background training currently requires a single GPU")
+        if (config.topology.enable_deletion and config.topology.use_low_contribution_deletion
+                and world_size != 1):
+            raise ValueError("Low-contribution deletion currently requires a single GPU")
         sampling_workers = (min(config.training.sampling_workers, report["cpu_threads"]["actual"])
                             if world_size == 1 else 0)
         view_batch_mode = world_size > 1
@@ -1883,6 +1954,11 @@ def run_training(distributed=None):
                                "incrementally rebuild this checkout")
         rgb_deletion_enabled = config.topology.use_rgb_deletion and config.topology.enable_deletion
         low_opacity_deletion_enabled = config.topology.use_low_opacity_deletion and config.topology.enable_deletion
+        low_contribution_deletion_enabled = config.topology.use_low_contribution_deletion and config.topology.enable_deletion
+        if (low_contribution_deletion_enabled
+                and getattr(mi.VoxelReconstruction, "max_contribution_version", 0) < 1):
+            raise RuntimeError("Low-contribution deletion requires native max_contribution_version >= 1; "
+                               "incrementally rebuild this checkout")
         if rgb_deletion_enabled and getattr(mi.VoxelReconstruction, "rgb_deletion_version", 0) < RGB_DELETION_EVIDENCE_VERSION:
             raise RuntimeError(f"Per-hit RGB deletion evidence requires native rgb_deletion_version >= {RGB_DELETION_EVIDENCE_VERSION}; "
                                "incrementally rebuild this checkout")
@@ -1973,6 +2049,9 @@ def run_training(distributed=None):
             topology_freeze_start_epoch=(math.floor(config.training.num_epochs *
                 (1. - config.topology.freeze_last_fraction)) + 1
                 if config.topology.freeze_last_fraction else None),
+            deletion_start_fraction=config.topology.deletion_start_fraction,
+            deletion_start_epoch=math.floor(config.training.num_epochs * config.topology.deletion_start_fraction) + 1,
+            deletion_start_scope="global total-epoch fraction; independent of adaptive refinement and newborn protection",
             growth_freeze_start_epoch=(max(1, config.training.num_epochs - config.topology.growth_freeze_last_epochs + 1)
                                        if config.topology.growth_freeze_last_epochs else None),
             deletion_evidence=("single-removal RGB gain from complete paths or stops justified by recorded hits; no extra trace"
@@ -1987,13 +2066,22 @@ def run_training(distributed=None):
                 "threshold": config.topology.deletion_opacity_threshold,
                 "confirmation_windows": config.topology.deletion_opacity_confirmation_windows,
                 "check_interval_epochs": config.topology.deletion_interval,
-                "policy": ("parameter-only epoch-end checks; no RGB/alpha removal votes"
-                           if not config.topology.use_rgb_deletion and not config.topology.use_legacy_deletion else
-                           "epoch-end parameter checks; OR with enabled evidence deletion; no extra trace"),
+                "policy": "epoch-end parameter checks; OR with other enabled deletion criteria; no extra trace",
                 "interval_alignment": config.topology.interval_alignment,
                 "newborn_protection_epochs": config.topology.deletion_protection_epochs,
                 "readback": "only DC opacity parameters at scheduled checks",
                 "loss_guarantee": "heuristic pruning; no guarantee of joint RGB loss decrease"},
+            low_contribution_deletion={
+                "enabled": low_contribution_deletion_enabled,
+                "native_version": getattr(mi.VoxelReconstruction, "max_contribution_version", 0),
+                "statistic": "maximum observed T_before * alpha across pixels and all training views in a scheduled epoch",
+                "threshold": config.topology.deletion_contribution_threshold,
+                "check_interval_epochs": config.topology.deletion_interval,
+                "newborn_protection_epochs": config.topology.deletion_protection_epochs,
+                "window": "online training parameters; complete training-view coverage required",
+                "truncation_policy": "skip contribution pruning on hit-budget/iteration truncation; normal transmittance cutoff allowed",
+                "policy": "OR with other enabled deletion criteria; no extra trace; disabled in the configured fixed-topology tail",
+                "loss_guarantee": "observed contribution heuristic; no guarantee of joint loss decrease"},
             deletion_freeze_last_epochs=config.topology.deletion_freeze_last_epochs,
             deletion_freeze_start_epoch=(max(1, config.training.num_epochs - config.topology.deletion_freeze_last_epochs + 1)
                                          if config.topology.deletion_freeze_last_epochs else None),
@@ -2162,6 +2250,10 @@ def run_training(distributed=None):
                  "alignment:", config.topology.interval_alignment, ";",
                  config.topology.deletion_warmup_epochs, "warmup epochs per level;",
                  config.topology.deletion_protection_epochs, "newborn protection epochs", flush=True)
+        if config.topology.enable_deletion:
+            emit("Deletion starts at global epoch", report["training_protocol"]["deletion_start_epoch"],
+                 "after", config.topology.deletion_start_fraction * 100.,
+                 "% of the full training budget; adaptive refinement is not delayed", flush=True)
         rng = np.random.default_rng(config.training.seed)
         sampler = make_sampler(config, np, sampling_workers=sampling_workers)
         completed, global_step, optimizer_step = 0, 0, 0
@@ -2256,8 +2348,29 @@ def run_training(distributed=None):
                 mi, dr, np, save, completed_epochs=completed_epochs, global_step=global_step)
             report["epoch_checkpoints"][str(completed_epochs)] = boundary["checkpoint"]
             report["checkpoint_renders"][str(completed_epochs)] = boundary["render"]
+            if periodic_training_view_due(config, completed_epochs):
+                report.setdefault("periodic_renders", {})[str(completed_epochs)] = dict(
+                    boundary["render"], reused_checkpoint_render=True)
             if boundary["render"]["status"] == "passed":
                 emit("Checkpoint training-view-0 image:", boundary["render"]["image"], flush=True)
+
+        def capture_periodic_training_view(completed_epochs):
+            if not primary:
+                return
+            key = str(completed_epochs)
+            existing = report["checkpoint_renders"].get(key)
+            if existing is None:
+                progress_line.finish()
+                emit(f"Rendering training-view-0 at completed epoch {completed_epochs}", flush=True)
+                native_replay.clear()
+                optimizer.clear_replay()
+                release_topology_cache(model, dr)
+            rendered = save_periodic_training_view(config, model, views, model_path, mi, dr, np,
+                completed_epochs=completed_epochs, global_step=global_step, existing_render=existing)
+            if rendered is not None:
+                report.setdefault("periodic_renders", {})[key] = rendered
+                if rendered["status"] == "passed" and not rendered.get("reused_checkpoint_render"):
+                    emit("Periodic training-view-0 image:", rendered["image"], flush=True)
 
         def capture_refinement_boundary(completed_epochs):
             if not primary or not is_refinement_boundary(topology, completed_epochs):
@@ -2390,6 +2503,7 @@ def run_training(distributed=None):
         for epoch in range(completed, end_epoch):
             started = time.perf_counter()
             config._collect_adaptive_priority = adaptive_background.begin_epoch(model, epoch + 1)
+            config._collect_max_contribution = topology.collect_contribution(epoch) if primary else False
             previous_sh_count = int(getattr(model, "active_sh_count", model.sh_count))
             previous_opacity_sh_count = int(getattr(model, "active_opacity_sh_count", model.opacity_sh_count))
             active_sh_count = apply_sh_schedule(model, config, epoch)
@@ -2516,6 +2630,10 @@ def run_training(distributed=None):
                             loss_components=loss_components, deferred_checks=deferred_checks)
                         gradients_done = time.perf_counter()
                         adaptive_background.observe(gradients)
+                        if primary and config._collect_max_contribution:
+                            topology.observe_contribution(model, gradients.pop("max_contribution"),
+                                view_id=int(index), epoch=epoch,
+                                truncated_rays=gradients.pop("max_contribution_truncated_rays"))
                         if primary and rgb_growth_requested:
                             topology.observe_rgb_growth(model, gradients, view_id=int(index), epoch=epoch,
                                                         pixel_count=ray_count)
@@ -2608,7 +2726,8 @@ def run_training(distributed=None):
                                  f"| view {len(views)}/{len(views)} (100%) | updating topology...", force=True)
             refinement_boundary = capture_refinement_boundary(epoch+1)
             topology_started = time.perf_counter()
-            topology_evidence_finished = rgb_growth_requested or (rgb_deletion_enabled and deletion_evidence_collected)
+            topology_evidence_finished = (rgb_growth_requested or (rgb_deletion_enabled and deletion_evidence_collected)
+                                          or config._collect_max_contribution)
             topology_cache_prepare_seconds = None
             if topology_evidence_finished or topology._low_opacity_deletion_due(epoch + 1):
                 # Evidence recordings can retain candidate/tree buffers even
@@ -2748,6 +2867,13 @@ def run_training(distributed=None):
             # invocation, even if it coincides with a scheduled boundary.
             if epoch + 1 in checkpoint_epochs and epoch + 1 < end_epoch:
                 capture_epoch_checkpoint(epoch + 1)
+                if distributed is not None:
+                    distributed.barrier()
+            if (periodic_training_view_due(config, epoch + 1)
+                    and not (epoch + 1 == end_epoch and checkpoint_epochs)):
+                # A planned final/stop checkpoint renders this same state below.
+                # Other completed checkpoints are reused from this run's report.
+                capture_periodic_training_view(epoch + 1)
                 if distributed is not None:
                     distributed.barrier()
             progress_line.finish(f"Epoch {epoch+1}/{config.training.num_epochs} done "

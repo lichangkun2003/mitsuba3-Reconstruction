@@ -17,6 +17,7 @@ from reconstruction_sh_schedule import sh_model_metadata
 
 
 BACKGROUND_RGB_DELETION_VERSION = 1
+CONTRIBUTION_DELETION_VERSION = 1
 
 
 class NoRepresentableChildren(RuntimeError):
@@ -35,8 +36,15 @@ class TopologySettings:
     # Independent cleanup of persistently transparent, isotropic voxels. The
     # default preserves the behavior of checkpoints predating this lifecycle.
     use_low_opacity_deletion: bool = False
+    # Maximum compositing weight over one complete scheduled training epoch.
+    # Missing fields retain historical checkpoints' parameter-only cleanup.
+    use_low_contribution_deletion: bool = False
+    deletion_contribution_threshold: float = 1e-4
     deletion_opacity_threshold: float = .005
     deletion_opacity_confirmation_windows: int = 2
+    # Global deletion-only delay; zero preserves historical checkpoints.
+    # Unlike the legacy warmup, this does not delay adaptive refinement.
+    deletion_start_fraction: float = 0.0
     deletion_warmup_epochs: int = 20
     deletion_protection_epochs: int = 20
     deletion_freeze_last_epochs: int = 0
@@ -630,6 +638,9 @@ class TopologyManager:
         self._device_statistics.update(rgb_deletion_device_views=0, rgb_deletion_cpu_views=0,
                                        rgb_deletion_readback_bytes=0)
         self._device_statistics["deletion_opacity_readback_bytes"] = 0
+        self._device_statistics.update(contribution_deletion_device_views=0,
+                                       contribution_deletion_cpu_views=0,
+                                       contribution_deletion_readback_bytes=0)
         self.before_refine_checkpoint = None
         self.completed_windows = 0
         if self.background_refinement == "adaptive" and int(model.active_voxel_count) > self.settings.max_active_voxels:
@@ -647,6 +658,11 @@ class TopologyManager:
                 or not isinstance(cfg.freeze_last_fraction, (int, float))
                 or not 0 <= cfg.freeze_last_fraction < 1):
             raise ValueError("topology.freeze_last_fraction must be in [0, 1)")
+        if (isinstance(cfg.deletion_start_fraction, bool)
+                or not isinstance(cfg.deletion_start_fraction, (int, float))
+                or not math.isfinite(cfg.deletion_start_fraction)
+                or not 0 <= cfg.deletion_start_fraction < 1):
+            raise ValueError("topology.deletion_start_fraction must be finite and in [0, 1)")
         if not (1 <= self.core_resolution <= 1024 and self.core_resolution <= self.resolution <= 1040):
             raise ValueError("Topology requires core resolution <= 1024 and grid resolution <= 1040")
         if self.core_resolution not in self.budgets:
@@ -666,6 +682,8 @@ class TopologyManager:
             raise ValueError("topology.interval_alignment must be warmup or global")
         if not isinstance(cfg.use_low_opacity_deletion, bool):
             raise ValueError("topology.use_low_opacity_deletion must be a boolean")
+        if not isinstance(cfg.use_low_contribution_deletion, bool):
+            raise ValueError("topology.use_low_contribution_deletion must be a boolean")
         active_opacity = self._model_active_opacity_sh_count
         # Restoring a frozen-tail checkpoint may already have high orders active.
         # Runtime entry points still refuse any topology work in that state.
@@ -691,7 +709,11 @@ class TopologyManager:
                 not isinstance(cfg.deletion_opacity_threshold, (int, float)) or
                 not 0 < cfg.deletion_opacity_threshold < 1):
             raise ValueError("topology.deletion_opacity_threshold must satisfy 0 < threshold < 1")
-        if ((cfg.use_rgb_deletion or cfg.use_low_opacity_deletion) and
+        if (isinstance(cfg.deletion_contribution_threshold, bool) or
+                not isinstance(cfg.deletion_contribution_threshold, (int, float)) or
+                not 0 < cfg.deletion_contribution_threshold < 1):
+            raise ValueError("topology.deletion_contribution_threshold must satisfy 0 < threshold < 1")
+        if ((cfg.use_rgb_deletion or cfg.use_low_opacity_deletion or cfg.use_low_contribution_deletion) and
                 (not isinstance(cfg.deletion_interval, int) or
                  isinstance(cfg.deletion_interval, bool))):
             raise ValueError("Deletion interval must be an integer")
@@ -735,6 +757,7 @@ class TopologyManager:
         self.growth_birth = np.zeros(count, dtype=np.int64)
         self.growth_wait_start = np.zeros(count, dtype=np.int64)
         self.pending_rgb_deletion = None
+        self.pending_contribution_deletion = None
         self._rgb_deletion_device = None
         self.rgb_deletion_streak = np.zeros(count, dtype=np.uint32)
         self.rgb_deletion_last_boundary = None
@@ -823,7 +846,9 @@ class TopologyManager:
         return self.level_start_epoch if self.schedule.enabled else self.opacity_warmup + self.opacity_ramp
 
     def collect_deletion(self, epoch):
-        if not self.settings.enable_deletion or self.deletion_frozen(int(epoch) + 1):
+        boundary = int(epoch) + 1
+        if (not self.settings.enable_deletion or not self.deletion_started(boundary)
+                or self.deletion_frozen(boundary)):
             return False
         if self.settings.use_rgb_deletion:
             return self._rgb_deletion_due(int(epoch) + 1)
@@ -831,6 +856,13 @@ class TopologyManager:
             return False  # Low-opacity deletion consumes parameters, not rays.
         return (self.settings.enable_deletion and epoch >= self.evidence_start and
                 (not self.uniform_refinement or self.core_resolution == self.schedule.target_resolution))
+
+    def collect_contribution(self, epoch):
+        """Collect max(T * alpha) only for a complete scheduled deletion epoch."""
+        due = self._low_contribution_deletion_due(int(epoch) + 1)
+        if not due:
+            self.pending_contribution_deletion = None
+        return due
 
     @property
     def legacy_deletion_enabled(self):
@@ -845,6 +877,8 @@ class TopologyManager:
                  ["legacy"] if self.legacy_deletion_enabled else [])
         if cfg.use_low_opacity_deletion:
             modes.append("low_opacity")
+        if cfg.use_low_contribution_deletion:
+            modes.append("low_contribution")
         return "+".join(modes) or "disabled"
 
     def _interval_due(self, boundary, interval, warmup):
@@ -867,16 +901,28 @@ class TopologyManager:
         count = self.settings.deletion_freeze_last_epochs
         return self.topology_frozen(boundary) or (count > 0 and boundary > max(0, self.schedule.total_epochs - count))
 
+    @property
+    def deletion_start_epoch(self):
+        """First allowed one-based epoch, relative to the full training budget."""
+        return math.floor(self.schedule.total_epochs * self.settings.deletion_start_fraction) + 1
+
+    def deletion_started(self, boundary):
+        return boundary >= self.deletion_start_epoch
+
     def _rgb_deletion_due(self, boundary):
         return self.settings.use_rgb_deletion and self._scheduled_deletion_due(boundary)
 
     def _low_opacity_deletion_due(self, boundary):
         return self.settings.use_low_opacity_deletion and self._scheduled_deletion_due(boundary)
 
+    def _low_contribution_deletion_due(self, boundary):
+        return self.settings.use_low_contribution_deletion and self._scheduled_deletion_due(boundary)
+
     def _scheduled_deletion_due(self, boundary):
         """Common epoch-end schedule, independent of per-ray RGB evidence."""
         cfg = self.settings
-        if not cfg.enable_deletion or self.deletion_frozen(boundary):
+        if (not cfg.enable_deletion or not self.deletion_started(boundary)
+                or self.deletion_frozen(boundary)):
             return False
         local_epoch = boundary - self.level_start_epoch
         # Refinement replaces all rows and resets evidence. Avoid collecting
@@ -1167,6 +1213,121 @@ class TopologyManager:
                 observe_numpy(pending, out, pixel_count, cfg.deletion_rgb_gain_epsilon, np)
                 self._device_statistics["rgb_deletion_cpu_views"] += 1
         pending["seen_views"].add(int(view_id))
+
+    def _contribution_window(self, model, view_id, epoch):
+        """Validate the full model row layout before accepting a camera."""
+        if not self.collect_contribution(epoch):
+            return None
+        if (isinstance(view_id, bool) or not isinstance(view_id, (int, self.np.integer)) or
+                not 0 <= view_id < self.view_count or int(model.active_voxel_count) != self.count):
+            raise ValueError("Unexpected contribution deletion view ID or model topology")
+        boundary = int(epoch) + 1
+        pending = self.pending_contribution_deletion
+        if pending is None or pending["boundary"] != boundary:
+            pending = {"boundary": boundary, "resolution": self.resolution, "count": self.count,
+                       "evidence_version": CONTRIBUTION_DELETION_VERSION, "seen_views": set()}
+            self.pending_contribution_deletion = pending
+        if pending["resolution"] != self.resolution or pending["count"] != self.count:
+            raise ValueError("Contribution deletion evidence differs from the current model layout")
+        if view_id in pending["seen_views"]:
+            raise ValueError("Contribution deletion requires each training view exactly once")
+        return pending
+
+    def observe_contribution(self, model, weights, *, view_id, epoch, truncated_rays=0):
+        """Take a per-row maximum over every pixel of each distinct training view.
+
+        ``weights`` is the native full-model max(T * alpha) table, including
+        zero rows for voxels never visited by that view. Ray chunks must be
+        combined with MAX before this call, rather than a gradient SUM.
+        """
+        try:
+            from reconstruction_topology_gpu import get_gpu_lifecycle
+            device = get_gpu_lifecycle(self, model)
+            if device is not None:
+                return device.observe_contribution(model, weights, view_id=view_id, epoch=epoch,
+                                                   truncated_rays=truncated_rays)
+            pending = self._contribution_window(model, view_id, epoch)
+            if pending is None:
+                return
+            np = self.np
+            values = np.array(weights, copy=True)
+            if (values.shape != (self.count,) or not np.issubdtype(values.dtype, np.floating) or
+                    not np.all(np.isfinite(values)) or np.any(values < 0) or np.any(values > 1)):
+                raise ValueError("Contribution deletion requires one finite weight in [0, 1] per model row")
+            if _cuda_array(weights) is not None:
+                self._device_statistics["contribution_deletion_readback_bytes"] += values.nbytes
+            truncated = np.asarray(truncated_rays).reshape(-1)
+            if (truncated.shape != (1,) or not np.issubdtype(truncated.dtype, np.integer) or
+                    np.issubdtype(truncated.dtype, np.bool_) or np.any(truncated < 0)):
+                raise ValueError("Contribution deletion requires a nonnegative integer truncated-ray count")
+            if "max_contribution" in pending:
+                np.maximum(pending["max_contribution"], values, out=pending["max_contribution"])
+            else:
+                pending["max_contribution"] = values.astype(np.float32, copy=True)
+            pending["truncated_rays"] = pending.get("truncated_rays", 0) + int(truncated[0])
+            pending["seen_views"].add(int(view_id))
+            self._device_statistics["contribution_deletion_cpu_views"] += 1
+        except Exception:
+            self.pending_contribution_deletion = None
+            raise
+
+    def _validate_contribution_pending(self, pending):
+        np = self.np
+        if (pending.get("evidence_version") != CONTRIBUTION_DELETION_VERSION or
+                pending.get("resolution") != self.resolution or pending.get("count") != self.count):
+            raise ValueError("Contribution deletion evidence version or model layout differs")
+        boundary = pending.get("boundary")
+        if (type(boundary) is not int or not self._low_contribution_deletion_due(boundary)):
+            raise ValueError("Contribution deletion evidence is not a scheduled window")
+        seen = pending.get("seen_views")
+        if (not isinstance(seen, set) or any(type(view) is not int or not 0 <= view < self.view_count
+                                             for view in seen)):
+            raise ValueError("Contribution deletion evidence contains invalid training views")
+        values = np.asarray(pending.get("max_contribution"))
+        if (values.shape != (self.count,) or not np.issubdtype(values.dtype, np.floating) or
+                not np.all(np.isfinite(values)) or np.any(values < 0) or np.any(values > 1)):
+            raise ValueError("Contribution deletion evidence contains invalid compositing weights")
+        truncated = np.asarray(pending.get("truncated_rays", 0)).reshape(-1)
+        invalid = np.asarray(pending.get("invalid_weights", 0)).reshape(-1)
+        for name, value in (("truncated rays", truncated), ("invalid weights", invalid)):
+            if (value.shape != (1,) or not np.issubdtype(value.dtype, np.integer) or
+                    np.any(value < 0)):
+                raise ValueError(f"Contribution deletion evidence contains invalid {name}")
+        if invalid[0]:
+            raise ValueError("Contribution deletion evidence contains invalid compositing weights")
+
+    def _evaluate_contribution_deletion(self, boundary, event):
+        if not self._low_contribution_deletion_due(boundary):
+            self.pending_contribution_deletion = None
+            return None
+        np, pending = self.np, self.pending_contribution_deletion
+        try:
+            matching = pending is not None and pending["boundary"] == boundary
+            if matching:
+                self._validate_contribution_pending(pending)
+            views = len(pending["seen_views"]) if matching else 0
+            complete = views == self.view_count
+            truncated = int(np.asarray(pending.get("truncated_rays", 0)).reshape(-1)[0]) if matching else 0
+            low = (pending["max_contribution"] < self.settings.deletion_contribution_threshold
+                   if matching else np.zeros(self.count, dtype=bool))
+            mature = ((self.growth_birth == 0) |
+                      (boundary - self.growth_birth >= self.settings.deletion_protection_epochs))
+            selected = low & mature & complete & (truncated == 0)
+            event["deletion_contribution"] = {
+                "status": ("incomplete_views" if not complete else
+                           "skipped_truncated_paths" if truncated else "complete"),
+                "evidence_version": CONTRIBUTION_DELETION_VERSION,
+                "statistic": "max(T*alpha)", "threshold": self.settings.deletion_contribution_threshold,
+                "views": views, "required_views": self.view_count, "tested_voxels": self.count,
+                "truncated_rays": truncated,
+                "low_contribution_voxels": int(np.count_nonzero(low)),
+                "eligible_voxels": int(np.count_nonzero(mature)),
+                "protected_voxels": int(np.count_nonzero(~mature)),
+                "qualified_voxels": int(np.count_nonzero(selected)),
+                "confirmation_windows": 1, "confirmed": int(np.count_nonzero(selected)), "deleted": 0}
+            return selected
+        finally:
+            self.pending_contribution_deletion = None
 
     def _evaluate_rgb_deletion(self, boundary, event, *, region_eligible=None):
         """Confirm removals using consecutive complete, reliable view windows."""
@@ -1473,6 +1634,7 @@ class TopologyManager:
 
     def _remap_lifecycle(self, survivors, new_count, boundary):
         np = self.np
+        self.pending_contribution_deletion = None
         self._materialize_deletion_masks()
         kept = len(survivors)
         for name in ("foreground_masks", "background_masks", "qualified", "candidates",
@@ -1612,9 +1774,13 @@ class TopologyManager:
                          growth_warmup_epochs=self.growth_warmup,
                          growth_warmup_active=boundary - self.level_start_epoch <= self.growth_warmup,
                          growth_evidence_requested=self._growth_due(boundary))
-        if cfg.use_rgb_deletion or cfg.use_low_opacity_deletion or self.legacy_deletion_enabled:
+        if (cfg.use_rgb_deletion or cfg.use_low_opacity_deletion or
+                cfg.use_low_contribution_deletion or self.legacy_deletion_enabled):
             event.update(deletion_mode=self.deletion_mode,
                          deletion_level_epoch=boundary - self.level_start_epoch,
+                         deletion_start_fraction=cfg.deletion_start_fraction,
+                         deletion_start_epoch=self.deletion_start_epoch,
+                         deletion_start_pending=not self.deletion_started(boundary),
                          deletion_warmup_epochs=cfg.deletion_warmup_epochs,
                          deletion_warmup_active=boundary - self.level_start_epoch <= cfg.deletion_warmup_epochs,
                          deletion_frozen=self.deletion_frozen(boundary),
@@ -1622,8 +1788,11 @@ class TopologyManager:
                          deletion_evidence_requested=self._rgb_deletion_due(boundary))
         if cfg.use_low_opacity_deletion:
             event["deletion_opacity_requested"] = self._low_opacity_deletion_due(boundary)
+        if cfg.use_low_contribution_deletion:
+            event["deletion_contribution_requested"] = self._low_contribution_deletion_due(boundary)
         if self.topology_frozen(boundary):
             self.pending_growth = self.pending_rgb_deletion = None
+            self.pending_contribution_deletion = None
             self._growth_world_cache = self._growth_device = self._rgb_growth_device = self._rgb_deletion_device = None
             model.clear_growth_candidates()
             event.update(finished=boundary >= schedule.total_epochs, active_voxel_count=self.count,
@@ -1658,9 +1827,11 @@ class TopologyManager:
         rgb_delete = (self._evaluate_rgb_deletion(boundary, event)
                       if cfg.use_rgb_deletion else None)
         opacity_delete = self._evaluate_low_opacity_deletion(model, boundary, event)
+        contribution_delete = self._evaluate_contribution_deletion(boundary, event)
         event["evidence_window_evaluated"] = (
-            rgb_delete is not None if cfg.use_rgb_deletion else
-            self._evaluate_deletion(boundary) if self.legacy_deletion_enabled else False)
+            (rgb_delete is not None if cfg.use_rgb_deletion else
+             self._evaluate_deletion(boundary) if self.legacy_deletion_enabled else False)
+            or opacity_delete is not None or contribution_delete is not None)
         final = level_done if schedule.enabled else boundary >= schedule.total_epochs
         first = self.evidence_start + 2 * cfg.evidence_interval
         periodic = boundary >= first and (boundary - first) % cfg.deletion_interval == 0
@@ -1668,7 +1839,8 @@ class TopologyManager:
                          (periodic or final) and self.collect_deletion(boundary - 1) else None)
         if legacy_delete is not None and self.scene_mapping == "world_shell":
             legacy_delete = legacy_delete & self._core_region_numpy(model)
-        masks = [mask for mask in (rgb_delete, legacy_delete, opacity_delete) if mask is not None]
+        masks = [mask for mask in (rgb_delete, legacy_delete, opacity_delete, contribution_delete)
+                 if mask is not None]
         delete = np.logical_or.reduce(masks) if masks else None
         if delete is not None and np.any(delete):
             checkpoint = model_checkpoint(model)
@@ -1682,6 +1854,8 @@ class TopologyManager:
                 event["deletion_rgb"]["deleted"] = int(np.count_nonzero(rgb_delete))
             if opacity_delete is not None:
                 event["deletion_opacity"]["deleted"] = int(np.count_nonzero(opacity_delete))
+            if contribution_delete is not None:
+                event["deletion_contribution"]["deleted"] = int(np.count_nonzero(contribution_delete))
             # Preserve every surviving Adam group for RGB/opacity cleanup.
             # Only actual legacy evidence removals retain Falcor's historical
             # radiance reset; a mere enabled legacy mode must not trigger it.
@@ -1755,6 +1929,7 @@ class TopologyManager:
         self._growth_device = None
         self._rgb_growth_device = None
         self.pending_rgb_deletion = None
+        self.pending_contribution_deletion = None
         self._rgb_deletion_device = None
         self.cooldown = {cell: expiry for cell, expiry in self.cooldown.items() if expiry > boundary}
         event.update(finished=final, active_voxel_count=self.count)
@@ -1765,6 +1940,7 @@ class TopologyManager:
         state = {"settings": asdict(self.settings), "schedule": asdict(self.schedule), "view_count": self.view_count,
                  "rgb_growth_evidence_version": RGB_GROWTH_EVIDENCE_VERSION,
                  "rgb_deletion_evidence_version": RGB_DELETION_EVIDENCE_VERSION,
+                 "contribution_deletion_version": CONTRIBUTION_DELETION_VERSION,
                   "background_rgb_deletion_version": BACKGROUND_RGB_DELETION_VERSION,
                  "opacity_warmup": self.opacity_warmup, "opacity_ramp": self.opacity_ramp,
                  "resolution": self.resolution, "schedule_start_resolution": self.schedule_start_resolution,
@@ -1772,6 +1948,7 @@ class TopologyManager:
                  "cooldown": {str(key): value for key, value in self.cooldown.items()}, "completed_windows": self.completed_windows,
                  "count": self.count, "pending_growth": self.pending_growth,
                  "pending_rgb_deletion": self.pending_rgb_deletion,
+                 "pending_contribution_deletion": self.pending_contribution_deletion,
                  "rgb_deletion_streak": self.rgb_deletion_streak,
                  "rgb_deletion_last_boundary": self.rgb_deletion_last_boundary,
                  "low_opacity_deletion_streak": self.low_opacity_deletion_streak,
@@ -1837,7 +2014,7 @@ class TopologyManager:
                 result.update({field: device_array_source(value, dr=evidence.dr)
                                for field, value in values.items()})
                 state[name] = result
-        for name in ("pending_growth", "pending_rgb_deletion"):
+        for name in ("pending_growth", "pending_rgb_deletion", "pending_contribution_deletion"):
             if state[name] is not None:
                 state[name] = dict(state[name])
                 state[name]["seen_views"] = sorted(state[name]["seen_views"])
@@ -1858,6 +2035,9 @@ class TopologyManager:
             state["pending_growth"]["seen_views"] = sorted(state["pending_growth"]["seen_views"])
         if state["pending_rgb_deletion"] is not None:
             state["pending_rgb_deletion"]["seen_views"] = sorted(state["pending_rgb_deletion"]["seen_views"])
+        if state["pending_contribution_deletion"] is not None:
+            state["pending_contribution_deletion"]["seen_views"] = sorted(
+                state["pending_contribution_deletion"]["seen_views"])
         return state
 
     def load_state_dict(self, state):
@@ -1887,12 +2067,20 @@ class TopologyManager:
             if any(name not in state for name in (
                     "low_opacity_deletion_streak", "low_opacity_deletion_last_boundary")):
                 raise ValueError("Low-opacity deletion lifecycle state is incomplete")
+        contribution_version = state.get("contribution_deletion_version", 0)
+        if (type(contribution_version) is not int or
+                not 0 <= contribution_version <= CONTRIBUTION_DELETION_VERSION):
+            raise ValueError("Unsupported contribution deletion version")
+        if (state.get("pending_contribution_deletion") is not None and
+                contribution_version != CONTRIBUTION_DELETION_VERSION):
+            raise ValueError("Contribution deletion evidence version differs")
         self._growth_world_cache = None
         self._growth_device = None
         self._rgb_growth_device = None
         self._deletion_device = None
         self._rgb_deletion_device = None
         self.pending_rgb_deletion = None
+        self.pending_contribution_deletion = None
         self.rgb_deletion_streak = self.np.zeros(self.count, dtype=self.np.uint32)
         self.rgb_deletion_last_boundary = None
         self.low_opacity_deletion_streak = self.np.zeros(self.count, dtype=self.np.uint32)
@@ -1901,6 +2089,7 @@ class TopologyManager:
         state.pop("rgb_growth_evidence_version", None)
         state.pop("rgb_deletion_evidence_version", None)
         state.pop("background_rgb_deletion_version", None)
+        state.pop("contribution_deletion_version", None)
         if reset_background_window:
             # Old windows mark views seen although native kernels excluded the
             # background. Do not reuse their partial evidence or confirmation
@@ -1924,6 +2113,12 @@ class TopologyManager:
             self.pending_growth["seen_views"] = set(self.pending_growth["seen_views"])
         if self.pending_rgb_deletion is not None:
             self.pending_rgb_deletion["seen_views"] = set(self.pending_rgb_deletion["seen_views"])
+        if self.pending_contribution_deletion is not None:
+            views = self.pending_contribution_deletion.get("seen_views", ())
+            if len(views) != len(set(views)):
+                self.pending_contribution_deletion = None
+                raise ValueError("Contribution deletion checkpoint contains duplicate training views")
+            self.pending_contribution_deletion["seen_views"] = set(views)
         self._validate()
         if self.pending_growth is not None and self.pending_growth.get("mode") == "rgb":
             self._rgb_normalization(self.pending_growth)
@@ -1956,3 +2151,9 @@ class TopologyManager:
             from reconstruction_deletion_rgb import validate_pending
             validate_pending(self.pending_rgb_deletion, self.count, self.resolution,
                              self.view_count, self.np)
+        if self.pending_contribution_deletion is not None:
+            try:
+                self._validate_contribution_pending(self.pending_contribution_deletion)
+            except Exception:
+                self.pending_contribution_deletion = None
+                raise

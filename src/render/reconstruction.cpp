@@ -1816,6 +1816,7 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         {"rgb_loss_channel_mean", 1.f},
         {"collect_rgb_deletion_evidence", 0.f},
         {"collect_adaptive_priority", 0.f},
+        {"collect_max_contribution", 0.f},
         {"collect_growth_evidence", 0.f}, {"max_growth_hits", 8.f},
         {"distortion_loss_weight", 0.f}, {"compact_gradient_capacity", 0.f},
         {"dssim_loss_weight", 0.f}, {"image_width", 0.f}, {"image_height", 0.f},
@@ -1832,6 +1833,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     // Each returned loss is per ray. Python averages rays for reporting;
     // parameter adjoints retain the existing sum-over-rays convention.
     const float rgb_loss_scale = cfg["rgb_loss_channel_mean"] != 0.f ? 1.f / 3.f : 1.f;
+    if (cfg["collect_max_contribution"] != 0.f && cfg["collect_max_contribution"] != 1.f)
+        Throw("VoxelReconstruction.loss_and_grad(): collect_max_contribution must be 0 or 1.");
+    const bool collect_max_contribution = cfg["collect_max_contribution"] != 0.f;
     if (cfg["rgb_loss_srgb"] != 0.f && cfg["rgb_loss_srgb"] != 1.f)
         Throw("VoxelReconstruction.loss_and_grad(): rgb_loss_srgb must be 0 or 1.");
     if (rgb_loss_srgb && !rgb_only)
@@ -1970,6 +1974,10 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         }
         if (collect_adaptive_priority)
             result.deletion_sums["adaptive_priority"] = dr::zeros<FloatBuffer>(0);
+        if (collect_max_contribution) {
+            result.deletion_sums["max_contribution"] = dr::zeros<FloatBuffer>(0);
+            result.counters["max_contribution_truncated_rays"] = dr::zeros<UIntBuffer>(1);
+        }
         if (dssim_enabled) {
             if (profiler.enabled()) {
                 evaluate_result(result);
@@ -2022,6 +2030,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         FloatBuffer values;
         UIntBuffer ids, front, unknown;
     };
+    // A recorded hit writes every field before incrementing s.hits. All
+    // consumers mask reads by that recorded prefix, so unused slots need no
+    // initialization. Keep reduction targets (e.g. growth_unknown) zeroed.
     struct Records {
         FloatBuffer hit;
         UIntBuffer hit_id;
@@ -2029,8 +2040,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         FloatBuffer growth_values;
         UIntBuffer growth_ids, growth_front, growth_unknown;
         DRJIT_STRUCT(Records, hit, hit_id, candidates, growth_values, growth_ids, growth_front, growth_unknown)
-    } records{dr::zeros<FloatBuffer>(width*max_hits*hit_fields),
-              dr::zeros<UIntBuffer>(width*max_hits),
+    } records{dr::empty<FloatBuffer>(width*max_hits*hit_fields),
+              dr::empty<UIntBuffer>(width*max_hits),
               std::vector<Candidate>(max_candidates,
                   Candidate{Vector3f(0.f), Float(0.f), Float(0.f), Float(0.f), UInt32(0), UInt32(0)}),
               dr::zeros<FloatBuffer>(collect_growth ? width*max_growth_hits*6 : 1),
@@ -2479,6 +2490,15 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
     result.raw_rgb=state.color+state.transmittance*background;
     result.raw_alpha=1.f-state.transmittance;
     result.hit_count=state.hits;
+    if (collect_max_contribution) {
+        Mask exited = !dr::all(state.cell >= 0) |
+            !dr::all(state.cell < int(root_resolution())) | (state.entry >= exit);
+        Mask hit_budget = (state.hits >= max_hits) &
+            (state.transmittance > cfg["transmittance_threshold"]);
+        Mask iteration_budget = state.iterations > 3 * root_resolution() + 3;
+        Mask truncated = active & !exited & (hit_budget | iteration_budget);
+        result.counters["max_contribution_truncated_rays"] = dr::sum(UInt32(truncated));
+    }
     if (profile_traversal) {
         result.counters["traversal_steps"] = state.traversal_steps;
         result.counters["traversal_skipped_cells"] = state.traversal_skipped;
@@ -2703,6 +2723,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         result.counters[key]=dr::zeros<UIntBuffer>(m_active_count);
     if (collect_adaptive_priority)
         result.deletion_sums["adaptive_priority"] = dr::zeros<FloatBuffer>(m_active_count);
+    if (collect_max_contribution)
+        result.deletion_sums["max_contribution"] = dr::zeros<FloatBuffer>(m_active_count);
     if (collect_rgb_deletion) {
         result.deletion_sums["deletion_gain"] = dr::zeros<FloatBuffer>(m_active_count);
         result.deletion_counts["deletion_observed"] = dr::zeros<UIntBuffer>(m_active_count);
@@ -2839,7 +2861,9 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                      distortion_moment,distortion_weight_derivative,deletion_known,
                      deletion_recovered,deletion_unknown_tail,deletion_unknown_trace,deletion_nonfinite)
     } reverse{dr::full<Int32>(int(max_hits)-1,width),background,Float(1.f),
-              dr::zeros<FloatBuffer>(size_t(hit_stride)*(compact_path_records ? 3u : 4u)),
+              // Only valid hit slots are written below; candidate reads use
+              // has_suffix to select those slots or the background directly.
+              dr::empty<FloatBuffer>(size_t(hit_stride)*(compact_path_records ? 3u : 4u)),
               std::move(result.gradients),std::move(result.counters),
               std::move(result.deletion_sums),std::move(result.deletion_counts),
               Float(0.f),Float(0.f),Float(0.f),Mask(false),Mask(false),Mask(false),Mask(false),Mask(false)};
@@ -2848,7 +2872,8 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         [this,hit_records=records.hit,hit_ids=records.hit_id,hit_count=state.hits,
          ray_count,hit_stride,lane,clean,dcolor,dalpha,d,weight,is_background,
          is_foreground,deletion_dcolor,deletion_dalpha,cfg,add_geometry,rgb_only,rgb_loss_scale,
-         collect_rgb_deletion,collect_adaptive_priority,deletion_exited,deletion_trace_valid,
+         collect_rgb_deletion,collect_adaptive_priority,collect_max_contribution,
+         deletion_exited,deletion_trace_valid,
          deletion_baseline_finite,deletion_residual,distortion_enabled,
          rgb_loss_srgb,deletion_rgb=result.raw_rgb,deletion_encoded_rgb=loss_rgb,
          distortion_weight,diagonal,quaternion,rotate,world_shell,
@@ -2872,6 +2897,17 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
             else
                 opacity=dr::gather<Float>(hit_records,7*hit_stride+slot,valid);
             Float before=dr::gather<Float>(hit_records,hit_before_field*hit_stride+slot,valid);
+            if (collect_max_contribution) {
+                Float contribution = before * opacity;
+                Mask finite_weight = dr::isfinite(contribution) &
+                    (contribution >= 0.f) & (contribution <= 1.f);
+                // Atomic max must not turn a NaN into the zero initializer.
+                // Preserve invalid recorded input as an unmistakable sentinel
+                // for the caller's finite/range checks before pruning.
+                contribution = dr::select(finite_weight, contribution, dr::Infinity<Float>);
+                dr::scatter_reduce(ReduceOp::Max, s.deletion_sums["max_contribution"],
+                    dr::detach(contribution), id, valid);
+            }
             Color3f grad_rgb=clean(dcolor*before*opacity);
             grad_rgb=dr::select(radiance<=0.f,dr::minimum(grad_rgb,0.f),grad_rgb);
             if(!rgb_only) grad_rgb=dr::select(is_background,Color3f(0.f),grad_rgb);

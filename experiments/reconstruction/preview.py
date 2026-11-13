@@ -63,6 +63,7 @@ class ModelConfig:
     bounds_max: tuple[float, float, float] = (1.6, 1.6, 1.6)
     bounds_padding: float = 1.02  # Falcor's actual grid is [-1.632, 1.632]^3.
     opacity_threshold: float = 0.05
+    initial_opacity: float = 0.5  # Actual seed alpha; opacity_threshold only filters PLY input.
     sh_count: int = 9  # Coefficient counts, not SH degrees.
     opacity_sh_count: int = 9
 
@@ -378,6 +379,9 @@ def validate_config(config: PreviewConfig) -> None:
         raise ValueError("Each bounds_min coordinate must be smaller than bounds_max")
     if not 0 < model.opacity_threshold < 1:
         raise ValueError("opacity_threshold must be in (0, 1)")
+    if (isinstance(model.initial_opacity, bool) or not isinstance(model.initial_opacity, (int, float))
+            or not math.isfinite(model.initial_opacity) or not 0 < model.initial_opacity < 1):
+        raise ValueError("model.initial_opacity must be finite and strictly between 0 and 1")
     if any(not isinstance(n, int) or not 1 <= n <= 16 for n in (model.sh_count, model.opacity_sh_count)):
         raise ValueError("SH coefficient counts must be integers in [1, 16]")
 

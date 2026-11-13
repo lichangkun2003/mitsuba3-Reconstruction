@@ -146,6 +146,31 @@ def prepare_dataset(config, np, *, load_points=True):
     return prepared
 
 
+def initialize_seed_opacity(model, opacity):
+    """Set fresh foreground seed alpha without changing geometry or radiance.
+
+    Native seeds have zero opacity coefficients, corresponding to alpha=0.5.
+    Retain that path for legacy defaults; other values initialize only the DC
+    coefficient as logit(alpha)/Y00, with all higher orders dormant at zero.
+    This helper is never applied to restored or subdivided model parameters.
+    """
+    if (isinstance(opacity, bool) or not isinstance(opacity, (int, float))
+            or not math.isfinite(opacity) or not 0 < opacity < 1):
+        raise ValueError("model.initial_opacity must be finite and strictly between 0 and 1")
+    if opacity == .5:
+        return model
+    import drjit as dr
+    original = model.snapshot()["opacity_sh"]
+    Float = type(original)
+    UInt = dr.uint32_array_t(Float)
+    values = dr.zeros(Float, len(original))
+    rows = dr.arange(UInt, int(model.active_voxel_count)) * int(model.opacity_sh_count)
+    dc = (math.log(opacity) - math.log1p(-opacity)) / .28209479177387814
+    dr.scatter(values, Float(dc), rows)
+    model.set_parameters({"opacity_sh": values})
+    return model
+
+
 def initialize_model(config, dataset, mi, np, *, prepared=None):
     mapping = prepared["initialization"].get("scene_mapping") if prepared is not None else "bounded"
     if mapping not in ("bounded", "world_shell"):
@@ -165,6 +190,7 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
             np.ascontiguousarray(prepared["colors"], dtype=np.float32).reshape(-1),
             prepared["resolution"], prepared["grid_min"], prepared["grid_max"],
             config.model.sh_count, config.model.opacity_sh_count, prepared["core_resolution"])
+        initialize_seed_opacity(model, getattr(config.model, "initial_opacity", .5))
         if mapping == "world_shell":
             import drjit as dr
             from reconstruction_background import initialize_background_model
@@ -184,9 +210,10 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
     center, half = (lo + hi) / 2, (hi - lo) / 2 * config.model.bounds_padding
     schedule = getattr(config, "schedule", None)
     resolution = schedule.start_resolution if schedule and schedule.enabled else config.model.grid_resolution
-    return mi.VoxelReconstruction(str(dataset / config.data.point_cloud), resolution,
+    model = mi.VoxelReconstruction(str(dataset / config.data.point_cloud), resolution,
         (center-half).tolist(), (center+half).tolist(), config.model.opacity_threshold,
         config.model.sh_count, config.model.opacity_sh_count)
+    return initialize_seed_opacity(model, getattr(config.model, "initial_opacity", .5))
 
 
 def load_views(dataset: Path, cameras_file: str, render: RenderConfig, np, *,

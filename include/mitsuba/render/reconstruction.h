@@ -59,6 +59,8 @@ public:
     static constexpr uint32_t rgb_loss_srgb_version = 1;
     /// RGB channel-mean MSE with matching adjoints and topology evidence.
     static constexpr uint32_t rgb_loss_reduction_version = 1;
+    /// Optional per-voxel maximum recorded compositing weight T_before * alpha.
+    static constexpr uint32_t max_contribution_version = 1;
     /// Progressive radiance SH with dormant coefficients and Adam degree clocks.
     static constexpr uint32_t sh_schedule_version = 2;
     /// GPU occupancy octree, including separately tagged hypothetical leaves.
@@ -207,6 +209,8 @@ public:
         std::map<std::string, UIntBuffer> growth_counts;
         /// Optional per-voxel single-removal RGB gain and ray coverage.
         /// Truncated or invalid paths abstain without affecting other rays.
+        /// Also carries max_contribution when requested. That field uses MAX,
+        /// not SUM, and retains the full voxel layout with compact gradients.
         std::map<std::string, FloatBuffer> deletion_sums;
         std::map<std::string, UIntBuffer> deletion_counts;
         /// Populated only by the diagnostic profile_stages setting.
@@ -238,6 +242,15 @@ public:
     /// rgb_loss_channel_mean=1 (default) averages RGB squared error over the
     /// three channels, including its adjoints and RGB topology gains. Explicit
     /// 0 retains the historical channel sum. Other loss terms are unchanged.
+    /// collect_max_contribution=1 returns a full per-voxel max_contribution
+    /// buffer: the largest recorded T_before * alpha over this ray batch.
+    /// This detached visibility statistic excludes sampling-PDF/loss scaling;
+    /// callers combine batches/views with MAX, not SUM. Unrecorded ray tails
+    /// are not observed. Invalid recorded weights are exposed as +infinity.
+    /// max_contribution_truncated_rays counts active rays still inside the
+    /// root when hit capacity stops them above the transmittance threshold,
+    /// or when the iteration guard is exceeded. Combine this one-element
+    /// counter with SUM; ordinary opacity stops are allowed.
     /// distortion_loss_weight optionally adds pairwise L1 separation of the
     /// recorded hard-hit contributions. Depth is the clipped ellipsoid-metric
     /// closest point, normalized by the fixed grid diagonal for legacy models.

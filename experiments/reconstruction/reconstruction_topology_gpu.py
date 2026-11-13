@@ -1,4 +1,4 @@
-"""GPU-resident RGB growth and RGB/low-opacity deletion lifecycle.
+"""GPU-resident growth and RGB/opacity/contribution deletion lifecycle.
 
 Ordinary topology updates retain rows, proposals, cooldowns and Adam on CUDA.
 When a complete replacement field would exceed free device memory, an exact
@@ -177,16 +177,19 @@ class GPUTopologyLifecycle:
         self.candidates = self.Bool(manager.candidates)
         self.cooldown_cells = self.Cell(list(manager.cooldown))
         self.cooldown_expiry = self.Int64(list(manager.cooldown.values()))
-        for name in ("pending_growth", "pending_rgb_deletion"):
+        for name in ("pending_growth", "pending_rgb_deletion", "pending_contribution_deletion"):
             pending = getattr(manager, name)
             if pending is not None:
                 self.upload_pending(pending)
+                if name == "pending_contribution_deletion":
+                    pending["truncated_rays"] = self.Cell(pending.get("truncated_rays", 0))
+                    pending["invalid_weights"] = self.UInt(pending.get("invalid_weights", 0))
 
     def upload_pending(self, pending):
         np, dr = self.manager.np, self.dr
         for name, value in list(pending.items()):
             if isinstance(value, np.ndarray):
-                cls = (self.Cell if name in ("cells", "parent_cells", "cell_indices") else
+                cls = (self.Cell if name in ("cells", "parent_cells", "cell_indices", "truncated_rays") else
                        self.UInt if np.issubdtype(value.dtype, np.integer) else
                        self.Double if value.dtype == np.float64 else self.Float)
                 pending[name] = cls(value.reshape(-1))
@@ -344,6 +347,49 @@ class GPUTopologyLifecycle:
         pending["seen_views"].add(int(view_id))
         m._device_statistics[f"rgb_{prefix}_device_views"] += 1
 
+    def observe_contribution(self, model, weights, *, view_id, epoch, truncated_rays=0):
+        m, dr, np = self.manager, self.dr, self.manager.np
+        try:
+            p = m._contribution_window(model, view_id, epoch)
+            if p is None:
+                return
+            if dr.is_array_v(type(weights)):
+                if not dr.is_float_v(type(weights)):
+                    raise ValueError("Contribution deletion weights must be floating point")
+            elif not np.issubdtype(np.asarray(weights).dtype, np.floating):
+                raise ValueError("Contribution deletion weights must be floating point")
+            values = self.Float(weights)
+            if len(values) != m.count:
+                raise ValueError("Contribution deletion requires one weight per model row")
+            if dr.is_array_v(type(truncated_rays)):
+                if not dr.is_integral_v(type(truncated_rays)) or dr.is_mask_v(type(truncated_rays)):
+                    raise ValueError("Contribution deletion requires an integer truncated-ray count")
+                truncated = truncated_rays
+            else:
+                truncated = np.asarray(truncated_rays).reshape(-1)
+                if (truncated.shape != (1,) or not np.issubdtype(truncated.dtype, np.integer) or
+                        np.issubdtype(truncated.dtype, np.bool_) or np.any(truncated < 0)):
+                    raise ValueError("Contribution deletion requires a nonnegative integer truncated-ray count")
+            if len(truncated) != 1:
+                raise ValueError("Contribution deletion requires one truncated-ray count per view")
+            valid = dr.isfinite(values) & (values >= 0) & (values <= 1)
+            invalid = self.UInt(dr.any(~valid)) if m.count else self.UInt(0)
+            if dr.is_array_v(type(truncated)):
+                invalid = invalid + self.UInt(truncated < 0)
+            # Keep validation on CUDA across views; one compact check at the
+            # boundary avoids synchronizing every evidence view with the host.
+            p["invalid_weights"] = p.get("invalid_weights", self.UInt(0)) + invalid
+            clean = dr.select(valid, values, 0)
+            p["max_contribution"] = (dr.maximum(p["max_contribution"], clean)
+                                     if "max_contribution" in p else clean)
+            p["truncated_rays"] = p.get("truncated_rays", self.Cell(0)) + self.Cell(truncated)
+            dr.eval(p["max_contribution"], p["invalid_weights"], p["truncated_rays"])
+            p["seen_views"].add(int(view_id))
+            m._device_statistics["contribution_deletion_device_views"] += 1
+        except Exception:
+            m.pending_contribution_deletion = None
+            raise
+
     def sum(self, value):
         dr = self.dr
         if not len(value):
@@ -444,6 +490,45 @@ class GPUTopologyLifecycle:
         event["deletion_rgb"] = detail
         m.pending_rgb_deletion = None
         return selected
+
+    def evaluate_contribution(self, boundary, event):
+        m, dr, cfg, p = self.manager, self.dr, self.manager.settings, self.manager.pending_contribution_deletion
+        if not m._low_contribution_deletion_due(boundary):
+            m.pending_contribution_deletion = None
+            return None
+        try:
+            matching = p is not None and p["boundary"] == boundary
+            if matching:
+                if (p["resolution"] != m.resolution or p["count"] != m.count or
+                        len(p["max_contribution"]) != m.count):
+                    raise ValueError("Contribution deletion evidence differs from the current model layout")
+                invalid = p.get("invalid_weights", self.UInt(0))
+                truncated = p.get("truncated_rays", self.Cell(0))
+                dr.eval(invalid, truncated)
+                if int(invalid[0]):
+                    raise ValueError("Contribution deletion encountered invalid compositing weights")
+                truncated_count = int(truncated[0])
+            else:
+                truncated_count = 0
+            views = len(p["seen_views"]) if matching else 0
+            complete = views == m.view_count
+            low = (p["max_contribution"] < cfg.deletion_contribution_threshold if matching else
+                   dr.zeros(self.Bool, m.count))
+            mature = self.mature(boundary)
+            selected = low & mature & complete & (truncated_count == 0) if m.count else low
+            event["deletion_contribution"] = {
+                "status": ("incomplete_views" if not complete else
+                           "skipped_truncated_paths" if truncated_count else "complete"),
+                "evidence_version": p["evidence_version"] if matching else 1,
+                "statistic": "max(T*alpha)", "threshold": cfg.deletion_contribution_threshold,
+                "views": views, "required_views": m.view_count, "tested_voxels": m.count,
+                "truncated_rays": truncated_count, "low_contribution_voxels": self.count(low),
+                "eligible_voxels": self.count(mature), "protected_voxels": self.count(~mature),
+                "qualified_voxels": self.count(selected), "confirmation_windows": 1,
+                "confirmed": self.count(selected), "deleted": 0}
+            return selected
+        finally:
+            m.pending_contribution_deletion = None
 
     def evaluate_opacity(self, model, boundary, event):
         m, dr, cfg = self.manager, self.dr, self.manager.settings
@@ -578,6 +663,7 @@ class GPUTopologyLifecycle:
 
     def remap(self, survivors, new_count, boundary):
         dr, kept = self.dr, len(survivors)
+        self.manager.pending_contribution_deletion = None
         if not new_count:
             self.fields = {name: dr.empty(type(value), 0) for name, value in self.fields.items()}
             self.candidates = dr.empty(self.Bool, 0)
@@ -718,6 +804,9 @@ class GPUTopologyLifecycle:
             "growth_evidence_requested": m._growth_due(boundary),
             "deletion_mode": m.deletion_mode,
             "deletion_level_epoch": boundary - m.level_start_epoch,
+            "deletion_start_fraction": cfg.deletion_start_fraction,
+            "deletion_start_epoch": m.deletion_start_epoch,
+            "deletion_start_pending": not m.deletion_started(boundary),
             "deletion_warmup_epochs": cfg.deletion_warmup_epochs,
             "deletion_warmup_active": boundary - m.level_start_epoch <= cfg.deletion_warmup_epochs,
             "deletion_frozen": m.deletion_frozen(boundary),
@@ -727,8 +816,11 @@ class GPUTopologyLifecycle:
             event["core_resolution"] = m.core_resolution
         if cfg.use_low_opacity_deletion:
             event["deletion_opacity_requested"] = m._low_opacity_deletion_due(boundary)
+        if cfg.use_low_contribution_deletion:
+            event["deletion_contribution_requested"] = m._low_contribution_deletion_due(boundary)
         if m.topology_frozen(boundary):
             m.pending_growth = m.pending_rgb_deletion = None
+            m.pending_contribution_deletion = None
             m._growth_world_cache = m._growth_device = m._rgb_growth_device = m._rgb_deletion_device = None
             event.update(finished=boundary >= m.schedule.total_epochs, active_voxel_count=m.count,
                          evidence_window_evaluated=False)
@@ -739,8 +831,9 @@ class GPUTopologyLifecycle:
             return self.refine(model, optimizer, boundary, event)
         rgb = self.evaluate_rgb_deletion(boundary, event)
         opacity = self.evaluate_opacity(model, boundary, event)
-        event["evidence_window_evaluated"] = rgb is not None
-        masks = [mask for mask in (rgb, opacity) if mask is not None]
+        contribution = self.evaluate_contribution(boundary, event)
+        event["evidence_window_evaluated"] = any(mask is not None for mask in (rgb, opacity, contribution))
+        masks = [mask for mask in (rgb, opacity, contribution) if mask is not None]
         checkpoint = None
         adam_survivors = None
         selected = None
@@ -779,6 +872,8 @@ class GPUTopologyLifecycle:
                     event["deletion_rgb"]["deleted"] = self.count(rgb)
                 if opacity is not None:
                     event["deletion_opacity"]["deleted"] = self.count(opacity)
+                if contribution is not None:
+                    event["deletion_contribution"]["deleted"] = self.count(contribution)
                 # Revalidation needs compact model/lifecycle row IDs, but it
                 # never reads Adam. Keep this map in the original Adam layout
                 # so a subsequent append does not migrate every moment twice.
@@ -842,6 +937,7 @@ class GPUTopologyLifecycle:
             event["topology_transfer"] = "host_staged" if host_staged else "gpu"
         selected = None
         m.pending_growth, m.pending_rgb_deletion = None, None
+        m.pending_contribution_deletion = None
         m._growth_world_cache = m._growth_device = m._rgb_growth_device = m._rgb_deletion_device = None
         if len(self.cooldown_cells):
             keep = dr.compress(self.cooldown_expiry > boundary)
@@ -878,13 +974,13 @@ class GPUTopologyLifecycle:
             expiry_chunk = expiry.read_chunk(start, count)
             cooldown.update((str(int(cell)), int(until)) for cell, until in zip(cell_chunk, expiry_chunk))
         state["cooldown"] = cooldown
-        for key in ("pending_growth", "pending_rgb_deletion"):
+        for key in ("pending_growth", "pending_rgb_deletion", "pending_contribution_deletion"):
             pending = getattr(m, key)
             if pending is None:
                 state[key] = None
                 continue
             result = dict(pending)
-            count = len(pending["cells"])
+            count = len(pending["cells"]) if "cells" in pending else pending["count"]
             for name, value in pending.items():
                 if not self.dr.is_array_v(type(value)):
                     continue
@@ -917,7 +1013,7 @@ class GPUTopologyLifecycle:
         m._background_masks = np.zeros((m.count, words), dtype=np.uint32)
         m.qualified = np.zeros(m.count, dtype=bool)
         m.cooldown = dict(zip(map(int, np.array(self.cooldown_cells)), map(int, np.array(self.cooldown_expiry))))
-        for key in ("pending_growth", "pending_rgb_deletion"):
+        for key in ("pending_growth", "pending_rgb_deletion", "pending_contribution_deletion"):
             p = getattr(m, key)
             if p is None:
                 continue

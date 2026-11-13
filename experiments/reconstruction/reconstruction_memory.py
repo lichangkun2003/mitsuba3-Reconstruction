@@ -202,7 +202,7 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
                              allocator_policy="cuda_2m", reference_image_pixels=None,
                              radiance_degree_steps=False, opacity_degree_steps=False, path_record_layout_version=0,
                              compact_path_records=True, srgb_loss=False,
-                             growth_evidence=False, max_growth_hits=8):
+                             growth_evidence=False, max_growth_hits=8, contribution_evidence=False):
     """Return named logical/allocated bytes for one view, excluding its cache.
 
     ``compact_capacity=0`` is the original N-row gradient layout. A positive
@@ -219,6 +219,9 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
     and voxel so newly enabled degrees start with independent bias correction.
     ``growth_evidence`` includes candidate records and shared RGB hit prefixes
     used to evaluate insertion-induced early stops (native evidence v5).
+    ``contribution_evidence`` reserves the full N-row per-view maximum, its
+    pending epoch window, two merge workspaces, and validation/counter storage.
+    These statistics retain the native voxel layout with compact gradients.
     """
     values = {
         "active_voxels": (active_voxels, 0), "sh_count": (sh_count, 1),
@@ -241,8 +244,8 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         raise ValueError("Reference image pixels must fit UInt32")
     if isinstance(lifecycle_epoch_bytes, bool) or lifecycle_epoch_bytes not in (4, 8):
         raise ValueError("lifecycle_epoch_bytes must be 4 or 8")
-    if not all(isinstance(value, bool) for value in (distortion, dssim, rgb_only, radiance_degree_steps, opacity_degree_steps, compact_path_records, srgb_loss, growth_evidence)):
-        raise ValueError("distortion, dssim, rgb_only, SH clock, path record and srgb_loss flags must be booleans")
+    if not all(isinstance(value, bool) for value in (distortion, dssim, rgb_only, radiance_degree_steps, opacity_degree_steps, compact_path_records, srgb_loss, growth_evidence, contribution_evidence)):
+        raise ValueError("distortion, dssim, rgb_only, SH clock, path record, srgb_loss and contribution flags must be booleans")
     round_cuda_allocation(0, allocator_policy)
 
     n = active_voxels
@@ -283,6 +286,21 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         # RGB/raw RGB, alpha/raw alpha, three loss planes, and hit_count.
         "render_result_planes": [(ray_count * 4, 12)],
     }
+    if contribution_evidence:
+        # At a merge boundary the native view output and pending epoch window
+        # can coexist with a cleaned view and the replacement maximum. Keep
+        # both workspaces even when JIT fusion or first-view aliasing saves one.
+        # Chunked callers must evaluate/release each chunk maximum to keep this
+        # allowance bounded instead of retaining every native chunk output.
+        buffers.update(
+            max_contribution_view=[(n * 4, 1)],
+            max_contribution_epoch=[(n * 4, 1)],
+            max_contribution_merge_workspace=[(n * 4, 2)],
+            max_contribution_validity_workspace=[(n, 1)],
+            # Native per-view truncated rays, epoch invalid-weight latch, and
+            # UInt64 epoch truncated-ray sum, each separately allocated.
+            max_contribution_counters=[(4, 1), (4, 1), (8, 1)],
+        )
     if radiance_degree_steps or opacity_degree_steps:
         radiance_clocks = math.isqrt(sh_count - 1) + 1 if radiance_degree_steps else 1
         opacity_clocks = math.isqrt(opacity_sh_count - 1) + 1 if opacity_degree_steps else 1
@@ -341,6 +359,7 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         "path_record_layout_version": path_record_layout_version,
         "compact_path_records": compact_records,
         "growth_evidence_records": growth_evidence,
+        "contribution_evidence": contribution_evidence,
         "allocator_policy": allocator_policy,
         "allocator_policy_requires_patched_runtime": allocator_policy == "cuda_2m",
         "buffer_groups": {name: [{"logical_bytes_each": size, "count": count}
@@ -352,12 +371,13 @@ def estimate_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         "legacy_allocated_components_bytes": legacy,
         "legacy_power_of_two_bytes": sum(legacy.values()),
         "scope": ("view with growth records" if growth_evidence else "ordinary view") +
+                 (" including scheduled contribution collection" if contribution_evidence else "") +
                  " per-buffer allocation plan; not measured dedicated VRAM or a topology-boundary peak",
         "unmodeled_storage": [
             "ray-generation inputs, native loop temporaries, and optimizer transaction workspace",
             "allocator caches, alignment, JIT buffers, and retained external aliases",
             "octree/spatial index bytes not supplied through known_index_bytes",
-            "growth/deletion vote tables, candidate models, cooldowns, and refinement old/new model overlap",
+            "other growth/deletion vote tables, candidate models, cooldowns, and refinement old/new model overlap",
             *([] if growth_evidence else ["growth candidate and RGB-prefix ray records"]),
         ],
     }
@@ -542,7 +562,7 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
                          allocator_policy="cuda_2m", reference_image_pixels=None,
                          radiance_degree_steps=False, opacity_degree_steps=False, path_record_layout_version=0,
                          compact_path_records=True, srgb_loss=False,
-                         growth_evidence=False, max_growth_hits=8):
+                         growth_evidence=False, max_growth_hits=8, contribution_evidence=False):
     """Recommend a reference-cache cap without changing training algorithms.
 
     ``gpu`` is the runtime report containing ``memory_mib`` (number or numeric
@@ -582,7 +602,8 @@ def plan_training_memory(*, active_voxels, sh_count, opacity_sh_count,
         opacity_degree_steps=opacity_degree_steps,
         path_record_layout_version=path_record_layout_version,
         compact_path_records=compact_path_records,
-        growth_evidence=growth_evidence, max_growth_hits=max_growth_hits)
+        growth_evidence=growth_evidence, max_growth_hits=max_growth_hits,
+        contribution_evidence=contribution_evidence)
     image_pixels = estimate["reference_image_pixels"]
     image_bytes = image_pixels * (3 if rgb_only else 4) * 4
     image_allocated_bytes = round_cuda_allocation(image_pixels * 4, allocator_policy) * (3 if rgb_only else 4)

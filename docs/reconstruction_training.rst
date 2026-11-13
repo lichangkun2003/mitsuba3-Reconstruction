@@ -42,15 +42,30 @@ flowers、treehill 不会自动加入，NeRF-Synthetic 场景不会被选中。P
 保持原总轮数与调度不变；报告为 ``smoke_passed``，不能当作完整实验结果。
 首轮验证包含图像读取和 JIT 初始化，耗时不代表后续普通轮速度，也不验证后期细分峰值或收敛质量。
 
-RGB-only 训练、自适应细分与低 opacity 删除（当前默认）
-------------------------------------------------------
+RGB-only 训练、自适应细分与低 opacity／低贡献删除（当前默认）
+------------------------------------------------------------
 
-正常训练统一使用 80% 的阶段边界：前 80% 的 radiance 与 opacity 都只启用 DC，
-允许细分；不设置全局拓扑 warmup，删除在全局第 20、40、60…轮检查；生长全程关闭，不准备候选或收集生长证据。
+普通 ``train.py CONFIG`` 使用 80% 的阶段边界：前 80% 的 radiance 与 opacity 都只启用 DC，
+允许细分；前 20% 不删除，中间 60% 按全局 20 轮周期检查删除；生长全程关闭，不准备候选或收集生长证据。
 最后 20% 同时停止细分、删除及其证据收集，开启全部存储的高阶 SH。连续几何参数在两阶段都继续优化。
-删除仅依据真实不透明度 ``sigmoid(Y0*b0) < 0.01``，满足一个检查窗口即可删除，
+删除依据真实不透明度 ``sigmoid(Y0*b0) < 0.01`` 或整轮最大观测贡献 ``max(T_before*alpha) < 1e-4``，
+任一条件满足一个检查窗口即可删除，
 保留新生体素 20 轮保护。RGB 收益删除与旧 alpha 冲突删除默认关闭。
 1500 轮时最后一次拓扑机会是第 1200 轮，高阶 SH 从第 1201 轮开始。
+
+当前 ``bicycle_1024.json`` 是全程 DC 对照：radiance 与 opacity 的存储系数数量均为 1，
+两个渐进 SH 开关均关闭。本次共 500 轮，第 401 轮起仍固定拓扑并衰减学习率，但不启用高阶。
+普通 ``train.py CONFIG`` 的渐进 SH 方案仍保留，旧 checkpoint 使用保存的配置。
+本次 JSON 另使用 ``topology.deletion_opacity_threshold=0.005``、``render.max_hits=32``；
+普通 ``CONFIG`` 仍为 ``0.01``、``128``，其低贡献阈值为 ``1e-4``。
+当前 JSON 仅保留低 opacity 删除，``use_low_contribution_deletion=false``、
+``deletion_mode="low_opacity"``；不收集贡献统计，也不按贡献删除。20 轮检查周期不变，普通 ``CONFIG`` 的贡献分支仍可使用。
+本次 JSON 的前景 ``model.initial_opacity`` 与背景 ``data.background_opacity`` 均为 ``0.2``；普通 ``CONFIG`` 仍为 ``0.1``。
+当前 JSON 使用 ``topology.deletion_start_fraction=0.0``：500 轮时，第 1–400 轮允许细分及低 opacity 删除，
+删除按全局 20 轮周期从第 20 轮检查至第 400 轮，第 401–500 轮固定拓扑，不细分也不删。
+普通 ``CONFIG`` 仍使用 ``deletion_start_fraction=0.2``：前 20% 不删，中间 60% 允许删除，最后 20% 固定拓扑；
+1500 轮时首次删除检查为第 320 轮，3000 轮时为第 620 轮。
+当前 JSON 的 ``training.preview_interval_epochs=20``，在第 20、40…500 轮保存首训练视角的 64 spp PNG，模型 checkpoint 不随预览周期增加。
 
 统一自适应训练（``bicycle_1024.json``）
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -61,26 +76,27 @@ RGB-only 训练、自适应细分与低 opacity 删除（当前默认）
 每片前景叶保存自己的 Morton 路径和深度；外壳仍使用世界空间混合尺寸叶，均保持椭球表示。
 
 ``topology.freeze_last_fraction=0.2`` 在最后 20% 同时关闭前后景细分、生长、删除及其证据收集。
-1500 轮时，第 1–1200 轮允许拓扑变化，第 1201–1500 轮只优化已有叶子的参数。
-自适应模式在冻结边界轮数的一半、冻结边界和训练结束各保存一次：1500 轮、冻结比例 20% 时，
-第 600、1200 轮保存 ``training/epoch-00600.npz``、``training/epoch-01200.npz``，
-第 1500 轮保存 ``model.npz``。每次保存后渲染第一个训练视角到 ``train/0000-epoch-XXXXX.png``。
-几何中心、尺度、旋转、DC 和已经开启的高阶系数在固定拓扑阶段继续更新。
+当前 JSON 的 500 轮中，第 1–400 轮允许拓扑变化，第 401–500 轮只优化已有叶子的参数。
+自适应模式在冻结边界轮数的一半、冻结边界和训练结束各保存一次：500 轮、冻结比例 20% 时，
+第 200、400 轮保存 ``training/epoch-00200.npz``、``training/epoch-00400.npz``，
+第 500 轮保存 ``model.npz``。每次保存后渲染第一个训练视角到 ``train/0000-epoch-XXXXX.png``。
+当前 DC-only JSON 在固定拓扑阶段继续更新几何中心、尺度、旋转及 DC。
 
-``training.sh_degree_weights=[8,0,2]`` 与
-``training.opacity_sh_degree_progression=true`` 让 radiance 和 opacity 同时在最后 20%
-从 DC 开放到各自存储的全部阶数。当前 JSON 中 ``model.sh_count=16`` 为 radiance
-每个 RGB 通道各保存十六个系数（到三阶），``model.opacity_sh_count=9`` 为标量 opacity
-保存九个系数（到二阶）。未开启的高阶参数及其 Adam 状态保持零，开启时使用独立阶数时钟，
-不重置已有 DC 或几何的优化历史。高阶 opacity 启用前必须已经冻结全部拓扑。
+当前 JSON 使用 ``model.sh_count=1``、``model.opacity_sh_count=1``，
+``training.sh_degree_progression=false``、``training.opacity_sh_degree_progression=false``。
+radiance 每个 RGB 通道只保存一个 DC 系数，opacity 只保存一个标量 DC，500 轮全程各向同性。
+保留的 ``training.sh_degree_weights=[8,0,2]`` 不触发阶数切换。
+仅关闭渐进开关会从第一轮启用所有存储系数，所以全程 DC 必须同时把两类系数数量设为 1。
 
 当前统一模式复用 ``background_refine_*`` 参数作为两区域共同的细分间隔、像素阈值、比例与单轮预算。
 当前 JSON 使用 ``background_refine_interval=20`` 和 ``background_refine_max_new_leaves=200000``：
 自适应细分从第 1 轮收集整轮优先级并在轮末检查，之后为第 21、41…轮，单次按最多增加 20 万片叶子的预算选择父体。
 这不是要求每次都新增 20 万片；投影阈值、成熟期、比例与容量限制仍生效，实际子体还取决于椭球覆盖。
-删除为 20 轮周期，按全局 epoch 对齐，不设置全局或层级启动等待，首次检查为第 20 轮；细分保持每 20 轮检查，不是每次拓扑事件都细分。
+当前 JSON 的低 opacity 删除在前 80% 按全局 epoch 的 20 轮周期检查，500 轮时从第 20 轮检查至第 400 轮。
+该比例只作用于删除；细分仍在第 1、21、41…轮检查，500 轮时最后一次细分检查为第 381 轮，不是每次拓扑事件都细分。
 新生及细分子体素的 20 轮保护保留，保护期内不参与删除或再次细分；初始叶子不受这段新生保护限制。
-高阶 SH 激活后的 ``optimizer.lr_sh_warmup_epochs=20`` 学习率预热保留，它独立于全局拓扑启动等待。
+可选渐进 SH 方案保留激活后 ``optimizer.lr_sh_warmup_epochs=20`` 的学习率预热，
+它独立于全局拓扑启动等待；当前 DC-only JSON 不触发高阶预热。
 当前关闭生长；其 50 轮周期仅在以后显式重新启用时生效。
 最后 20% 的统一冻结规则同时约束这三种拓扑变化。
 ``background_refine_pixel_threshold=6`` 指投影包围盒的最长边像素数，不是投影面积。
@@ -102,10 +118,11 @@ RGB-only 训练、自适应细分与低 opacity 删除（当前默认）
 
    CONFIG.training.rgb_only = True
    CONFIG.data.reference_compositing = "srgb"
-   CONFIG.model.sh_count = 9  # 普通入口默认；bicycle_1024.json 单独配置为 16。
+   CONFIG.model.sh_count = 9  # 普通入口默认；当前 bicycle_1024.json 配置为 1，全程 DC。
    CONFIG.model.opacity_sh_count = 9
    CONFIG.render.width = CONFIG.render.height = 800
    CONFIG.render.spp = 1
+   CONFIG.render.max_hits = 128
    CONFIG.render.traversal = "octree"
    CONFIG.training.num_epochs = 1500
    CONFIG.training.sh_degree_progression = True
@@ -122,9 +139,12 @@ RGB-only 训练、自适应细分与低 opacity 删除（当前默认）
    CONFIG.topology.use_rgb_deletion = False
    CONFIG.topology.use_legacy_deletion = False
    CONFIG.topology.use_low_opacity_deletion = True
+   CONFIG.topology.use_low_contribution_deletion = True
+   CONFIG.topology.deletion_contribution_threshold = 1e-4
    CONFIG.topology.deletion_opacity_threshold = 0.01
    CONFIG.topology.deletion_opacity_confirmation_windows = 1
    CONFIG.topology.deletion_warmup_epochs = 0
+   CONFIG.topology.deletion_start_fraction = 0.2
    CONFIG.topology.deletion_protection_epochs = 20
    CONFIG.topology.deletion_interval = 20
    CONFIG.topology.deletion_freeze_last_epochs = 0
@@ -163,14 +183,14 @@ alpha 的 carve。这里的“双向”指允许扩张和收缩，不是启用�
 本阶段仍使用 1 spp 的同样本残差，尚未实现多 spp 前缀估计器，也不声明其对无限采样
 平均图像 RGB 目标无偏。
 
-训练只启用低 opacity 删除，关闭生长，保留已有分辨率调度及父体到子体的分裂。
+训练启用低 opacity／低贡献删除，关闭生长，保留已有分辨率调度及父体到子体的分裂。
 分裂仍使用原有拟合与 opacity 衰减规则，本次不修改。分裂可能改变前向图像，不能视为严格
 保持渲染结果。RGB-only 去掉了 alpha 约束，RGB loss 的下降本身不能证明几何或 opacity
 唯一可辨识。当前同时关闭 ``topology.enable_growth`` 和 ``schedule.enable_coarse_growth``；
 ``topology.use_rgb_growth=True`` 仅保留算法选择，不会启用生长。
-要同时关闭删除，设置 ``topology.enable_deletion=False``。``use_rgb_deletion``、``use_legacy_deletion`` 和
-``use_low_opacity_deletion`` 分别控制 RGB 收益、旧 alpha 证据和低 opacity 删除，
-总开关关闭时均不执行。当前 RGB-only 入口仅启用低 opacity 分支；
+要同时关闭删除，设置 ``topology.enable_deletion=False``。``use_rgb_deletion``、``use_legacy_deletion``、
+``use_low_opacity_deletion`` 和 ``use_low_contribution_deletion`` 分别控制 RGB 收益、旧 alpha 证据、低 opacity 和低贡献删除，
+总开关关闭时均不执行。当前 RGB-only 入口启用后两条分支；
 设置 ``topology.enable_deletion=False`` 即可关闭删除，不影响细分设置。
 
 用已知相机生成 Mip-NeRF 360 稠密初始化点云
@@ -226,14 +246,16 @@ PatchMatch 会继续缺失的深度图。修改输入或算法选项时需用另
 渐进开启辐射颜色的 SH 阶数
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-新实验默认在前 80% 的训练轮数只开启辐射颜色的 0 阶，在最后 20% 同时开启所有存储的高阶。
+以下为普通 ``train.py CONFIG`` 保留的渐进 SH 方案及可选高阶对照；当前
+``bicycle_1024.json`` 全程仅 DC，不采用下面的高阶设置。
+渐进方案在前 80% 的训练轮数只开启辐射颜色的 0 阶，在最后 20% 同时开启所有存储的高阶。
 前景和世界空间背景共用同一阶数调度，方向性颜色使用世界空间射线方向。
 ``l=0、1、2、3`` 各有 ``1、3、5、7`` 个基函数，累计系数数为 ``1、4、9、16``。
-当前 bicycle JSON 使用 ``model.sh_count=16``，每个系数包含 RGB 三个颜色分量，
+高阶对照可使用 ``model.sh_count=16``，每个系数包含 RGB 三个颜色分量，
 即每体素保存 48 个颜色参数。``model.opacity_sh_count=9`` 独立保存九个标量系数；
 启用 ``opacity_sh_degree_progression`` 时，opacity 同样在拓扑冻结后从 DC 开放到二阶。
 
-在 JSON 中设置：
+高阶对照可在单独的 JSON 中设置：
 
 .. code-block:: json
 
@@ -274,7 +296,7 @@ PatchMatch 会继续缺失的深度图。修改输入或算法选项时需用另
 快照保存当前 ``active_sh_count``，因此中途保存的模型在预览、评价和恢复时不会
 提前使用尚未开启的高阶颜色。续训保留动量与分阶更新计数，依据原总轮数和已完成
 轮数继续调度。旧 checkpoint 缺少渐进配置时保持原先的全阶行为；底层原生模型
-也默认使用全部已存系数。新的十六系数配置用于新实验；旧九系数 checkpoint
+也默认使用全部已存系数。上述十六系数设置用于可选高阶对照；旧九系数 checkpoint
 不自动扩容，使用它自己的配置续训会保持九系数。原生 SH 调度功能要求
 ``mi.VoxelReconstruction.sh_schedule_version >= 1``；已有此构建时，修改阶段比例无需重新编译。
 
@@ -283,20 +305,21 @@ PatchMatch 会继续缺失的深度图。修改输入或算法选项时需用另
 
 当前新实验的 ``CONFIG`` 与 ``bicycle_1024.json`` 都显式启用
 ``optimizer.lr_schedule_enabled=true``，并使用相同的分组学习率。
-前期 radiance DC、中心、log-scale、旋转学习率分别为 ``0.04``、``0.015``、
-``0.03``、``0.0075``；opacity DC 为 ``0.01``。拓扑冻结前保持这些值，
+前期 radiance DC、中心、log-scale、旋转学习率分别为 ``0.08``、``0.015``、
+``0.03``、``0.0075``；opacity DC 为 ``0.02``。拓扑冻结前保持这些值，
 冻结后按全局 epoch 指数衰减，最后一轮达到峰值的 ``lr_final_factor=0.1``。
-3000 轮、``freeze_last_fraction=0.2`` 时，第 2401 轮开始进入衰减阶段。
+普通 ``CONFIG`` 的 1500 轮、``freeze_last_fraction=0.2`` 时，第 1201 轮开始进入衰减阶段；当前 JSON 为 500 轮，从第 401 轮开始衰减。
 
 高阶 radiance 与 opacity 使用独立峰值 ``lr_radiance_sh=0.004`` 和
-``lr_opacity_sh=0.001``。每个 SH 阶从实际开启时单独计龄，
+``lr_opacity_sh=0.001``；当前 DC-only JSON 中高阶全程不活跃，这些峰值字段不产生更新。
+启用高阶对照时，每个 SH 阶从实际开启时单独计龄，
 ``lr_sh_warmup_epochs=20`` 表示前 20 个活跃 epoch 线性预热到峰值，之后在
 固定拓扑阶段指数衰减，最后一轮达到该峰值的 10%，不再叠乘 DC 的衰减倍率。
 阶段 ``[8,0,2]`` 的 3000 轮示例中，第 2401 轮开始预热，第 2420 轮达到高阶峰值。
 若实验尾段短于预热长度，会缩短预热以保留最后的衰减终点；只有一个剩余 epoch
 时直接采用终点倍率。没有拓扑冻结尾段时，已有参数不衰减，高阶预热后维持峰值。
 
-Adam 单次更新上限同步设置为 radiance ``1.0``、opacity ``0.2``、中心 ``0.2``、
+Adam 单次更新上限保持为 radiance ``1.0``、opacity ``0.2``、中心 ``0.2``、
 log-scale ``0.2``；radiance 与 opacity 的 DC／高阶分别共用各自的组上限。
 旋转使用切向量更新，其范数上限为 ``0.2`` 弧度。原始梯度裁剪
 ``gradient_clip=10`` 与几何代理标量裁剪 ``geometry_grad_clamp=5`` 保留。
@@ -318,7 +341,7 @@ log-scale ``0.2``；radiance 与 opacity 的 DC／高阶分别共用各自的组
 
 在 ``CONFIG.gradient.distortion_loss_weight``、JSON 的
 ``gradient.distortion_loss_weight`` 或命令行 ``--distortion-weight`` 设置权重。
-当前新实验默认 ``0.1`` 开启此项；显式 ``0`` 关闭。通用设置类保留 ``0`` 作为旧
+普通 ``CONFIG`` 默认 ``0.1`` 开启此项；当前 DC-only JSON 显式使用 ``0`` 关闭。通用设置类保留 ``0`` 作为旧
 checkpoint 缺字段时的兼容值。该项从第一轮开始生效，升层时权重不变。
 更改权重应新开实验，续训使用 checkpoint 保存的权重，不能中途悄悄切换目标。
 需重新编译 C++，非零权重要求 ``mi.VoxelReconstruction.distortion_version >= 1``。
@@ -423,7 +446,7 @@ tangent 的导数。深度最小点位于网格段内部时使用解析导数；
 只有 RGB L2 及对应 RGB 生长／删除收益乘以 ``1/3``；D-SSIM、distortion、alpha 项的
 定义与权重保持不变。像素梯度仍按像素求和，没有额外除以 ``HW``；
 通道归一化本身不联动调整学习率或 ``grad_scale``。当前 JSON 预设因此为
-``RGB MSE + 0.2 * (1-SSIM) + 0.2 * distortion``，旧日志的 RGB loss 与总 loss
+``RGB MSE + 0.05 * (1-SSIM)``，Distortion 关闭，旧日志的 RGB loss 与总 loss
 不能和新定义直接比较。报告和每轮日志记录实际通道归一化。
 这项改动需要先增量编译原生模块及绑定：
 
@@ -459,9 +482,9 @@ L2 和 D-SSIM 都在这个浮点空间计算，不经过 PNG 或 8 位量化。s
 
 JSON 的 ``gradient.dssim_loss_weight`` 控制独立的加法权重，也可用
 ``--dssim-weight`` 覆盖。通用配置与旧 checkpoint 缺失该字段时使用 ``0``，
-保持原执行路径；``configs/bicycle_1024.json`` 显式设置 ``0.2``，可改为 ``0`` 做对照。
+保持原执行路径；普通 ``CONFIG`` 显式设置 ``0.1``，当前 ``configs/bicycle_1024.json`` 使用 ``0.05``，可改为 ``0`` 做对照。
 启用需要重新编译 C++，要求 ``mi.VoxelReconstruction.dssim_version >= 1``。
-将下面字段加入现有 ``gradient`` 对象，保留其他已有参数：
+以下为同时开启 D-SSIM 与 Distortion 的可选对照示例；当前 JSON 使用 D-SSIM ``0.05``、Distortion ``0``。将字段加入现有 ``gradient`` 对象，保留其他已有参数：
 
 .. code-block:: json
 
@@ -507,7 +530,7 @@ D-SSIM 则在通道间平均；采用 ``1-SSIM`` 定义，没有再除以 2。
 不增加跨卡图像通信，各卡梯度按实际参与视角数平均，尾批规则保持一致。
 新增工作区按单视角复用，不默认缓存全部参考图的局部均值与方差。
 
-生长及可选 RGB 删除仍按纯 RGB 单体素反事实收益投票，默认低 opacity 删除只检查 opacity；
+生长及可选 RGB 删除仍按纯 RGB 单体素反事实收益投票，默认删除检查 opacity 与最大观测贡献；
 不把图像邻域导数直接代入原来的精确单像素收益公式。
 ``training.jsonl`` 增加 ``mean_dssim_loss``、``mean_weighted_dssim_loss`` 与
 ``dssim_loss_weight``，总 ``mean_loss`` 包含该项。原生返回 ``dssim_loss``，
@@ -700,7 +723,7 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 该结果不包含训练前后向、优化器、升层和存档，不代表真实 Bicycle 或完整训练的加速比。
 
 通过后正常优化新体素的几何、radiance SH 与 DC opacity，新生体素按原成熟期等待后
-才能继续成为父体。默认删除只检查下面的低 opacity 条件，RGB 删除收益保留为可选兼容路径。
+才能继续成为父体。默认删除合并下面的低 opacity 与低贡献条件，RGB 删除收益保留为可选兼容路径。
 
 ``training.jsonl`` 的生长事件在 ``topology.growth_rgb`` 中记录归一化模式、几何／评估
 提案数和对应的不同目标格数、有效／未知射线与视角数，以及无观测、支持不足、反对、
@@ -733,13 +756,14 @@ RGB 资格，再按当时的几何检查父体与目标格是否合法；同格�
 一定淘汰它们。应通过生长数量、有效／未知证据、损失及图像对照评估此次实验。
 分裂保持不变，也不能用本次生长规则声称 RGB 已唯一确定几何。
 
-删除：低 opacity 默认规则与可选 RGB 规则
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+删除：低 opacity／低贡献默认规则与可选 RGB 规则
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-当前新实验只启用低 opacity 删除：每 20 个全局 epoch 检查真实不透明度，
-不设置全局或层级删除 warmup，首次在第 20 轮检查，随后为第 40、60…轮。
-``a < 0.01`` 一次即可删除，仍受新生保护和最后 20% 冻结约束。
-不要求 RGB 收益、支持视角或旧 alpha 冲突票，也不把未观测作为删除原因。
+普通 ``CONFIG`` 启用低 opacity／低贡献删除：前 20% 不删，中间 60% 每 20 个全局 epoch 检查真实不透明度和整轮最大观测贡献。
+不增加固定轮数的层级删除 warmup；1500 轮时首次在第 320 轮检查，随后为第 340、360…1200 轮。
+``a < 0.01`` 或完整窗口的 ``max(T_before*alpha) < 1e-4`` 一次即可删除，仍受新生保护和最后 20% 冻结约束。
+当前 DC-only JSON 仅按低 opacity 阈值 ``0.005`` 删除，贡献统计与低贡献删除均关闭；其删除起点为 ``0.0``，500 轮时从第 20 轮检查至第 400 轮，周期、新生保护和末尾冻结规则相同。
+不要求 RGB 收益、支持视角或旧 alpha 冲突票；低贡献分支额外要求全部训练视角完成且无人工路径截断。
 以下 RGB 收益公式仅用于显式开启 ``use_rgb_deletion=True`` 的兼容模式；默认不收集其证据。
 在现有命中反向循环中，令 ``T`` 为某体素命中前的透射率，``a`` 为其 opacity，
 ``c`` 为它的颜色，``B`` 为从该命中之后看向射线末端的合成颜色（包含背景），
@@ -782,7 +806,7 @@ RGB 分支要求至少 3 个支持视角、没有反对视角，且跨视角带�
 这里的反对是一个视角的可靠命中平均收益为负，不是任意单条负收益射线直接否决。
 任一视角出现非有限聚合收益时，该体素本窗口不通过。
 
-当前默认配置集中在 ``train.py`` 的 ``CONFIG.topology``，仅启用低 opacity 分支：
+当前默认配置集中在 ``train.py`` 的 ``CONFIG.topology``，合并低 opacity 与低贡献分支：
 
 .. code-block:: python
 
@@ -790,7 +814,10 @@ RGB 分支要求至少 3 个支持视角、没有反对视角，且跨视角带�
    CONFIG.topology.use_rgb_deletion = False
    CONFIG.topology.use_legacy_deletion = False
    CONFIG.topology.use_low_opacity_deletion = True
+   CONFIG.topology.use_low_contribution_deletion = True
+   CONFIG.topology.deletion_contribution_threshold = 1e-4
    CONFIG.topology.deletion_warmup_epochs = 0
+   CONFIG.topology.deletion_start_fraction = 0.2
    CONFIG.topology.deletion_interval = 20
    CONFIG.topology.deletion_protection_epochs = 20
    CONFIG.topology.deletion_freeze_last_epochs = 0
@@ -799,8 +826,9 @@ RGB 分支要求至少 3 个支持视角、没有反对视角，且跨视角带�
    CONFIG.topology.deletion_opacity_threshold = 0.01
    CONFIG.topology.deletion_opacity_confirmation_windows = 1
 
-新实验没有全局或层级删除 warmup，事件按全局每 20 轮对齐。
-初始体素最早可在第 20 轮删除，随后是第 40、60…轮；新生和细分后的体素先保护 20 个完整训练轮次。
+普通 ``CONFIG`` 按总轮数的 ``deletion_start_fraction=0.2`` 延迟删除，事件按全局每 20 轮对齐。
+初始体素在 1500 轮总计划中最早可在第 320 轮删除，3000 轮计划中最早为第 620 轮；新生和细分后的体素先保护 20 个完整训练轮次。
+该比例不影响细分启动，也不因 ``--stop-after-epochs`` 或续训而重新计算起点；旧 checkpoint 缺字段按 ``0.0`` 保留原删除行为。
 删除后的格子沿用原冷却期，避免立即被重新生长。
 删除与生长都在 epoch 边界处理，幸存体素保留 Adam 状态。
 
@@ -813,27 +841,42 @@ RGB 分支要求至少 3 个支持视角、没有反对视角，且跨视角带�
 按真实前向公式 ``a = sigmoid(Y0 * b0)`` 计算不透明度，
 一个窗口满足 ``a < deletion_opacity_threshold`` 即通过。新实验阈值为 ``0.01``：比较的是实际不透明度，
 不是 ``T*a`` 贡献、参考 alpha 或未经 sigmoid 的 SH 系数，
-当前只支持各向同性 DC opacity，因此只在前 80% 拓扑可变阶段执行；
+当前只支持各向同性 DC opacity，在配置允许删除的阶段执行（普通 ``CONFIG`` 为总进度 20%–80%，当前 JSON 为前 80%）；
 非有限参数不能作为低 opacity 证据。
 这个分支不要求 RGB 删除收益为正，因此可以清理 RGB 删除收益已接近零的透明体素。
 它不把没有命中或没有观测当作零贡献，也不额外运行前向；只有事件末的 opacity 参数读取与检查。
 
+低贡献分支在每个检查轮的正常训练前向中，为每个体素累计全部训练视角、全部训练像素上的
+``w = T_before * alpha`` 最大值。每个训练视角必须完整出现一次；分块时取 MAX，
+所有视角到齐后才以 ``max(w) < deletion_contribution_threshold`` 通过，默认阈值 ``1e-4``，
+满足一次即可删除。它与低 opacity 条件取 OR，前后景采用相同贡献判据，保留新生 20 轮保护和最后 20% 冻结。
+统计不增加追踪，且各视角之间仍更新模型参数，所以它是在线训练观测的最大值，
+不是同一个冻结模型的全数据集可见性证明。已完成全部训练视角、仍未命中的行以零观测贡献参与该近似判据。
+
+原生实现另外累计命中预算或遍历迭代保护导致的未结束路径；只要检查轮存在这种人工截断，
+整轮低贡献分支跳过，状态为 ``skipped_truncated_paths``，低 opacity 删除仍照常执行。
+未触及迭代保护的普通透射率早停仍按当前渲染语义参与统计，不据此跳过窗口；缺少训练视角则标为 ``incomplete_views`` 并保留全部低贡献候选。
+非有限或越界贡献会报错，不作为可删除的零值。贡献表按完整模型行数保存，不随紧凑梯度表改变布局。
+普通 ``CONFIG`` 的 ``render.max_hits=128`` 增加逐射线命中工作区；当前 DC-only JSON 使用 ``32``，现有显存计划使用实际预算适配。
+低贡献分支目前仅支持单卡，启用时多卡入口会明确拒绝，避免错误合并视角统计。
+
 删除仍受新生体素 20 轮保护、删除周期、冷却期和统一末尾冻结约束；旧 checkpoint 按保存的层级 warmup 续训。
 细分后重新开始保护与确认，避免直接清理经过 opacity 衰减、尚未重新优化的子体素；
 幸存体素的连续确认状态随 checkpoint 保存和恢复。
-``0.01`` 是本次实验阈值；20 轮新生保护和 20 轮检查周期仍然生效。
+``0.01`` 是普通 ``CONFIG`` 阈值，当前 DC-only JSON 使用 ``0.005``；20 轮新生保护和 20 轮检查周期仍然生效。
 通用 ``TopologySettings`` 的兼容默认值仍为 ``0.005``；训练入口的新实验显式使用 ``0.01``，
 旧 checkpoint 继续采用保存的阈值，缺失字段时采用兼容默认值。
 旧 ``--config`` 文件中显式填写的阈值、末尾冻结轮数会覆盖训练入口的新默认值，
 使用新规则时应检查这些字段并新开实验。
 低 opacity 裁剪是近似清理：
 很多低 opacity 体素仍可能共同产生可见贡献，持续低值不构成删除后图像不变的证明。
-本阶段尚未实现按 ``T * a`` 的低贡献统计裁剪，保留它作为后续独立对照。
+低贡献分支也只是观测近似；多个弱贡献体素一起删除仍可能产生可见变化。
 
 ``training.jsonl`` 的 ``topology.deletion_opacity`` 记录低 opacity 检查、保护与确认统计，
-``topology.deleted`` 为实际删除数，``deletion_mode="low_opacity"`` 表示当前默认模式。
+``topology.deletion_contribution`` 记录视角完整性、截断、阈值和贡献筛选统计，
+``topology.deleted`` 为实际删除数，``deletion_mode="low_opacity+low_contribution"`` 表示当前默认模式。
 显式启用 RGB 删除时，``topology.deletion_rgb`` 另外记录可靠／未知命中、支持／反对与确认；
-两条分支可能命中同一体素，实际删除数按合并去重后的结果计算。
+各分支可能命中同一体素，实际删除数按合并去重后的结果计算。
 这些拒绝原因可能重叠，不能求和当作被拒绝的唯一体素数。可靠比例仍仅覆盖已遇到的
 命中，未访问区域不在分母中。条件观测均值不能保证未知区域无损。
 
@@ -874,6 +917,9 @@ checkpoint 同时保存内部生长证据版本 5 和删除证据版本 2；启�
 当前配置新开实验，不在旧 checkpoint 上切换算法。
 同样，旧 checkpoint 缺少 ``use_low_opacity_deletion`` 时按 ``False`` 恢复；
 只有当前 ``train.py`` 的新实验配置默认启用低 opacity 清理，不会改变既有实验的续训行为。
+缺少 ``use_low_contribution_deletion`` 时同样按 ``False`` 恢复；新分支的未完成视角集合和
+最大贡献表随 checkpoint 保存，模型行变化后清空。启用要求重新编译后的
+``mi.VoxelReconstruction.max_contribution_version >= 1``。
 缺少 ``use_legacy_deletion`` 时保留兼容默认 ``True``，缺少 ``interval_alignment`` 时按
 ``"warmup"`` 恢复相对周期；当前新实验显式设置为 ``False`` 与 ``"global"``。
 从仓库目录启动新的单卡实验：
@@ -884,7 +930,7 @@ checkpoint 同时保存内部生长证据版本 5 和删除证据版本 2；启�
      --rgb-only --dataset datasets/lego --epochs 1000 --chunk-size 0 \
      --eval-spp 64 --eval-train-max-views 0 --eval-test-max-views 0
 
-在已经分配同节点两张 GPU 的 Linux Slurm 作业内启动新的双卡实验：
+关闭 ``topology.use_low_contribution_deletion`` 后，可在已分配同节点两张 GPU 的 Linux Slurm 作业内启动双卡实验：
 
 .. code-block:: bash
 
@@ -896,9 +942,9 @@ checkpoint 同时保存内部生长证据版本 5 和删除证据版本 2；启�
 两条命令都自动创建新的实验目录。需要短跑时添加 ``--stop-after-epochs 10``，保持
 ``--epochs 1000``，避免改变完整调度。训练后的 64 spp 只用于评价出图，不改变训练 spp。
 多卡平台要求和资源分配方式见下文“同节点 N 张 GPU 训练与评价”。
-十轮不会到达第 20 轮的首次删除检查，但自适应细分可从第 1 轮检查；默认生长全程关闭。
-可短跑 40 轮覆盖第 20、40 轮的前两次删除检查，
-是否删除取决于低 opacity 和保护条件。从仓库根目录执行 Windows 短跑：
+十轮和四十轮都不会进入新实验的删除阶段，但自适应细分可从第 1 轮检查；默认生长全程关闭。
+1000 轮总计划需要短跑至第 240 轮，才能覆盖第 220、240 轮的前两次删除检查；
+是否删除取决于 opacity、完整贡献窗口和保护条件。下面的四十轮命令只验证优化与细分，从仓库根目录执行：
 
 .. code-block:: powershell
 
@@ -993,7 +1039,16 @@ COLMAP 场景使用无界模式与黑色背景。数据格式不能保证物理�
 
    CONFIG.data.scene_mode = "auto"
    CONFIG.data.background_shell_levels = 5
-   CONFIG.data.background_opacity = 0.5
+   CONFIG.data.background_opacity = 0.1
+   CONFIG.model.initial_opacity = 0.1
+
+普通 ``CONFIG`` 的前景点云种子与背景初始实际不透明度均为 ``0.1``；当前 DC-only JSON 两者均为 ``0.2``，用
+``b0 = logit(opacity) / Y00`` 写入 DC，其他 opacity SH 系数初始为零。
+较低初值减少早期遮挡，让射线有机会命中更多后方体素；实际梯度还取决于透射率、
+opacity 和图像残差。``model.opacity_threshold=0.05`` 是 PLY 导入筛选，
+不用于设置初始 opacity，也不等于训练删除阈值 ``0.01``。
+该设置只应用于全新初始化；细分子体素沿用已有拟合继承，恢复 checkpoint 不重置参数。
+旧配置缺少 ``model.initial_opacity`` 时按 ``0.5`` 兼容，不自动套用新实验初值。
 
 无界场景使用 ``scene_mapping="world_shell"``。核心范围沿用相机位姿确定的立方体，
 仅做统一平移、旋转和缩放，不压缩坐标。核心内点云初始化前景椭球；核心外点不压到边界。
@@ -1034,12 +1089,12 @@ B=2 的兼容模式初始化时所有背景叶子都分配为非空。
 均匀分成八个候选子立方体，并按前景规则拟合父椭球在各子盒内的几何；不与父椭球
 相交或无法拟合的子叶不分配。B=2 的八壳背景容量上限为 ``448 -> 3584 -> 28672``，实际数量
 可更小。子叶继承全部 radiance SH，并像前景新子体素一样重置 Adam 状态。
-SH 激活仍按全局训练进度进行：``sh_degree_weights=[8,0,2]`` 时前 80% 只有 DC，
+启用渐进 SH 对照时，SH 激活按全局训练进度进行：``sh_degree_weights=[8,0,2]`` 时前 80% 只有 DC，
 最后 20% 前景、背景一起开启全部存储的高阶；1500 轮对应第 1201 轮开始，
 九系数模型启用到二阶，十六系数模型启用到三阶。
 该旧模式的背景不做邻居生长或回填，已删除的父叶子不会因升层重新生成。
-旧检查点沿用保存的 RGB／低 opacity 删除设置；新实验默认在前 80% 按全局 20 轮周期
-检查低 opacity，最后 20% 统一停止删除。
+旧检查点沿用保存的 RGB／低 opacity 删除设置；普通 ``CONFIG`` 在总进度 20%–80% 按全局 20 轮周期
+检查低 opacity／低贡献，当前 JSON 在前 80% 仅检查低 opacity，最后 20% 均停止删除。
 
 保持现有逐叶 alpha 渲染，新椭球背景的 opacity 拟合与前景使用相同的
 ``opacity_optical_depth_scale``。旧占用盒检查点继续使用半光学厚度分裂规则。
@@ -1104,7 +1159,7 @@ j 按外盒 x、y、z 顺序枚举并跳过中央八格。子码使用 S 层 xyz
 排序及少量地址分组仍在CPU完成，初始化和CPU参考实现保留原路径。
 拟合前按全部候选子叶的保守上界预检一次显存，提交前按实际数量再检查一次，
 不在每个小批次重复清理缓存或查询设备。每次细分记录筛选、拟合和状态迁移的分项耗时。
-背景在前 80% 与前景一起参与默认低 opacity 删除，遵守暖身、20 轮保护和全局 20 轮周期；
+普通 ``CONFIG`` 的背景在总进度 20%–80% 与前景一起参与低 opacity／低贡献删除；当前 JSON 的前后景在前 80% 仅参与低 opacity 删除，均遵守 20 轮新生保护和全局 20 轮周期；
 最后 20% 停止删除。RGB 删除仅在显式启用其兼容开关时参与。
 邻格生长支持不同叶尺寸、壳边界和核心接口，冷却及占用检查均覆盖完整空间区间。
 候选生成的动态批次偏移、二分查找边界和展开长度使用设备标量，避免拓扑变化时
@@ -1167,7 +1222,8 @@ Adam 回归覆盖密集、设备稀疏、紧凑与参考实现。旧 Distortion�
    CONFIG.data.point_cloud = "init_points.ply"
    CONFIG.data.scene_mode = "auto"  # 合成场景有界白底；COLMAP 无界黑底
    CONFIG.data.background_shell_levels = 5  # 每壳初始56叶，随前景升层八分裂
-   CONFIG.data.background_opacity = 0.5
+   CONFIG.data.background_opacity = 0.1
+   CONFIG.model.initial_opacity = 0.1
    CONFIG.data.cameras = "transforms_train.json"
    CONFIG.render.width = 800
    CONFIG.render.height = 800
@@ -2279,7 +2335,7 @@ checkpoint；新的上述实验保存 ``training/epoch-00010.npz``。到达这�
 
 两个命令分别自动分配实验目录。先比较预热后的完整普通轮时间，再单独比较拓扑事件轮。
 批次更新与单卡逐视角更新的轨迹不同，需比较收敛与最终评价，不能要求对应参数完全一致；
-也不能只根据每轮时间判断算法质量。默认生长全程关闭；十轮短跑不覆盖第 20 轮开始的删除事件。
+也不能只根据每轮时间判断算法质量。默认生长全程关闭；十轮短跑不覆盖总进度 20% 之后才开启的删除事件。
 单卡入口即使看见两个 GPU，也只使用一张卡，并保留调度器环境。
 
 短测试确认后，在有足够剩余作业时间的终端开启新的完整双卡实验：
@@ -2371,8 +2427,8 @@ Checkpoint 与恢复
 
 统一自适应模式（``schedule.refinement="adaptive"``）保存三次：冻结边界轮数的一半、冻结边界、最终。
 冻结边界为 ``floor(num_epochs * (1 - topology.freeze_last_fraction))``，一半轮数向下取整。
-当前 1500 轮、冻结比例 20% 时，计划为 600、1200、1500；前两次写入
-``training/epoch-00600.npz`` 和 ``training/epoch-01200.npz``，最后一次只写 ``model.npz``。
+当前 JSON 为 500 轮、冻结比例 20%，计划为 200、400、500；前两次写入
+``training/epoch-00200.npz`` 和 ``training/epoch-00400.npz``，最后一次只写 ``model.npz``。
 总轮数或冻结比例改变时自动重算；极短训练的边界至少为第 1 轮，重合边界只保存一次。
 中间保存发生在本轮拓扑更新完成后，包含完整模型、Adam、随机数和生命周期状态，
 ``pending_epoch_transition=false``。恢复后继续按原总轮数和冻结边界的计划保存，不从恢复点重新计时。
@@ -2489,11 +2545,22 @@ COLMAP 数据集中的相机全局索引不一定为 0。
 若缺失也不把恢复后的模型当作初始化模型重新出图。``--skip-evaluation`` 同时关闭此功能。
 
 统一自适应模式在每次检查点成功写入后，保存同一模型的
-``train/0000-epoch-{completed:05d}.png``。当前计划生成 ``0000-epoch-00600.png``、
-``0000-epoch-01200.png``、``0000-epoch-01500.png``。这些图使用初始化图相同的第一个
+``train/0000-epoch-{completed:05d}.png``。当前 JSON 的 checkpoint 计划生成 ``0000-epoch-00200.png``、
+``0000-epoch-00400.png``、``0000-epoch-00500.png``。这些图使用初始化图相同的第一个
 训练相机、``evaluation.spp``、分辨率和固定评价随机种子，不消耗训练随机数。
 ``training-report.json`` 的 ``epoch_checkpoints`` 和 ``checkpoint_renders`` 按轮数记录模型和图片路径。
 仅 rank 0 保存和出图；``--skip-evaluation`` 关闭图片但仍保存模型。
+
+当前 JSON 已设置 ``training.preview_interval_epochs=20``，或在命令末尾显式加 ``--preview-every 20``，
+渲染第 20、40…500 轮的首训练视角，保存为 ``train/0000-epoch-XXXXX.png``；此周期不增加模型 checkpoint。
+通用可选示例是训练命令加 ``--preview-every 100``，或设置 ``training.preview_interval_epochs=100``，
+每完成 100 个 epoch 渲染同一个首训练视角，保存为
+``train/0000-epoch-00100.png``、``train/0000-epoch-00200.png`` 等。
+默认间隔为 0，不增加周期渲染。预览在拓扑变更提交后进行，使用评价的 spp（默认 64）
+和固定种子，不推进训练随机序列，也不增加模型 checkpoint。
+同轮 checkpoint 已出图时复用；最终轮或显式短跑停止轮不会重复渲染。
+仅 rank 0 出图，其他进程同步等待；``--skip-evaluation`` 同样关闭周期预览。
+``training-report.json`` 的 ``periodic_renders`` 保存每次实际相机索引、路径和渲染耗时。
 最终训练集、测试集的全视角评价继续执行，epoch 对照图不会被最终评价覆盖。
 
 旧整体升层模式启用多层调度时，每层最后一个 epoch 的全部训练视角更新完、执行升层之前，
