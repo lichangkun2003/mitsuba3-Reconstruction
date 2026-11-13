@@ -31,7 +31,9 @@
     "bounds_padding": 1.02,
     "opacity_threshold": 0.05,
     "initial_opacity": 0.5,
-    "sh_count": 16,
+    "radiance_representation": "octahedral_scale",
+    "radiance_resolution": 5,
+    "sh_count": 26,
     "opacity_sh_count": 9
   },
   "render": {
@@ -92,7 +94,7 @@
     "max_growth_hits": 8
   },
   "optimizer": {
-    "lr_radiance": 0.02,
+    "lr_radiance": 0.005641895835477563,
     "lr_opacity": 0.005,
     "lr_center": 0.015,
     "lr_log_scale": 0.03,

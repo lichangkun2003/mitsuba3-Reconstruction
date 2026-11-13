@@ -63,6 +63,8 @@ public:
     static constexpr uint32_t max_contribution_version = 1;
     /// Progressive radiance SH with dormant coefficients and Adam degree clocks.
     static constexpr uint32_t sh_schedule_version = 2;
+    /// Real RGB base times a bilinear, seam-wrapped octahedral RGB scale map.
+    static constexpr uint32_t octahedral_radiance_version = 1;
     /// GPU occupancy octree, including separately tagged hypothetical leaves.
     static constexpr uint32_t octree_version = 1;
     /// Device-resident compact Adam, including transactional moment updates.
@@ -80,7 +82,9 @@ public:
                         const std::array<float, 3> &grid_min,
                         const std::array<float, 3> &grid_max,
                         double opacity_threshold = .05,
-                        uint32_t sh_count = 9, uint32_t opacity_sh_count = 9);
+                        uint32_t sh_count = 9, uint32_t opacity_sh_count = 9,
+                        const std::string &radiance_representation = "sh",
+                        uint32_t radiance_resolution = 5);
 
     /// Plain XYZ and sRGB triples already expressed in the renderer frame.
     VoxelReconstruction(const float *positions, const float *colors, size_t point_count,
@@ -89,7 +93,9 @@ public:
                         uint32_t sh_count = 9, uint32_t opacity_sh_count = 9,
                         uint32_t core_resolution = 0, uint32_t background_shell_levels = 0,
                         uint32_t background_subdivision_level = 0,
-                        bool background_use_ellipsoid = true, bool background_adaptive = false);
+                        bool background_use_ellipsoid = true, bool background_adaptive = false,
+                        const std::string &radiance_representation = "sh",
+                        uint32_t radiance_resolution = 5);
 
     VoxelReconstruction(uint32_t resolution,
                         const std::array<float, 3> &grid_min,
@@ -99,7 +105,9 @@ public:
                         uint32_t sh_count = 9, uint32_t opacity_sh_count = 9,
                         uint32_t core_resolution = 0, uint32_t background_shell_levels = 0,
                         uint32_t background_subdivision_level = 0,
-                        bool background_use_ellipsoid = true, bool background_adaptive = false);
+                        bool background_use_ellipsoid = true, bool background_adaptive = false,
+                        const std::string &radiance_representation = "sh",
+                        uint32_t radiance_resolution = 5);
 
     /// Replace continuous parameters without changing occupancy or array sizes.
     void set_parameters(const std::map<std::string, FloatBuffer> &parameters);
@@ -188,6 +196,8 @@ public:
     void set_active_sh_count(uint32_t count);
     void set_active_opacity_sh_count(uint32_t count);
     std::string native_scene_mapping() const { return m_scene_mapping; }
+    std::string radiance_representation() const { return m_octahedral_radiance ? "octahedral_scale" : "sh"; }
+    uint32_t radiance_resolution() const { return m_radiance_resolution; }
 
     struct TrainingResult {
         Color3f rgb, raw_rgb;
@@ -316,6 +326,10 @@ public:
     MI_DECLARE_CLASS(VoxelReconstruction)
 
 private:
+    void validate_radiance_layout() const;
+    /// SH returns its unclamped sum. Octahedral mode returns max(base,0)*scale.
+    Color3f radiance_value(const FloatBuffer &parameters, const UInt32 &id,
+                          const Vector3f &view, const Mask &active) const;
     using SpatialTree = CompactReconstructionTree<UIntBuffer, IntBuffer>;
     struct RaySegment {
         Point3f origin;
@@ -379,6 +393,8 @@ private:
 
     uint32_t m_resolution, m_core_resolution, m_active_count, m_sh_count, m_active_sh_count,
              m_opacity_sh_count, m_active_opacity_sh_count;
+    bool m_octahedral_radiance = false;
+    uint32_t m_radiance_resolution = 5;
     std::string m_scene_mapping = "bounded";
     uint32_t m_background_shell_levels = 0, m_background_subdivision_level = 0;
     bool m_background_use_ellipsoid = true, m_background_adaptive = false;

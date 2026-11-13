@@ -64,8 +64,10 @@ class ModelConfig:
     bounds_padding: float = 1.02  # Falcor's actual grid is [-1.632, 1.632]^3.
     opacity_threshold: float = 0.05
     initial_opacity: float = 0.5  # Actual seed alpha; opacity_threshold only filters PLY input.
-    sh_count: int = 9  # Coefficient counts, not SH degrees.
+    sh_count: int = 9  # RGB storage slots: SH coefficients or 1 + direction-map texels.
     opacity_sh_count: int = 9
+    radiance_representation: str = "sh"  # Legacy default for old configs/checkpoints.
+    radiance_resolution: int = 5  # N x N octahedral scale map; ignored by SH rendering.
 
 
 
@@ -382,8 +384,10 @@ def validate_config(config: PreviewConfig) -> None:
     if (isinstance(model.initial_opacity, bool) or not isinstance(model.initial_opacity, (int, float))
             or not math.isfinite(model.initial_opacity) or not 0 < model.initial_opacity < 1):
         raise ValueError("model.initial_opacity must be finite and strictly between 0 and 1")
-    if any(not isinstance(n, int) or not 1 <= n <= 16 for n in (model.sh_count, model.opacity_sh_count)):
-        raise ValueError("SH coefficient counts must be integers in [1, 16]")
+    from reconstruction_sh_schedule import radiance_model_layout
+    radiance_model_layout(model)
+    if type(model.opacity_sh_count) is not int or not 1 <= model.opacity_sh_count <= 16:
+        raise ValueError("Opacity SH coefficient count must be an integer in [1, 16]")
 
 
 def validate_traversal(render, mi, report=None):

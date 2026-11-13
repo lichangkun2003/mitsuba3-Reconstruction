@@ -75,32 +75,37 @@ MI_PY_EXPORT(VoxelReconstruction) {
     auto cls = nb::class_<Model, Object>(m, "VoxelReconstruction", nb::dynamic_attr(),
         "Point-cloud voxel ellipsoids with the Falcor NoLightTransport forward model.")
         .def(nb::init<const std::string &, uint32_t, const std::array<float, 3> &,
-                     const std::array<float, 3> &, double, uint32_t, uint32_t>(),
+                     const std::array<float, 3> &, double, uint32_t, uint32_t,
+                     const std::string &, uint32_t>(),
              "filename"_a, "resolution"_a, "grid_min"_a, "grid_max"_a,
              "opacity_threshold"_a = .05, "sh_count"_a = 9, "opacity_sh_count"_a = 9,
+             "radiance_representation"_a = "sh", "radiance_resolution"_a = 5,
              nb::call_guard<nb::gil_scoped_release>())
         .def_static("from_points", [](const PointArray &positions, const PointArray &colors,
                  uint32_t resolution, const std::array<float, 3> &grid_min,
                  const std::array<float, 3> &grid_max, uint32_t sh_count,
                  uint32_t opacity_sh_count, uint32_t core_resolution, uint32_t background_shell_levels,
-                 uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive) {
+                 uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive,
+                 const std::string &radiance_representation, uint32_t radiance_resolution) {
             if (!positions.size() || positions.size() % 3 || colors.size() != positions.size())
                 throw nb::value_error("from_points(): expected nonempty flat XYZ and RGB arrays of equal length");
             nb::gil_scoped_release release;
             return new Model(positions.data(), colors.data(), positions.size() / 3,
                              resolution, grid_min, grid_max, sh_count, opacity_sh_count,
                              core_resolution, background_shell_levels, background_subdivision_level,
-                             background_use_ellipsoid, background_adaptive);
+                             background_use_ellipsoid, background_adaptive, radiance_representation, radiance_resolution);
         }, "positions"_a.noconvert(), "colors"_a.noconvert(), "resolution"_a,
            "grid_min"_a, "grid_max"_a, "sh_count"_a = 9, "opacity_sh_count"_a = 9,
            "core_resolution"_a = 0, "background_shell_levels"_a = 0, "background_subdivision_level"_a = 0,
-           "background_use_ellipsoid"_a = true, "background_adaptive"_a = false, nb::rv_policy::take_ownership,
+           "background_use_ellipsoid"_a = true, "background_adaptive"_a = false,
+           "radiance_representation"_a = "sh", "radiance_resolution"_a = 5, nb::rv_policy::take_ownership,
            "Initialize from flat CPU float32 XYZ and sRGB arrays in the renderer frame.")
         .def_static("from_state", [](uint32_t resolution,
                  const std::array<float, 3> &grid_min,
                  const std::array<float, 3> &grid_max, const nb::dict &state,
                  uint32_t sh_count, uint32_t opacity_sh_count, uint32_t core_resolution, uint32_t background_shell_levels,
-                 uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive) {
+                 uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive,
+                 const std::string &radiance_representation, uint32_t radiance_resolution) {
             if (!state.contains("cell_indices"))
                 throw nb::value_error("from_state(): missing cell_indices");
             typename Model::CellBuffer cells;
@@ -116,10 +121,12 @@ MI_PY_EXPORT(VoxelReconstruction) {
             }
             return new Model(resolution, grid_min, grid_max, cells,
                              parameters, sh_count, opacity_sh_count, core_resolution, background_shell_levels,
-                             background_subdivision_level, background_use_ellipsoid, background_adaptive);
+                             background_subdivision_level, background_use_ellipsoid, background_adaptive,
+                             radiance_representation, radiance_resolution);
         }, "resolution"_a, "grid_min"_a, "grid_max"_a, "state"_a,
            "sh_count"_a = 9, "opacity_sh_count"_a = 9, "core_resolution"_a = 0, "background_shell_levels"_a = 0, "background_subdivision_level"_a = 0,
            "background_use_ellipsoid"_a = true, "background_adaptive"_a = false,
+           "radiance_representation"_a = "sh", "radiance_resolution"_a = 5,
            nb::rv_policy::take_ownership)
         .def("set_parameters", &Model::set_parameters, "parameters"_a,
              "Replace continuous parameter buffers atomically after shape/finite validation.")
@@ -318,6 +325,8 @@ MI_PY_EXPORT(VoxelReconstruction) {
         .def_prop_ro("active_sh_count", &Model::active_sh_count)
         .def_prop_ro("active_opacity_sh_count", &Model::active_opacity_sh_count)
         .def_prop_ro("opacity_sh_count", &Model::opacity_sh_count)
+        .def_prop_ro("radiance_representation", &Model::radiance_representation)
+        .def_prop_ro("radiance_resolution", &Model::radiance_resolution)
         .def_prop_ro("grid_min", &Model::grid_min)
         .def_prop_ro("grid_max", &Model::grid_max)
         .def_prop_ro("voxel_size", &Model::voxel_size)
@@ -345,6 +354,7 @@ MI_PY_EXPORT(VoxelReconstruction) {
     cls.attr("rgb_loss_reduction_version") = nb::int_(Model::rgb_loss_reduction_version);
     cls.attr("max_contribution_version") = nb::int_(Model::max_contribution_version);
     cls.attr("sh_schedule_version") = nb::int_(Model::sh_schedule_version);
+    cls.attr("octahedral_radiance_version") = nb::int_(Model::octahedral_radiance_version);
     cls.attr("octree_version") = nb::int_(Model::octree_version);
     cls.attr("optimizer_device_version") = nb::int_(Model::optimizer_device_version);
     cls.attr("learning_rate_schedule_version") = nb::int_(Model::learning_rate_schedule_version);

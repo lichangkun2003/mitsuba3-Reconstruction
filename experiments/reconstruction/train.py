@@ -826,6 +826,7 @@ def training_memory_plan(config, model, report, view_count, *, world_size=1,
         compact = compact_capacity_override
     arguments = dict(active_voxels=count,
         sh_count=int(model.sh_count), opacity_sh_count=int(model.opacity_sh_count),
+        radiance_representation=getattr(model, "radiance_representation", "sh"),
         radiance_degree_steps=config.training.sh_degree_progression or config.optimizer.lr_schedule_enabled,
         opacity_degree_steps=config.training.opacity_sh_degree_progression or config.optimizer.lr_schedule_enabled,
         compact_capacity=compact, ray_count=effective_chunk_size(config),
@@ -1602,7 +1603,8 @@ def prepare_training_output(config, resume_path=None, checkpoint_config=None):
 def normalized_algorithm_group(name, values):
     """Compare legacy saves with explicit defaults, without changing algorithms."""
     if name == "model" and values is not None:
-        return {"initial_opacity": ModelConfig().initial_opacity, **values}
+        return {"initial_opacity": ModelConfig().initial_opacity,
+                "radiance_representation": "sh", "radiance_resolution": 5, **values}
     if name == "render" and values is not None:
         # Traversal is an acceleration choice and can change on resume; it does
         # not change leaf shading, gradients, candidate evidence, or sampling.
@@ -2792,7 +2794,10 @@ def run_training(distributed=None):
             evidence_ray_report = read_evidence_rays(evidence_ray_totals)
             entry = {"epoch": epoch+1, "global_step": global_step, "mean_loss": epoch_loss / len(views),
                      "active_sh_count": active_sh_count,
-                     "active_sh_degree": math.isqrt(active_sh_count - 1),
+                     "radiance_representation": getattr(model, "radiance_representation", "sh"),
+                     "active_sh_degree": (math.isqrt(active_sh_count - 1)
+                         if getattr(model, "radiance_representation", "sh") == "sh" else None),
+                     "radiance_directional_active": active_sh_count > 1,
                      "active_opacity_sh_count": active_opacity_sh_count,
                      "active_opacity_sh_degree": math.isqrt(active_opacity_sh_count - 1),
                      "topology_frozen": topology.topology_frozen(epoch + 1),

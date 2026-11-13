@@ -142,7 +142,7 @@ class FalcorOptimizer:
                 or any(type(value) not in (int, float) or not math.isfinite(value)
                        or not 0 <= value <= 3.4028234663852886e38 for value in rates)):
             raise ValueError("Learning rates must contain ten finite nonnegative float32 values")
-        if self.sh_count > 16 or self.opacity_sh_count > 9:
+        if (self.radiance_representation == "sh" and self.sh_count > 16) or self.opacity_sh_count > 9:
             raise ValueError("Learning-rate packs support up to 16 radiance and 9 opacity coefficients")
         values = tuple(float(value) for value in rates)
         if values == self._learning_rate_values:
@@ -203,9 +203,13 @@ class FalcorOptimizer:
         self.clear_replay()
         self.update_healthy = self.mi.Bool(True)
         self.count = int(model.active_voxel_count)
+        self.radiance_representation = getattr(model, "radiance_representation", "sh")
         self.sh_count = int(model.sh_count)
         self.active_sh_count = int(getattr(model, "active_sh_count", self.sh_count))
-        self.sh_degree_count = math.isqrt(self.sh_count - 1) + 1
+        # Octahedral storage has two optimization groups: RGB base and every
+        # directional log-scale. Its table entries are not spherical harmonics.
+        self.sh_degree_count = (2 if self.radiance_representation == "octahedral_scale"
+                                else math.isqrt(self.sh_count - 1) + 1)
         self.radiance_degree_steps |= self.active_sh_count < self.sh_count
         self.opacity_sh_count = int(model.opacity_sh_count)
         self.active_opacity_sh_count = int(getattr(model, "active_opacity_sh_count", self.opacity_sh_count))

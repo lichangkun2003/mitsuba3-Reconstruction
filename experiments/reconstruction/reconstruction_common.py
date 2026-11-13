@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 
 from reconstruction_color import reference_from_bitmap, validate_reference_compositing
-from reconstruction_sh_schedule import restore_sh_state, sh_model_metadata
+from reconstruction_sh_schedule import radiance_model_layout, restore_sh_state, sh_model_metadata
 from reconstruction_world_shell import (configure_world_shell_model, require_world_shell_native,
                                         validate_world_shell_layout, world_shell_ray_maxt,
                                         world_shell_metadata_layout, world_shell_metadata_geometry,
@@ -172,6 +172,9 @@ def initialize_seed_opacity(model, opacity):
 
 
 def initialize_model(config, dataset, mi, np, *, prepared=None):
+    radiance_mode, radiance_resolution, _ = radiance_model_layout(config.model)
+    radiance_options = dict(radiance_representation=radiance_mode,
+                            radiance_resolution=radiance_resolution)
     mapping = prepared["initialization"].get("scene_mapping") if prepared is not None else "bounded"
     if mapping not in ("bounded", "world_shell"):
         raise ValueError("Compressed scene mappings are no longer supported")
@@ -189,7 +192,8 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
             np.ascontiguousarray(prepared["positions"], dtype=np.float32).reshape(-1),
             np.ascontiguousarray(prepared["colors"], dtype=np.float32).reshape(-1),
             prepared["resolution"], prepared["grid_min"], prepared["grid_max"],
-            config.model.sh_count, config.model.opacity_sh_count, prepared["core_resolution"])
+            config.model.sh_count, config.model.opacity_sh_count, prepared["core_resolution"],
+            **radiance_options)
         initialize_seed_opacity(model, getattr(config.model, "initial_opacity", .5))
         if mapping == "world_shell":
             import drjit as dr
@@ -212,7 +216,7 @@ def initialize_model(config, dataset, mi, np, *, prepared=None):
     resolution = schedule.start_resolution if schedule and schedule.enabled else config.model.grid_resolution
     model = mi.VoxelReconstruction(str(dataset / config.data.point_cloud), resolution,
         (center-half).tolist(), (center+half).tolist(), config.model.opacity_threshold,
-        config.model.sh_count, config.model.opacity_sh_count)
+        config.model.sh_count, config.model.opacity_sh_count, **radiance_options)
     return initialize_seed_opacity(model, getattr(config.model, "initial_opacity", .5))
 
 
@@ -444,6 +448,8 @@ def restore_model(checkpoint, mi):
     _validate_model_metadata(metadata)
     mapping = metadata.get("scene_mapping", "bounded")
     options = ({"core_resolution": metadata["core_resolution"]} if "core_resolution" in metadata else {})
+    radiance_mode, radiance_resolution, _ = radiance_model_layout(metadata)
+    options.update(radiance_representation=radiance_mode, radiance_resolution=radiance_resolution)
     if mapping == "world_shell":
         require_world_shell_native(mi.VoxelReconstruction)
         mode = metadata.get("background_resolution_mode")

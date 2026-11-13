@@ -70,9 +70,16 @@ def _validate_model_metadata(metadata):
     elif any(name in metadata for name in ("background_shell_levels", "background_refinement",
                                            "background_subdivision_level", "world_shell_version", "background_geometry")):
         raise ValueError("Bounded models cannot contain background shell metadata")
-    sh = _integer(metadata["sh_count"], "sh_count", 1, 16)
+    from reconstruction_sh_schedule import radiance_model_layout
+    representation, _, sh = radiance_model_layout(metadata)
+    if representation == "octahedral_scale":
+        if "radiance_resolution" not in metadata:
+            raise ValueError("Octahedral model metadata must declare radiance_resolution")
+        _integer(metadata.get("octahedral_radiance_version", 1), "octahedral_radiance_version", 1, 1)
     if "active_sh_count" in metadata:
-        _integer(metadata["active_sh_count"], "active_sh_count", 1, sh)
+        active = _integer(metadata["active_sh_count"], "active_sh_count", 1, sh)
+        if representation == "octahedral_scale" and active not in (1, sh):
+            raise ValueError("Octahedral active_sh_count must be 1 or the full radiance storage stride")
     opacity_sh = _integer(metadata["opacity_sh_count"], "opacity_sh_count", 1, 16)
     if "active_opacity_sh_count" in metadata:
         _integer(metadata["active_opacity_sh_count"], "active_opacity_sh_count", 1, opacity_sh)
@@ -92,6 +99,15 @@ def _validate_mapping_config(metadata, config):
                                             world_shell_metadata_geometry, background_initial_subdivision)
     data = config.get("data", {})
     model = config.get("model", {})
+    if model:
+        actual_radiance = metadata.get("radiance_representation", "sh")
+        if model.get("radiance_representation", "sh") != actual_radiance:
+            raise ValueError("Checkpoint radiance_representation differs between model and configuration")
+        if actual_radiance == "octahedral_scale":
+            if model.get("radiance_resolution", 5) != metadata["radiance_resolution"]:
+                raise ValueError("Checkpoint radiance_resolution differs between model and configuration")
+            if "sh_count" in model and model["sh_count"] != metadata["sh_count"]:
+                raise ValueError("Checkpoint octahedral storage stride differs from configuration")
     reject_removed_background_fields(data)
     reject_removed_background_fields(model)
     initialization = data.get("initialization") or {}

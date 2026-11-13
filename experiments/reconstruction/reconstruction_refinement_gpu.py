@@ -117,9 +117,10 @@ def _refine(checkpoint, config, max_active_voxels, dr, *, before_allocate=None):
     rows = dr.arange(U, total)
     sh_count = metadata["sh_count"]
     result["radiance_sh"] = dr.zeros(F, total * sh_count * 3)
-    # Progressive SH is global across spatial levels. Keep all stored parent
-    # coefficients so refinement does not erase already trained higher degrees.
-    radiance_components = sh_count * 3 if "active_sh_count" in metadata else 3
+    # Keep both learned and dormant SH coefficients or octahedral log-scales.
+    preserve_all = ("active_sh_count" in metadata
+                    or metadata.get("radiance_representation", "sh") == "octahedral_scale")
+    radiance_components = sh_count * 3 if preserve_all else 3
     for component in range(radiance_components):
         value = dr.gather(F, state["radiance_sh"], parents * sh_count * 3 + component)
         dr.scatter(result["radiance_sh"], value, rows * sh_count * 3 + component)

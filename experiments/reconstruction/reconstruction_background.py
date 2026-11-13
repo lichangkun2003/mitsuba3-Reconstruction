@@ -186,6 +186,8 @@ def prepare_sparse_background(positions, colors, core_resolution, grid_min, grid
 
 
 def _sparse_background_state(points, model, mi, dr, np, opacity, shell_levels, subdivision):
+    from reconstruction_sh_schedule import radiance_model_layout
+    radiance_mode, radiance_resolution, _ = radiance_model_layout(model)
     core, sh, opacity_sh = int(model.core_resolution), int(model.sh_count), int(model.opacity_sh_count)
     for key, expected in (("core_resolution", core), ("shell_levels", shell_levels),
                           ("background_subdivision_level", subdivision),
@@ -208,7 +210,8 @@ def _sparse_background_state(points, model, mi, dr, np, opacity, shell_levels, s
         fitted = mi.VoxelReconstruction.from_points(
             np.ascontiguousarray(positions.reshape(-1), dtype=np.float32),
             np.ascontiguousarray(colors.reshape(-1), dtype=np.float32),
-            side, lower.tolist(), upper.tolist(), sh, opacity_sh)
+            side, lower.tolist(), upper.tolist(), sh, opacity_sh,
+            radiance_representation=radiance_mode, radiance_resolution=radiance_resolution)
         snapshot = fitted.snapshot()
         local = np.asarray(snapshot["cell_indices"], dtype=np.uint64)
         cells = _compact_shell_cells(local, core, shell, subdivision, np)
@@ -239,6 +242,11 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, shell_levels=5
                                 background_geometry="ellipsoid", background_points=None,
                                 background_subdivision_level=0, adaptive_background=None):
     """Append point-fitted sparse leaves, or retain the legacy dense S=0 layout."""
+    from reconstruction_sh_schedule import radiance_model_layout, restore_sh_state, sh_model_metadata
+    radiance_mode, radiance_resolution, _ = radiance_model_layout(model)
+    radiance_options = dict(radiance_representation=radiance_mode,
+                            radiance_resolution=radiance_resolution)
+    appearance_metadata = sh_model_metadata(model)
     if mapping != "world_shell":
         raise ValueError("Only world_shell background initialization is supported")
     if background_geometry not in ("ellipsoid", "occupied_cell"):
@@ -292,7 +300,9 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, shell_levels=5
         result = mi.VoxelReconstruction.from_state(
             core, model.grid_min, model.grid_max, state, int(model.sh_count), int(model.opacity_sh_count),
             core_resolution=core, background_shell_levels=shell_levels,
-            background_subdivision_level=subdivision, background_use_ellipsoid=background_geometry == "ellipsoid")
+            background_subdivision_level=subdivision, background_use_ellipsoid=background_geometry == "ellipsoid",
+            **radiance_options)
+        restore_sh_state(result, appearance_metadata)
         configure_world_shell_model(result, shell_levels, background_refinement, subdivision, background_geometry)
         result.background_initialization = dict(
             region="nested_world_cube_shells", initialization="point_cloud_sparse",
@@ -322,7 +332,10 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, shell_levels=5
         "radiance_sh": np.zeros((count, 3 * sh), dtype=np.float32),
         "opacity_sh": np.zeros((count, opacity_sh), dtype=np.float32),
     }
-    background["radiance_sh"][:, :3] = colors / .28209479177387814
+    # Octahedral storage starts with actual linear RGB and zero log-scales
+    # (exp(0)=1); SH storage starts with RGB/Y00 and zero higher coefficients.
+    background["radiance_sh"][:, :3] = (colors if radiance_mode == "octahedral_scale"
+                                        else colors / .28209479177387814)
     background["opacity_sh"][:, 0] = math.log(opacity / (1. - opacity)) / .28209479177387814
     state = {key: _concat_nonempty([mi.UInt64(seed[key]) if key == "cell_indices" else seed[key],
                            (mi.UInt64 if key == "cell_indices" else mi.Float)(value.ravel())], dr)
@@ -345,7 +358,8 @@ def initialize_background_model(model, mi, dr, np, opacity=.5, *, shell_levels=5
         core, model.grid_min, model.grid_max, state, sh, opacity_sh,
         core_resolution=core, background_shell_levels=shell_levels,
         background_subdivision_level=0, background_use_ellipsoid=background_geometry == "ellipsoid",
-        **({"background_adaptive": True} if adaptive else {}))
+        **({"background_adaptive": True} if adaptive else {}), **radiance_options)
+    restore_sh_state(result, appearance_metadata)
     configure_world_shell_model(result, shell_levels, background_refinement=background_refinement,
                                 background_subdivision_level=0, background_geometry=background_geometry)
     result.background_initialization = dict(

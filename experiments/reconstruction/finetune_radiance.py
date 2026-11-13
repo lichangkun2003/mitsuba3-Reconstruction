@@ -3,7 +3,7 @@
 Defaults: bonsai-11.04, 1000 additional epochs over every training camera,
 one full-image 1-spp update per camera. Geometry, opacity, cameras and topology
 stay fixed. Original RGB losses, Adam settings and clipping are retained.
-After completion, render every train/test camera and train/0091 SH components
+After completion, render every train/test camera and train/0091 radiance components
 at 64 spp. This driver never invokes the normal training loop or topology code.
 Relative paths use the workspace (parent of the Mitsuba source checkout).
 """
@@ -50,7 +50,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, help='Default: saved radiance learning rate')
     parser.add_argument('--reset-adam', action='store_true', help='Start fresh moments instead of continuing saved Adam')
     parser.add_argument('--save-every', type=int, default=100, help='Overwrite the new run model.npz every N epochs; 0: final only')
-    parser.add_argument('--preview-every', type=int, default=100, help='Save full-SH train/0091 preview every N epochs; 0: initial/final only')
+    parser.add_argument('--preview-every', type=int, default=100, help='Save full-radiance train/0091 preview every N epochs; 0: initial/final only')
     parser.add_argument('--preview-view', type=int, default=91, help='Saved training camera index')
     parser.add_argument('--stop-after-epochs', type=int, help='Stop after N epochs this invocation, save resumable state; defer final evaluation')
     parser.add_argument('--reference-cache-mib', type=int, default=8192)
@@ -91,7 +91,7 @@ def frozen_digests(model, dr):
 
 def ensure_frozen(model, expected, expected_metadata, dr):
     if common.model_metadata(model) != expected_metadata:
-        raise RuntimeError('Model topology or active SH settings changed')
+        raise RuntimeError('Model topology or active appearance settings changed')
     actual = frozen_digests(model, dr)
     if actual != expected:
         changed = [name for name in FROZEN_FIELDS if actual[name] != expected[name]]
@@ -103,13 +103,16 @@ def run_final_outputs(args, output, report):
     scripts = Path(__file__).resolve().parent
     runtime = ['--build-dir', args.build_dir, '--gpu', str(args.gpu)]
     model_path = str(output / 'model.npz')
+    octahedral = report['model_metadata'].get('radiance_representation', 'sh') == 'octahedral_scale'
+    component_job = 'radiance_components' if octahedral else 'sh_components'
+    component_folder = 'radiance-components' if octahedral else 'sh-components'
     jobs = [
         ('evaluation', [str(scripts / 'evaluate.py'), '--checkpoint', model_path,
                         '--split', 'both', '--train-max-views', '0', '--test-max-views', '0',
                         '--spp', '64', '--output-dir', str(output), *runtime]),
-        ('sh_components', [str(scripts / 'render_sh_components.py'), '--checkpoint', model_path,
+        (component_job, [str(scripts / 'render_sh_components.py'), '--checkpoint', model_path,
                            '--split', 'train', '--view', str(args.preview_view),
-                           '--output-dir', str(output / 'sh-components' / f'train-{args.preview_view:05d}'),
+                           '--output-dir', str(output / component_folder / f'train-{args.preview_view:05d}'),
                            *runtime]),
     ]
     for name, command in jobs:
@@ -187,8 +190,8 @@ def run(args):
             report['discarded_unsaved_log_epochs'] = len(lines) - len(kept)
             log_path.write_text(''.join(line + '\n' for line in kept), encoding='utf-8')
         model = common.restore_model(checkpoint, mi)
-        # Train every stored RGB SH coefficient from the start. Opacity stays at
-        # exactly the saved activation, including its high-order coefficients.
+        # Train all stored radiance entries: SH coefficients, or RGB base and
+        # the entire octahedral log-scale table. Opacity keeps saved activation.
         model.set_active_sh_count(int(model.sh_count))
         expected_metadata = common.model_metadata(model)
         print('Hashing fixed geometry, opacity and cell indices...', flush=True)

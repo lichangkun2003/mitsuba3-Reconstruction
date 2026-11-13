@@ -1,8 +1,9 @@
 """Pure global-epoch learning rates for a frozen-topology optimization tail.
 
-The native pack contains radiance degrees 0..3, opacity degrees 0..2,
-center, log-scale and rotation. Its values are runtime inputs to replay,
-independent of SH storage and Adam clocks.
+The native pack contains four radiance slots, opacity degrees 0..2,
+center, log-scale and rotation. Legacy radiance uses degrees 0..3; octahedral
+radiance uses base/map in slots 0/1 and leaves 2/3 zero. Values are runtime
+inputs to replay, independent of storage capacity and Adam clocks.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import math
 
 from reconstruction_sh_schedule import (active_opacity_sh_count_for_epoch,
                                         active_sh_count_for_epoch,
+                                        radiance_model_layout,
                                         validate_sh_schedule)
 
 
@@ -29,9 +31,8 @@ def validate_learning_rate_schedule(config):
             or not 0 <= fraction < 1):
         raise ValueError("topology.freeze_last_fraction must be in [0, 1)")
     validate_sh_schedule(config)
-    if (config.optimizer.lr_schedule_enabled
-            and (not 1 <= config.model.sh_count <= 16 or not 1 <= config.model.opacity_sh_count <= 9)):
-        raise ValueError("Learning-rate packs support up to 16 radiance and 9 opacity coefficients")
+    if config.optimizer.lr_schedule_enabled and not 1 <= config.model.opacity_sh_count <= 9:
+        raise ValueError("Learning-rate packs support up to 9 opacity coefficients")
 
 
 def topology_freeze_start_epoch(config):
@@ -46,6 +47,8 @@ def topology_freeze_start_epoch(config):
 
 def _activation_epoch(config, degree, *, opacity):
     stored = config.model.opacity_sh_count if opacity else config.model.sh_count
+    if not opacity and radiance_model_layout(config.model)[0] == "octahedral_scale" and degree > 1:
+        return None  # Slots 2/3 stay unused; slot 1 controls every map texel.
     if degree * degree >= stored:
         return None
     active = active_opacity_sh_count_for_epoch if opacity else active_sh_count_for_epoch
@@ -127,6 +130,10 @@ def learning_rate_schedule(config, epoch):
               for value in (cfg.lr_center, cfg.lr_log_scale, cfg.lr_rotation)]
     result.update(rates=rates, base_factor=base_factor,
                   radiance_bands=radiance, opacity_bands=opacity)
+    if radiance_model_layout(config.model)[0] == "octahedral_scale":
+        result["radiance_representation"] = "octahedral_scale"
+        for band, name in zip(radiance, ("base_rgb", "direction_log_scale", "unused", "unused")):
+            band["parameter_group"] = name
     return result
 
 
@@ -134,8 +141,11 @@ def learning_rate_schedule_protocol(config):
     validate_learning_rate_schedule(config)
     cfg = config.optimizer
     freeze_start = topology_freeze_start_epoch(config)
-    return dict(enabled=cfg.lr_schedule_enabled, version=1,
-                rate_names=list(RATE_NAMES), progress="zero-based global training epoch",
+    octahedral = radiance_model_layout(config.model)[0] == "octahedral_scale"
+    names = (("radiance_base_rgb", "radiance_direction_log_scale", "unused", "unused") + RATE_NAMES[4:]
+             if octahedral else RATE_NAMES)
+    return dict(enabled=cfg.lr_schedule_enabled, version=2 if octahedral else 1,
+                rate_names=list(names), progress="zero-based global training epoch",
                 total_epochs=config.training.num_epochs, freeze_start_epoch=freeze_start,
                 final_factor=cfg.lr_final_factor, sh_warmup_epochs=cfg.lr_sh_warmup_epochs,
                 radiance_high_order_peak=(cfg.lr_radiance if cfg.lr_radiance_sh is None

@@ -146,13 +146,17 @@ private:
 MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     const std::string &filename, uint32_t resolution,
     const std::array<float, 3> &grid_min, const std::array<float, 3> &grid_max,
-    double opacity_threshold, uint32_t sh_count, uint32_t opacity_sh_count)
+    double opacity_threshold, uint32_t sh_count, uint32_t opacity_sh_count,
+    const std::string &radiance_representation, uint32_t radiance_resolution)
     : m_resolution(resolution), m_core_resolution(resolution), m_active_count(0), m_sh_count(sh_count),
       m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count), m_active_opacity_sh_count(opacity_sh_count), m_min(grid_min), m_max(grid_max) {
     if (resolution < 1 || resolution > max_core_resolution)
         Throw("VoxelReconstruction: resolution must be in [1, 1024].");
-    if (sh_count < 1 || sh_count > 16 || opacity_sh_count < 1 || opacity_sh_count > 16)
-        Throw("VoxelReconstruction: SH coefficient counts must be in [1, 16].");
+    if (radiance_representation != "sh" && radiance_representation != "octahedral_scale")
+        Throw("VoxelReconstruction: unknown radiance representation.");
+    m_octahedral_radiance = radiance_representation == "octahedral_scale";
+    m_radiance_resolution = radiance_resolution;
+    validate_radiance_layout();
     for (size_t axis = 0; axis < 3; ++axis) {
         if (!std::isfinite(m_min[axis]) || !std::isfinite(m_max[axis]) ||
             m_max[axis] <= m_min[axis])
@@ -169,7 +173,8 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     uint32_t resolution, const std::array<float, 3> &grid_min,
     const std::array<float, 3> &grid_max, uint32_t sh_count,
     uint32_t opacity_sh_count, uint32_t core_resolution, uint32_t background_shell_levels,
-    uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive)
+    uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive,
+    const std::string &radiance_representation, uint32_t radiance_resolution)
     : m_resolution(resolution), m_core_resolution(core_resolution ? core_resolution : resolution),
       m_active_count(0), m_sh_count(sh_count), m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count), m_active_opacity_sh_count(opacity_sh_count),
       m_min(grid_min), m_max(grid_max) {
@@ -177,8 +182,11 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
         m_core_resolution > max_core_resolution || m_core_resolution != resolution)
         Throw("VoxelReconstruction.from_points(): core resolution must be in [1, 1024], "
               "with core_resolution equal to resolution; compressed layouts are unsupported.");
-    if (sh_count < 1 || sh_count > 16 || opacity_sh_count < 1 || opacity_sh_count > 16)
-        Throw("VoxelReconstruction.from_points(): SH coefficient counts must be in [1, 16].");
+    if (radiance_representation != "sh" && radiance_representation != "octahedral_scale")
+        Throw("VoxelReconstruction.from_points(): unknown radiance representation.");
+    m_octahedral_radiance = radiance_representation == "octahedral_scale";
+    m_radiance_resolution = radiance_resolution;
+    validate_radiance_layout();
     for (size_t axis = 0; axis < 3; ++axis) {
         if (!std::isfinite(m_min[axis]) || !std::isfinite(m_max[axis]) ||
             m_max[axis] <= m_min[axis])
@@ -201,6 +209,7 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::initialize_seeds(
     if (loaded.seeds.empty())
         Throw("VoxelReconstruction: no occupied voxels; check point cloud and grid bounds.");
     m_active_count = (uint32_t) loaded.seeds.size();
+    validate_radiance_layout();
     const auto &s = loaded.statistics;
     m_statistics = {{"input_points", s.inputPoints}, {"invalid_points", s.invalidPoints},
         {"outside_points", s.outsidePoints}, {"colored_points", s.coloredPoints},
@@ -221,7 +230,7 @@ MI_VARIANT void VoxelReconstruction<Float, Spectrum>::initialize_seeds(
         for (size_t a = 0; a < 3; ++a) {
             centers[i * 3 + a] = seed.center[a];
             scales[i * 3 + a] = std::log(std::max(seed.scale[a], 1e-8f));
-            radiance[i * sh_count * 3 + a] = seed.color[a] / y00;
+            radiance[i * sh_count * 3 + a] = m_octahedral_radiance ? seed.color[a] : seed.color[a] / y00;
         }
         for (size_t a = 0; a < 4; ++a)
             rotations[i * 4 + a] = seed.rotation[a];
@@ -240,15 +249,20 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     const std::array<float, 3> &grid_max, const CellBuffer &cells,
     const std::map<std::string, FloatBuffer> &parameters,
     uint32_t sh_count, uint32_t opacity_sh_count, uint32_t core_resolution, uint32_t background_shell_levels,
-    uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive)
+    uint32_t background_subdivision_level, bool background_use_ellipsoid, bool background_adaptive,
+    const std::string &radiance_representation, uint32_t radiance_resolution)
     : m_resolution(resolution), m_core_resolution(core_resolution ? core_resolution : resolution),
       m_active_count((uint32_t) cells.size()),
       m_sh_count(sh_count), m_active_sh_count(sh_count), m_opacity_sh_count(opacity_sh_count), m_active_opacity_sh_count(opacity_sh_count),
       m_min(grid_min), m_max(grid_max) {
     if (!resolution || resolution > max_grid_resolution || cells.size() > size_t(INT32_MAX) ||
-        m_core_resolution > max_core_resolution || m_core_resolution != resolution ||
-        sh_count < 1 || sh_count > 16 || opacity_sh_count < 1 || opacity_sh_count > 16)
-        Throw("VoxelReconstruction.from_state(): invalid grid, occupancy, or SH counts.");
+        m_core_resolution > max_core_resolution || m_core_resolution != resolution)
+        Throw("VoxelReconstruction.from_state(): invalid grid or occupancy.");
+    if (radiance_representation != "sh" && radiance_representation != "octahedral_scale")
+        Throw("VoxelReconstruction.from_state(): unknown radiance representation.");
+    m_octahedral_radiance = radiance_representation == "octahedral_scale";
+    m_radiance_resolution = radiance_resolution;
+    validate_radiance_layout();
     for (size_t a = 0; a < 3; ++a) {
         if (!std::isfinite(m_min[a]) || !std::isfinite(m_max[a]) || m_max[a] <= m_min[a])
             Throw("VoxelReconstruction.from_state(): invalid bounds.");
@@ -275,6 +289,21 @@ MI_VARIANT VoxelReconstruction<Float, Spectrum>::VoxelReconstruction(
     set_parameters(parameters);
     m_statistics = {{"restored_voxels", m_active_count}};
     rebuild_octree();
+}
+
+MI_VARIANT void VoxelReconstruction<Float, Spectrum>::validate_radiance_layout() const {
+    if (m_radiance_resolution < 2 || m_radiance_resolution > 64)
+        Throw("VoxelReconstruction: radiance_resolution must be in [2, 64].");
+    if (m_opacity_sh_count < 1 || m_opacity_sh_count > 16)
+        Throw("VoxelReconstruction: opacity SH coefficient count must be in [1, 16].");
+    if (m_octahedral_radiance) {
+        if (m_sh_count != 1u + m_radiance_resolution * m_radiance_resolution)
+            Throw("VoxelReconstruction: octahedral radiance requires 1 + resolution^2 RGB entries.");
+    } else if (m_sh_count < 1 || m_sh_count > 16) {
+        Throw("VoxelReconstruction: radiance SH coefficient count must be in [1, 16].");
+    }
+    if (uint64_t(m_active_count) * m_sh_count * 3u > UINT32_MAX)
+        Throw("VoxelReconstruction: radiance buffer exceeds 32-bit element addressing.");
 }
 
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::update_spatial_statistics() {
@@ -599,7 +628,8 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                 setting("lr_rotation"), rotation_limit, 9}
         }};
         const size_t input_rows = compact_indices ? compact_indices->size() : m_active_count;
-        const uint32_t radiance_degrees = uint32_t(std::ceil(std::sqrt(double(m_sh_count))));
+        const uint32_t radiance_degrees = m_octahedral_radiance ? 2u :
+            uint32_t(std::ceil(std::sqrt(double(m_sh_count))));
         const uint32_t opacity_degrees = uint32_t(std::ceil(std::sqrt(double(m_opacity_sh_count))));
         if (dr::width(allowed) != 1 || appearance_valid.size() != input_rows ||
             geometry_valid.size() != input_rows || background_carve_valid.size() != input_rows ||
@@ -691,6 +721,7 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                 const bool rotation = std::string(group.name) == "rotation_tangent";
                 const bool radiance = std::string(group.name) == "radiance_sh";
                 const bool opacity = std::string(group.name) == "opacity_sh";
+                const bool octahedral = radiance && m_octahedral_radiance;
                 const uint32_t active_coefficients = radiance ? m_active_sh_count : m_active_opacity_sh_count;
                 const uint32_t degree_count = radiance ? radiance_degrees : opacity_degrees;
                 const bool centers = std::string(group.name) == "centers";
@@ -708,10 +739,9 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                 // supplies voxel-major degree clocks so a newly enabled degree
                 // starts its own Adam bias correction without altering DC age.
                 const uint32_t clock_width = clock_target.size() == m_active_count ? 1 : degree_count;
-                const uint32_t active_clocks = clock_width == 1 ? 1 :
-                    uint32_t(std::ceil(std::sqrt(double(active_coefficients))));
-                const uint32_t active_degrees = (radiance || opacity) ?
-                    uint32_t(std::ceil(std::sqrt(double(active_coefficients)))) : 1u;
+                const uint32_t active_degrees = octahedral ? (m_active_sh_count == 1 ? 1u : 2u) :
+                    ((radiance || opacity) ? uint32_t(std::ceil(std::sqrt(double(active_coefficients)))) : 1u);
+                const uint32_t active_clocks = clock_width == 1 ? 1 : active_degrees;
                 std::vector<Float> rates;
                 Mask group_enabled(true);
                 if (scheduled_rates) {
@@ -723,6 +753,8 @@ VoxelReconstruction<Float, Spectrum>::optimizer_step_device_impl(
                     }
                 }
                 auto component_degree = [&](uint32_t component) {
+                    if (octahedral)
+                        return component < 3u ? 0u : 1u;
                     return (radiance || opacity) ?
                         uint32_t(std::sqrt(double(component / (radiance ? 3u : 1u)))) : 0u;
                 };
@@ -1167,9 +1199,73 @@ template <typename T> static T reconstruction_sh(uint32_t i, const Vector<T, 3> 
     }
 }
 
+/// Octahedral texel centers use UV*N-.5. Each of the four bilinear taps
+/// crossing a square edge folds back onto the opposite half of that edge.
+/// The corner case folds twice, making all four representations of -Z agree.
+template <typename T>
+static std::pair<std::array<dr::uint32_array_t<T>, 4>, std::array<T, 4>>
+reconstruction_octahedral_taps(const Vector<T, 3> &direction, uint32_t resolution) {
+    using Index = dr::uint32_array_t<T>;
+    using Signed = dr::int32_array_t<T>;
+    using Mask = dr::mask_t<T>;
+    T denominator = dr::maximum(dr::abs(direction.x()) + dr::abs(direction.y()) +
+                                dr::abs(direction.z()), T(1e-20f));
+    T x = direction.x() / denominator, y = direction.y() / denominator;
+    T folded_x = (1.f - dr::abs(y)) * dr::select(x >= 0.f, T(1.f), T(-1.f));
+    T folded_y = (1.f - dr::abs(x)) * dr::select(y >= 0.f, T(1.f), T(-1.f));
+    x = dr::select(direction.z() < 0.f, folded_x, x);
+    y = dr::select(direction.z() < 0.f, folded_y, y);
+    T sx = dr::clip((x + 1.f) * (.5f * resolution) - .5f, -.5f, float(resolution) - .5f);
+    T sy = dr::clip((y + 1.f) * (.5f * resolution) - .5f, -.5f, float(resolution) - .5f);
+    T fx = sx - dr::floor(sx), fy = sy - dr::floor(sy);
+    Signed bx(dr::floor(sx)), by(dr::floor(sy));
+    std::array<T, 4> weights = {(1.f-fx)*(1.f-fy), fx*(1.f-fy), (1.f-fx)*fy, fx*fy};
+    std::array<Index, 4> indices;
+    const int32_t n = int32_t(resolution);
+    for (uint32_t tap = 0; tap < 4; ++tap) {
+        Signed ix = bx + int32_t(tap & 1u), iy = by + int32_t(tap >> 1u);
+        Mask outside_x = (ix < 0) | (ix >= n);
+        ix = dr::select(ix < 0, -ix-1, dr::select(ix >= n, 2*n-1-ix, ix));
+        iy = dr::select(outside_x, n-1-iy, iy);
+        Mask outside_y = (iy < 0) | (iy >= n);
+        iy = dr::select(iy < 0, -iy-1, dr::select(iy >= n, 2*n-1-iy, iy));
+        ix = dr::select(outside_y, n-1-ix, ix);
+        indices[tap] = Index(iy*n + ix);
+    }
+    return {indices, weights};
+}
+
+MI_VARIANT typename VoxelReconstruction<Float, Spectrum>::Color3f
+VoxelReconstruction<Float, Spectrum>::radiance_value(const FloatBuffer &parameters,
+    const UInt32 &id, const Vector3f &view, const Mask &active) const {
+    Color3f value(0.f);
+    if (!m_octahedral_radiance) {
+        for (uint32_t k = 0; k < m_active_sh_count; ++k) {
+            Float basis = reconstruction_sh(k, view);
+            for (uint32_t channel = 0; channel < 3; ++channel)
+                value[channel] += basis * dr::gather<Float>(parameters, (id*m_sh_count+k)*3+channel, active);
+        }
+        return value;
+    }
+    for (uint32_t channel = 0; channel < 3; ++channel)
+        value[channel] = dr::maximum(dr::gather<Float>(parameters, id*m_sh_count*3+channel, active), 0.f);
+    if (m_active_sh_count == 1)
+        return value;
+    auto [indices, weights] = reconstruction_octahedral_taps(view, m_radiance_resolution);
+    Color3f scale(0.f);
+    for (uint32_t tap = 0; tap < 4; ++tap)
+        for (uint32_t channel = 0; channel < 3; ++channel) {
+            Float q = dr::gather<Float>(parameters, (id*m_sh_count+1u+indices[tap])*3+channel, active);
+            scale[channel] += weights[tap] * dr::exp(q);
+        }
+    return value * scale;
+}
+
 MI_VARIANT void VoxelReconstruction<Float, Spectrum>::set_active_sh_count(uint32_t count) {
     if (!count || count > m_sh_count)
         Throw("VoxelReconstruction.set_active_sh_count(): count must be in [1, %u].", m_sh_count);
+    if (m_octahedral_radiance && count != 1 && count != m_sh_count)
+        Throw("VoxelReconstruction.set_active_sh_count(): octahedral radiance permits base-only or the full map.");
     if (count != m_active_sh_count) {
         m_active_sh_count = count;
         // Frozen rendering captures the active coefficient loop bound.
@@ -1643,16 +1739,11 @@ VoxelReconstruction<Float, Spectrum>::trace(const Ray3f &ray, const Color3f &bac
             // occupied-volume hits, while the legacy ellipsoid rule is retained.
             if (voxel_background)
                 hit |= occupied & !ellipsoid & (end > s.entry);
-            Color3f emission(0.f);
+            Color3f emission = radiance_value(m_radiance, id, Vector3f(-world_d), hit);
             Float logit = 0.f;
-            for (uint32_t k = 0; k < std::max(m_active_sh_count, m_active_opacity_sh_count); ++k) {
+            for (uint32_t k = 0; k < m_active_opacity_sh_count; ++k) {
                 Float sh = reconstruction_sh(k, Vector3f(-world_d));
-                if (k < m_active_sh_count)
-                    for (uint32_t channel = 0; channel < 3; ++channel)
-                        emission[channel] += sh * dr::gather<Float>(m_radiance,
-                            (id*m_sh_count+k)*3+channel, hit);
-                if (k < m_active_opacity_sh_count)
-                    logit += sh * dr::gather<Float>(m_opacity, id*m_opacity_sh_count+k, hit);
+                logit += sh * dr::gather<Float>(m_opacity, id*m_opacity_sh_count+k, hit);
             }
             Float alpha = dr::select(hit, dr::rcp(1.f + dr::exp(-logit)), 0.f);
             s.color += s.transmittance * alpha * dr::maximum(emission, 0.f);
@@ -2094,15 +2185,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
         q = dr::select(valid, q/dr::select(valid,norm,1.f), Vector3f(0.f));
     };
     auto appearance = [this, clean](UInt32 id, const Vector3f &view, Mask mask, Color3f &rgb, Float &alpha) {
-        rgb = Color3f(0.f);
+        rgb = radiance_value(m_radiance, id, view, mask);
         Float logit(0.f);
-        for (uint32_t k=0; k<std::max(m_active_sh_count,m_active_opacity_sh_count); ++k) {
+        for (uint32_t k=0; k<m_active_opacity_sh_count; ++k) {
             Float sh = reconstruction_sh(k,view);
-            if (k<m_active_sh_count)
-                for (uint32_t a=0;a<3;++a)
-                    rgb[a] += sh*dr::gather<Float>(m_radiance,(id*m_sh_count+k)*3+a,mask);
-            if (k<m_active_opacity_sh_count)
-                logit += sh*dr::gather<Float>(m_opacity,id*m_opacity_sh_count+k,mask);
+            logit += sh*dr::gather<Float>(m_opacity,id*m_opacity_sh_count+k,mask);
         }
         rgb = dr::maximum(clean(rgb),0.f);
         alpha = dr::rcp(1.f+dr::exp(-logit));
@@ -2609,16 +2696,11 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                     Mask &known_ray,Mask &recovered_ray,Mask &invalid_trace,Mask &nonfinite) {
                     Mask valid = id!=UInt32(UINT32_MAX);
                     Mask hit = growth_intersects(id,segment_entry,segment_end,ray.o,d,valid);
-                    Color3f radiance(0.f);
+                    Color3f radiance = radiance_value(m_growth_radiance,id,Vector3f(-d),hit);
                     Float logit(0.f);
-                    for (uint32_t j=0; j<std::max(m_active_sh_count,m_active_opacity_sh_count); ++j) {
+                    for (uint32_t j=0; j<m_active_opacity_sh_count; ++j) {
                         Float sh = reconstruction_sh(j,Vector3f(-d));
-                        if (j<m_active_sh_count)
-                            for (uint32_t channel=0; channel<3; ++channel)
-                                radiance[channel] += sh*dr::gather<Float>(m_growth_radiance,
-                                    (id*m_sh_count+j)*3+channel,hit);
-                        if (j<m_active_opacity_sh_count)
-                            logit += sh*dr::gather<Float>(m_growth_opacity,id*m_opacity_sh_count+j,hit);
+                        logit += sh*dr::gather<Float>(m_growth_opacity,id*m_opacity_sh_count+j,hit);
                     }
                     radiance = dr::maximum(clean(radiance),0.f);
                     Float opacity = dr::rcp(1.f+dr::exp(-logit));
@@ -3009,14 +3091,40 @@ VoxelReconstruction<Float, Spectrum>::loss_and_grad(
                 s.distortion_moment += contribution*depth;
                 s.distortion_weight_derivative += contribution*derivative;
             }
-            for(uint32_t k=0;k<std::max(m_active_sh_count,m_active_opacity_sh_count);++k) {
-                Float sh=reconstruction_sh(k,Vector3f(-d));
-                if(k<m_active_sh_count)
-                    for(uint32_t j=0;j<3;++j)
-                        dr::scatter_reduce(ReduceOp::Add,s.gradients["radiance_sh"],grad_rgb[j]*sh,(row*m_sh_count+k)*3+j,stored);
-                if(k<m_active_opacity_sh_count)
-                    dr::scatter_reduce(ReduceOp::Add,s.gradients["opacity_sh"],grad_logit*sh,row*m_opacity_sh_count+k,stored);
+            if (m_octahedral_radiance) {
+                Color3f base(0.f), scale(1.f);
+                for (uint32_t channel=0;channel<3;++channel)
+                    base[channel]=dr::maximum(dr::gather<Float>(m_radiance,id*m_sh_count*3+channel,valid),0.f);
+                if (m_active_sh_count > 1) {
+                    auto [indices, weights]=reconstruction_octahedral_taps(Vector3f(-d),m_radiance_resolution);
+                    scale=Color3f(0.f);
+                    for (uint32_t tap=0;tap<4;++tap)
+                        for (uint32_t channel=0;channel<3;++channel) {
+                            Float q=dr::gather<Float>(m_radiance,(id*m_sh_count+1u+indices[tap])*3+channel,valid);
+                            Float weighted_scale=weights[tap]*dr::exp(q);
+                            scale[channel]+=weighted_scale;
+                            // Interpolate actual positive scales, not their logits.
+                            dr::scatter_reduce(ReduceOp::Add,s.gradients["radiance_sh"],
+                                grad_rgb[channel]*base[channel]*weighted_scale,
+                                (row*m_sh_count+1u+indices[tap])*3+channel,stored);
+                        }
+                }
+                // Preserve the existing black-color recovery convention in
+                // grad_rgb. Dormant map values and moments remain untouched.
+                for (uint32_t channel=0;channel<3;++channel)
+                    dr::scatter_reduce(ReduceOp::Add,s.gradients["radiance_sh"],
+                        grad_rgb[channel]*scale[channel],row*m_sh_count*3+channel,stored);
+            } else {
+                for(uint32_t k=0;k<m_active_sh_count;++k) {
+                    Float sh=reconstruction_sh(k,Vector3f(-d));
+                    for(uint32_t channel=0;channel<3;++channel)
+                        dr::scatter_reduce(ReduceOp::Add,s.gradients["radiance_sh"],
+                            grad_rgb[channel]*sh,(row*m_sh_count+k)*3+channel,stored);
+                }
             }
+            for(uint32_t k=0;k<m_active_opacity_sh_count;++k)
+                dr::scatter_reduce(ReduceOp::Add,s.gradients["opacity_sh"],
+                    grad_logit*reconstruction_sh(k,Vector3f(-d)),row*m_opacity_sh_count+k,stored);
             dr::scatter_reduce(ReduceOp::Add,s.counters["appearance_valid"],UInt32(1),row,stored);
             if(!rgb_only && cfg.at("collect_deletion_evidence")!=0.f) {
                 Color3f dc=before*opacity*(s.behind-radiance);
@@ -3138,7 +3246,8 @@ MI_VARIANT std::string VoxelReconstruction<Float, Spectrum>::to_string() const {
     out << "VoxelReconstruction[resolution=" << m_resolution << ", active_voxels="
         << m_active_count << ", sh_count=" << m_sh_count << ", active_sh_count="
         << m_active_sh_count << ", opacity_sh_count="
-        << m_opacity_sh_count << "]";
+        << m_opacity_sh_count << ", radiance_representation=" << radiance_representation()
+        << ", radiance_resolution=" << m_radiance_resolution << "]";
     return out.str();
 }
 

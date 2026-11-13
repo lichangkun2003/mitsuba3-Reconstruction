@@ -511,10 +511,11 @@ def refine_state(checkpoint: dict, config: CoarseToFineConfig, max_active_voxels
         "log_scales": np.concatenate([block[3] for block in blocks]).astype(np.float32).ravel(),
         "rotations": quaternion[parent_ids].astype(np.float32).ravel(),
     }
-    if "active_sh_count" in metadata:
-        # The global SH schedule can cross a spatial refinement boundary while
-        # degree one is already trained. Preserve learned and dormant storage;
-        # the model's active count controls which coefficients affect rendering.
+    if ("active_sh_count" in metadata
+            or metadata.get("radiance_representation", "sh") == "octahedral_scale"):
+        # Preserve learned and dormant appearance storage across refinement.
+        # Octahedral entries are log-scales, not higher-degree SH coefficients.
+        # The model's active count controls whether directional entries render.
         new_radiance = radiance[parent_ids].astype(np.float32)
     else:
         new_radiance = np.zeros((count, metadata["sh_count"], 3), dtype=np.float32)
